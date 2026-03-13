@@ -6,7 +6,9 @@ use core::fmt::{self, Write};
 use hal_api::{hal, ConsoleWriter};
 use mm::MemoryManager;
 use proc::ProcessTable;
-use syscall::SyscallDispatcher;
+use syscall::{
+    SyscallArgs, SyscallDispatcher, SYS_EXECVE,
+};
 use task::Scheduler;
 use vfs::KernelVfs;
 
@@ -35,9 +37,14 @@ impl Kernel {
         let _ = user_init::seed_filesystem(&mut vfs);
 
         let mut processes = ProcessTable::new();
-        let init_pid = processes.spawn_init("init");
+        let init_entry = user_init::builtin_program("/bin/init")
+            .map(|program| program.image.as_ptr() as usize + program.entry)
+            .unwrap_or(0);
+        let init_pid = processes.spawn_init("init", init_entry);
         processes.set_current(init_pid).expect("init pid must exist");
-        user_init::seed_process(processes.current_mut().expect("init process must exist"));
+        if init_entry == 0 {
+            user_init::seed_process(processes.current_mut().expect("init process must exist"));
+        }
 
         let mut scheduler = Scheduler::new();
         scheduler.spawn("init", init_pid);
@@ -47,20 +54,34 @@ impl Kernel {
         logln(format_args!("whuse: memory initialized"));
         logln(format_args!("whuse: rootfs mounted with devfs/procfs-lite"));
 
-        Self {
+        let kernel = Self {
             info,
             memory,
             processes,
             scheduler,
             vfs,
             syscalls: SyscallDispatcher::new(),
-        }
+        };
+        logln(format_args!("whuse: init process bootstrapped"));
+        kernel
     }
 
     pub fn run_forever(&mut self) -> ! {
         logln(format_args!("whuse: entering scheduler loop"));
         loop {
-            hal().cpu.wait_for_interrupt();
+            if self.scheduler.ensure_current().is_none() {
+                hal().cpu.wait_for_interrupt();
+                continue;
+            }
+            let pid = match self.scheduler.current_process_id() {
+                Some(pid) => pid,
+                None => continue,
+            };
+            if self.processes.set_current(pid).is_err() {
+                let _ = self.scheduler.yield_now();
+                continue;
+            }
+            self.run_current_process();
         }
     }
 }
@@ -68,6 +89,72 @@ impl Kernel {
 pub fn boot_forever(info: BootInfo) -> ! {
     let mut kernel = Kernel::bootstrap(info);
     kernel.run_forever();
+}
+
+impl Kernel {
+    fn run_current_process(&mut self) {
+        {
+            let process = match self.processes.current() {
+                Ok(process) => process,
+                Err(_) => return,
+            };
+            hal().cpu.switch_address_space(process.address_space.token());
+        }
+
+        {
+            let frame = match self.processes.current_frame_mut() {
+                Ok(frame) => frame,
+                Err(_) => return,
+            };
+            hal().cpu.run_user(frame);
+        }
+
+        self.handle_trap();
+    }
+
+    fn handle_trap(&mut self) {
+        let (sysno, args, scause, sepc, pid) = match self.processes.current() {
+            Ok(process) => (
+                process.trap_frame.syscall_number(),
+                process.trap_frame.syscall_args(),
+                process.trap_frame.scause,
+                process.trap_frame.sepc,
+                process.pid,
+            ),
+            Err(_) => return,
+        };
+
+        match scause {
+            8 => {
+                let result = self.syscalls.dispatch(
+                    sysno,
+                    SyscallArgs(args),
+                    &mut self.processes,
+                    &mut self.scheduler,
+                    &mut self.vfs,
+                );
+                if let Ok(process) = self.processes.current_mut() {
+                    process.trap_frame.set_retval(result as usize);
+                    if sysno != SYS_EXECVE {
+                        process.trap_frame.sepc = sepc + 4;
+                    }
+                }
+            }
+            _ => {
+                logln(format_args!(
+                    "whuse: pid {} trapped with scause={} stval={:#x}",
+                    pid,
+                    scause,
+                    self.processes
+                        .current()
+                        .map(|process| process.trap_frame.stval)
+                        .unwrap_or(0),
+                ));
+                let _ = self.processes.exit_current(-1);
+                self.scheduler.exit_current();
+            }
+        }
+    }
 }
 
 pub fn logln(args: fmt::Arguments<'_>) {

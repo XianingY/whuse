@@ -2,8 +2,10 @@
 members = [
     "tools/xtask",
     "platform/riscv64-virt",
+    "platform/loongarch64-virt",
     "crates/hal-api",
     "crates/hal-riscv64-virt",
+    "crates/hal-loongarch64-virt",
     "crates/kernel-core",
     "crates/mm",
     "crates/task",

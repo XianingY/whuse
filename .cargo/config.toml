@@ -3,3 +3,6 @@ xtask = "run --package xtask --"
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = ["-Clink-arg=-Tplatform/riscv64-virt/linker.ld"]
+
+[target.loongarch64-unknown-none-softfloat]
+rustflags = ["-Clink-arg=-Tplatform/loongarch64-virt/linker.ld"]

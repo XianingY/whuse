@@ -17,7 +17,7 @@ pub(crate) fn dispatch(
         SYS_GETPPID => ctx.dispatcher.sys_getppid(ctx.procs),
         SYS_GETTID => ctx.dispatcher.sys_gettid(ctx.procs),
         SYS_CLONE => ctx.dispatcher.sys_fork(ctx.procs, ctx.scheduler),
-        SYS_EXECVE => ctx.dispatcher.sys_execve(args, ctx.procs),
+        SYS_EXECVE => ctx.dispatcher.sys_execve(args, ctx.procs, ctx.vfs),
         SYS_WAIT => ctx.dispatcher.sys_wait(args, ctx.procs),
         SYS_SETPGID => ctx.dispatcher.sys_setpgid(args, ctx.procs),
         SYS_GETPGID => ctx.dispatcher.sys_getpgid(args, ctx.procs),

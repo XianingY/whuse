@@ -31,6 +31,7 @@ const EFAULT: i32 = 14;
 const EINVAL: i32 = 22;
 const ENOENT: i32 = 2;
 const ENOSYS: i32 = 38;
+const EPROTOTYPE: i32 = 91;
 
 pub const SYS_EVENTFD2: usize = 19;
 pub const SYS_EPOLL_CREATE1: usize = 20;
@@ -585,9 +586,20 @@ impl SyscallDispatcher {
         Ok(pid)
     }
 
-    fn sys_execve(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
+    fn sys_execve(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        vfs: &mut KernelVfs,
+    ) -> Result<usize, i32> {
         let path = procs.current()?.read_user_cstr(args.0[0]).map_err(|_| EFAULT)?;
-        let program = builtin_program(&path).ok_or(ENOENT)?;
+        let cwd = procs.current()?.cwd.clone();
+        let program = vfs
+            .read_file_all(&cwd, &path)
+            .ok()
+            .and_then(|data| resolve_exec_payload(&data))
+            .or_else(|| builtin_program(&path))
+            .ok_or(ENOENT)?;
         let entry = program.image.as_ptr() as usize + program.entry;
         let _argv = args.0[1];
         let _envp = args.0[2];
@@ -1764,8 +1776,13 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        if args.0[0] != 1 {
+        let family = args.0[0];
+        let sock_type = args.0[1] & 0xf;
+        if !matches!(family, 1 | 2 | 10) {
             return Err(EAFNOSUPPORT);
+        }
+        if sock_type != 1 {
+            return Err(EPROTOTYPE);
         }
         let handle = vfs.create_socket()?;
         Ok(procs.current_mut()?.add_fd(handle) as usize)
@@ -1847,7 +1864,7 @@ impl SyscallDispatcher {
         };
         let new_fd = procs.current_mut()?.add_fd(new_handle.clone());
         if args.0[1] != 0 && args.0[2] != 0 {
-            write_sockaddr_un(procs.current_mut()?, args.0[1], args.0[2], &new_handle.path)?;
+            write_sockaddr(procs.current_mut()?, args.0[1], args.0[2], &new_handle.path)?;
         }
         Ok(new_fd as usize)
     }
@@ -1859,7 +1876,7 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let fd = args.0[0] as i32;
         let path = procs.current()?.fd(fd)?.path.clone();
-        write_sockaddr_un(procs.current_mut()?, args.0[1], args.0[2], &path)?;
+        write_sockaddr(procs.current_mut()?, args.0[1], args.0[2], &path)?;
         Ok(0)
     }
 
@@ -2225,23 +2242,58 @@ fn stack_t_to_bytes(stack: (usize, usize, u32)) -> [u8; 24] {
 }
 
 fn parse_sockaddr_path(process: &proc::Process, addr: usize, len: usize) -> Result<String, i32> {
-    if addr == 0 || len < 3 {
+    if addr == 0 || len < 2 {
         return Err(EFAULT);
     }
     let bytes = process.read_user_bytes(addr, len).map_err(|_| EFAULT)?;
     let family = u16::from_le_bytes([bytes[0], bytes[1]]);
-    if family != 1 {
-        return Err(EAFNOSUPPORT);
+    match family {
+        1 => {
+            let end = bytes[2..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|pos| pos + 2)
+                .unwrap_or(len);
+            String::from_utf8(bytes[2..end].to_vec()).map_err(|_| EINVAL)
+        }
+        2 => {
+            if len < 8 {
+                return Err(EINVAL);
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            Ok(format!(
+                "/inet/{:03}.{:03}.{:03}.{:03}:{}",
+                bytes[4], bytes[5], bytes[6], bytes[7], port
+            ))
+        }
+        10 => {
+            if len < 28 {
+                return Err(EINVAL);
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let mut groups = [0u16; 8];
+            for (index, group) in groups.iter_mut().enumerate() {
+                let offset = 8 + index * 2;
+                *group = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+            }
+            Ok(format!(
+                "/inet6/{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{}",
+                groups[0],
+                groups[1],
+                groups[2],
+                groups[3],
+                groups[4],
+                groups[5],
+                groups[6],
+                groups[7],
+                port
+            ))
+        }
+        _ => Err(EAFNOSUPPORT),
     }
-    let end = bytes[2..]
-        .iter()
-        .position(|byte| *byte == 0)
-        .map(|pos| pos + 2)
-        .unwrap_or(len);
-    String::from_utf8(bytes[2..end].to_vec()).map_err(|_| EINVAL)
 }
 
-fn write_sockaddr_un(
+fn write_sockaddr(
     process: &mut proc::Process,
     addr_ptr: usize,
     len_ptr: usize,
@@ -2251,16 +2303,104 @@ fn write_sockaddr_un(
         return Ok(());
     }
     let max_len = read_u32(process, len_ptr)? as usize;
-    let mut bytes = Vec::with_capacity(2 + path.len() + 1);
-    bytes.extend_from_slice(&1u16.to_le_bytes());
-    bytes.extend_from_slice(path.as_bytes());
-    bytes.push(0);
+    let bytes = if let Some(rest) = path.strip_prefix("/inet/") {
+        encode_sockaddr_in(rest)?
+    } else if let Some(rest) = path.strip_prefix("/inet6/") {
+        encode_sockaddr_in6(rest)?
+    } else {
+        let mut bytes = Vec::with_capacity(2 + path.len() + 1);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+        bytes
+    };
     let used = bytes.len().min(max_len);
     process.write_user_bytes(addr_ptr, &bytes[..used]).map_err(|_| EFAULT)?;
     process
         .write_user_bytes(len_ptr, &(bytes.len() as u32).to_le_bytes())
         .map_err(|_| EFAULT)?;
     Ok(())
+}
+
+fn encode_sockaddr_in(spec: &str) -> Result<Vec<u8>, i32> {
+    let (ip, port) = spec.rsplit_once(':').ok_or(EINVAL)?;
+    let mut bytes = vec![0u8; 16];
+    bytes[..2].copy_from_slice(&2u16.to_le_bytes());
+    bytes[2..4].copy_from_slice(&port.parse::<u16>().map_err(|_| EINVAL)?.to_be_bytes());
+    let octets = parse_ipv4(ip)?;
+    bytes[4..8].copy_from_slice(&octets);
+    Ok(bytes)
+}
+
+fn encode_sockaddr_in6(spec: &str) -> Result<Vec<u8>, i32> {
+    let (ip, port) = spec.rsplit_once(':').ok_or(EINVAL)?;
+    let mut bytes = vec![0u8; 28];
+    bytes[..2].copy_from_slice(&10u16.to_le_bytes());
+    bytes[2..4].copy_from_slice(&port.parse::<u16>().map_err(|_| EINVAL)?.to_be_bytes());
+    let groups = parse_ipv6(ip)?;
+    for (index, group) in groups.iter().enumerate() {
+        let offset = 8 + index * 2;
+        bytes[offset..offset + 2].copy_from_slice(&group.to_be_bytes());
+    }
+    Ok(bytes)
+}
+
+fn parse_ipv4(ip: &str) -> Result<[u8; 4], i32> {
+    let mut out = [0u8; 4];
+    let mut count = 0;
+    for (index, segment) in ip.split('.').enumerate() {
+        if index >= 4 {
+            return Err(EINVAL);
+        }
+        out[index] = segment.parse::<u8>().map_err(|_| EINVAL)?;
+        count += 1;
+    }
+    if count != 4 {
+        return Err(EINVAL);
+    }
+    Ok(out)
+}
+
+fn parse_ipv6(ip: &str) -> Result<[u16; 8], i32> {
+    let mut groups = [0u16; 8];
+    let mut filled = 0usize;
+    let mut compressed = None;
+    for segment in ip.split(':') {
+        if segment.is_empty() {
+            if compressed.is_some() {
+                continue;
+            }
+            compressed = Some(filled);
+            continue;
+        }
+        if filled >= 8 {
+            return Err(EINVAL);
+        }
+        groups[filled] = u16::from_str_radix(segment, 16).map_err(|_| EINVAL)?;
+        filled += 1;
+    }
+    if let Some(pos) = compressed {
+        let tail_len = filled.saturating_sub(pos);
+        for index in 0..tail_len {
+            groups[7 - index] = groups[pos + tail_len - 1 - index];
+            groups[pos + tail_len - 1 - index] = 0;
+        }
+    } else if filled != 8 {
+        return Err(EINVAL);
+    }
+    Ok(groups)
+}
+
+fn resolve_exec_payload(data: &[u8]) -> Option<user_init::BuiltinProgram> {
+    let text = core::str::from_utf8(data).ok()?.trim();
+    if let Some(path) = text.strip_prefix("builtin ") {
+        return builtin_program(path.trim());
+    }
+    match text {
+        "builtin-init" => builtin_program("/sbin/init"),
+        "builtin-child" => builtin_program("/bin/child"),
+        _ => None,
+    }
 }
 
 fn read_u32(process: &proc::Process, addr: usize) -> Result<u32, i32> {
@@ -2633,6 +2773,119 @@ mod tests {
             4
         );
         assert_eq!(procs.current().unwrap().read_user_bytes(0x8600, 4).unwrap(), b"pong");
+    }
+
+    #[test]
+    fn inet_loopback_socket_smoke() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let mut sockaddr = [0u8; 16];
+        sockaddr[..2].copy_from_slice(&2u16.to_le_bytes());
+        sockaddr[2..4].copy_from_slice(&7000u16.to_be_bytes());
+        sockaddr[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        procs.current_mut().unwrap().address_space.install_bytes(0x9000, &sockaddr);
+        procs.current_mut().unwrap().address_space.install_bytes(0x9100, &[0; 16]);
+        procs.current_mut().unwrap().address_space.install_bytes(0x9200, &16u32.to_le_bytes());
+
+        let server = dispatcher.dispatch(
+            SYS_SOCKET,
+            SyscallArgs([2, 1, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        ) as usize;
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_BIND,
+                SyscallArgs([server, 0x9000, 16, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_LISTEN,
+                SyscallArgs([server, 1, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+
+        let client = dispatcher.dispatch(
+            SYS_SOCKET,
+            SyscallArgs([2, 1, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        ) as usize;
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_CONNECT,
+                SyscallArgs([client, 0x9000, 16, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        let accepted = dispatcher.dispatch(
+            SYS_ACCEPT,
+            SyscallArgs([server, 0x9100, 0x9200, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        ) as usize;
+        assert!(accepted >= 3);
+
+        procs.current_mut().unwrap().address_space.install_bytes(0x9300, b"tcp");
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SENDTO,
+                SyscallArgs([client, 0x9300, 3, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            3
+        );
+        procs.current_mut().unwrap().address_space.install_bytes(0x9400, &[0; 3]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_RECVFROM,
+                SyscallArgs([accepted, 0x9400, 3, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            3
+        );
+        assert_eq!(procs.current().unwrap().read_user_bytes(0x9400, 3).unwrap(), b"tcp");
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_GETSOCKNAME,
+                SyscallArgs([server, 0x9100, 0x9200, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        let returned = procs.current().unwrap().read_user_bytes(0x9100, 8).unwrap();
+        assert_eq!(u16::from_le_bytes([returned[0], returned[1]]), 2);
+        assert_eq!(u16::from_be_bytes([returned[2], returned[3]]), 7000);
     }
 
     #[test]

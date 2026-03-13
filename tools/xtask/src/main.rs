@@ -48,7 +48,10 @@ fn objcopy_to_binary(input: &PathBuf, output: &PathBuf) -> ExitCode {
     let mut command = Command::new(&objcopy);
     if bundled.as_ref() == Some(&objcopy) {
         if let Some(ld_library_path) = bundled_rustc_lib_dir() {
-            command.env("LD_LIBRARY_PATH", prepend_env_path("LD_LIBRARY_PATH", &ld_library_path));
+            command.env(
+                "LD_LIBRARY_PATH",
+                prepend_env_path("LD_LIBRARY_PATH", &ld_library_path),
+            );
         }
     }
     let status = command
@@ -149,11 +152,17 @@ fn rootfs_source_dir() -> PathBuf {
 }
 
 fn rootfs_stage_dir(arch: &str) -> PathBuf {
-    repo_root().join("target").join("rootfs").join(format!("{arch}-stage"))
+    repo_root()
+        .join("target")
+        .join("rootfs")
+        .join(format!("{arch}-stage"))
 }
 
 fn rootfs_image_path(arch: &str) -> PathBuf {
-    repo_root().join("target").join("rootfs").join(format!("{arch}.ext4"))
+    repo_root()
+        .join("target")
+        .join("rootfs")
+        .join(format!("{arch}.ext4"))
 }
 
 fn build_rootfs_image(arch: &str) -> ExitCode {
@@ -213,7 +222,10 @@ fn prepare_rootfs_stage(arch: &str, stage: &PathBuf) -> io::Result<()> {
     fs::create_dir_all(stage.join("dev"))?;
     fs::create_dir_all(stage.join("proc"))?;
     fs::create_dir_all(stage.join("tmp"))?;
-    fs::write(stage.join("etc").join("issue"), format!("whuse {arch} ext4 rootfs\n"))?;
+    fs::write(
+        stage.join("etc").join("issue"),
+        format!("whuse {arch} ext4 rootfs\n"),
+    )?;
     Ok(())
 }
 
@@ -253,10 +265,15 @@ fn oscomp_loongarch() -> ExitCode {
 }
 
 fn qemu_riscv() -> ExitCode {
-    qemu_riscv_with_disk(env::var("WHUSE_DISK_IMAGE").ok().map(PathBuf::from).or_else(|| {
-        let image = rootfs_image_path("riscv64");
-        image.exists().then_some(image)
-    }))
+    qemu_riscv_with_disk(
+        env::var("WHUSE_DISK_IMAGE")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                let image = rootfs_image_path("riscv64");
+                image.exists().then_some(image)
+            }),
+    )
 }
 
 fn qemu_riscv_with_disk(disk: Option<PathBuf>) -> ExitCode {
@@ -307,10 +324,15 @@ fn qemu_riscv_with_disk(disk: Option<PathBuf>) -> ExitCode {
 }
 
 fn qemu_loongarch() -> ExitCode {
-    qemu_loongarch_with_disk(env::var("WHUSE_DISK_IMAGE").ok().map(PathBuf::from).or_else(|| {
-        let image = rootfs_image_path("loongarch64");
-        image.exists().then_some(image)
-    }))
+    qemu_loongarch_with_disk(
+        env::var("WHUSE_DISK_IMAGE")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                let image = rootfs_image_path("loongarch64");
+                image.exists().then_some(image)
+            }),
+    )
 }
 
 fn qemu_loongarch_with_disk(disk: Option<PathBuf>) -> ExitCode {

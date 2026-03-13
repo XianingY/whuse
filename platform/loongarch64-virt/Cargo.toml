@@ -7,3 +7,8 @@ license.workspace = true
 [dependencies]
 hal-loongarch64-virt = { path = "../../crates/hal-loongarch64-virt" }
 kernel-core = { path = "../../crates/kernel-core" }
+
+[[bin]]
+name = "whuse-loongarch64-virt"
+path = "src/main.rs"
+test = false

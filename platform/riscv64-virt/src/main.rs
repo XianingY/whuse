@@ -2,9 +2,9 @@
 #![cfg_attr(target_os = "none", no_main)]
 
 #[cfg(target_os = "none")]
-use core::arch::global_asm;
-#[cfg(target_os = "none")]
 use core::alloc::{GlobalAlloc, Layout};
+#[cfg(target_os = "none")]
+use core::arch::global_asm;
 #[cfg(target_os = "none")]
 use core::panic::PanicInfo;
 #[cfg(target_os = "none")]
@@ -53,12 +53,10 @@ unsafe impl GlobalAlloc for BumpAllocator {
             if next > HEAP_SIZE {
                 return null_mut();
             }
-            match self.offset.compare_exchange(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .offset
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::Relaxed)
+            {
                 Ok(_) => return aligned as *mut u8,
                 Err(observed) => current = observed,
             }

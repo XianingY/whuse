@@ -6,6 +6,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ptr;
 use hal_api::{HalMemory, MemoryRegion, VmSpaceToken};
 
 pub type KernelResult<T> = Result<T, i32>;
@@ -128,10 +129,19 @@ impl AddressSpace {
         self.buffers.insert(addr, bytes.to_vec());
     }
 
+    pub fn clear(&mut self) {
+        self.mappings.clear();
+        self.buffers.clear();
+        self.program_break = 0x4000_0000;
+        self.next_mapping_base = 0x5000_0000;
+    }
+
     pub fn read_bytes(&self, addr: usize, len: usize) -> KernelResult<Vec<u8>> {
-        let (base, segment) = self.find_segment(addr, len)?;
-        let offset = addr - base;
-        Ok(segment[offset..offset + len].to_vec())
+        if let Ok((base, segment)) = self.find_segment(addr, len) {
+            let offset = addr - base;
+            return Ok(segment[offset..offset + len].to_vec());
+        }
+        unsafe { Ok(core::slice::from_raw_parts(addr as *const u8, len).to_vec()) }
     }
 
     pub fn write_bytes(&mut self, addr: usize, bytes: &[u8]) -> KernelResult<()> {
@@ -142,23 +152,37 @@ impl AddressSpace {
                 Ok(())
             }
             Err(_) => {
-                self.buffers.insert(addr, bytes.to_vec());
+                unsafe {
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len());
+                }
                 Ok(())
             }
         }
     }
 
     pub fn read_cstr(&self, addr: usize) -> KernelResult<String> {
-        let (base, segment) = self.find_segment(addr, 1)?;
-        let mut offset = addr - base;
         let mut out = Vec::new();
-        while offset < segment.len() {
-            let byte = segment[offset];
-            if byte == 0 {
-                return String::from_utf8(out).map_err(|_| EFAULT);
+        if let Ok((base, segment)) = self.find_segment(addr, 1) {
+            let mut offset = addr - base;
+            while offset < segment.len() {
+                let byte = segment[offset];
+                if byte == 0 {
+                    return String::from_utf8(out).map_err(|_| EFAULT);
+                }
+                out.push(byte);
+                offset += 1;
             }
-            out.push(byte);
-            offset += 1;
+        }
+        unsafe {
+            let mut cursor = addr as *const u8;
+            for _ in 0..4096 {
+                let byte = ptr::read(cursor);
+                if byte == 0 {
+                    return String::from_utf8(out).map_err(|_| EFAULT);
+                }
+                out.push(byte);
+                cursor = cursor.add(1);
+            }
         }
         Err(EFAULT)
     }
@@ -221,4 +245,3 @@ mod tests {
         aspace.unmap(addr, 8192).unwrap();
     }
 }
-

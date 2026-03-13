@@ -2,13 +2,13 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use mm::{AddressSpace, KernelResult as MmResult};
 use hal_api::TrapFrame;
+use mm::{AddressSpace, KernelResult as MmResult};
 use vfs::FileHandle;
 
 pub type KernelResult<T> = Result<T, i32>;
@@ -17,6 +17,8 @@ const EBADF: i32 = 9;
 const ECHILD: i32 = 10;
 const ENOENT: i32 = 2;
 const EINVAL: i32 = 22;
+const ESRCH: i32 = 3;
+const WNOHANG: u32 = 1;
 
 const USER_STACK_SIZE: usize = 8192;
 
@@ -55,6 +57,30 @@ pub struct SignalState {
     pub tid_address: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SigAction {
+    pub handler: usize,
+    pub flags: usize,
+    pub restorer: usize,
+    pub mask: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitSelector {
+    Any,
+    Pid(usize),
+    Pgid(usize),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ThreadExit {
+    pub tid: usize,
+    pub tgid: usize,
+    pub clear_child_tid: Option<usize>,
+    pub group_exited: bool,
+    pub parent_tgid: Option<usize>,
+}
+
 pub struct Process {
     pub pid: usize,
     pub tid: usize,
@@ -82,18 +108,23 @@ pub struct Process {
     pub signal_mask: u64,
     pub pending_signals: u64,
     pub sigaltstack: Option<(usize, usize, u32)>,
+    pub signal_actions: BTreeMap<usize, SigAction>,
+    pub is_thread: bool,
 }
 
 pub struct ProcessTable {
     next_pid: usize,
-    current_pid: usize,
+    current_tid: usize,
     processes: BTreeMap<usize, Process>,
+    futex_waiters: BTreeMap<usize, VecDeque<usize>>,
 }
 
 impl Process {
     pub fn new(name: &str, pid: usize, parent: Option<usize>, entry: usize) -> Self {
         let user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
         let sp = user_stack.as_ptr() as usize + user_stack.len() - 16;
+        let address_space = AddressSpace::new_user();
+        let _ = address_space.install_host_range(user_stack.as_ptr() as usize, user_stack.len(), 0b11);
         Self {
             pid,
             tid: pid,
@@ -102,7 +133,7 @@ impl Process {
             sid: parent.unwrap_or(pid),
             parent,
             name: name.to_string(),
-            cwd: "/".to_string(),
+            cwd: String::from("/"),
             uid: 0,
             euid: 0,
             gid: 0,
@@ -111,7 +142,7 @@ impl Process {
             umask: 0o022,
             state: ProcessState::Ready,
             exit_code: None,
-            address_space: AddressSpace::new_user(),
+            address_space,
             fds: BTreeMap::new(),
             trap_frame: TrapFrame::new_user(entry, sp),
             user_stack,
@@ -121,6 +152,8 @@ impl Process {
             signal_mask: 0,
             pending_signals: 0,
             sigaltstack: None,
+            signal_actions: BTreeMap::new(),
+            is_thread: false,
         }
     }
 
@@ -157,13 +190,21 @@ impl Process {
         self.address_space.read_cstr(addr)
     }
 
-    pub fn reset_image(&mut self, entry: usize) {
+    pub fn reset_image(&mut self, entry: usize, stack_pointer: Option<usize>) {
         self.address_space.clear();
         self.user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
-        let sp = self.user_stack.as_ptr() as usize + self.user_stack.len() - 16;
+        let _ = self
+            .address_space
+            .install_host_range(self.user_stack.as_ptr() as usize, self.user_stack.len(), 0b11);
+        let sp = stack_pointer.unwrap_or_else(|| self.user_stack.as_ptr() as usize + self.user_stack.len() - 16);
         self.trap_frame = TrapFrame::new_user(entry, sp);
         self.state = ProcessState::Ready;
         self.exit_code = None;
+        self.pending_signals = 0;
+        self.signal_mask = 0;
+        self.clear_child_tid = None;
+        self.tid_address = None;
+        self.robust_list = None;
     }
 
     fn fork_from(&self, pid: usize) -> Self {
@@ -183,13 +224,16 @@ impl Process {
         trap_frame.set_retval(0);
         trap_frame.sepc += 4;
 
+        let address_space = self.address_space.clone_private();
+        let _ = address_space.install_host_range(new_base, user_stack.len(), 0b11);
+
         Self {
             pid,
             tid: pid,
             tgid: pid,
             pgid: self.pgid,
             sid: self.sid,
-            parent: Some(self.pid),
+            parent: Some(self.tgid),
             name: self.name.clone(),
             cwd: self.cwd.clone(),
             uid: self.uid,
@@ -200,7 +244,7 @@ impl Process {
             umask: self.umask,
             state: ProcessState::Ready,
             exit_code: None,
-            address_space: self.address_space.clone(),
+            address_space,
             fds: self.fds.clone(),
             trap_frame,
             user_stack,
@@ -208,8 +252,58 @@ impl Process {
             clear_child_tid: self.clear_child_tid,
             robust_list: self.robust_list,
             signal_mask: self.signal_mask,
-            pending_signals: self.pending_signals,
+            pending_signals: 0,
             sigaltstack: self.sigaltstack,
+            signal_actions: self.signal_actions.clone(),
+            is_thread: false,
+        }
+    }
+
+    fn clone_thread_from(&self, tid: usize, stack: usize, tls: Option<usize>) -> Self {
+        let user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
+        let fallback_sp = user_stack.as_ptr() as usize + user_stack.len() - 16;
+        let mut trap_frame = self.trap_frame;
+        trap_frame.set_retval(0);
+        trap_frame.sepc += 4;
+        if stack != 0 {
+            trap_frame.regs[2] = stack;
+        } else {
+            trap_frame.regs[2] = fallback_sp;
+        }
+        if let Some(tls) = tls {
+            trap_frame.regs[4] = tls;
+        }
+        let address_space = self.address_space.clone();
+        let _ = address_space.install_host_range(user_stack.as_ptr() as usize, user_stack.len(), 0b11);
+        Self {
+            pid: tid,
+            tid,
+            tgid: self.tgid,
+            pgid: self.pgid,
+            sid: self.sid,
+            parent: self.parent,
+            name: self.name.clone(),
+            cwd: self.cwd.clone(),
+            uid: self.uid,
+            euid: self.euid,
+            gid: self.gid,
+            egid: self.egid,
+            groups: self.groups.clone(),
+            umask: self.umask,
+            state: ProcessState::Ready,
+            exit_code: None,
+            address_space,
+            fds: self.fds.clone(),
+            trap_frame,
+            user_stack,
+            tid_address: None,
+            clear_child_tid: None,
+            robust_list: None,
+            signal_mask: self.signal_mask,
+            pending_signals: 0,
+            sigaltstack: self.sigaltstack,
+            signal_actions: self.signal_actions.clone(),
+            is_thread: true,
         }
     }
 
@@ -225,7 +319,7 @@ impl Process {
 
     pub fn process_group(&self) -> ProcessGroupState {
         ProcessGroupState {
-            pid: self.pid,
+            pid: self.tgid,
             parent: self.parent,
             pgid: self.pgid,
             sid: self.sid,
@@ -260,8 +354,9 @@ impl ProcessTable {
     pub fn new() -> Self {
         Self {
             next_pid: 1,
-            current_pid: 0,
+            current_tid: 0,
             processes: BTreeMap::new(),
+            futex_waiters: BTreeMap::new(),
         }
     }
 
@@ -270,30 +365,37 @@ impl ProcessTable {
     }
 
     pub fn spawn(&mut self, name: &str, parent: Option<usize>, entry: usize) -> usize {
-        let pid = self.next_pid;
-        self.next_pid += 1;
+        let pid = self.next_id();
         let process = Process::new(name, pid, parent, entry);
         self.processes.insert(pid, process);
-        if self.current_pid == 0 {
-            self.current_pid = pid;
+        if self.current_tid == 0 {
+            self.current_tid = pid;
         }
         pid
     }
 
     pub fn current(&self) -> KernelResult<&Process> {
-        self.processes.get(&self.current_pid).ok_or(EBADF)
+        self.processes.get(&self.current_tid).ok_or(EBADF)
+    }
+
+    pub fn current_tid(&self) -> KernelResult<usize> {
+        Ok(self.current()?.tid)
+    }
+
+    pub fn current_tgid(&self) -> KernelResult<usize> {
+        Ok(self.current()?.tgid)
     }
 
     pub fn current_pid(&self) -> KernelResult<usize> {
-        Ok(self.current()?.pid)
+        self.current_tgid()
     }
 
     pub fn has_pid(&self, pid: usize) -> bool {
-        self.processes.contains_key(&pid)
+        self.processes.contains_key(&pid) || self.processes.values().any(|process| process.tgid == pid)
     }
 
     pub fn current_mut(&mut self) -> KernelResult<&mut Process> {
-        self.processes.get_mut(&self.current_pid).ok_or(EBADF)
+        self.processes.get_mut(&self.current_tid).ok_or(EBADF)
     }
 
     pub fn current_frame_mut(&mut self) -> KernelResult<&mut TrapFrame> {
@@ -301,54 +403,98 @@ impl ProcessTable {
     }
 
     pub fn duplicate_fd_from(&self, pid: usize, fd: i32) -> KernelResult<FileHandle> {
-        let process = self.processes.get(&pid).ok_or(ENOENT)?;
+        let process = self.find_process_by_pid(pid)?;
         process.fd(fd).cloned()
     }
 
-    pub fn set_current(&mut self, pid: usize) -> KernelResult<()> {
-        if self.processes.contains_key(&pid) {
-            self.current_pid = pid;
+    pub fn set_current(&mut self, tid: usize) -> KernelResult<()> {
+        if self.processes.contains_key(&tid) {
+            self.current_tid = tid;
             Ok(())
         } else {
             Err(EBADF)
         }
     }
 
+    pub fn wait(&mut self, parent_pid: usize, pid: i32) -> KernelResult<(usize, i32)> {
+        self.wait_child(parent_pid, selector_from_wait_pid(pid, self.find_process_by_pid(parent_pid)?.pgid), 0)
+    }
+
     pub fn exit_current(&mut self, code: i32) -> KernelResult<()> {
-        let process = self.current_mut()?;
-        process.state = ProcessState::Exited;
-        process.exit_code = Some(code);
+        let _ = self.exit_current_thread(code)?;
         Ok(())
     }
 
-    pub fn wait(&mut self, parent_pid: usize, pid: i32) -> KernelResult<(usize, i32)> {
-        let child_pid = self
+    pub fn wait_child(&mut self, parent_tgid: usize, selector: WaitSelector, options: u32) -> KernelResult<(usize, i32)> {
+        let child_tid = self
             .processes
             .values()
-            .find(|process| {
-                process.parent == Some(parent_pid)
-                    && process.state == ProcessState::Exited
-                    && (pid == -1 || process.pid == pid as usize)
-            })
-            .map(|process| process.pid)
-            .ok_or(ECHILD)?;
+            .filter(|process| !process.is_thread)
+            .filter(|process| process.parent == Some(parent_tgid))
+            .find(|process| process.state == ProcessState::Exited && selector_matches(selector, process))
+            .map(|process| process.tgid);
 
-        let process = self.processes.remove(&child_pid).ok_or(ENOENT)?;
-        Ok((child_pid, process.exit_code.unwrap_or_default() << 8))
+        let Some(child_tid) = child_tid else {
+            let has_any_child = self
+                .processes
+                .values()
+                .any(|process| !process.is_thread && process.parent == Some(parent_tgid) && selector_matches(selector, process));
+            if options & WNOHANG != 0 && has_any_child {
+                return Ok((0, 0));
+            }
+            return Err(ECHILD);
+        };
+
+        let status = self
+            .processes
+            .get(&child_tid)
+            .and_then(|process| process.exit_code)
+            .unwrap_or_default()
+            << 8;
+        self.reap_thread_group(child_tid);
+        Ok((child_tid, status))
     }
 
     pub fn fork_current(&mut self) -> KernelResult<usize> {
-        let parent = self.current()?.fork_from(self.next_pid);
-        let pid = parent.pid;
-        self.next_pid += 1;
+        self.fork_process_from_current()
+    }
+
+    pub fn fork_process_from_current(&mut self) -> KernelResult<usize> {
+        let pid = self.next_id();
+        let parent = self.current()?.fork_from(pid);
         self.processes.insert(pid, parent);
         Ok(pid)
     }
 
+    pub fn clone_thread_from_current(&mut self, stack: usize, tls: Option<usize>) -> KernelResult<usize> {
+        let tid = self.next_id();
+        let thread = self.current()?.clone_thread_from(tid, stack, tls);
+        self.processes.insert(tid, thread);
+        Ok(tid)
+    }
+
     pub fn execve_current(&mut self, entry: usize) -> KernelResult<()> {
+        self.execve_current_image(entry, None)
+    }
+
+    pub fn execve_current_image(&mut self, entry: usize, stack_pointer: Option<usize>) -> KernelResult<()> {
+        let current_tgid = self.current_tgid()?;
+        let current_tid = self.current_tid()?;
+        let other_threads = self
+            .processes
+            .iter()
+            .filter_map(|(tid, process)| {
+                (process.tgid == current_tgid && *tid != current_tid).then_some(*tid)
+            })
+            .collect::<Vec<_>>();
+        for tid in other_threads {
+            self.processes.remove(&tid);
+            self.remove_futex_waiter(tid);
+        }
         let process = self.current_mut()?;
-        process.reset_image(entry);
-        process.pending_signals = 0;
+        process.reset_image(entry, stack_pointer);
+        process.is_thread = false;
+        process.pid = process.tgid;
         Ok(())
     }
 
@@ -380,47 +526,52 @@ impl ProcessTable {
         let process = if pid == 0 {
             self.current()?
         } else {
-            self.processes.get(&pid).ok_or(ENOENT)?
+            self.find_process_by_pid(pid)?
         };
         process.robust_list.ok_or(EINVAL)
     }
 
     pub fn getpgid(&self, pid: usize) -> KernelResult<usize> {
-        let target = if pid == 0 { self.current()? } else { self.processes.get(&pid).ok_or(ENOENT)? };
+        let target = if pid == 0 { self.current()? } else { self.find_process_by_pid(pid)? };
         Ok(target.pgid)
     }
 
     pub fn setpgid(&mut self, pid: usize, pgid: usize) -> KernelResult<()> {
-        let pid = if pid == 0 { self.current_pid()? } else { pid };
-        let process = self.processes.get_mut(&pid).ok_or(ENOENT)?;
+        let pid = if pid == 0 { self.current_tgid()? } else { pid };
+        let process = self.find_process_by_pid_mut(pid)?;
         process.pgid = if pgid == 0 { pid } else { pgid };
         Ok(())
     }
 
     pub fn getsid(&self, pid: usize) -> KernelResult<usize> {
-        let target = if pid == 0 { self.current()? } else { self.processes.get(&pid).ok_or(ENOENT)? };
+        let target = if pid == 0 { self.current()? } else { self.find_process_by_pid(pid)? };
         Ok(target.sid)
     }
 
     pub fn setsid_current(&mut self) -> KernelResult<usize> {
-        let pid = self.current_pid()?;
-        let process = self.current_mut()?;
-        process.sid = pid;
-        process.pgid = pid;
+        let pid = self.current_tgid()?;
+        for process in self.processes.values_mut().filter(|process| process.tgid == pid) {
+            process.sid = pid;
+            process.pgid = pid;
+        }
         Ok(pid)
     }
 
     pub fn setuid_current(&mut self, uid: u32) -> KernelResult<()> {
-        let process = self.current_mut()?;
-        process.uid = uid;
-        process.euid = uid;
+        let tgid = self.current_tgid()?;
+        for process in self.processes.values_mut().filter(|process| process.tgid == tgid) {
+            process.uid = uid;
+            process.euid = uid;
+        }
         Ok(())
     }
 
     pub fn setgid_current(&mut self, gid: u32) -> KernelResult<()> {
-        let process = self.current_mut()?;
-        process.gid = gid;
-        process.egid = gid;
+        let tgid = self.current_tgid()?;
+        for process in self.processes.values_mut().filter(|process| process.tgid == tgid) {
+            process.gid = gid;
+            process.egid = gid;
+        }
         Ok(())
     }
 
@@ -429,7 +580,10 @@ impl ProcessTable {
     }
 
     pub fn setgroups_current(&mut self, groups: &[u32]) -> KernelResult<()> {
-        self.current_mut()?.groups = groups.to_vec();
+        let tgid = self.current_tgid()?;
+        for process in self.processes.values_mut().filter(|process| process.tgid == tgid) {
+            process.groups = groups.to_vec();
+        }
         Ok(())
     }
 
@@ -455,7 +609,7 @@ impl ProcessTable {
     }
 
     pub fn pending_signals(&self) -> KernelResult<u64> {
-        Ok(self.current()?.pending_signals)
+        Ok(self.current()?.pending_signals & !self.current()?.signal_mask)
     }
 
     pub fn set_sigaltstack(
@@ -468,11 +622,19 @@ impl ProcessTable {
         Ok(previous)
     }
 
+    pub fn deliver_signal(&mut self, pid: usize, signal: usize) -> KernelResult<()> {
+        self.send_signal(pid, signal)
+    }
+
     pub fn send_signal(&mut self, pid: usize, signal: usize) -> KernelResult<()> {
-        if signal == 0 || signal > 64 {
+        if signal > 64 {
             return Err(EINVAL);
         }
-        let process = self.processes.get_mut(&pid).ok_or(ENOENT)?;
+        if signal == 0 {
+            return Ok(());
+        }
+        let target_tid = self.resolve_target_tid(pid)?;
+        let process = self.processes.get_mut(&target_tid).ok_or(ENOENT)?;
         process.pending_signals |= 1u64 << (signal - 1);
         Ok(())
     }
@@ -485,17 +647,238 @@ impl ProcessTable {
         Ok(())
     }
 
+    pub fn set_sigaction(&mut self, signal: usize, action: SigAction) -> KernelResult<()> {
+        if signal == 0 || signal > 64 {
+            return Err(EINVAL);
+        }
+        let tgid = self.current_tgid()?;
+        for process in self.processes.values_mut().filter(|process| process.tgid == tgid) {
+            process.signal_actions.insert(signal, action);
+        }
+        Ok(())
+    }
+
+    pub fn sigaction(&self, signal: usize) -> KernelResult<SigAction> {
+        if signal == 0 || signal > 64 {
+            return Err(EINVAL);
+        }
+        Ok(self.current()?.signal_actions.get(&signal).copied().unwrap_or_default())
+    }
+
+    pub fn dequeue_unmasked_signal(&mut self) -> KernelResult<Option<usize>> {
+        let pending = self.pending_signals()?;
+        if pending == 0 {
+            return Ok(None);
+        }
+        let signal = pending.trailing_zeros() as usize + 1;
+        self.clear_pending_signal(signal)?;
+        Ok(Some(signal))
+    }
+
+    pub fn enqueue_futex_waiter(&mut self, addr: usize, tid: usize) {
+        let waiters = self.futex_waiters.entry(addr).or_default();
+        if !waiters.iter().any(|waiter| *waiter == tid) {
+            waiters.push_back(tid);
+        }
+    }
+
+    pub fn wake_futex(&mut self, addr: usize, count: usize) -> Vec<usize> {
+        let mut woke = Vec::new();
+        if let Some(waiters) = self.futex_waiters.get_mut(&addr) {
+            for _ in 0..count {
+                let Some(tid) = waiters.pop_front() else {
+                    break;
+                };
+                woke.push(tid);
+            }
+            if waiters.is_empty() {
+                self.futex_waiters.remove(&addr);
+            }
+        }
+        woke
+    }
+
+    pub fn requeue_futex(&mut self, from: usize, to: usize, wake_count: usize, requeue_count: usize) -> Vec<usize> {
+        let woke = self.wake_futex(from, wake_count);
+        let mut moved = VecDeque::new();
+        if let Some(waiters) = self.futex_waiters.get_mut(&from) {
+            for _ in 0..requeue_count {
+                let Some(tid) = waiters.pop_front() else {
+                    break;
+                };
+                moved.push_back(tid);
+            }
+            if waiters.is_empty() {
+                self.futex_waiters.remove(&from);
+            }
+        }
+        if !moved.is_empty() {
+            self.futex_waiters.entry(to).or_default().extend(moved);
+        }
+        woke
+    }
+
+    pub fn exit_current_thread(&mut self, code: i32) -> KernelResult<ThreadExit> {
+        let current_tid = self.current_tid()?;
+        let current_tgid = self.current_tgid()?;
+        let parent_tgid = self.current()?.parent;
+        let clear_child_tid = self.current()?.clear_child_tid;
+        if let Some(addr) = clear_child_tid {
+            let _ = self.current_mut()?.write_user_bytes(addr, &0u32.to_le_bytes());
+        }
+        self.remove_futex_waiter(current_tid);
+        {
+            let process = self.current_mut()?;
+            process.state = ProcessState::Exited;
+            process.exit_code = Some(code);
+        }
+
+        let group_alive = self
+            .processes
+            .values()
+            .any(|process| process.tgid == current_tgid && process.tid != current_tid && process.state != ProcessState::Exited);
+        if !group_alive {
+            for process in self.processes.values_mut().filter(|process| process.tgid == current_tgid) {
+                process.state = ProcessState::Exited;
+                process.exit_code = Some(code);
+            }
+            if let Some(parent_tgid) = parent_tgid {
+                let _ = self.send_signal(parent_tgid, 17);
+            }
+        }
+
+        Ok(ThreadExit {
+            tid: current_tid,
+            tgid: current_tgid,
+            clear_child_tid,
+            group_exited: !group_alive,
+            parent_tgid,
+        })
+    }
+
+    pub fn exit_current_process_group(&mut self, code: i32) -> KernelResult<ThreadExit> {
+        let current_tgid = self.current_tgid()?;
+        let current_tid = self.current_tid()?;
+        let parent_tgid = self.current()?.parent;
+        let clear_child_tid = self.current()?.clear_child_tid;
+        let tids = self
+            .processes
+            .iter()
+            .filter_map(|(tid, process)| (process.tgid == current_tgid).then_some(*tid))
+            .collect::<Vec<_>>();
+        for tid in tids {
+            if let Some(process) = self.processes.get_mut(&tid) {
+                if let Some(addr) = process.clear_child_tid {
+                    let _ = process.write_user_bytes(addr, &0u32.to_le_bytes());
+                }
+                process.state = ProcessState::Exited;
+                process.exit_code = Some(code);
+            }
+            self.remove_futex_waiter(tid);
+        }
+        if let Some(parent_tgid) = parent_tgid {
+            let _ = self.send_signal(parent_tgid, 17);
+        }
+        Ok(ThreadExit {
+            tid: current_tid,
+            tgid: current_tgid,
+            clear_child_tid,
+            group_exited: true,
+            parent_tgid,
+        })
+    }
+
     pub fn process_count(&self) -> usize {
         self.processes
             .values()
-            .filter(|process| process.state != ProcessState::Exited)
+            .filter(|process| !process.is_thread && process.state != ProcessState::Exited)
             .count()
+    }
+
+    fn next_id(&mut self) -> usize {
+        let id = self.next_pid;
+        self.next_pid += 1;
+        id
+    }
+
+    fn reap_thread_group(&mut self, tgid: usize) {
+        let tids = self
+            .processes
+            .iter()
+            .filter_map(|(tid, process)| (process.tgid == tgid).then_some(*tid))
+            .collect::<Vec<_>>();
+        for tid in tids {
+            self.processes.remove(&tid);
+            self.remove_futex_waiter(tid);
+        }
+    }
+
+    fn remove_futex_waiter(&mut self, tid: usize) {
+        let addrs = self.futex_waiters.keys().copied().collect::<Vec<_>>();
+        for addr in addrs {
+            if let Some(waiters) = self.futex_waiters.get_mut(&addr) {
+                waiters.retain(|waiter| *waiter != tid);
+                if waiters.is_empty() {
+                    self.futex_waiters.remove(&addr);
+                }
+            }
+        }
+    }
+
+    fn find_process_by_pid(&self, pid: usize) -> KernelResult<&Process> {
+        self.processes
+            .get(&pid)
+            .or_else(|| self.processes.values().find(|process| !process.is_thread && process.tgid == pid))
+            .ok_or(ENOENT)
+    }
+
+    fn find_process_by_pid_mut(&mut self, pid: usize) -> KernelResult<&mut Process> {
+        if self.processes.contains_key(&pid) {
+            return self.processes.get_mut(&pid).ok_or(ENOENT);
+        }
+        let tid = self
+            .processes
+            .iter()
+            .find_map(|(tid, process)| (!process.is_thread && process.tgid == pid).then_some(*tid))
+            .ok_or(ENOENT)?;
+        self.processes.get_mut(&tid).ok_or(ENOENT)
+    }
+
+    fn resolve_target_tid(&self, pid: usize) -> KernelResult<usize> {
+        if self.processes.contains_key(&pid) {
+            return Ok(pid);
+        }
+        self.processes
+            .values()
+            .find(|process| process.tgid == pid && !process.is_thread)
+            .map(|process| process.tid)
+            .ok_or(ESRCH)
+    }
+}
+
+fn selector_from_wait_pid(pid: i32, current_pgid: usize) -> WaitSelector {
+    if pid == -1 {
+        WaitSelector::Any
+    } else if pid == 0 {
+        WaitSelector::Pgid(current_pgid)
+    } else if pid > 0 {
+        WaitSelector::Pid(pid as usize)
+    } else {
+        WaitSelector::Pgid((-pid) as usize)
+    }
+}
+
+fn selector_matches(selector: WaitSelector, process: &Process) -> bool {
+    match selector {
+        WaitSelector::Any => true,
+        WaitSelector::Pid(pid) => process.tgid == pid,
+        WaitSelector::Pgid(pgid) => process.pgid == pgid,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ProcessTable;
+    use super::{ProcessTable, SigAction, WaitSelector};
 
     #[test]
     fn process_accessors_expose_competition_state() {
@@ -505,6 +888,7 @@ mod tests {
         table.set_tid_address(0x4000).unwrap();
         table.setgroups_current(&[10, 20]).unwrap();
         table.send_signal(pid, 10).unwrap();
+        table.set_sigaction(10, SigAction { handler: 1, flags: 2, restorer: 3, mask: 4 }).unwrap();
 
         let process = table.current().unwrap();
         let creds = process.credentials();
@@ -518,5 +902,43 @@ mod tests {
         let signal = process.signal_state();
         assert_eq!(signal.clear_child_tid, Some(0x4000));
         assert_ne!(signal.pending_mask, 0);
+        assert_eq!(table.sigaction(10).unwrap().handler, 1);
+    }
+
+    #[test]
+    fn thread_clone_shares_address_space_and_waits_only_processes() {
+        let mut table = ProcessTable::new();
+        let leader = table.spawn_init("init", 0x1000);
+        table.set_current(leader).unwrap();
+        let addr = table.current().unwrap().address_space.map_anonymous(4096, 0b11).unwrap();
+        table.current_mut().unwrap().address_space.write_bytes(addr, b"x").unwrap();
+
+        let thread = table.clone_thread_from_current(0, None).unwrap();
+        table.set_current(thread).unwrap();
+        assert_eq!(table.current().unwrap().address_space.read_bytes(addr, 1).unwrap(), b"x");
+        assert_eq!(table.current().unwrap().tgid, leader);
+        assert_ne!(table.gettid().unwrap(), table.current_pid().unwrap());
+
+        table.set_current(leader).unwrap();
+        let child = table.fork_process_from_current().unwrap();
+        table.set_current(child).unwrap();
+        table.exit_current_thread(7).unwrap();
+        table.set_current(leader).unwrap();
+        let (waited, status) = table.wait_child(leader, WaitSelector::Pid(child), 0).unwrap();
+        assert_eq!(waited, child);
+        assert_eq!(status, 7 << 8);
+    }
+
+    #[test]
+    fn futex_requeue_moves_waiters() {
+        let mut table = ProcessTable::new();
+        let leader = table.spawn_init("init", 0x1000);
+        table.set_current(leader).unwrap();
+        let thread = table.clone_thread_from_current(0, None).unwrap();
+        table.enqueue_futex_waiter(0x1000, leader);
+        table.enqueue_futex_waiter(0x1000, thread);
+        let woke = table.requeue_futex(0x1000, 0x2000, 1, 1);
+        assert_eq!(woke, vec![leader]);
+        assert_eq!(table.wake_futex(0x2000, 1), vec![thread]);
     }
 }

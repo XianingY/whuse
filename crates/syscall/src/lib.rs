@@ -2334,8 +2334,9 @@ mod tests {
         SYS_WAIT, SYS_WRITE, SYS_WRITEV,
     };
     use hal_api::{
-        register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalMemory, HalPlatform,
-        HalTimer, MemoryRegion, PlatformArch, Timespec, TrapFrame, VmSpaceToken,
+        register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
+        HalNetDevice, HalPlatform, HalPlatformLifecycle, HalTimer, MemoryRegion, PlatformArch,
+        Timespec, TrapFrame, VmSpaceToken,
     };
     use proc::ProcessTable;
     use spin::Once;
@@ -2347,18 +2348,25 @@ mod tests {
     struct TestTimer;
     struct TestConsole;
     struct TestPlatform;
+    struct TestInterrupt;
+    struct TestLifecycle;
+    struct TestNet;
 
     static TEST_CPU: TestCpu = TestCpu;
     static TEST_MEMORY: TestMemory = TestMemory;
     static TEST_TIMER: TestTimer = TestTimer;
     static TEST_CONSOLE: TestConsole = TestConsole;
     static TEST_PLATFORM: TestPlatform = TestPlatform;
+    static TEST_INTERRUPT: TestInterrupt = TestInterrupt;
+    static TEST_LIFECYCLE: TestLifecycle = TestLifecycle;
+    static TEST_NET: TestNet = TestNet;
     static TEST_REGIONS: [MemoryRegion; 1] = [MemoryRegion {
         start: 0x8000_0000,
         size: 0x100000,
         usable: true,
     }];
     static TEST_BLOCKS: [&'static dyn HalBlockDevice; 0] = [];
+    static TEST_NETS: [&'static dyn HalNetDevice; 1] = [&TEST_NET];
     static INIT_HAL: Once<()> = Once::new();
 
     impl HalCpu for TestCpu {
@@ -2395,15 +2403,44 @@ mod tests {
         fn architecture(&self) -> PlatformArch { PlatformArch::Riscv64 }
     }
 
+    impl HalPlatformLifecycle for TestLifecycle {
+        fn supports_userspace(&self) -> bool { true }
+
+        fn idle(&self) -> ! {
+            panic!("test lifecycle idle should never be entered");
+        }
+    }
+
+    impl HalInterrupt for TestInterrupt {
+        fn name(&self) -> &'static str { "test-interrupt" }
+        fn enable_irq(&self, _irq: usize) {}
+        fn disable_irq(&self, _irq: usize) {}
+        fn ack_irq(&self, _irq: usize) {}
+        fn next_pending(&self) -> Option<usize> { None }
+    }
+
+    impl HalNetDevice for TestNet {
+        fn name(&self) -> &'static str { "test-net" }
+        fn mac_address(&self) -> [u8; 6] { [0, 1, 2, 3, 4, 5] }
+        fn mtu(&self) -> usize { 1500 }
+        fn can_send(&self) -> bool { false }
+        fn can_recv(&self) -> bool { false }
+        fn send_frame(&self, _frame: &[u8]) -> Result<usize, i32> { Err(95) }
+        fn recv_frame(&self, _frame: &mut [u8]) -> Result<usize, i32> { Err(11) }
+    }
+
     fn ensure_test_hal() {
         INIT_HAL.call_once(|| {
             let _ = register_hal(HalBundle {
                 platform: &TEST_PLATFORM,
+                lifecycle: &TEST_LIFECYCLE,
+                interrupt: &TEST_INTERRUPT,
                 cpu: &TEST_CPU,
                 memory: &TEST_MEMORY,
                 timer: &TEST_TIMER,
                 console: &TEST_CONSOLE,
                 block_devices: &TEST_BLOCKS,
+                net_devices: &TEST_NETS,
             });
         });
     }

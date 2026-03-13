@@ -37,6 +37,12 @@ impl Kernel {
             hal().platform.platform_name(),
             hal().platform.architecture()
         ));
+        logln(format_args!(
+            "whuse: devices block={} net={} irq={}",
+            hal().block_devices.len(),
+            hal().net_devices.len(),
+            hal().interrupt.name(),
+        ));
 
         let mut vfs = KernelVfs::new();
         let _ = user_init::seed_filesystem(&mut vfs);
@@ -93,7 +99,14 @@ impl Kernel {
 
 pub fn boot_forever(info: BootInfo) -> ! {
     let mut kernel = Kernel::bootstrap(info);
-    kernel.run_forever();
+    if hal().lifecycle.supports_userspace() {
+        kernel.run_forever();
+    }
+    logln(format_args!(
+        "whuse: userspace is not enabled on {}, idling in kernel-only mode",
+        hal().platform.platform_name()
+    ));
+    hal().lifecycle.idle();
 }
 
 impl Kernel {

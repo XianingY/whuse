@@ -362,6 +362,12 @@ impl KernelVfs {
         Ok(())
     }
 
+    pub fn read_file_all(&mut self, cwd: &str, path: &str) -> KernelResult<Vec<u8>> {
+        let mut handle = self.open(cwd, path, O_RDONLY, 0)?;
+        let size = self.stat_handle(&handle)?.size as usize;
+        self.read(&mut handle, size)
+    }
+
     pub fn rename(&mut self, cwd: &str, old_path: &str, new_path: &str) -> KernelResult<()> {
         let old_absolute = normalize_path(cwd, old_path);
         let new_absolute = normalize_path(cwd, new_path);
@@ -578,6 +584,7 @@ impl KernelVfs {
             return Err(EINVAL);
         };
         state.path = Some(absolute.clone());
+        handle.path = absolute.clone();
         self.socket_bindings.insert(absolute, handle.node.clone());
         Ok(())
     }
@@ -607,6 +614,7 @@ impl KernelVfs {
             state.pending.push(Arc::new(Node::socket_connected(&absolute, channel.clone(), 1)));
         }
         *handle.node.data.lock() = NodeData::SocketConnected { channel, side: 0 };
+        handle.path = absolute;
         Ok(())
     }
 

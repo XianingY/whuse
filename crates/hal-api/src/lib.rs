@@ -34,15 +34,43 @@ pub struct TrapFrame {
     pub regs: [usize; 32],
     pub sepc: usize,
     pub sstatus: usize,
+    pub scause: usize,
+    pub stval: usize,
 }
 
 impl TrapFrame {
+    pub fn new_user(entry: usize, sp: usize) -> Self {
+        let mut frame = Self::default();
+        frame.sepc = entry;
+        frame.regs[2] = sp;
+        frame
+    }
+
     pub fn a(&self, index: usize) -> usize {
         self.regs[10 + index]
     }
 
     pub fn set_a(&mut self, index: usize, value: usize) {
         self.regs[10 + index] = value;
+    }
+
+    pub fn syscall_number(&self) -> usize {
+        self.regs[17]
+    }
+
+    pub fn syscall_args(&self) -> [usize; 6] {
+        [
+            self.regs[10],
+            self.regs[11],
+            self.regs[12],
+            self.regs[13],
+            self.regs[14],
+            self.regs[15],
+        ]
+    }
+
+    pub fn set_retval(&mut self, value: usize) {
+        self.regs[10] = value;
     }
 }
 
@@ -53,6 +81,7 @@ pub trait HalCpu: Send + Sync {
     fn interrupts_enabled(&self) -> bool;
     fn switch_address_space(&self, token: VmSpaceToken);
     fn wait_for_interrupt(&self);
+    fn run_user(&self, frame: &mut TrapFrame);
 }
 
 pub trait HalMemory: Send + Sync {
@@ -112,4 +141,3 @@ impl fmt::Write for ConsoleWriter {
         Ok(())
     }
 }
-

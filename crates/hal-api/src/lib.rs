@@ -103,6 +103,14 @@ pub trait HalTimer: Send + Sync {
     fn program_oneshot(&self, deadline_nanos: u64);
 }
 
+pub trait HalInterrupt: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn enable_irq(&self, irq: usize);
+    fn disable_irq(&self, irq: usize);
+    fn ack_irq(&self, irq: usize);
+    fn next_pending(&self) -> Option<usize>;
+}
+
 pub trait HalBlockDevice: Send + Sync {
     fn name(&self) -> &'static str;
     fn sector_size(&self) -> usize;
@@ -117,18 +125,36 @@ pub trait HalCharDevice: Send + Sync {
     fn get_byte(&self) -> Option<u8>;
 }
 
+pub trait HalNetDevice: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn mac_address(&self) -> [u8; 6];
+    fn mtu(&self) -> usize;
+    fn can_send(&self) -> bool;
+    fn can_recv(&self) -> bool;
+    fn send_frame(&self, frame: &[u8]) -> Result<usize, i32>;
+    fn recv_frame(&self, frame: &mut [u8]) -> Result<usize, i32>;
+}
+
 pub trait HalPlatform: Send + Sync {
     fn platform_name(&self) -> &'static str;
     fn architecture(&self) -> PlatformArch;
 }
 
+pub trait HalPlatformLifecycle: Send + Sync {
+    fn supports_userspace(&self) -> bool;
+    fn idle(&self) -> !;
+}
+
 pub struct HalBundle {
     pub platform: &'static dyn HalPlatform,
+    pub lifecycle: &'static dyn HalPlatformLifecycle,
+    pub interrupt: &'static dyn HalInterrupt,
     pub cpu: &'static dyn HalCpu,
     pub memory: &'static dyn HalMemory,
     pub timer: &'static dyn HalTimer,
     pub console: &'static dyn HalCharDevice,
     pub block_devices: &'static [&'static dyn HalBlockDevice],
+    pub net_devices: &'static [&'static dyn HalNetDevice],
 }
 
 static HAL_BUNDLE: Once<HalBundle> = Once::new();

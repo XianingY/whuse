@@ -6,8 +6,9 @@ use core::arch::global_asm;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hal_api::{
-    register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalMemory, HalPlatform,
-    HalTimer, MemoryRegion, PlatformArch, Timespec, TrapFrame, VmSpaceToken,
+    register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
+    HalNetDevice, HalPlatform, HalPlatformLifecycle, HalTimer, MemoryRegion, PlatformArch,
+    Timespec, TrapFrame, VmSpaceToken,
 };
 
 pub const UART0_BASE: usize = 0x1000_0000;
@@ -17,12 +18,16 @@ pub const PHYS_MEM_BASE: usize = 0x8000_0000;
 pub const PHYS_MEM_SIZE: usize = 128 * 1024 * 1024;
 
 static CPU: VirtCpu = VirtCpu::new();
+static INTERRUPT: VirtInterruptController = VirtInterruptController;
 static PLATFORM: VirtPlatform = VirtPlatform;
+static LIFECYCLE: VirtLifecycle = VirtLifecycle;
 static MEMORY: VirtMemory = VirtMemory;
 static TIMER: VirtTimer = VirtTimer::new();
 static UART: Ns16550 = Ns16550::new(UART0_BASE);
 static VIRTIO_BLK: VirtioBlockStub = VirtioBlockStub;
+static VIRTIO_NET: VirtioNetStub = VirtioNetStub;
 static BLOCK_DEVS: [&'static dyn HalBlockDevice; 1] = [&VIRTIO_BLK];
+static NET_DEVS: [&'static dyn HalNetDevice; 1] = [&VIRTIO_NET];
 
 #[cfg(target_arch = "riscv64")]
 #[no_mangle]
@@ -174,11 +179,14 @@ static MEMORY_MAP: [MemoryRegion; 2] = [
 pub fn bootstrap() {
     register_hal(HalBundle {
         platform: &PLATFORM,
+        lifecycle: &LIFECYCLE,
+        interrupt: &INTERRUPT,
         cpu: &CPU,
         memory: &MEMORY,
         timer: &TIMER,
         console: &UART,
         block_devices: &BLOCK_DEVS,
+        net_devices: &NET_DEVS,
     });
 }
 
@@ -186,7 +194,9 @@ struct VirtCpu {
     interrupts_enabled: AtomicBool,
 }
 
+struct VirtInterruptController;
 struct VirtPlatform;
+struct VirtLifecycle;
 
 impl HalPlatform for VirtPlatform {
     fn platform_name(&self) -> &'static str {
@@ -195,6 +205,39 @@ impl HalPlatform for VirtPlatform {
 
     fn architecture(&self) -> PlatformArch {
         PlatformArch::Riscv64
+    }
+}
+
+impl HalPlatformLifecycle for VirtLifecycle {
+    fn supports_userspace(&self) -> bool {
+        true
+    }
+
+    fn idle(&self) -> ! {
+        loop {
+            #[cfg(target_arch = "riscv64")]
+            unsafe {
+                core::arch::asm!("wfi");
+            }
+            #[cfg(not(target_arch = "riscv64"))]
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl HalInterrupt for VirtInterruptController {
+    fn name(&self) -> &'static str {
+        "plic-stub"
+    }
+
+    fn enable_irq(&self, _irq: usize) {}
+
+    fn disable_irq(&self, _irq: usize) {}
+
+    fn ack_irq(&self, _irq: usize) {}
+
+    fn next_pending(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -350,5 +393,37 @@ impl HalBlockDevice for VirtioBlockStub {
 
     fn write_sector(&self, _sector: usize, _buf: &[u8]) -> Result<(), i32> {
         Err(95)
+    }
+}
+
+struct VirtioNetStub;
+
+impl HalNetDevice for VirtioNetStub {
+    fn name(&self) -> &'static str {
+        "virtio-net0"
+    }
+
+    fn mac_address(&self) -> [u8; 6] {
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
+    }
+
+    fn mtu(&self) -> usize {
+        1500
+    }
+
+    fn can_send(&self) -> bool {
+        false
+    }
+
+    fn can_recv(&self) -> bool {
+        false
+    }
+
+    fn send_frame(&self, _frame: &[u8]) -> Result<usize, i32> {
+        Err(95)
+    }
+
+    fn recv_frame(&self, _frame: &mut [u8]) -> Result<usize, i32> {
+        Err(11)
     }
 }

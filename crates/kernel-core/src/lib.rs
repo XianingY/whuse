@@ -53,13 +53,13 @@ impl Kernel {
             .map(|program| program.image.as_ptr() as usize + program.entry)
             .unwrap_or(0);
         let init_pid = processes.spawn_init("init", init_entry);
-        processes.set_current(init_pid).expect("init pid must exist");
+        processes.set_current(init_pid).expect("init tid must exist");
         if init_entry == 0 {
             user_init::seed_process(processes.current_mut().expect("init process must exist"));
         }
 
         let mut scheduler = Scheduler::new();
-        scheduler.spawn("init", init_pid);
+        scheduler.spawn("init", init_pid, init_pid);
         scheduler.start();
 
         let memory = MemoryManager::from_hal(hal().memory);
@@ -85,11 +85,11 @@ impl Kernel {
                 hal().cpu.wait_for_interrupt();
                 continue;
             }
-            let pid = match self.scheduler.current_process_id() {
-                Some(pid) => pid,
+            let tid = match self.scheduler.current_thread_id() {
+                Some(tid) => tid,
                 None => continue,
             };
-            if self.processes.set_current(pid).is_err() {
+            if self.processes.set_current(tid).is_err() {
                 let _ = self.scheduler.yield_now();
                 continue;
             }
@@ -138,7 +138,7 @@ impl Kernel {
                 process.trap_frame.syscall_args(),
                 process.trap_frame.scause,
                 process.trap_frame.sepc,
-                process.pid,
+                process.tgid,
             ),
             Err(_) => return,
         };
@@ -174,8 +174,9 @@ impl Kernel {
                 .map(|process| process.trap_frame.stval)
                 .unwrap_or(0),
         ));
-        let _ = self.processes.exit_current(-1);
-        self.scheduler.exit_current();
+        if let Ok(exit) = self.processes.exit_current_thread(-1) {
+            self.scheduler.remove_task(exit.tid);
+        }
     }
 }
 

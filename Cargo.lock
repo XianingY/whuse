@@ -52,6 +52,7 @@ name = "mm"
 version = "0.1.0"
 dependencies = [
  "hal-api",
+ "spin",
 ]
 
 [[package]]
@@ -60,6 +61,7 @@ version = "0.1.0"
 dependencies = [
  "hal-api",
  "mm",
+ "spin",
  "vfs",
 ]
 

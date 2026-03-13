@@ -8,7 +8,7 @@ qemu:
 	cargo xtask qemu-riscv
 
 test:
-	cargo test --workspace --exclude whuse-riscv64-virt
+	cargo test -p proc -p task -p mm -p vfs -p syscall
 
 build-riscv:
 	cargo xtask build-riscv

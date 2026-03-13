@@ -24,18 +24,139 @@ global_asm!(
     .global whuse_user_init_end
 whuse_user_init_start:
 whuse_user_init_entry:
-    addi sp, sp, -16
+    addi sp, sp, -384
     li a0, 1
     la a1, init_msg
     li a2, init_msg_end - init_msg
     li a7, 64
     ecall
 
+    li a0, 0
+    li a1, 0
+    li a7, 19
+    ecall
+    mv s1, a0
+    mv a0, s1
+    la a1, one64
+    li a2, 8
+    li a7, 64
+    ecall
+
+    li a0, 0
+    li a7, 20
+    ecall
+    mv s2, a0
+    li t0, 1
+    sw t0, 0(sp)
+    sw zero, 4(sp)
+    mv t0, s1
+    sd t0, 8(sp)
+    mv a0, s2
+    li a1, 1
+    mv a2, s1
+    mv a3, sp
+    li a7, 21
+    ecall
+    mv a0, s2
+    addi a1, sp, 16
+    li a2, 1
+    li a3, 0
+    li a4, 0
+    li a5, 0
+    li a7, 22
+    ecall
+    mv a0, s1
+    addi a1, sp, 32
+    li a2, 8
+    li a7, 63
+    ecall
+    li a0, 1
+    la a1, event_msg
+    li a2, event_msg_end - event_msg
+    li a7, 64
+    ecall
+
+    li a0, 1
+    li a1, 1
+    li a2, 0
+    addi a3, sp, 40
+    li a7, 199
+    ecall
+    lw s3, 40(sp)
+    lw s4, 44(sp)
+    mv a0, s3
+    la a1, sock_payload
+    li a2, sock_payload_end - sock_payload
+    li a3, 0
+    li a4, 0
+    li a5, 0
+    li a7, 206
+    ecall
+    mv a0, s4
+    addi a1, sp, 48
+    li a2, 4
+    li a3, 0
+    li a4, 0
+    li a5, 0
+    li a7, 207
+    ecall
+    li a0, 1
+    la a1, socket_msg
+    li a2, socket_msg_end - socket_msg
+    li a7, 64
+    ecall
+
     li a7, 172
     ecall
+    mv s5, a0
     li a7, 173
     ecall
     li a7, 178
+    ecall
+    mv a0, s5
+    li a1, 10
+    li a7, 129
+    ecall
+    addi a0, sp, 56
+    li a1, 8
+    li a7, 136
+    ecall
+    addi a0, sp, 56
+    addi a1, sp, 64
+    li a2, 0
+    li a3, 8
+    li a7, 137
+    ecall
+    li a0, 1
+    la a1, signal_msg
+    li a2, signal_msg_end - signal_msg
+    li a7, 64
+    ecall
+
+    li a0, 1
+    li a1, 4096
+    li a2, 0
+    li a7, 194
+    ecall
+    mv s6, a0
+    mv a0, s6
+    li a1, 0
+    li a2, 0
+    li a7, 196
+    ecall
+    mv s7, a0
+    mv a0, s6
+    li a1, 2
+    addi a2, sp, 200
+    li a7, 195
+    ecall
+    mv a0, s7
+    li a7, 197
+    ecall
+    li a0, 1
+    la a1, shm_msg
+    li a2, shm_msg_end - shm_msg
+    li a7, 64
     ecall
 
     li a7, 220
@@ -74,6 +195,18 @@ whuse_user_init_entry:
 init_msg:
     .ascii "user:init entered\n"
 init_msg_end:
+event_msg:
+    .ascii "user:eventfd epoll ok\n"
+event_msg_end:
+socket_msg:
+    .ascii "user:socketpair ok\n"
+socket_msg_end:
+signal_msg:
+    .ascii "user:signal ok\n"
+signal_msg_end:
+shm_msg:
+    .ascii "user:shm ok\n"
+shm_msg_end:
 parent_msg:
     .ascii "user:init wait complete\n"
 parent_msg_end:
@@ -82,6 +215,11 @@ exec_fail_msg:
 exec_fail_msg_end:
 child_path:
     .asciz "/bin/child"
+one64:
+    .dword 1
+sock_payload:
+    .ascii "pong"
+sock_payload_end:
 whuse_user_init_end:
 
     .section .text.whuse_user_child, "ax"

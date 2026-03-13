@@ -10,7 +10,7 @@ pub(crate) fn dispatch(
     args: SyscallArgs,
 ) -> Option<Result<usize, i32>> {
     Some(match sysno {
-        SYS_FUTEX => ctx.dispatcher.sys_futex(args, ctx.procs),
+        SYS_FUTEX => ctx.dispatcher.sys_futex(args, ctx.procs, ctx.scheduler),
         SYS_SET_ROBUST_LIST => ctx.dispatcher.sys_set_robust_list(args, ctx.procs),
         SYS_GET_ROBUST_LIST => ctx.dispatcher.sys_get_robust_list(args, ctx.procs),
         SYS_KILL | SYS_TGKILL => ctx.dispatcher.sys_kill(args, ctx.procs),

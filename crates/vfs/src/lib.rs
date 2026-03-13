@@ -19,7 +19,6 @@ pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 
 const ENOENT: i32 = 2;
-const EIO: i32 = 5;
 const EEXIST: i32 = 17;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
@@ -29,6 +28,7 @@ const ENOTEMPTY: i32 = 39;
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFCHR: u32 = 0o020000;
+const S_IFIFO: u32 = 0o010000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeKind {
@@ -36,6 +36,7 @@ pub enum NodeKind {
     File,
     CharDevice,
     Proc,
+    Pipe,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,7 +62,7 @@ pub struct FileHandle {
 }
 
 struct Node {
-    name: String,
+    _name: String,
     kind: NodeKind,
     data: Mutex<NodeData>,
 }
@@ -69,13 +70,15 @@ struct Node {
 enum NodeData {
     Directory(BTreeMap<String, Arc<Node>>),
     File(Vec<u8>),
-    CharDevice(&'static str),
+    CharDevice,
     ProcFile(Vec<u8>),
+    Pipe(Vec<u8>),
 }
 
 pub struct KernelVfs {
     root: Arc<Node>,
     mounts: Vec<MountRecord>,
+    next_pipe_id: usize,
 }
 
 impl KernelVfs {
@@ -84,6 +87,7 @@ impl KernelVfs {
         let mut vfs = Self {
             root,
             mounts: Vec::new(),
+            next_pipe_id: 0,
         };
         for dir in ["/dev", "/proc", "/mnt", "/tmp", "/bin", "/etc"] {
             let _ = vfs.mkdir("/", dir, 0o755);
@@ -94,7 +98,8 @@ impl KernelVfs {
     }
 
     pub fn create_char_device(&mut self, path: &str, name: &'static str) -> KernelResult<()> {
-        self.create_node(path, NodeKind::CharDevice, Some(NodeData::CharDevice(name)))
+        let _ = name;
+        self.create_node(path, NodeKind::CharDevice, Some(NodeData::CharDevice))
     }
 
     pub fn create_proc_file(&mut self, path: &str, contents: &[u8]) -> KernelResult<()> {
@@ -141,7 +146,7 @@ impl KernelVfs {
     }
 
     pub fn read(&self, handle: &mut FileHandle, len: usize) -> KernelResult<Vec<u8>> {
-        match &*handle.node.data.lock() {
+        match &mut *handle.node.data.lock() {
             NodeData::Directory(_) => Err(EISDIR),
             NodeData::File(buf) | NodeData::ProcFile(buf) => {
                 let start = handle.offset.min(buf.len());
@@ -149,7 +154,11 @@ impl KernelVfs {
                 handle.offset = end;
                 Ok(buf[start..end].to_vec())
             }
-            NodeData::CharDevice(_) => Ok(Vec::new()),
+            NodeData::Pipe(buf) => {
+                let end = len.min(buf.len());
+                Ok(buf.drain(..end).collect())
+            }
+            NodeData::CharDevice => Ok(Vec::new()),
         }
     }
 
@@ -167,11 +176,18 @@ impl KernelVfs {
                 handle.offset += data.len();
                 Ok(data.len())
             }
-            NodeData::CharDevice(_) => Ok(data.len()),
+            NodeData::Pipe(buf) => {
+                buf.extend_from_slice(data);
+                Ok(data.len())
+            }
+            NodeData::CharDevice => Ok(data.len()),
         }
     }
 
     pub fn seek(&self, handle: &mut FileHandle, offset: isize, whence: u32) -> KernelResult<usize> {
+        if handle.node.kind == NodeKind::Pipe {
+            return Err(EINVAL);
+        }
         let size = self.stat(&handle.node)?.size as isize;
         let base = match whence {
             0 => 0,
@@ -188,7 +204,8 @@ impl KernelVfs {
     }
 
     pub fn getdents(&self, handle: &mut FileHandle) -> KernelResult<Vec<u8>> {
-        let entries = match &*handle.node.data.lock() {
+        let guard = handle.node.data.lock();
+        let entries = match &*guard {
             NodeData::Directory(entries) => entries,
             _ => return Err(ENOTDIR),
         };
@@ -277,6 +294,73 @@ impl KernelVfs {
         normalize_path("/", cwd)
     }
 
+    pub fn access(&self, cwd: &str, path: &str) -> KernelResult<()> {
+        let absolute = normalize_path(cwd, path);
+        let _ = self.lookup_abs(&absolute)?;
+        Ok(())
+    }
+
+    pub fn rename(&mut self, cwd: &str, old_path: &str, new_path: &str) -> KernelResult<()> {
+        let old_absolute = normalize_path(cwd, old_path);
+        let new_absolute = normalize_path(cwd, new_path);
+        let (old_parent_path, old_name) = split_parent(&old_absolute)?;
+        let (new_parent_path, new_name) = split_parent(&new_absolute)?;
+
+        let node = {
+            let old_parent = self.lookup_abs(&old_parent_path)?;
+            let mut guard = old_parent.data.lock();
+            let NodeData::Directory(entries) = &mut *guard else {
+                return Err(ENOTDIR);
+            };
+            entries.remove(old_name).ok_or(ENOENT)?
+        };
+
+        let new_parent = self.lookup_abs(&new_parent_path)?;
+        let mut guard = new_parent.data.lock();
+        let NodeData::Directory(entries) = &mut *guard else {
+            return Err(ENOTDIR);
+        };
+        if entries.contains_key(new_name) {
+            return Err(EEXIST);
+        }
+        entries.insert(new_name.to_string(), node);
+        Ok(())
+    }
+
+    pub fn truncate(&mut self, handle: &mut FileHandle, len: usize) -> KernelResult<()> {
+        match &mut *handle.node.data.lock() {
+            NodeData::File(buf) | NodeData::ProcFile(buf) => {
+                buf.resize(len, 0);
+                handle.offset = handle.offset.min(len);
+                Ok(())
+            }
+            NodeData::Pipe(_) | NodeData::Directory(_) | NodeData::CharDevice => Err(EINVAL),
+        }
+    }
+
+    pub fn create_pipe(&mut self) -> KernelResult<(FileHandle, FileHandle)> {
+        let path = format!("pipe:[{}]", self.next_pipe_id);
+        self.next_pipe_id += 1;
+        let node = Arc::new(Node::pipe(&path));
+        let read_end = FileHandle {
+            node: node.clone(),
+            offset: 0,
+            flags: O_RDONLY,
+            path: path.clone(),
+        };
+        let write_end = FileHandle {
+            node,
+            offset: 0,
+            flags: O_WRONLY,
+            path,
+        };
+        Ok((read_end, write_end))
+    }
+
+    pub fn is_pipe(&self, handle: &FileHandle) -> bool {
+        handle.node.kind == NodeKind::Pipe
+    }
+
     fn refresh_mounts_proc(&mut self) {
         let mut data = String::new();
         for mount in &self.mounts {
@@ -319,9 +403,10 @@ impl KernelVfs {
             NodeKind::Directory => Node::directory(name),
             NodeKind::File => Node::file(name, data.unwrap_or_else(|| NodeData::File(Vec::new()))),
             NodeKind::CharDevice => {
-                Node::char_device(name, data.unwrap_or(NodeData::CharDevice("char")))
+                Node::char_device(name, data.unwrap_or(NodeData::CharDevice))
             }
             NodeKind::Proc => Node::proc(name, data.unwrap_or_else(|| NodeData::ProcFile(Vec::new()))),
+            NodeKind::Pipe => Node::pipe(name),
         });
         entries.insert(name.to_string(), node);
         Ok(())
@@ -331,12 +416,14 @@ impl KernelVfs {
         let size = match &*node.data.lock() {
             NodeData::Directory(entries) => entries.len() as u64,
             NodeData::File(buf) | NodeData::ProcFile(buf) => buf.len() as u64,
-            NodeData::CharDevice(_) => 0,
+            NodeData::Pipe(buf) => buf.len() as u64,
+            NodeData::CharDevice => 0,
         };
         let mode = match node.kind {
             NodeKind::Directory => S_IFDIR | 0o755,
             NodeKind::File | NodeKind::Proc => S_IFREG | 0o644,
             NodeKind::CharDevice => S_IFCHR | 0o600,
+            NodeKind::Pipe => S_IFIFO | 0o644,
         };
         Ok(FileStat {
             mode,
@@ -349,7 +436,7 @@ impl KernelVfs {
 impl Node {
     fn directory(name: &str) -> Self {
         Self {
-            name: name.to_string(),
+            _name: name.to_string(),
             kind: NodeKind::Directory,
             data: Mutex::new(NodeData::Directory(BTreeMap::new())),
         }
@@ -357,7 +444,7 @@ impl Node {
 
     fn file(name: &str, data: NodeData) -> Self {
         Self {
-            name: name.to_string(),
+            _name: name.to_string(),
             kind: NodeKind::File,
             data: Mutex::new(data),
         }
@@ -365,7 +452,7 @@ impl Node {
 
     fn char_device(name: &str, data: NodeData) -> Self {
         Self {
-            name: name.to_string(),
+            _name: name.to_string(),
             kind: NodeKind::CharDevice,
             data: Mutex::new(data),
         }
@@ -373,9 +460,17 @@ impl Node {
 
     fn proc(name: &str, data: NodeData) -> Self {
         Self {
-            name: name.to_string(),
+            _name: name.to_string(),
             kind: NodeKind::Proc,
             data: Mutex::new(data),
+        }
+    }
+
+    fn pipe(name: &str) -> Self {
+        Self {
+            _name: name.to_string(),
+            kind: NodeKind::Pipe,
+            data: Mutex::new(NodeData::Pipe(Vec::new())),
         }
     }
 }

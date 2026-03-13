@@ -6,6 +6,7 @@ use alloc::collections::BTreeMap;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec;
+use alloc::vec::Vec;
 use mm::{AddressSpace, KernelResult as MmResult};
 use hal_api::TrapFrame;
 use vfs::FileHandle;
@@ -32,9 +33,16 @@ pub struct Process {
     pub tid: usize,
     pub tgid: usize,
     pub pgid: usize,
+    pub sid: usize,
     pub parent: Option<usize>,
     pub name: String,
     pub cwd: String,
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub groups: Vec<u32>,
+    pub umask: u32,
     pub state: ProcessState,
     pub exit_code: Option<i32>,
     pub address_space: AddressSpace,
@@ -43,6 +51,9 @@ pub struct Process {
     pub user_stack: Box<[u8]>,
     pub tid_address: Option<usize>,
     pub robust_list: Option<(usize, usize)>,
+    pub signal_mask: u64,
+    pub pending_signals: u64,
+    pub sigaltstack: Option<(usize, usize, u32)>,
 }
 
 pub struct ProcessTable {
@@ -60,9 +71,16 @@ impl Process {
             tid: pid,
             tgid: pid,
             pgid: parent.unwrap_or(pid),
+            sid: parent.unwrap_or(pid),
             parent,
             name: name.to_string(),
             cwd: "/".to_string(),
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            groups: Vec::new(),
+            umask: 0o022,
             state: ProcessState::Ready,
             exit_code: None,
             address_space: AddressSpace::new_user(),
@@ -71,6 +89,9 @@ impl Process {
             user_stack,
             tid_address: None,
             robust_list: None,
+            signal_mask: 0,
+            pending_signals: 0,
+            sigaltstack: None,
         }
     }
 
@@ -138,9 +159,16 @@ impl Process {
             tid: pid,
             tgid: pid,
             pgid: self.pgid,
+            sid: self.sid,
             parent: Some(self.pid),
             name: self.name.clone(),
             cwd: self.cwd.clone(),
+            uid: self.uid,
+            euid: self.euid,
+            gid: self.gid,
+            egid: self.egid,
+            groups: self.groups.clone(),
+            umask: self.umask,
             state: ProcessState::Ready,
             exit_code: None,
             address_space: self.address_space.clone(),
@@ -149,6 +177,9 @@ impl Process {
             user_stack,
             tid_address: self.tid_address,
             robust_list: self.robust_list,
+            signal_mask: self.signal_mask,
+            pending_signals: self.pending_signals,
+            sigaltstack: self.sigaltstack,
         }
     }
 }
@@ -185,12 +216,21 @@ impl ProcessTable {
         Ok(self.current()?.pid)
     }
 
+    pub fn has_pid(&self, pid: usize) -> bool {
+        self.processes.contains_key(&pid)
+    }
+
     pub fn current_mut(&mut self) -> KernelResult<&mut Process> {
         self.processes.get_mut(&self.current_pid).ok_or(EBADF)
     }
 
     pub fn current_frame_mut(&mut self) -> KernelResult<&mut TrapFrame> {
         Ok(&mut self.current_mut()?.trap_frame)
+    }
+
+    pub fn duplicate_fd_from(&self, pid: usize, fd: i32) -> KernelResult<FileHandle> {
+        let process = self.processes.get(&pid).ok_or(ENOENT)?;
+        process.fd(fd).cloned()
     }
 
     pub fn set_current(&mut self, pid: usize) -> KernelResult<()> {
@@ -234,7 +274,9 @@ impl ProcessTable {
     }
 
     pub fn execve_current(&mut self, entry: usize) -> KernelResult<()> {
-        self.current_mut()?.reset_image(entry);
+        let process = self.current_mut()?;
+        process.reset_image(entry);
+        process.pending_signals = 0;
         Ok(())
     }
 
@@ -260,6 +302,15 @@ impl ProcessTable {
         Ok(())
     }
 
+    pub fn get_robust_list(&self, pid: usize) -> KernelResult<(usize, usize)> {
+        let process = if pid == 0 {
+            self.current()?
+        } else {
+            self.processes.get(&pid).ok_or(ENOENT)?
+        };
+        process.robust_list.ok_or(EINVAL)
+    }
+
     pub fn getpgid(&self, pid: usize) -> KernelResult<usize> {
         let target = if pid == 0 { self.current()? } else { self.processes.get(&pid).ok_or(ENOENT)? };
         Ok(target.pgid)
@@ -269,6 +320,89 @@ impl ProcessTable {
         let pid = if pid == 0 { self.current_pid()? } else { pid };
         let process = self.processes.get_mut(&pid).ok_or(ENOENT)?;
         process.pgid = if pgid == 0 { pid } else { pgid };
+        Ok(())
+    }
+
+    pub fn getsid(&self, pid: usize) -> KernelResult<usize> {
+        let target = if pid == 0 { self.current()? } else { self.processes.get(&pid).ok_or(ENOENT)? };
+        Ok(target.sid)
+    }
+
+    pub fn setsid_current(&mut self) -> KernelResult<usize> {
+        let pid = self.current_pid()?;
+        let process = self.current_mut()?;
+        process.sid = pid;
+        process.pgid = pid;
+        Ok(pid)
+    }
+
+    pub fn setuid_current(&mut self, uid: u32) -> KernelResult<()> {
+        let process = self.current_mut()?;
+        process.uid = uid;
+        process.euid = uid;
+        Ok(())
+    }
+
+    pub fn setgid_current(&mut self, gid: u32) -> KernelResult<()> {
+        let process = self.current_mut()?;
+        process.gid = gid;
+        process.egid = gid;
+        Ok(())
+    }
+
+    pub fn getgroups_current(&self) -> KernelResult<Vec<u32>> {
+        Ok(self.current()?.groups.clone())
+    }
+
+    pub fn setgroups_current(&mut self, groups: &[u32]) -> KernelResult<()> {
+        self.current_mut()?.groups = groups.to_vec();
+        Ok(())
+    }
+
+    pub fn umask_current(&mut self, mask: u32) -> KernelResult<u32> {
+        let process = self.current_mut()?;
+        let previous = process.umask;
+        process.umask = mask & 0o777;
+        Ok(previous)
+    }
+
+    pub fn signal_mask(&self) -> KernelResult<u64> {
+        Ok(self.current()?.signal_mask)
+    }
+
+    pub fn set_signal_mask(&mut self, mask: u64) -> KernelResult<()> {
+        self.current_mut()?.signal_mask = mask;
+        Ok(())
+    }
+
+    pub fn pending_signals(&self) -> KernelResult<u64> {
+        Ok(self.current()?.pending_signals)
+    }
+
+    pub fn set_sigaltstack(
+        &mut self,
+        stack: Option<(usize, usize, u32)>,
+    ) -> KernelResult<Option<(usize, usize, u32)>> {
+        let process = self.current_mut()?;
+        let previous = process.sigaltstack;
+        process.sigaltstack = stack;
+        Ok(previous)
+    }
+
+    pub fn send_signal(&mut self, pid: usize, signal: usize) -> KernelResult<()> {
+        if signal == 0 || signal > 64 {
+            return Err(EINVAL);
+        }
+        let process = self.processes.get_mut(&pid).ok_or(ENOENT)?;
+        process.pending_signals |= 1u64 << (signal - 1);
+        Ok(())
+    }
+
+    pub fn clear_pending_signal(&mut self, signal: usize) -> KernelResult<()> {
+        if signal == 0 || signal > 64 {
+            return Err(EINVAL);
+        }
+        self.current_mut()?.pending_signals &= !(1u64 << (signal - 1));
         Ok(())
     }
 

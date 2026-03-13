@@ -12,6 +12,7 @@ members = [
     "crates/task",
     "crates/proc",
     "crates/vfs",
+    "crates/fs-ext4",
     "crates/syscall",
     "crates/user-init",
 ]
@@ -25,6 +26,7 @@ authors = ["Codex"]
 
 [workspace.dependencies]
 spin = "0.9"
+ext4-view = { version = "0.9.3", default-features = false }
 
 [profile.dev]
 panic = "abort"

@@ -9,9 +9,12 @@ use hal_api::{
     Timespec, TrapFrame, VmSpaceToken,
 };
 
-pub const UART0_BASE: usize = 0x1fe0_01e0;
-pub const MMIO_BASE: usize = 0x1000_0000;
-pub const PHYS_MEM_BASE: usize = 0x8000_0000;
+pub const DMWIN_UNCACHED_BASE: usize = 0x8000_0000_0000_0000;
+pub const DMWIN_CACHED_BASE: usize = 0x9000_0000_0000_0000;
+pub const UART0_PHYS_BASE: usize = 0x1fe0_01e0;
+pub const MMIO_PHYS_BASE: usize = 0x1000_0000;
+pub const UART0_BASE: usize = UART0_PHYS_BASE;
+pub const PHYS_MEM_BASE: usize = 0x9000_0000;
 pub const PHYS_MEM_SIZE: usize = 128 * 1024 * 1024;
 
 static CPU: VirtCpu = VirtCpu::new();
@@ -29,7 +32,7 @@ static NET_DEVS: [&'static dyn HalNetDevice; 1] = [&VIRTIO_NET];
 static MEMORY_MAP: [MemoryRegion; 2] = [
     MemoryRegion {
         start: 0,
-        size: MMIO_BASE,
+        size: MMIO_PHYS_BASE,
         usable: false,
     },
     MemoryRegion {
@@ -151,7 +154,7 @@ impl HalMemory for VirtMemory {
     }
 
     fn mmio_base(&self) -> usize {
-        MMIO_BASE
+        MMIO_PHYS_BASE
     }
 }
 
@@ -198,6 +201,7 @@ impl HalCharDevice for Ns16550 {
     fn put_byte(&self, byte: u8) {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
+            while read_volatile((self.base + 5) as *const u8) & (1 << 5) == 0 {}
             write_volatile(self.base as *mut u8, byte);
         }
         #[cfg(not(target_arch = "loongarch64"))]
@@ -207,6 +211,9 @@ impl HalCharDevice for Ns16550 {
     fn get_byte(&self) -> Option<u8> {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
+            if read_volatile((self.base + 5) as *const u8) & 1 == 0 {
+                return None;
+            }
             return Some(read_volatile(self.base as *const u8));
         }
         #[cfg(not(target_arch = "loongarch64"))]

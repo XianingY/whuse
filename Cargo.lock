@@ -110,6 +110,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "whuse-loongarch64-bootrom"
+version = "0.1.0"
+
+[[package]]
 name = "whuse-loongarch64-virt"
 version = "0.1.0"
 dependencies = [

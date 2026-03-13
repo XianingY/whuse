@@ -2,6 +2,7 @@
 members = [
     "tools/xtask",
     "platform/riscv64-virt",
+    "platform/loongarch64-bootrom",
     "platform/loongarch64-virt",
     "crates/hal-api",
     "crates/hal-riscv64-virt",

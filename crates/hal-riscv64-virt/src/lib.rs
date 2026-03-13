@@ -6,8 +6,8 @@ use core::arch::global_asm;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hal_api::{
-    register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalMemory, HalTimer,
-    MemoryRegion, Timespec, TrapFrame, VmSpaceToken,
+    register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalMemory, HalPlatform,
+    HalTimer, MemoryRegion, PlatformArch, Timespec, TrapFrame, VmSpaceToken,
 };
 
 pub const UART0_BASE: usize = 0x1000_0000;
@@ -17,6 +17,7 @@ pub const PHYS_MEM_BASE: usize = 0x8000_0000;
 pub const PHYS_MEM_SIZE: usize = 128 * 1024 * 1024;
 
 static CPU: VirtCpu = VirtCpu::new();
+static PLATFORM: VirtPlatform = VirtPlatform;
 static MEMORY: VirtMemory = VirtMemory;
 static TIMER: VirtTimer = VirtTimer::new();
 static UART: Ns16550 = Ns16550::new(UART0_BASE);
@@ -172,6 +173,7 @@ static MEMORY_MAP: [MemoryRegion; 2] = [
 
 pub fn bootstrap() {
     register_hal(HalBundle {
+        platform: &PLATFORM,
         cpu: &CPU,
         memory: &MEMORY,
         timer: &TIMER,
@@ -182,6 +184,18 @@ pub fn bootstrap() {
 
 struct VirtCpu {
     interrupts_enabled: AtomicBool,
+}
+
+struct VirtPlatform;
+
+impl HalPlatform for VirtPlatform {
+    fn platform_name(&self) -> &'static str {
+        "riscv64-virt"
+    }
+
+    fn architecture(&self) -> PlatformArch {
+        PlatformArch::Riscv64
+    }
 }
 
 impl VirtCpu {

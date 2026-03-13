@@ -32,6 +32,11 @@ impl Kernel {
     pub fn bootstrap(info: BootInfo) -> Self {
         logln(format_args!("whuse: booting on {}", info.platform));
         logln(format_args!("whuse: hart={} dtb={:#x}", info.hart_id, info.dtb_pa));
+        logln(format_args!(
+            "whuse: hal platform={} arch={:?}",
+            hal().platform.platform_name(),
+            hal().platform.architecture()
+        ));
 
         let mut vfs = KernelVfs::new();
         let _ = user_init::seed_filesystem(&mut vfs);

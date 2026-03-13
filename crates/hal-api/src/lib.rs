@@ -19,6 +19,12 @@ pub struct Timespec {
     pub tv_nsec: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformArch {
+    Riscv64,
+    LoongArch64,
+}
+
 impl Timespec {
     pub const fn from_nanos(total_nanos: u64) -> Self {
         Self {
@@ -111,7 +117,13 @@ pub trait HalCharDevice: Send + Sync {
     fn get_byte(&self) -> Option<u8>;
 }
 
+pub trait HalPlatform: Send + Sync {
+    fn platform_name(&self) -> &'static str;
+    fn architecture(&self) -> PlatformArch;
+}
+
 pub struct HalBundle {
+    pub platform: &'static dyn HalPlatform,
     pub cpu: &'static dyn HalCpu,
     pub memory: &'static dyn HalMemory,
     pub timer: &'static dyn HalTimer,

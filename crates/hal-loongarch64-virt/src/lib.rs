@@ -1,6 +1,8 @@
 #![cfg_attr(not(test), no_std)]
 
 #[cfg(target_arch = "loongarch64")]
+use core::arch::global_asm;
+#[cfg(target_arch = "loongarch64")]
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hal_api::{
@@ -8,6 +10,132 @@ use hal_api::{
     HalNetDevice, HalPlatform, HalPlatformLifecycle, HalTimer, MemoryRegion, PlatformArch,
     Timespec, TrapFrame, VmSpaceToken,
 };
+
+#[cfg(target_arch = "loongarch64")]
+#[no_mangle]
+static mut __whuse_current_frame: usize = 0;
+
+#[cfg(target_arch = "loongarch64")]
+#[no_mangle]
+static mut __whuse_kernel_ra: usize = 0;
+
+#[cfg(target_arch = "loongarch64")]
+global_asm!(
+    r#"
+    .section .text
+    .globl __whuse_run_user
+__whuse_run_user:
+    la.local $t0, __whuse_current_frame
+    st.d $a0, $t0, 0
+    la.local $t0, __whuse_kernel_ra
+    st.d $ra, $t0, 0
+    la.local $t0, __whuse_user_trap_entry
+    csrwr $t0, 0xc
+
+    ld.d $t0, $a0, 80
+    csrwr $t0, 0x30
+    move $t0, $sp
+    csrwr $t0, 0x31
+
+    ld.d $ra, $a0, 8
+    ld.d $sp, $a0, 16
+    ld.d $tp, $a0, 32
+    ld.d $t0, $a0, 40
+    ld.d $t1, $a0, 48
+    ld.d $t2, $a0, 56
+    ld.d $fp, $a0, 64
+    ld.d $s0, $a0, 72
+    ld.d $a1, $a0, 88
+    ld.d $a2, $a0, 96
+    ld.d $a3, $a0, 104
+    ld.d $a4, $a0, 112
+    ld.d $a5, $a0, 120
+    ld.d $a6, $a0, 128
+    ld.d $a7, $a0, 136
+    ld.d $s1, $a0, 144
+    ld.d $s2, $a0, 152
+    ld.d $s3, $a0, 160
+    ld.d $s4, $a0, 168
+    ld.d $s5, $a0, 176
+    ld.d $s6, $a0, 184
+    ld.d $s7, $a0, 192
+    ld.d $s8, $a0, 200
+    ld.d $r31, $a0, 208
+    ld.d $r22, $a0, 216
+    ld.d $r12, $a0, 224
+    ld.d $r13, $a0, 232
+    ld.d $r14, $a0, 240
+    ld.d $r15, $a0, 248
+
+    ld.d $t0, $a0, 256
+    csrwr $t0, 0x6
+    ld.d $t0, $a0, 264
+    bnez $t0, 1f
+    li.d $t0, 3
+1:
+    csrwr $t0, 0x1
+    csrwr $a0, 0x30
+    ertn
+
+    .align 4
+    .globl __whuse_user_trap_entry
+__whuse_user_trap_entry:
+    csrwr $a0, 0x30
+
+    st.d $ra, $a0, 8
+    st.d $sp, $a0, 16
+    st.d $tp, $a0, 32
+    st.d $t0, $a0, 40
+    st.d $t1, $a0, 48
+    st.d $t2, $a0, 56
+    st.d $fp, $a0, 64
+    st.d $s0, $a0, 72
+    st.d $a1, $a0, 88
+    st.d $a2, $a0, 96
+    st.d $a3, $a0, 104
+    st.d $a4, $a0, 112
+    st.d $a5, $a0, 120
+    st.d $a6, $a0, 128
+    st.d $a7, $a0, 136
+    st.d $s1, $a0, 144
+    st.d $s2, $a0, 152
+    st.d $s3, $a0, 160
+    st.d $s4, $a0, 168
+    st.d $s5, $a0, 176
+    st.d $s6, $a0, 184
+    st.d $s7, $a0, 192
+    st.d $s8, $a0, 200
+    st.d $r31, $a0, 208
+    st.d $r22, $a0, 216
+    st.d $r12, $a0, 224
+    st.d $r13, $a0, 232
+    st.d $r14, $a0, 240
+    st.d $r15, $a0, 248
+
+    csrrd $t0, 0x30
+    st.d $t0, $a0, 80
+    csrrd $sp, 0x31
+    csrrd $t0, 0x6
+    st.d $t0, $a0, 256
+    csrrd $t0, 0x1
+    st.d $t0, $a0, 264
+    csrrd $t0, 0x5
+    srli.d $t1, $t0, 16
+    andi $t1, $t1, 0x3f
+    st.d $t1, $a0, 272
+    csrrd $t0, 0x7
+    st.d $t0, $a0, 280
+
+    la.local $t0, __whuse_kernel_ra
+    ld.d $ra, $t0, 0
+    jirl $zero, $ra, 0
+"#
+);
+
+#[cfg(target_arch = "loongarch64")]
+unsafe extern "C" {
+    fn __whuse_run_user(frame: *mut TrapFrame);
+}
 
 pub const DMWIN_UNCACHED_BASE: usize = 0x8000_0000_0000_0000;
 pub const DMWIN_CACHED_BASE: usize = 0x9000_0000_0000_0000;
@@ -76,7 +204,7 @@ impl HalPlatform for VirtPlatform {
 
 impl HalPlatformLifecycle for VirtLifecycle {
     fn supports_userspace(&self) -> bool {
-        false
+        cfg!(target_arch = "loongarch64")
     }
 
     fn idle(&self) -> ! {
@@ -130,11 +258,23 @@ impl HalCpu for VirtCpu {
     fn switch_address_space(&self, _token: VmSpaceToken) {}
 
     fn wait_for_interrupt(&self) {
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            core::arch::asm!("idle 0");
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
         core::hint::spin_loop();
     }
 
     fn run_user(&self, frame: &mut TrapFrame) {
-        frame.scause = usize::MAX;
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            __whuse_run_user(frame as *mut TrapFrame);
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            frame.scause = usize::MAX;
+        }
     }
 }
 

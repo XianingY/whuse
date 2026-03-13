@@ -1,0 +1,5 @@
+[package]
+name = "whuse-loongarch64-bootrom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

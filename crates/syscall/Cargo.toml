@@ -10,3 +10,4 @@ proc = { path = "../proc" }
 task = { path = "../task" }
 user-init = { path = "../user-init" }
 vfs = { path = "../vfs" }
+spin.workspace = true

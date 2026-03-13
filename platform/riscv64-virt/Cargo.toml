@@ -7,4 +7,3 @@ license.workspace = true
 [dependencies]
 hal-riscv64-virt = { path = "../../crates/hal-riscv64-virt" }
 kernel-core = { path = "../../crates/kernel-core" }
-

@@ -28,6 +28,33 @@ pub enum ProcessState {
     Exited,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Credentials {
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub groups: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessGroupState {
+    pub pid: usize,
+    pub parent: Option<usize>,
+    pub pgid: usize,
+    pub sid: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalState {
+    pub blocked_mask: u64,
+    pub pending_mask: u64,
+    pub altstack: Option<(usize, usize, u32)>,
+    pub robust_list: Option<(usize, usize)>,
+    pub clear_child_tid: Option<usize>,
+    pub tid_address: Option<usize>,
+}
+
 pub struct Process {
     pub pid: usize,
     pub tid: usize,
@@ -50,6 +77,7 @@ pub struct Process {
     pub trap_frame: TrapFrame,
     pub user_stack: Box<[u8]>,
     pub tid_address: Option<usize>,
+    pub clear_child_tid: Option<usize>,
     pub robust_list: Option<(usize, usize)>,
     pub signal_mask: u64,
     pub pending_signals: u64,
@@ -88,6 +116,7 @@ impl Process {
             trap_frame: TrapFrame::new_user(entry, sp),
             user_stack,
             tid_address: None,
+            clear_child_tid: None,
             robust_list: None,
             signal_mask: 0,
             pending_signals: 0,
@@ -176,11 +205,54 @@ impl Process {
             trap_frame,
             user_stack,
             tid_address: self.tid_address,
+            clear_child_tid: self.clear_child_tid,
             robust_list: self.robust_list,
             signal_mask: self.signal_mask,
             pending_signals: self.pending_signals,
             sigaltstack: self.sigaltstack,
         }
+    }
+
+    pub fn credentials(&self) -> Credentials {
+        Credentials {
+            uid: self.uid,
+            euid: self.euid,
+            gid: self.gid,
+            egid: self.egid,
+            groups: self.groups.clone(),
+        }
+    }
+
+    pub fn process_group(&self) -> ProcessGroupState {
+        ProcessGroupState {
+            pid: self.pid,
+            parent: self.parent,
+            pgid: self.pgid,
+            sid: self.sid,
+        }
+    }
+
+    pub fn session(&self) -> usize {
+        self.sid
+    }
+
+    pub fn signal_state(&self) -> SignalState {
+        SignalState {
+            blocked_mask: self.signal_mask,
+            pending_mask: self.pending_signals,
+            altstack: self.sigaltstack,
+            robust_list: self.robust_list,
+            clear_child_tid: self.clear_child_tid,
+            tid_address: self.tid_address,
+        }
+    }
+
+    pub fn fd_table(&self) -> &BTreeMap<i32, FileHandle> {
+        &self.fds
+    }
+
+    pub fn clear_child_tid(&self) -> Option<usize> {
+        self.clear_child_tid
     }
 }
 
@@ -290,7 +362,9 @@ impl ProcessTable {
 
     pub fn set_tid_address(&mut self, addr: usize) -> KernelResult<usize> {
         let tid = self.current()?.tid;
-        self.current_mut()?.tid_address = Some(addr);
+        let process = self.current_mut()?;
+        process.tid_address = Some(addr);
+        process.clear_child_tid = Some(addr);
         Ok(tid)
     }
 
@@ -375,6 +449,11 @@ impl ProcessTable {
         Ok(())
     }
 
+    pub fn set_clear_child_tid(&mut self, addr: Option<usize>) -> KernelResult<()> {
+        self.current_mut()?.clear_child_tid = addr;
+        Ok(())
+    }
+
     pub fn pending_signals(&self) -> KernelResult<u64> {
         Ok(self.current()?.pending_signals)
     }
@@ -411,5 +490,33 @@ impl ProcessTable {
             .values()
             .filter(|process| process.state != ProcessState::Exited)
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProcessTable;
+
+    #[test]
+    fn process_accessors_expose_competition_state() {
+        let mut table = ProcessTable::new();
+        let pid = table.spawn_init("init", 0x1000);
+        table.set_current(pid).unwrap();
+        table.set_tid_address(0x4000).unwrap();
+        table.setgroups_current(&[10, 20]).unwrap();
+        table.send_signal(pid, 10).unwrap();
+
+        let process = table.current().unwrap();
+        let creds = process.credentials();
+        assert_eq!(creds.uid, 0);
+        assert_eq!(creds.groups, vec![10, 20]);
+
+        let group = process.process_group();
+        assert_eq!(group.pid, pid);
+        assert_eq!(group.pgid, pid);
+
+        let signal = process.signal_state();
+        assert_eq!(signal.clear_child_tid, Some(0x4000));
+        assert_ne!(signal.pending_mask, 0);
     }
 }

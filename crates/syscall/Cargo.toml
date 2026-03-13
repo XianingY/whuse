@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 hal-api = { path = "../hal-api" }
+mm = { path = "../mm" }
 proc = { path = "../proc" }
 task = { path = "../task" }
 user-init = { path = "../user-init" }

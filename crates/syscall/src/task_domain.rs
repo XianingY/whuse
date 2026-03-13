@@ -1,7 +1,7 @@
 use crate::{
     DispatchContext, SyscallArgs, SYS_CLONE, SYS_CLONE3, SYS_EXECVE, SYS_EXIT, SYS_EXIT_GROUP,
-    SYS_GETPGID, SYS_GETPID, SYS_GETPPID, SYS_GETSID, SYS_GETTID, SYS_POWER_OFF,
-    SYS_SCHED_YIELD, SYS_SETPGID, SYS_SETSID, SYS_SET_TID_ADDRESS, SYS_WAIT,
+    SYS_GETPGID, SYS_GETPID, SYS_GETPPID, SYS_GETSID, SYS_GETTID, SYS_POWER_OFF, SYS_SCHED_YIELD,
+    SYS_SETPGID, SYS_SETSID, SYS_SET_TID_ADDRESS, SYS_WAIT,
 };
 
 pub(crate) fn dispatch(
@@ -12,8 +12,12 @@ pub(crate) fn dispatch(
     Some(match sysno {
         SYS_SET_TID_ADDRESS => ctx.dispatcher.sys_set_tid_address(args, ctx.procs),
         SYS_SCHED_YIELD => ctx.dispatcher.sys_sched_yield(ctx.scheduler),
-        SYS_EXIT => ctx.dispatcher.sys_exit(args, ctx.procs, ctx.scheduler, false),
-        SYS_EXIT_GROUP => ctx.dispatcher.sys_exit(args, ctx.procs, ctx.scheduler, true),
+        SYS_EXIT => ctx
+            .dispatcher
+            .sys_exit(args, ctx.procs, ctx.scheduler, false),
+        SYS_EXIT_GROUP => ctx
+            .dispatcher
+            .sys_exit(args, ctx.procs, ctx.scheduler, true),
         SYS_GETPID => ctx.dispatcher.sys_getpid(ctx.procs),
         SYS_GETPPID => ctx.dispatcher.sys_getppid(ctx.procs),
         SYS_GETTID => ctx.dispatcher.sys_gettid(ctx.procs),

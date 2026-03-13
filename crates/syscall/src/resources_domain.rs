@@ -1,4 +1,6 @@
-use crate::{DispatchContext, SyscallArgs, SYS_GETPRIORITY, SYS_GETRUSAGE, SYS_PRLIMIT64, SYS_SYSLOG};
+use crate::{
+    DispatchContext, SyscallArgs, SYS_GETPRIORITY, SYS_GETRUSAGE, SYS_PRLIMIT64, SYS_SYSLOG,
+};
 
 pub(crate) fn dispatch(
     ctx: &mut DispatchContext<'_>,

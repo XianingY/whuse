@@ -1,8 +1,8 @@
 use crate::{
-    DispatchContext, SyscallArgs, SYS_GETEGID, SYS_GETEUID, SYS_GETGID, SYS_GETGROUPS, SYS_GETRANDOM,
-    SYS_GETUID, SYS_MEMFD_CREATE, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL,
-    SYS_RISCV_FLUSH_ICACHE, SYS_SECCOMP, SYS_SETGID, SYS_SETGROUPS, SYS_SETUID, SYS_SYSINFO,
-    SYS_UMASK, SYS_UNAME, SYS_PRCTL,
+    DispatchContext, SyscallArgs, SYS_GETEGID, SYS_GETEUID, SYS_GETGID, SYS_GETGROUPS,
+    SYS_GETRANDOM, SYS_GETUID, SYS_MEMFD_CREATE, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN,
+    SYS_PIDFD_SEND_SIGNAL, SYS_PRCTL, SYS_RISCV_FLUSH_ICACHE, SYS_SECCOMP, SYS_SETGID,
+    SYS_SETGROUPS, SYS_SETUID, SYS_SYSINFO, SYS_UMASK, SYS_UNAME,
 };
 
 pub(crate) fn dispatch(
@@ -25,7 +25,9 @@ pub(crate) fn dispatch(
         SYS_PRCTL => ctx.dispatcher.sys_prctl(),
         SYS_GETRANDOM => ctx.dispatcher.sys_getrandom(args, ctx.procs),
         SYS_MEMFD_CREATE => ctx.dispatcher.sys_memfd_create(args, ctx.procs, ctx.vfs),
-        SYS_PIDFD_SEND_SIGNAL => ctx.dispatcher.sys_pidfd_send_signal(args, ctx.procs, ctx.vfs),
+        SYS_PIDFD_SEND_SIGNAL => ctx
+            .dispatcher
+            .sys_pidfd_send_signal(args, ctx.procs, ctx.vfs),
         SYS_PIDFD_OPEN => ctx.dispatcher.sys_pidfd_open(args, ctx.procs, ctx.vfs),
         SYS_PIDFD_GETFD => ctx.dispatcher.sys_pidfd_getfd(args, ctx.procs, ctx.vfs),
         SYS_SECCOMP => Ok(0),

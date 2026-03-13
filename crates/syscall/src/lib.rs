@@ -12,13 +12,14 @@ mod sys_domain;
 mod task_domain;
 mod time_domain;
 
-use alloc::format;
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::mem::size_of;
 use hal_api::{hal, Timespec};
+use mm::{BinaryLoader, ElfBinaryLoader};
 use proc::{ProcessTable, SigAction, WaitSelector};
 use spin::Mutex;
 use task::Scheduler;
@@ -201,8 +202,14 @@ const CLONE_SETTLS: usize = 0x0008_0000;
 const CLONE_PARENT_SETTID: usize = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
 const CLONE_CHILD_SETTID: usize = 0x0100_0000;
-const CLONE_NAMESPACE_MASK: usize =
-    0x0002_0000 | 0x0004_0000 | 0x0200_0000 | 0x0400_0000 | 0x0800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000;
+const CLONE_NAMESPACE_MASK: usize = 0x0002_0000
+    | 0x0004_0000
+    | 0x0200_0000
+    | 0x0400_0000
+    | 0x0800_0000
+    | 0x1000_0000
+    | 0x2000_0000
+    | 0x4000_0000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SyscallArgs(pub [usize; 6]);
@@ -329,7 +336,10 @@ impl SyscallDispatcher {
         } else {
             (args.0[0], args.0[1] as u32)
         };
-        let path = procs.current()?.read_user_cstr(path_arg).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(path_arg)
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         vfs.mkdir(&cwd, &path, mode)?;
         Ok(0)
@@ -341,7 +351,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let _ = args.0[0];
         let _ = args.0[2];
@@ -355,9 +368,18 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let source = procs.current()?.read_user_cstr(args.0[0]).map_err(|_| EFAULT)?;
-        let target = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
-        let fs_type = procs.current()?.read_user_cstr(args.0[2]).map_err(|_| EFAULT)?;
+        let source = procs
+            .current()?
+            .read_user_cstr(args.0[0])
+            .map_err(|_| EFAULT)?;
+        let target = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
+        let fs_type = procs
+            .current()?
+            .read_user_cstr(args.0[2])
+            .map_err(|_| EFAULT)?;
         let _ = args.0[3];
         let _ = args.0[4];
         vfs.mount(&source, &target, &fs_type)?;
@@ -370,7 +392,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let target = procs.current()?.read_user_cstr(args.0[0]).map_err(|_| EFAULT)?;
+        let target = procs
+            .current()?
+            .read_user_cstr(args.0[0])
+            .map_err(|_| EFAULT)?;
         let _ = args.0[1];
         vfs.umount(&target)?;
         Ok(0)
@@ -382,7 +407,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
         let flags = normalize_open_flags(args.0[2] as u32);
         let mode = args.0[3] as u32;
         let cwd = procs.current()?.cwd.clone();
@@ -411,7 +439,10 @@ impl SyscallDispatcher {
             vfs.getdents(handle)?
         };
         let trimmed = &bytes[..bytes.len().min(count)];
-        procs.current_mut()?.write_user_bytes(buf, trimmed).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(buf, trimmed)
+            .map_err(|_| EFAULT)?;
         Ok(trimmed.len())
     }
 
@@ -442,7 +473,10 @@ impl SyscallDispatcher {
             let handle = process.fd_mut(fd)?;
             vfs.read(handle, count)?
         };
-        procs.current_mut()?.write_user_bytes(buf, &bytes).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(buf, &bytes)
+            .map_err(|_| EFAULT)?;
         Ok(bytes.len())
     }
 
@@ -455,7 +489,10 @@ impl SyscallDispatcher {
         let fd = args.0[0] as i32;
         let buf = args.0[1];
         let count = args.0[2];
-        let data = procs.current()?.read_user_bytes(buf, count).map_err(|_| EFAULT)?;
+        let data = procs
+            .current()?
+            .read_user_bytes(buf, count)
+            .map_err(|_| EFAULT)?;
         match fd {
             1 | 2 => {
                 for byte in data.iter().copied() {
@@ -593,7 +630,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[0]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[0])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let new_cwd = vfs.chdir(&cwd, &path)?;
         procs.current_mut()?.cwd = new_cwd;
@@ -603,7 +643,9 @@ impl SyscallDispatcher {
     fn sys_brk(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let requested = args.0[0];
         let process = procs.current_mut()?;
-        process.address_space.brk((requested != 0).then_some(requested))
+        process
+            .address_space
+            .brk((requested != 0).then_some(requested))
     }
 
     fn sys_clone(
@@ -628,12 +670,18 @@ impl SyscallDispatcher {
             let child_tid_ptr = args.0[3];
             let tid = procs.clone_thread_from_current(stack, tls)?;
             if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
-                procs.current_mut()?.write_user_bytes(parent_tid, &(tid as u32).to_le_bytes()).map_err(|_| EFAULT)?;
+                procs
+                    .current_mut()?
+                    .write_user_bytes(parent_tid, &(tid as u32).to_le_bytes())
+                    .map_err(|_| EFAULT)?;
             }
             let current_tid = procs.current_tid()?;
             procs.set_current(tid)?;
             if flags & CLONE_CHILD_SETTID != 0 && child_tid_ptr != 0 {
-                procs.current_mut()?.write_user_bytes(child_tid_ptr, &(tid as u32).to_le_bytes()).map_err(|_| EFAULT)?;
+                procs
+                    .current_mut()?
+                    .write_user_bytes(child_tid_ptr, &(tid as u32).to_le_bytes())
+                    .map_err(|_| EFAULT)?;
             }
             if flags & CLONE_CHILD_CLEARTID != 0 && child_tid_ptr != 0 {
                 procs.set_clear_child_tid(Some(child_tid_ptr))?;
@@ -655,7 +703,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[0]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[0])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let argv = read_string_vector(procs.current()?, args.0[1])?;
         let envp = read_string_vector(procs.current()?, args.0[2])?;
@@ -665,16 +716,21 @@ impl SyscallDispatcher {
             let entry = start + program.entry;
             procs.execve_current_image(entry, None)?;
             let process = procs.current_mut()?;
-            let _ = process.address_space.install_host_range(start, program.image.len(), 0b101);
+            let _ = process
+                .address_space
+                .install_host_range(start, program.image.len(), 0b101);
             return Ok(0);
         }
         if file_data.starts_with(b"#!") {
             return Err(ENOEXEC);
         }
-        let loaded = procs
-            .current_mut()?
-            .address_space
-            .load_static_elf(&file_data, &argv, &envp)
+        let loaded = ElfBinaryLoader::new()
+            .load(
+                &procs.current_mut()?.address_space,
+                &file_data,
+                &argv,
+                &envp,
+            )
             .map_err(|err| if err == ENOEXEC { ENOEXEC } else { EFAULT })?;
         procs.execve_current_image(loaded.entry, Some(loaded.stack_pointer))?;
         Ok(0)
@@ -701,7 +757,10 @@ impl SyscallDispatcher {
         let addr = args.0[0];
         let len = args.0[1];
         let prot = args.0[2];
-        procs.current_mut()?.address_space.mprotect(addr, len, prot)?;
+        procs
+            .current_mut()?
+            .address_space
+            .mprotect(addr, len, prot)?;
         Ok(0)
     }
 
@@ -783,7 +842,10 @@ impl SyscallDispatcher {
             let mut winsz = [0u8; 8];
             winsz[..2].copy_from_slice(&24u16.to_le_bytes());
             winsz[2..4].copy_from_slice(&80u16.to_le_bytes());
-            procs.current_mut()?.write_user_bytes(arg, &winsz).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(arg, &winsz)
+                .map_err(|_| EFAULT)?;
         }
         Ok(0)
     }
@@ -807,7 +869,9 @@ impl SyscallDispatcher {
         let mut bytes = [0u8; 8];
         bytes[..4].copy_from_slice(&read_fd.to_le_bytes());
         bytes[4..].copy_from_slice(&write_fd.to_le_bytes());
-        process.write_user_bytes(args.0[0], &bytes).map_err(|_| EFAULT)?;
+        process
+            .write_user_bytes(args.0[0], &bytes)
+            .map_err(|_| EFAULT)?;
         Ok(0)
     }
 
@@ -826,7 +890,10 @@ impl SyscallDispatcher {
                 let handle = process.fd_mut(fd)?;
                 vfs.read(handle, iov.iov_len)?
             };
-            procs.current_mut()?.write_user_bytes(iov.iov_base, &bytes).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(iov.iov_base, &bytes)
+                .map_err(|_| EFAULT)?;
             total += bytes.len();
             if bytes.len() < iov.iov_len {
                 break;
@@ -845,7 +912,10 @@ impl SyscallDispatcher {
         let iovecs = read_iovecs(procs.current()?, args.0[1], args.0[2])?;
         let mut total = 0;
         for iov in iovecs {
-            let bytes = procs.current()?.read_user_bytes(iov.iov_base, iov.iov_len).map_err(|_| EFAULT)?;
+            let bytes = procs
+                .current()?
+                .read_user_bytes(iov.iov_base, iov.iov_len)
+                .map_err(|_| EFAULT)?;
             if fd == 1 || fd == 2 {
                 for byte in bytes.iter().copied() {
                     hal().console.put_byte(byte);
@@ -876,7 +946,10 @@ impl SyscallDispatcher {
         let mut handle = procs.current()?.fd(fd)?.clone();
         handle.offset = offset;
         let bytes = vfs.read(&mut handle, count)?;
-        procs.current_mut()?.write_user_bytes(buf, &bytes).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(buf, &bytes)
+            .map_err(|_| EFAULT)?;
         Ok(bytes.len())
     }
 
@@ -953,7 +1026,15 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        self.sys_copy_between_fds(args.0[0] as i32, args.0[2] as i32, args.0[4], args.0[1], args.0[3], procs, vfs)
+        self.sys_copy_between_fds(
+            args.0[0] as i32,
+            args.0[2] as i32,
+            args.0[4],
+            args.0[1],
+            args.0[3],
+            procs,
+            vfs,
+        )
     }
 
     fn sys_readlinkat(
@@ -962,24 +1043,22 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let target = match path.as_str() {
             "/proc/self/exe" => String::from("/bin/init"),
             "/proc/self/cwd" => cwd.clone(),
-            _ => {
-                vfs.access(&cwd, &path)?;
-                let resolved = if path.starts_with('/') {
-                    path.clone()
-                } else {
-                    format!("{}/{}", cwd.trim_end_matches('/'), path)
-                };
-                vfs.cwd_string(&resolved)
-            }
+            _ => vfs.read_link(&cwd, &path)?,
         };
         let bytes = target.as_bytes();
         let len = bytes.len().min(args.0[3]);
-        procs.current_mut()?.write_user_bytes(args.0[2], &bytes[..len]).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(args.0[2], &bytes[..len])
+            .map_err(|_| EFAULT)?;
         Ok(len)
     }
 
@@ -989,10 +1068,16 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let stat = vfs.stat_path(&cwd, &path)?;
-        procs.current_mut()?.write_user_bytes(args.0[2], &stat_to_bytes(stat)).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(args.0[2], &stat_to_bytes(stat))
+            .map_err(|_| EFAULT)?;
         Ok(0)
     }
 
@@ -1002,10 +1087,16 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[0]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[0])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         vfs.access(&cwd, &path)?;
-        procs.current_mut()?.write_user_bytes(args.0[1], &statfs_bytes()).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(args.0[1], &statfs_bytes())
+            .map_err(|_| EFAULT)?;
         Ok(0)
     }
 
@@ -1015,7 +1106,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let _mode = args.0[2];
         let _flags = args.0[3];
@@ -1045,7 +1139,10 @@ impl SyscallDispatcher {
         let old = args.0[2];
         if old != 0 {
             let current = procs.sigaction(sig)?;
-            procs.current_mut()?.write_user_bytes(old, &sigaction_to_bytes(current)).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(old, &sigaction_to_bytes(current))
+                .map_err(|_| EFAULT)?;
         }
         if new != 0 {
             procs.set_sigaction(sig, read_sigaction(procs.current()?, new)?)?;
@@ -1090,14 +1187,20 @@ impl SyscallDispatcher {
             return Err(EAGAIN);
         };
         if args.0[1] != 0 {
-            procs.current_mut()?.write_user_bytes(args.0[1], &[0; 128]).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(args.0[1], &[0; 128])
+                .map_err(|_| EFAULT)?;
         }
         Ok(signal)
     }
 
     fn sys_times(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         if args.0[0] != 0 {
-            procs.current_mut()?.write_user_bytes(args.0[0], &[0; 32]).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(args.0[0], &[0; 32])
+                .map_err(|_| EFAULT)?;
         }
         Ok(hal().timer.monotonic_time().tv_sec.max(0) as usize)
     }
@@ -1139,7 +1242,10 @@ impl SyscallDispatcher {
             SYSLOG_ACTION_SIZE_BUFFER => Ok(message.len()),
             SYSLOG_ACTION_READ_ALL => {
                 let written = message.len().min(len);
-                procs.current_mut()?.write_user_bytes(buf, &message[..written]).map_err(|_| EFAULT)?;
+                procs
+                    .current_mut()?
+                    .write_user_bytes(buf, &message[..written])
+                    .map_err(|_| EFAULT)?;
                 Ok(written)
             }
             _ => Ok(0),
@@ -1179,7 +1285,10 @@ impl SyscallDispatcher {
         };
         let process = procs.current_mut()?;
         let new_addr = process.address_space.map_anonymous(new_len, 0b11)?;
-        process.address_space.write_bytes(new_addr, &bytes).map_err(|_| EFAULT)?;
+        process
+            .address_space
+            .write_bytes(new_addr, &bytes)
+            .map_err(|_| EFAULT)?;
         process.address_space.unmap(old_addr, old_len)?;
         Ok(new_addr)
     }
@@ -1193,7 +1302,10 @@ impl SyscallDispatcher {
             let mut bytes = [0u8; 16];
             bytes[..8].copy_from_slice(&usize::MAX.to_le_bytes());
             bytes[8..].copy_from_slice(&usize::MAX.to_le_bytes());
-            procs.current_mut()?.write_user_bytes(old_limit, &bytes).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(old_limit, &bytes)
+                .map_err(|_| EFAULT)?;
         }
         Ok(0)
     }
@@ -1204,8 +1316,14 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let old_path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
-        let new_path = procs.current()?.read_user_cstr(args.0[3]).map_err(|_| EFAULT)?;
+        let old_path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
+        let new_path = procs
+            .current()?
+            .read_user_cstr(args.0[3])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let _flags = args.0[4];
         vfs.rename(&cwd, &old_path, &new_path)?;
@@ -1221,7 +1339,10 @@ impl SyscallDispatcher {
         for (index, byte) in bytes.iter_mut().enumerate() {
             *byte = pattern[index % pattern.len()];
         }
-        procs.current_mut()?.write_user_bytes(buf, &bytes).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(buf, &bytes)
+            .map_err(|_| EFAULT)?;
         Ok(len)
     }
 
@@ -1231,7 +1352,15 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        self.sys_copy_between_fds(args.0[0] as i32, args.0[2] as i32, args.0[4], args.0[1], args.0[3], procs, vfs)
+        self.sys_copy_between_fds(
+            args.0[0] as i32,
+            args.0[2] as i32,
+            args.0[4],
+            args.0[1],
+            args.0[3],
+            procs,
+            vfs,
+        )
     }
 
     fn sys_copy_between_fds(
@@ -1255,12 +1384,18 @@ impl SyscallDispatcher {
         let bytes = vfs.read(&mut in_handle, len)?;
         let written = vfs.write(&mut out_handle, &bytes)?;
         if off_in_ptr != 0 {
-            procs.current_mut()?.write_user_bytes(off_in_ptr, &in_handle.offset.to_le_bytes()).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(off_in_ptr, &in_handle.offset.to_le_bytes())
+                .map_err(|_| EFAULT)?;
         } else {
             procs.current_mut()?.fd_mut(in_fd)?.offset = in_handle.offset;
         }
         if off_out_ptr != 0 {
-            procs.current_mut()?.write_user_bytes(off_out_ptr, &out_handle.offset.to_le_bytes()).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(off_out_ptr, &out_handle.offset.to_le_bytes())
+                .map_err(|_| EFAULT)?;
         } else {
             procs.current_mut()?.fd_mut(out_fd)?.offset = out_handle.offset;
         }
@@ -1273,11 +1408,17 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let stat = vfs.stat_path(&cwd, &path)?;
         let bytes = statx_bytes(stat);
-        procs.current_mut()?.write_user_bytes(args.0[4], &bytes).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(args.0[4], &bytes)
+            .map_err(|_| EFAULT)?;
         Ok(0)
     }
 
@@ -1301,7 +1442,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[0]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[0])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         vfs.truncate_path(&cwd, &path, args.0[1])?;
         Ok(0)
@@ -1360,7 +1504,7 @@ impl SyscallDispatcher {
                 Ok(woke.len())
             }
             FUTEX_REQUEUE => {
-                let moved = procs.requeue_futex(uaddr, args.0[4], val.max(0) as usize, args.0[3],);
+                let moved = procs.requeue_futex(uaddr, args.0[4], val.max(0) as usize, args.0[3]);
                 for tid in &moved {
                     let _ = scheduler.wake_task(*tid);
                 }
@@ -1489,8 +1633,14 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let target = procs.current()?.read_user_cstr(args.0[0]).map_err(|_| EFAULT)?;
-        let linkpath = procs.current()?.read_user_cstr(args.0[2]).map_err(|_| EFAULT)?;
+        let target = procs
+            .current()?
+            .read_user_cstr(args.0[0])
+            .map_err(|_| EFAULT)?;
+        let linkpath = procs
+            .current()?
+            .read_user_cstr(args.0[2])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         vfs.create_symlink(&cwd, &linkpath, &target)?;
         Ok(0)
@@ -1502,8 +1652,14 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let old_path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
-        let new_path = procs.current()?.read_user_cstr(args.0[3]).map_err(|_| EFAULT)?;
+        let old_path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
+        let new_path = procs
+            .current()?
+            .read_user_cstr(args.0[3])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let _flags = args.0[4];
         vfs.link(&cwd, &old_path, &new_path)?;
@@ -1516,8 +1672,14 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let old_path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
-        let new_path = procs.current()?.read_user_cstr(args.0[3]).map_err(|_| EFAULT)?;
+        let old_path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
+        let new_path = procs
+            .current()?
+            .read_user_cstr(args.0[3])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         vfs.rename(&cwd, &old_path, &new_path)?;
         Ok(0)
@@ -1539,7 +1701,10 @@ impl SyscallDispatcher {
         _vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
         let _ = procs.current()?.fd(args.0[0] as i32)?;
-        procs.current_mut()?.write_user_bytes(args.0[1], &statfs_bytes()).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(args.0[1], &statfs_bytes())
+            .map_err(|_| EFAULT)?;
         Ok(0)
     }
 
@@ -1562,7 +1727,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[0]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[0])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let new_root = vfs.chdir(&cwd, &path)?;
         procs.current_mut()?.cwd = new_root;
@@ -1581,7 +1749,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let _mode = args.0[2];
         let _flags = args.0[3];
@@ -1595,7 +1766,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let _owner = args.0[2];
         let _group = args.0[3];
@@ -1617,7 +1791,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs.current()?.read_user_cstr(args.0[1]).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(args.0[1])
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let _times = args.0[2];
         let _flags = args.0[3];
@@ -1625,11 +1802,7 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
-    fn sys_close_range(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-    ) -> Result<usize, i32> {
+    fn sys_close_range(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let first = args.0[0] as i32;
         let last = args.0[1] as i32;
         let _flags = args.0[2];
@@ -1650,7 +1823,10 @@ impl SyscallDispatcher {
         let buf = args.0[1];
         let count = args.0[2];
         let offset = args.0[3];
-        let data = procs.current()?.read_user_bytes(buf, count).map_err(|_| EFAULT)?;
+        let data = procs
+            .current()?
+            .read_user_bytes(buf, count)
+            .map_err(|_| EFAULT)?;
         let mut handle = procs.current()?.fd(fd)?.clone();
         handle.offset = offset;
         vfs.write(&mut handle, &data)
@@ -1669,7 +1845,10 @@ impl SyscallDispatcher {
         let mut total = 0;
         for iov in iovecs {
             let bytes = vfs.read(&mut handle, iov.iov_len)?;
-            procs.current_mut()?.write_user_bytes(iov.iov_base, &bytes).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(iov.iov_base, &bytes)
+                .map_err(|_| EFAULT)?;
             total += bytes.len();
             if bytes.len() < iov.iov_len {
                 break;
@@ -1690,7 +1869,10 @@ impl SyscallDispatcher {
         handle.offset = args.0[3];
         let mut total = 0;
         for iov in iovecs {
-            let bytes = procs.current()?.read_user_bytes(iov.iov_base, iov.iov_len).map_err(|_| EFAULT)?;
+            let bytes = procs
+                .current()?
+                .read_user_bytes(iov.iov_base, iov.iov_len)
+                .map_err(|_| EFAULT)?;
             total += vfs.write(&mut handle, &bytes)?;
         }
         Ok(total)
@@ -1698,7 +1880,10 @@ impl SyscallDispatcher {
 
     fn sys_getitimer(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let _which = args.0[0];
-        procs.current_mut()?.write_user_bytes(args.0[1], &[0; 32]).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(args.0[1], &[0; 32])
+            .map_err(|_| EFAULT)?;
         Ok(0)
     }
 
@@ -1706,7 +1891,10 @@ impl SyscallDispatcher {
         let _which = args.0[0];
         let _new = args.0[1];
         if args.0[2] != 0 {
-            procs.current_mut()?.write_user_bytes(args.0[2], &[0; 32]).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(args.0[2], &[0; 32])
+                .map_err(|_| EFAULT)?;
         }
         Ok(0)
     }
@@ -1715,7 +1903,13 @@ impl SyscallDispatcher {
         let _clock_id = args.0[0];
         procs
             .current_mut()?
-            .write_user_bytes(args.0[1], &timespec_to_bytes(Timespec { tv_sec: 0, tv_nsec: 1_000 }))
+            .write_user_bytes(
+                args.0[1],
+                &timespec_to_bytes(Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000,
+                }),
+            )
             .map_err(|_| EFAULT)?;
         Ok(0)
     }
@@ -1729,11 +1923,7 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
-    fn sys_sigaltstack(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-    ) -> Result<usize, i32> {
+    fn sys_sigaltstack(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let new_ptr = args.0[0];
         let old_ptr = args.0[1];
         let previous = procs.set_sigaltstack(if new_ptr == 0 {
@@ -1743,27 +1933,22 @@ impl SyscallDispatcher {
         })?;
         if old_ptr != 0 {
             let bytes = stack_t_to_bytes(previous.unwrap_or((0, 0, 2)));
-            procs.current_mut()?.write_user_bytes(old_ptr, &bytes).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(old_ptr, &bytes)
+                .map_err(|_| EFAULT)?;
         }
         Ok(0)
     }
 
-    fn sys_rt_sigsuspend(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-    ) -> Result<usize, i32> {
+    fn sys_rt_sigsuspend(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let _set = args.0[0];
         let _size = args.0[1];
         let _ = procs.current()?;
         Err(EAGAIN)
     }
 
-    fn sys_rt_sigpending(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-    ) -> Result<usize, i32> {
+    fn sys_rt_sigpending(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let pending = procs.pending_signals()?;
         procs
             .current_mut()?
@@ -1796,11 +1981,7 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
-    fn sys_getgroups(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-    ) -> Result<usize, i32> {
+    fn sys_getgroups(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let groups = procs.getgroups_current()?;
         let size = args.0[0];
         if size == 0 {
@@ -1813,17 +1994,19 @@ impl SyscallDispatcher {
         for group in &groups {
             bytes.extend_from_slice(&group.to_le_bytes());
         }
-        procs.current_mut()?.write_user_bytes(args.0[1], &bytes).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(args.0[1], &bytes)
+            .map_err(|_| EFAULT)?;
         Ok(groups.len())
     }
 
-    fn sys_setgroups(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-    ) -> Result<usize, i32> {
+    fn sys_setgroups(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let size = args.0[0];
-        let raw = procs.current()?.read_user_bytes(args.0[1], size * 4).map_err(|_| EFAULT)?;
+        let raw = procs
+            .current()?
+            .read_user_bytes(args.0[1], size * 4)
+            .map_err(|_| EFAULT)?;
         let mut groups = Vec::with_capacity(size);
         for chunk in raw.chunks_exact(4) {
             let mut bytes = [0u8; 4];
@@ -1854,16 +2037,19 @@ impl SyscallDispatcher {
         let _addr = args.0[1];
         let _flags = args.0[2];
         let data = SHM_STATE.lock().segments.get(&id).cloned().ok_or(ENOENT)?;
-        let addr = procs.current_mut()?.address_space.map_anonymous(data.len(), 0b11)?;
-        procs.current_mut()?.address_space.write_bytes(addr, &data).map_err(|_| EFAULT)?;
+        let addr = procs
+            .current_mut()?
+            .address_space
+            .map_anonymous(data.len(), 0b11)?;
+        procs
+            .current_mut()?
+            .address_space
+            .write_bytes(addr, &data)
+            .map_err(|_| EFAULT)?;
         Ok(addr)
     }
 
-    fn sys_shmctl(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-    ) -> Result<usize, i32> {
+    fn sys_shmctl(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let id = args.0[0];
         let cmd = args.0[1] as i32;
         let buf = args.0[2];
@@ -1873,7 +2059,10 @@ impl SyscallDispatcher {
             }
             2 => {
                 if buf != 0 {
-                    procs.current_mut()?.write_user_bytes(buf, &[0; 128]).map_err(|_| EFAULT)?;
+                    procs
+                        .current_mut()?
+                        .write_user_bytes(buf, &[0; 128])
+                        .map_err(|_| EFAULT)?;
                 }
             }
             _ => {}
@@ -1919,7 +2108,9 @@ impl SyscallDispatcher {
         let mut bytes = [0u8; 8];
         bytes[..4].copy_from_slice(&left_fd.to_le_bytes());
         bytes[4..].copy_from_slice(&right_fd.to_le_bytes());
-        process.write_user_bytes(args.0[3], &bytes).map_err(|_| EFAULT)?;
+        process
+            .write_user_bytes(args.0[3], &bytes)
+            .map_err(|_| EFAULT)?;
         Ok(0)
     }
 
@@ -1984,11 +2175,7 @@ impl SyscallDispatcher {
         Ok(new_fd as usize)
     }
 
-    fn sys_getsockname(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-    ) -> Result<usize, i32> {
+    fn sys_getsockname(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let fd = args.0[0] as i32;
         let path = procs.current()?.fd(fd)?.path.clone();
         write_sockaddr(procs.current_mut()?, args.0[1], args.0[2], &path)?;
@@ -2005,7 +2192,10 @@ impl SyscallDispatcher {
         let buf = args.0[1];
         let count = args.0[2];
         let _flags = args.0[3];
-        let data = procs.current()?.read_user_bytes(buf, count).map_err(|_| EFAULT)?;
+        let data = procs
+            .current()?
+            .read_user_bytes(buf, count)
+            .map_err(|_| EFAULT)?;
         let process = procs.current_mut()?;
         let handle = process.fd_mut(fd)?;
         vfs.write(handle, &data)
@@ -2023,7 +2213,10 @@ impl SyscallDispatcher {
             let handle = process.fd_mut(fd)?;
             vfs.read(handle, args.0[2])?
         };
-        procs.current_mut()?.write_user_bytes(args.0[1], &bytes).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(args.0[1], &bytes)
+            .map_err(|_| EFAULT)?;
         Ok(bytes.len())
     }
 
@@ -2031,19 +2224,21 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
-    fn sys_getsockopt(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-    ) -> Result<usize, i32> {
+    fn sys_getsockopt(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let _fd = args.0[0];
         let _level = args.0[1];
         let _opt = args.0[2];
         if args.0[3] != 0 {
-            procs.current_mut()?.write_user_bytes(args.0[3], &0u32.to_le_bytes()).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(args.0[3], &0u32.to_le_bytes())
+                .map_err(|_| EFAULT)?;
         }
         if args.0[4] != 0 {
-            procs.current_mut()?.write_user_bytes(args.0[4], &4u32.to_le_bytes()).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(args.0[4], &4u32.to_le_bytes())
+                .map_err(|_| EFAULT)?;
         }
         Ok(0)
     }
@@ -2062,7 +2257,10 @@ impl SyscallDispatcher {
         let iovecs = read_iovecs(procs.current()?, msg.msg_iov, msg.msg_iovlen)?;
         let mut total = 0;
         for iov in iovecs {
-            let bytes = procs.current()?.read_user_bytes(iov.iov_base, iov.iov_len).map_err(|_| EFAULT)?;
+            let bytes = procs
+                .current()?
+                .read_user_bytes(iov.iov_base, iov.iov_len)
+                .map_err(|_| EFAULT)?;
             let process = procs.current_mut()?;
             let handle = process.fd_mut(args.0[0] as i32)?;
             total += vfs.write(handle, &bytes)?;
@@ -2085,7 +2283,10 @@ impl SyscallDispatcher {
                 let handle = process.fd_mut(args.0[0] as i32)?;
                 vfs.read(handle, iov.iov_len)?
             };
-            procs.current_mut()?.write_user_bytes(iov.iov_base, &bytes).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(iov.iov_base, &bytes)
+                .map_err(|_| EFAULT)?;
             total += bytes.len();
             if bytes.len() < iov.iov_len {
                 break;
@@ -2100,7 +2301,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let name = procs.current()?.read_user_cstr(args.0[0]).map_err(|_| EFAULT)?;
+        let name = procs
+            .current()?
+            .read_user_cstr(args.0[0])
+            .map_err(|_| EFAULT)?;
         let _flags = args.0[1];
         let handle = vfs.create_memfd(&name)?;
         Ok(procs.current_mut()?.add_fd(handle) as usize)
@@ -2166,7 +2370,10 @@ impl SyscallDispatcher {
         bytes[64..72].copy_from_slice(&(scheduler.current().is_some() as u64).to_le_bytes());
         bytes[80..82].copy_from_slice(&(procs.process_count() as u16).to_le_bytes());
         bytes[104..108].copy_from_slice(&1u32.to_le_bytes());
-        procs.current_mut()?.write_user_bytes(args.0[0], &bytes).map_err(|_| EFAULT)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(args.0[0], &bytes)
+            .map_err(|_| EFAULT)?;
         Ok(0)
     }
 }
@@ -2480,7 +2687,9 @@ fn write_sockaddr(
         bytes
     };
     let used = bytes.len().min(max_len);
-    process.write_user_bytes(addr_ptr, &bytes[..used]).map_err(|_| EFAULT)?;
+    process
+        .write_user_bytes(addr_ptr, &bytes[..used])
+        .map_err(|_| EFAULT)?;
     process
         .write_user_bytes(len_ptr, &(bytes.len() as u32).to_le_bytes())
         .map_err(|_| EFAULT)?;
@@ -2620,20 +2829,20 @@ fn statx_bytes(stat: FileStat) -> [u8; 256] {
 #[cfg(test)]
 mod tests {
     use super::{
-        SyscallArgs, SyscallDispatcher, SYS_ACCEPT, SYS_BIND, SYS_CLOCK_GETRES,
-        SYS_CLONE, SYS_CONNECT, SYS_COPY_FILE_RANGE, SYS_DUP3, SYS_EPOLL_CREATE1,
-        SYS_EPOLL_CTL, SYS_EPOLL_PWAIT, SYS_EVENTFD2, SYS_FACCESSAT2, SYS_FALLOCATE, SYS_FCHDIR,
-        SYS_FCHMOD, SYS_FCHMODAT, SYS_FCHOWN, SYS_FCHOWNAT, SYS_FDATASYNC, SYS_FLOCK, SYS_FSTATFS,
-        SYS_FSYNC, SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER, SYS_GETSID, SYS_GETSOCKOPT,
-        SYS_GETSOCKNAME, SYS_GET_ROBUST_LIST, SYS_GETTIMEOFDAY, SYS_GETPRIORITY, SYS_LINKAT,
-        SYS_LISTEN, SYS_LSEEK, SYS_MEMFD_CREATE, SYS_MKDIR, SYS_MLOCK, SYS_MLOCK2,
-        SYS_MSYNC, SYS_OPENAT, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PSELECT6, SYS_PWRITE64,
-        SYS_PWRITEV, SYS_PWRITEV2, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL,
-        SYS_PIPE, SYS_PPOLL, SYS_PRCTL, SYS_PRLIMIT64, SYS_READ, SYS_RECVFROM, SYS_RECVMSG,
-        SYS_RENAMEAT, SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE, SYS_RT_SIGPENDING, SYS_RT_SIGRETURN,
+        SyscallArgs, SyscallDispatcher, SYS_ACCEPT, SYS_BIND, SYS_CLOCK_GETRES, SYS_CLONE,
+        SYS_CONNECT, SYS_COPY_FILE_RANGE, SYS_DUP3, SYS_EPOLL_CREATE1, SYS_EPOLL_CTL,
+        SYS_EPOLL_PWAIT, SYS_EVENTFD2, SYS_FACCESSAT2, SYS_FALLOCATE, SYS_FCHDIR, SYS_FCHMOD,
+        SYS_FCHMODAT, SYS_FCHOWN, SYS_FCHOWNAT, SYS_FDATASYNC, SYS_FLOCK, SYS_FSTATFS, SYS_FSYNC,
+        SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER, SYS_GETPRIORITY, SYS_GETSID,
+        SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTIMEOFDAY, SYS_GET_ROBUST_LIST, SYS_LINKAT,
+        SYS_LISTEN, SYS_LSEEK, SYS_MEMFD_CREATE, SYS_MKDIR, SYS_MLOCK, SYS_MLOCK2, SYS_MSYNC,
+        SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL, SYS_PIPE, SYS_PPOLL,
+        SYS_PRCTL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PRLIMIT64, SYS_PSELECT6, SYS_PWRITE64,
+        SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RENAMEAT,
+        SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE, SYS_RT_SIGPENDING, SYS_RT_SIGRETURN,
         SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SECCOMP, SYS_SENDMSG, SYS_SENDTO, SYS_SETGID,
-        SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_TID_ADDRESS,
-        SYS_SET_ROBUST_LIST, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET, SYS_SHUTDOWN,
+        SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_ROBUST_LIST,
+        SYS_SET_TID_ADDRESS, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET, SYS_SHUTDOWN,
         SYS_SIGACTION, SYS_SIGALTSTACK, SYS_SIGPROCMASK, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SPLICE,
         SYS_STATX, SYS_SYMLINKAT, SYS_TIMES, SYS_TRUNCATE, SYS_UMASK, SYS_UNAME, SYS_UTIMENSAT,
         SYS_WAIT, SYS_WRITE, SYS_WRITEV,
@@ -2675,41 +2884,70 @@ mod tests {
     static INIT_HAL: Once<()> = Once::new();
 
     impl HalCpu for TestCpu {
-        fn cpu_id(&self) -> usize { 0 }
+        fn cpu_id(&self) -> usize {
+            0
+        }
         fn enable_interrupts(&self) {}
         fn disable_interrupts(&self) {}
-        fn interrupts_enabled(&self) -> bool { false }
+        fn interrupts_enabled(&self) -> bool {
+            false
+        }
         fn switch_address_space(&self, _token: VmSpaceToken) {}
         fn wait_for_interrupt(&self) {}
         fn run_user(&self, _frame: &mut TrapFrame) {}
     }
 
     impl HalMemory for TestMemory {
-        fn memory_regions(&self) -> &'static [MemoryRegion] { &TEST_REGIONS }
-        fn phys_to_virt(&self, phys: usize) -> usize { phys }
-        fn virt_to_phys(&self, virt: usize) -> usize { virt }
-        fn mmio_base(&self) -> usize { 0x1000_0000 }
+        fn memory_regions(&self) -> &'static [MemoryRegion] {
+            &TEST_REGIONS
+        }
+        fn phys_to_virt(&self, phys: usize) -> usize {
+            phys
+        }
+        fn virt_to_phys(&self, virt: usize) -> usize {
+            virt
+        }
+        fn mmio_base(&self) -> usize {
+            0x1000_0000
+        }
     }
 
     impl HalTimer for TestTimer {
-        fn monotonic_time(&self) -> Timespec { Timespec { tv_sec: 1, tv_nsec: 0 } }
-        fn monotonic_nanos(&self) -> u64 { 1_000_000_000 }
+        fn monotonic_time(&self) -> Timespec {
+            Timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            }
+        }
+        fn monotonic_nanos(&self) -> u64 {
+            1_000_000_000
+        }
         fn program_oneshot(&self, _deadline_nanos: u64) {}
     }
 
     impl HalCharDevice for TestConsole {
-        fn name(&self) -> &'static str { "test-console" }
+        fn name(&self) -> &'static str {
+            "test-console"
+        }
         fn put_byte(&self, _byte: u8) {}
-        fn get_byte(&self) -> Option<u8> { None }
+        fn get_byte(&self) -> Option<u8> {
+            None
+        }
     }
 
     impl HalPlatform for TestPlatform {
-        fn platform_name(&self) -> &'static str { "test-platform" }
-        fn architecture(&self) -> PlatformArch { PlatformArch::Riscv64 }
+        fn platform_name(&self) -> &'static str {
+            "test-platform"
+        }
+        fn architecture(&self) -> PlatformArch {
+            PlatformArch::Riscv64
+        }
     }
 
     impl HalPlatformLifecycle for TestLifecycle {
-        fn supports_userspace(&self) -> bool { true }
+        fn supports_userspace(&self) -> bool {
+            true
+        }
 
         fn idle(&self) -> ! {
             panic!("test lifecycle idle should never be entered");
@@ -2717,21 +2955,39 @@ mod tests {
     }
 
     impl HalInterrupt for TestInterrupt {
-        fn name(&self) -> &'static str { "test-interrupt" }
+        fn name(&self) -> &'static str {
+            "test-interrupt"
+        }
         fn enable_irq(&self, _irq: usize) {}
         fn disable_irq(&self, _irq: usize) {}
         fn ack_irq(&self, _irq: usize) {}
-        fn next_pending(&self) -> Option<usize> { None }
+        fn next_pending(&self) -> Option<usize> {
+            None
+        }
     }
 
     impl HalNetDevice for TestNet {
-        fn name(&self) -> &'static str { "test-net" }
-        fn mac_address(&self) -> [u8; 6] { [0, 1, 2, 3, 4, 5] }
-        fn mtu(&self) -> usize { 1500 }
-        fn can_send(&self) -> bool { false }
-        fn can_recv(&self) -> bool { false }
-        fn send_frame(&self, _frame: &[u8]) -> Result<usize, i32> { Err(95) }
-        fn recv_frame(&self, _frame: &mut [u8]) -> Result<usize, i32> { Err(11) }
+        fn name(&self) -> &'static str {
+            "test-net"
+        }
+        fn mac_address(&self) -> [u8; 6] {
+            [0, 1, 2, 3, 4, 5]
+        }
+        fn mtu(&self) -> usize {
+            1500
+        }
+        fn can_send(&self) -> bool {
+            false
+        }
+        fn can_recv(&self) -> bool {
+            false
+        }
+        fn send_frame(&self, _frame: &[u8]) -> Result<usize, i32> {
+            Err(95)
+        }
+        fn recv_frame(&self, _frame: &mut [u8]) -> Result<usize, i32> {
+            Err(11)
+        }
     }
 
     fn ensure_test_hal() {
@@ -2762,31 +3018,72 @@ mod tests {
         scheduler.start();
         let mut vfs = KernelVfs::new();
 
-        procs.current_mut().unwrap().address_space.install_bytes(0x1000, b"/work\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x1000, b"/work\0");
         assert_eq!(
-            dispatcher.dispatch(SYS_MKDIR, SyscallArgs([0x1000, 0o755, 0, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_MKDIR,
+                SyscallArgs([0x1000, 0o755, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             0
         );
 
-        procs.current_mut().unwrap().address_space.install_bytes(0x2000, b"/work/log.txt\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x2000, b"/work/log.txt\0");
         let fd = dispatcher.dispatch(
             SYS_OPENAT,
-            SyscallArgs([!0usize, 0x2000, (vfs::O_CREAT | vfs::O_RDWR) as usize, 0o644, 0, 0]),
+            SyscallArgs([
+                !0usize,
+                0x2000,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
             &mut procs,
             &mut scheduler,
             &mut vfs,
         );
         assert!(fd >= 3);
 
-        procs.current_mut().unwrap().address_space.install_bytes(0x3000, b"hello");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x3000, b"hello");
         assert_eq!(
-            dispatcher.dispatch(SYS_WRITE, SyscallArgs([fd as usize, 0x3000, 5, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_WRITE,
+                SyscallArgs([fd as usize, 0x3000, 5, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             5
         );
 
-        procs.current_mut().unwrap().address_space.install_bytes(0x4000, &[0; 64]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x4000, &[0; 64]);
         assert_eq!(
-            dispatcher.dispatch(SYS_GETCWD, SyscallArgs([0x4000, 64, 0, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_GETCWD,
+                SyscallArgs([0x4000, 64, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             0x4000
         );
     }
@@ -2803,35 +3100,80 @@ mod tests {
         scheduler.start();
         let mut vfs = KernelVfs::new();
 
-        procs.current_mut().unwrap().address_space.install_bytes(0x1000, b"/tmp/ext.txt\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x1000, b"/tmp/ext.txt\0");
         let fd = dispatcher.dispatch(
             SYS_OPENAT,
-            SyscallArgs([!0usize, 0x1000, (vfs::O_CREAT | vfs::O_RDWR) as usize, 0o644, 0, 0]),
+            SyscallArgs([
+                !0usize,
+                0x1000,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
             &mut procs,
             &mut scheduler,
             &mut vfs,
         ) as usize;
 
-        procs.current_mut().unwrap().address_space.install_bytes(0x2000, b"he");
-        procs.current_mut().unwrap().address_space.install_bytes(0x3000, b"llo");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x2000, b"he");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x3000, b"llo");
         let mut iov = [0u8; 32];
         iov[..8].copy_from_slice(&0x2000usize.to_le_bytes());
         iov[8..16].copy_from_slice(&2usize.to_le_bytes());
         iov[16..24].copy_from_slice(&0x3000usize.to_le_bytes());
         iov[24..32].copy_from_slice(&3usize.to_le_bytes());
-        procs.current_mut().unwrap().address_space.install_bytes(0x4000, &iov);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x4000, &iov);
         assert_eq!(
-            dispatcher.dispatch(SYS_WRITEV, SyscallArgs([fd, 0x4000, 2, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_WRITEV,
+                SyscallArgs([fd, 0x4000, 2, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             5
         );
 
         assert_eq!(
-            dispatcher.dispatch(SYS_LSEEK, SyscallArgs([fd, 0, 0, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_LSEEK,
+                SyscallArgs([fd, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             0
         );
-        procs.current_mut().unwrap().address_space.install_bytes(0x5000, &[0; 8]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x5000, &[0; 8]);
         assert_eq!(
-            dispatcher.dispatch(SYS_PREAD64, SyscallArgs([fd, 0x5000, 5, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_PREAD64,
+                SyscallArgs([fd, 0x5000, 5, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             5
         );
         assert_eq!(
@@ -2839,22 +3181,52 @@ mod tests {
             b"hello"
         );
 
-        procs.current_mut().unwrap().address_space.install_bytes(0x6000, &[0; 8]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x6000, &[0; 8]);
         assert_eq!(
-            dispatcher.dispatch(SYS_PIPE, SyscallArgs([0x6000, 0, 0, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_PIPE,
+                SyscallArgs([0x6000, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             0
         );
         let pipe_fds = procs.current().unwrap().read_user_bytes(0x6000, 8).unwrap();
         let read_fd = i32::from_le_bytes(pipe_fds[..4].try_into().unwrap()) as usize;
         let write_fd = i32::from_le_bytes(pipe_fds[4..8].try_into().unwrap()) as usize;
-        procs.current_mut().unwrap().address_space.install_bytes(0x7000, b"ping");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x7000, b"ping");
         assert_eq!(
-            dispatcher.dispatch(SYS_WRITE, SyscallArgs([write_fd, 0x7000, 4, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_WRITE,
+                SyscallArgs([write_fd, 0x7000, 4, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             4
         );
-        procs.current_mut().unwrap().address_space.install_bytes(0x7100, &[0; 4]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x7100, &[0; 4]);
         assert_eq!(
-            dispatcher.dispatch(SYS_READ, SyscallArgs([read_fd, 0x7100, 4, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_READ,
+                SyscallArgs([read_fd, 0x7100, 4, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             4
         );
         assert_eq!(
@@ -2882,9 +3254,19 @@ mod tests {
             &mut scheduler,
             &mut vfs,
         ) as usize;
-        procs.current_mut().unwrap().address_space.install_bytes(0x8000, &1u64.to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x8000, &1u64.to_le_bytes());
         assert_eq!(
-            dispatcher.dispatch(SYS_WRITE, SyscallArgs([eventfd, 0x8000, 8, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_WRITE,
+                SyscallArgs([eventfd, 0x8000, 8, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             8
         );
 
@@ -2898,46 +3280,117 @@ mod tests {
         let mut event = [0u8; 16];
         event[..4].copy_from_slice(&1u32.to_le_bytes());
         event[8..16].copy_from_slice(&(eventfd as u64).to_le_bytes());
-        procs.current_mut().unwrap().address_space.install_bytes(0x8100, &event);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x8100, &event);
         assert_eq!(
-            dispatcher.dispatch(SYS_EPOLL_CTL, SyscallArgs([epfd, 1, eventfd, 0x8100, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_EPOLL_CTL,
+                SyscallArgs([epfd, 1, eventfd, 0x8100, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             0
         );
-        procs.current_mut().unwrap().address_space.install_bytes(0x8200, &[0; 16]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x8200, &[0; 16]);
         assert_eq!(
-            dispatcher.dispatch(SYS_EPOLL_PWAIT, SyscallArgs([epfd, 0x8200, 4, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_EPOLL_PWAIT,
+                SyscallArgs([epfd, 0x8200, 4, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             1
         );
 
-        procs.current_mut().unwrap().address_space.install_bytes(0x8300, &[0; 8]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x8300, &[0; 8]);
         assert_eq!(
-            dispatcher.dispatch(SYS_READ, SyscallArgs([eventfd, 0x8300, 8, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_READ,
+                SyscallArgs([eventfd, 0x8300, 8, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             8
         );
         assert_eq!(
-            u64::from_le_bytes(procs.current().unwrap().read_user_bytes(0x8300, 8).unwrap().try_into().unwrap()),
+            u64::from_le_bytes(
+                procs
+                    .current()
+                    .unwrap()
+                    .read_user_bytes(0x8300, 8)
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            ),
             1
         );
 
-        procs.current_mut().unwrap().address_space.install_bytes(0x8400, &[0; 8]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x8400, &[0; 8]);
         assert_eq!(
-            dispatcher.dispatch(SYS_SOCKETPAIR, SyscallArgs([1, 1, 0, 0x8400, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_SOCKETPAIR,
+                SyscallArgs([1, 1, 0, 0x8400, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             0
         );
         let pair = procs.current().unwrap().read_user_bytes(0x8400, 8).unwrap();
         let left = i32::from_le_bytes(pair[..4].try_into().unwrap()) as usize;
         let right = i32::from_le_bytes(pair[4..8].try_into().unwrap()) as usize;
-        procs.current_mut().unwrap().address_space.install_bytes(0x8500, b"pong");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x8500, b"pong");
         assert_eq!(
-            dispatcher.dispatch(SYS_SENDTO, SyscallArgs([left, 0x8500, 4, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_SENDTO,
+                SyscallArgs([left, 0x8500, 4, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             4
         );
-        procs.current_mut().unwrap().address_space.install_bytes(0x8600, &[0; 4]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x8600, &[0; 4]);
         assert_eq!(
-            dispatcher.dispatch(SYS_RECVFROM, SyscallArgs([right, 0x8600, 4, 0, 0, 0]), &mut procs, &mut scheduler, &mut vfs),
+            dispatcher.dispatch(
+                SYS_RECVFROM,
+                SyscallArgs([right, 0x8600, 4, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
             4
         );
-        assert_eq!(procs.current().unwrap().read_user_bytes(0x8600, 4).unwrap(), b"pong");
+        assert_eq!(
+            procs.current().unwrap().read_user_bytes(0x8600, 4).unwrap(),
+            b"pong"
+        );
     }
 
     #[test]
@@ -2952,7 +3405,11 @@ mod tests {
         scheduler.start();
         let mut vfs = KernelVfs::new();
 
-        procs.current_mut().unwrap().address_space.install_bytes(0xa000, &[0u8; 4]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xa000, &[0u8; 4]);
         let thread_flags = super::CLONE_VM
             | super::CLONE_FS
             | super::CLONE_FILES
@@ -2968,7 +3425,11 @@ mod tests {
         ) as usize;
         assert!(thread_tid > init);
 
-        procs.current_mut().unwrap().address_space.install_bytes(0xa100, &[0; 32]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xa100, &[0; 32]);
         assert_eq!(
             dispatcher.dispatch(
                 SYS_SIGACTION,
@@ -2979,7 +3440,14 @@ mod tests {
             ),
             0
         );
-        assert_eq!(procs.current().unwrap().read_user_bytes(0xa100, 32).unwrap(), [0u8; 32]);
+        assert_eq!(
+            procs
+                .current()
+                .unwrap()
+                .read_user_bytes(0xa100, 32)
+                .unwrap(),
+            [0u8; 32]
+        );
 
         assert_eq!(
             dispatcher.dispatch(
@@ -3016,7 +3484,11 @@ mod tests {
         scheduler.remove_task(child);
         procs.set_current(init).unwrap();
 
-        procs.current_mut().unwrap().address_space.install_bytes(0xa200, &[0; 4]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xa200, &[0; 4]);
         assert_eq!(
             dispatcher.dispatch(
                 SYS_WAIT,
@@ -3028,11 +3500,23 @@ mod tests {
             child as isize
         );
         assert_eq!(
-            i32::from_le_bytes(procs.current().unwrap().read_user_bytes(0xa200, 4).unwrap().try_into().unwrap()),
+            i32::from_le_bytes(
+                procs
+                    .current()
+                    .unwrap()
+                    .read_user_bytes(0xa200, 4)
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            ),
             5 << 8
         );
 
-        procs.current_mut().unwrap().address_space.install_bytes(0xa300, &[0; 8]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xa300, &[0; 8]);
         assert_eq!(
             dispatcher.dispatch(
                 SYS_RT_SIGPENDING,
@@ -3061,9 +3545,21 @@ mod tests {
         sockaddr[..2].copy_from_slice(&2u16.to_le_bytes());
         sockaddr[2..4].copy_from_slice(&7000u16.to_be_bytes());
         sockaddr[4..8].copy_from_slice(&[127, 0, 0, 1]);
-        procs.current_mut().unwrap().address_space.install_bytes(0x9000, &sockaddr);
-        procs.current_mut().unwrap().address_space.install_bytes(0x9100, &[0; 16]);
-        procs.current_mut().unwrap().address_space.install_bytes(0x9200, &16u32.to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x9000, &sockaddr);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x9100, &[0; 16]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x9200, &16u32.to_le_bytes());
 
         let server = dispatcher.dispatch(
             SYS_SOCKET,
@@ -3119,7 +3615,11 @@ mod tests {
         ) as usize;
         assert!(accepted >= 3);
 
-        procs.current_mut().unwrap().address_space.install_bytes(0x9300, b"tcp");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x9300, b"tcp");
         assert_eq!(
             dispatcher.dispatch(
                 SYS_SENDTO,
@@ -3130,7 +3630,11 @@ mod tests {
             ),
             3
         );
-        procs.current_mut().unwrap().address_space.install_bytes(0x9400, &[0; 3]);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x9400, &[0; 3]);
         assert_eq!(
             dispatcher.dispatch(
                 SYS_RECVFROM,
@@ -3141,7 +3645,10 @@ mod tests {
             ),
             3
         );
-        assert_eq!(procs.current().unwrap().read_user_bytes(0x9400, 3).unwrap(), b"tcp");
+        assert_eq!(
+            procs.current().unwrap().read_user_bytes(0x9400, 3).unwrap(),
+            b"tcp"
+        );
 
         assert_eq!(
             dispatcher.dispatch(
@@ -3170,51 +3677,164 @@ mod tests {
         scheduler.start();
         let mut vfs = KernelVfs::new();
 
-        procs.current_mut().unwrap().address_space.install_bytes(0x1000, &[0; 4096]);
-        procs.current_mut().unwrap().write_user_bytes(0x1000, b"/tmp/x\0").unwrap();
-        procs.current_mut().unwrap().write_user_bytes(0x1100, b"/tmp/y\0").unwrap();
-        procs.current_mut().unwrap().write_user_bytes(0x1200, b"memfd\0").unwrap();
-        procs.current_mut().unwrap().write_user_bytes(0x1380, &128u32.to_le_bytes()).unwrap();
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x1000, &[0; 4096]);
+        procs
+            .current_mut()
+            .unwrap()
+            .write_user_bytes(0x1000, b"/tmp/x\0")
+            .unwrap();
+        procs
+            .current_mut()
+            .unwrap()
+            .write_user_bytes(0x1100, b"/tmp/y\0")
+            .unwrap();
+        procs
+            .current_mut()
+            .unwrap()
+            .write_user_bytes(0x1200, b"memfd\0")
+            .unwrap();
+        procs
+            .current_mut()
+            .unwrap()
+            .write_user_bytes(0x1380, &128u32.to_le_bytes())
+            .unwrap();
         let mut sockaddr = [0u8; 32];
         sockaddr[..2].copy_from_slice(&1u16.to_le_bytes());
         sockaddr[2..12].copy_from_slice(b"socktest\0\0");
-        procs.current_mut().unwrap().write_user_bytes(0x1600, &sockaddr).unwrap();
+        procs
+            .current_mut()
+            .unwrap()
+            .write_user_bytes(0x1600, &sockaddr)
+            .unwrap();
         let mut iov = [0u8; 16];
         iov[..8].copy_from_slice(&0x1700usize.to_le_bytes());
         iov[8..16].copy_from_slice(&4usize.to_le_bytes());
-        procs.current_mut().unwrap().write_user_bytes(0x1680, &iov).unwrap();
-        procs.current_mut().unwrap().write_user_bytes(0x1700, b"data").unwrap();
+        procs
+            .current_mut()
+            .unwrap()
+            .write_user_bytes(0x1680, &iov)
+            .unwrap();
+        procs
+            .current_mut()
+            .unwrap()
+            .write_user_bytes(0x1700, b"data")
+            .unwrap();
         let mut msghdr = [0u8; 56];
         msghdr[16..24].copy_from_slice(&0x1680usize.to_le_bytes());
         msghdr[24..32].copy_from_slice(&1usize.to_le_bytes());
-        procs.current_mut().unwrap().write_user_bytes(0x1780, &msghdr).unwrap();
+        procs
+            .current_mut()
+            .unwrap()
+            .write_user_bytes(0x1780, &msghdr)
+            .unwrap();
         let mut epoll_event = [0u8; 16];
         epoll_event[..4].copy_from_slice(&1u32.to_le_bytes());
-        procs.current_mut().unwrap().write_user_bytes(0x17c0, &epoll_event).unwrap();
+        procs
+            .current_mut()
+            .unwrap()
+            .write_user_bytes(0x17c0, &epoll_event)
+            .unwrap();
 
         let syscalls = [
-            SYS_GETCWD, SYS_DUP3, SYS_FLOCK, SYS_MKDIR, SYS_SYMLINKAT, SYS_LINKAT, SYS_RENAMEAT,
-            SYS_RENAMEAT2, SYS_FSTATFS, SYS_TRUNCATE, SYS_FALLOCATE, SYS_FCHDIR, SYS_FCHMOD,
-            SYS_FCHMODAT, SYS_FCHOWNAT, SYS_FCHOWN, SYS_PWRITE64, SYS_PREADV, SYS_PWRITEV,
-            SYS_PREADV2, SYS_PWRITEV2, SYS_PSELECT6, SYS_FSYNC, SYS_FDATASYNC, SYS_UTIMENSAT,
-            SYS_SET_TID_ADDRESS, SYS_GET_ROBUST_LIST, SYS_SET_ROBUST_LIST, SYS_GETITIMER,
-            SYS_SETITIMER, SYS_CLOCK_GETRES, SYS_SIGALTSTACK, SYS_RT_SIGSUSPEND, SYS_RT_SIGPENDING,
-            SYS_RT_SIGRETURN, SYS_GETPRIORITY, SYS_GETSID, SYS_SETSID, SYS_GETGROUPS, SYS_SETGROUPS,
-            SYS_UMASK, SYS_PRCTL, SYS_SHMGET, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SOCKET,
-            SYS_SOCKETPAIR, SYS_BIND, SYS_LISTEN, SYS_ACCEPT, SYS_CONNECT, SYS_GETSOCKNAME,
-            SYS_SENDTO, SYS_RECVFROM, SYS_SETSOCKOPT, SYS_GETSOCKOPT, SYS_SHUTDOWN, SYS_SENDMSG,
-            SYS_RECVMSG, SYS_MSYNC, SYS_MLOCK, SYS_MLOCK2, SYS_MEMFD_CREATE, SYS_PIDFD_OPEN,
-            SYS_PIDFD_SEND_SIGNAL, SYS_PIDFD_GETFD, SYS_FACCESSAT2, SYS_EPOLL_CREATE1,
-            SYS_EPOLL_CTL, SYS_EPOLL_PWAIT, SYS_SECCOMP, SYS_RISCV_FLUSH_ICACHE, SYS_WAIT,
-            SYS_PPOLL, SYS_TIMES, SYS_UNAME, SYS_GETTIMEOFDAY, SYS_PRLIMIT64, SYS_STATX,
-            SYS_COPY_FILE_RANGE, SYS_SPLICE, SYS_SETUID, SYS_SETGID, SYS_SIGACTION,
-            SYS_SIGPROCMASK, SYS_RT_SIGTIMEDWAIT,
+            SYS_GETCWD,
+            SYS_DUP3,
+            SYS_FLOCK,
+            SYS_MKDIR,
+            SYS_SYMLINKAT,
+            SYS_LINKAT,
+            SYS_RENAMEAT,
+            SYS_RENAMEAT2,
+            SYS_FSTATFS,
+            SYS_TRUNCATE,
+            SYS_FALLOCATE,
+            SYS_FCHDIR,
+            SYS_FCHMOD,
+            SYS_FCHMODAT,
+            SYS_FCHOWNAT,
+            SYS_FCHOWN,
+            SYS_PWRITE64,
+            SYS_PREADV,
+            SYS_PWRITEV,
+            SYS_PREADV2,
+            SYS_PWRITEV2,
+            SYS_PSELECT6,
+            SYS_FSYNC,
+            SYS_FDATASYNC,
+            SYS_UTIMENSAT,
+            SYS_SET_TID_ADDRESS,
+            SYS_GET_ROBUST_LIST,
+            SYS_SET_ROBUST_LIST,
+            SYS_GETITIMER,
+            SYS_SETITIMER,
+            SYS_CLOCK_GETRES,
+            SYS_SIGALTSTACK,
+            SYS_RT_SIGSUSPEND,
+            SYS_RT_SIGPENDING,
+            SYS_RT_SIGRETURN,
+            SYS_GETPRIORITY,
+            SYS_GETSID,
+            SYS_SETSID,
+            SYS_GETGROUPS,
+            SYS_SETGROUPS,
+            SYS_UMASK,
+            SYS_PRCTL,
+            SYS_SHMGET,
+            SYS_SHMAT,
+            SYS_SHMCTL,
+            SYS_SHMDT,
+            SYS_SOCKET,
+            SYS_SOCKETPAIR,
+            SYS_BIND,
+            SYS_LISTEN,
+            SYS_ACCEPT,
+            SYS_CONNECT,
+            SYS_GETSOCKNAME,
+            SYS_SENDTO,
+            SYS_RECVFROM,
+            SYS_SETSOCKOPT,
+            SYS_GETSOCKOPT,
+            SYS_SHUTDOWN,
+            SYS_SENDMSG,
+            SYS_RECVMSG,
+            SYS_MSYNC,
+            SYS_MLOCK,
+            SYS_MLOCK2,
+            SYS_MEMFD_CREATE,
+            SYS_PIDFD_OPEN,
+            SYS_PIDFD_SEND_SIGNAL,
+            SYS_PIDFD_GETFD,
+            SYS_FACCESSAT2,
+            SYS_EPOLL_CREATE1,
+            SYS_EPOLL_CTL,
+            SYS_EPOLL_PWAIT,
+            SYS_SECCOMP,
+            SYS_RISCV_FLUSH_ICACHE,
+            SYS_WAIT,
+            SYS_PPOLL,
+            SYS_TIMES,
+            SYS_UNAME,
+            SYS_GETTIMEOFDAY,
+            SYS_PRLIMIT64,
+            SYS_STATX,
+            SYS_COPY_FILE_RANGE,
+            SYS_SPLICE,
+            SYS_SETUID,
+            SYS_SETGID,
+            SYS_SIGACTION,
+            SYS_SIGPROCMASK,
+            SYS_RT_SIGTIMEDWAIT,
         ];
 
         for sysno in syscalls {
             let args = match sysno {
                 SYS_BIND | SYS_CONNECT => SyscallArgs([3, 0x1600, 32, 0, 0, 0]),
-                SYS_GETSOCKNAME | SYS_GETSOCKOPT => SyscallArgs([3, 0x1800, 0x1380, 0x1800, 0x1380, 0]),
+                SYS_GETSOCKNAME | SYS_GETSOCKOPT => {
+                    SyscallArgs([3, 0x1800, 0x1380, 0x1800, 0x1380, 0])
+                }
                 SYS_SENDTO | SYS_RECVFROM => SyscallArgs([3, 0x1700, 4, 0, 0x1600, 32]),
                 SYS_SENDMSG | SYS_RECVMSG => SyscallArgs([3, 0x1780, 0, 0, 0, 0]),
                 SYS_PREADV | SYS_PWRITEV | SYS_PREADV2 | SYS_PWRITEV2 => {
@@ -3229,14 +3849,13 @@ mod tests {
                 SYS_RT_SIGTIMEDWAIT => SyscallArgs([0x1800, 0x1900, 0, 8, 0, 0]),
                 _ => SyscallArgs([0x1000, 0x1100, 0x1300, 0x1380, 0x1400, 0x1500]),
             };
-            let rc = dispatcher.dispatch(
-                sysno,
-                args,
-                &mut procs,
-                &mut scheduler,
-                &mut vfs,
+            let rc = dispatcher.dispatch(sysno, args, &mut procs, &mut scheduler, &mut vfs);
+            assert_ne!(
+                rc,
+                -(super::ENOSYS as isize),
+                "syscall {} fell through to ENOSYS",
+                sysno
             );
-            assert_ne!(rc, -(super::ENOSYS as isize), "syscall {} fell through to ENOSYS", sysno);
         }
     }
 }

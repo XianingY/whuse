@@ -41,11 +41,15 @@ pub struct FrameAllocator {
 
 impl FrameAllocator {
     pub fn from_regions(regions: &[MemoryRegion]) -> Self {
-        let usable = regions.iter().find(|region| region.usable).copied().unwrap_or(MemoryRegion {
-            start: 0,
-            size: 0,
-            usable: false,
-        });
+        let usable = regions
+            .iter()
+            .find(|region| region.usable)
+            .copied()
+            .unwrap_or(MemoryRegion {
+                start: 0,
+                size: 0,
+                usable: false,
+            });
         Self {
             start: usable.start,
             end: usable.start + usable.size,
@@ -99,6 +103,37 @@ pub struct LoadedImage {
     pub stack_pointer: usize,
 }
 
+pub trait BinaryLoader {
+    fn load(
+        &self,
+        address_space: &AddressSpace,
+        image: &[u8],
+        args: &[String],
+        envs: &[String],
+    ) -> KernelResult<LoadedImage>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ElfBinaryLoader;
+
+impl ElfBinaryLoader {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl BinaryLoader for ElfBinaryLoader {
+    fn load(
+        &self,
+        address_space: &AddressSpace,
+        image: &[u8],
+        args: &[String],
+        envs: &[String],
+    ) -> KernelResult<LoadedImage> {
+        address_space.load_elf_image(image, args, envs)
+    }
+}
+
 impl AddressSpace {
     pub fn new_user() -> Self {
         Self {
@@ -130,7 +165,13 @@ impl AddressSpace {
         Ok(start)
     }
 
-    pub fn map_fixed_bytes(&self, addr: usize, bytes: &[u8], mem_len: usize, prot: usize) -> KernelResult<()> {
+    pub fn map_fixed_bytes(
+        &self,
+        addr: usize,
+        bytes: &[u8],
+        mem_len: usize,
+        prot: usize,
+    ) -> KernelResult<()> {
         if mem_len == 0 || bytes.len() > mem_len {
             return Err(EINVAL);
         }
@@ -227,7 +268,11 @@ impl AddressSpace {
                     return Err(EFAULT);
                 }
                 unsafe {
-                    ptr::copy_nonoverlapping(bytes.as_ptr(), (*ptr + offset) as *mut u8, bytes.len());
+                    ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        (*ptr + offset) as *mut u8,
+                        bytes.len(),
+                    );
                 }
                 Ok(())
             }
@@ -253,7 +298,9 @@ impl AddressSpace {
             let storage = match &segment.storage {
                 SegmentStorage::Owned(bytes) => SegmentStorage::Owned(bytes.clone()),
                 SegmentStorage::Host { ptr, len } => unsafe {
-                    SegmentStorage::Owned(core::slice::from_raw_parts(*ptr as *const u8, *len).to_vec())
+                    SegmentStorage::Owned(
+                        core::slice::from_raw_parts(*ptr as *const u8, *len).to_vec(),
+                    )
                 },
             };
             mappings.insert(
@@ -274,7 +321,21 @@ impl AddressSpace {
         }
     }
 
-    pub fn load_static_elf(&self, image: &[u8], args: &[String], envs: &[String]) -> KernelResult<LoadedImage> {
+    pub fn load_static_elf(
+        &self,
+        image: &[u8],
+        args: &[String],
+        envs: &[String],
+    ) -> KernelResult<LoadedImage> {
+        ElfBinaryLoader::new().load(self, image, args, envs)
+    }
+
+    pub fn load_elf_image(
+        &self,
+        image: &[u8],
+        args: &[String],
+        envs: &[String],
+    ) -> KernelResult<LoadedImage> {
         let header = ElfHeader::parse(image)?;
         if header.program_header_size != 56 || header.class != 2 || header.endianness != 1 {
             return Err(ENOEXEC);
@@ -432,7 +493,11 @@ fn overlaps(mappings: &BTreeMap<usize, Segment>, start: usize, len: usize) -> bo
     })
 }
 
-fn find_segment(mappings: &BTreeMap<usize, Segment>, addr: usize, len: usize) -> KernelResult<(&Segment, usize)> {
+fn find_segment(
+    mappings: &BTreeMap<usize, Segment>,
+    addr: usize,
+    len: usize,
+) -> KernelResult<(&Segment, usize)> {
     mappings
         .iter()
         .find(|(base, segment)| **base <= addr && addr + len <= **base + segment.area.len)
@@ -452,7 +517,12 @@ fn find_segment_mut(
         .ok_or(EFAULT)
 }
 
-fn build_initial_stack(args: &[String], envs: &[String], stack_base: usize, stack_top: usize) -> KernelResult<Vec<u8>> {
+fn build_initial_stack(
+    args: &[String],
+    envs: &[String],
+    stack_base: usize,
+    stack_top: usize,
+) -> KernelResult<Vec<u8>> {
     let pointer_size = size_of::<usize>();
     let strings = args.iter().chain(envs.iter()).collect::<Vec<_>>();
     let total_strings_len = strings.iter().map(|entry| entry.len() + 1).sum::<usize>();
@@ -504,14 +574,18 @@ fn read_u32(bytes: &[u8], offset: usize) -> KernelResult<u32> {
     if offset + 4 > bytes.len() {
         return Err(ENOEXEC);
     }
-    Ok(u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()))
+    Ok(u32::from_le_bytes(
+        bytes[offset..offset + 4].try_into().unwrap(),
+    ))
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> KernelResult<u64> {
     if offset + 8 > bytes.len() {
         return Err(ENOEXEC);
     }
-    Ok(u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()))
+    Ok(u64::from_le_bytes(
+        bytes[offset..offset + 8].try_into().unwrap(),
+    ))
 }
 
 fn align_up(value: usize, alignment: usize) -> usize {
@@ -523,20 +597,11 @@ mod tests {
     use super::{AddressSpace, EFAULT, ENOEXEC};
 
     const TEST_ELF: &[u8] = &[
-        0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        2, 0, 0xf3, 0, 1, 0, 0, 0,
-        0x00, 0x10, 0x00, 0x40, 0, 0, 0, 0,
-        64, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 64, 0, 56, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-        1, 0, 0, 0, 5, 0, 0, 0,
-        0x78, 0, 0, 0, 0, 0, 0, 0,
-        0x00, 0x10, 0x00, 0x40, 0, 0, 0, 0,
-        0x00, 0x10, 0x00, 0x40, 0, 0, 0, 0,
-        4, 0, 0, 0, 0, 0, 0, 0,
-        8, 0, 0, 0, 0, 0, 0, 0,
-        0, 0x10, 0, 0, 0, 0, 0, 0,
-        0x13, 0, 0, 0, 0, 0, 0, 0,
+        0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0xf3, 0, 1, 0, 0, 0,
+        0x00, 0x10, 0x00, 0x40, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 64, 0, 56, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0x78, 0, 0, 0, 0, 0, 0,
+        0, 0x00, 0x10, 0x00, 0x40, 0, 0, 0, 0, 0x00, 0x10, 0x00, 0x40, 0, 0, 0, 0, 4, 0, 0, 0, 0,
+        0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0x13, 0, 0, 0, 0, 0, 0, 0,
     ];
 
     #[test]
@@ -561,7 +626,11 @@ mod tests {
     fn load_minimal_static_elf() {
         let aspace = AddressSpace::new_user();
         let loaded = aspace
-            .load_static_elf(TEST_ELF, &[String::from("/bin/test")], &[String::from("A=B")])
+            .load_static_elf(
+                TEST_ELF,
+                &[String::from("/bin/test")],
+                &[String::from("A=B")],
+            )
             .unwrap();
         assert_eq!(loaded.entry, 0x4000_1000);
         assert_eq!(aspace.read_bytes(0x4000_1000, 4).unwrap(), &[0x13, 0, 0, 0]);
@@ -570,6 +639,9 @@ mod tests {
     #[test]
     fn reject_non_elf_images() {
         let aspace = AddressSpace::new_user();
-        assert_eq!(aspace.load_static_elf(b"nope", &[], &[]).unwrap_err(), ENOEXEC);
+        assert_eq!(
+            aspace.load_static_elf(b"nope", &[], &[]).unwrap_err(),
+            ENOEXEC
+        );
     }
 }

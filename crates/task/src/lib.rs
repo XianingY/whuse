@@ -95,9 +95,9 @@ impl Scheduler {
         WaitQueue::new(id)
     }
 
-    pub fn spawn(&mut self, name: &str, process_id: usize) -> usize {
-        let id = self.next_id;
-        self.next_id += 1;
+    pub fn spawn(&mut self, name: &str, thread_id: usize, process_id: usize) -> usize {
+        let id = thread_id;
+        self.next_id = self.next_id.max(thread_id + 1);
         self.ready.push_back(Task {
             id,
             process_id,
@@ -143,6 +143,10 @@ impl Scheduler {
         self.current.as_ref().map(|task| task.process_id)
     }
 
+    pub fn current_thread_id(&self) -> Option<usize> {
+        self.current.as_ref().map(|task| task.id)
+    }
+
     pub fn block_current_on(&mut self, queue: &mut WaitQueue) -> Option<WaitToken> {
         let mut current = self.current.take()?;
         current.state = TaskState::Blocked;
@@ -150,6 +154,15 @@ impl Scheduler {
         self.blocked.insert(current.id, current);
         let _ = self.schedule_next();
         Some(token)
+    }
+
+    pub fn block_current(&mut self) -> Option<usize> {
+        let mut current = self.current.take()?;
+        current.state = TaskState::Blocked;
+        let id = current.id;
+        self.blocked.insert(id, current);
+        let _ = self.schedule_next();
+        Some(id)
     }
 
     pub fn wake_task(&mut self, task_id: usize) -> bool {
@@ -182,6 +195,40 @@ impl Scheduler {
         self.blocked.len()
     }
 
+    pub fn remove_task(&mut self, task_id: usize) -> bool {
+        if self.current.as_ref().is_some_and(|task| task.id == task_id) {
+            self.current = None;
+            return true;
+        }
+        if let Some(index) = self.ready.iter().position(|task| task.id == task_id) {
+            self.ready.remove(index);
+            return true;
+        }
+        self.blocked.remove(&task_id).is_some()
+    }
+
+    pub fn exit_group(&mut self, process_id: usize) -> usize {
+        let mut removed = 0;
+        if self.current.as_ref().is_some_and(|task| task.process_id == process_id) {
+            self.current = None;
+            removed += 1;
+        }
+        let before_ready = self.ready.len();
+        self.ready.retain(|task| task.process_id != process_id);
+        removed += before_ready - self.ready.len();
+
+        let blocked_ids = self
+            .blocked
+            .iter()
+            .filter_map(|(task_id, task)| (task.process_id == process_id).then_some(*task_id))
+            .collect::<Vec<_>>();
+        for task_id in blocked_ids {
+            self.blocked.remove(&task_id);
+            removed += 1;
+        }
+        removed
+    }
+
     fn schedule_next(&mut self) -> Option<usize> {
         let mut task = self.ready.pop_front()?;
         task.state = TaskState::Running;
@@ -198,8 +245,8 @@ mod tests {
     #[test]
     fn round_robin_scheduler() {
         let mut scheduler = Scheduler::new();
-        let a = scheduler.spawn("a", 1);
-        let b = scheduler.spawn("b", 2);
+        let a = scheduler.spawn("a", 1, 1);
+        let b = scheduler.spawn("b", 2, 2);
         assert_eq!(scheduler.start(), Some(a));
         assert_eq!(scheduler.yield_now(), Some(b));
     }
@@ -207,8 +254,8 @@ mod tests {
     #[test]
     fn wait_queue_round_trip() {
         let mut scheduler = Scheduler::new();
-        let task_a = scheduler.spawn("a", 1);
-        let task_b = scheduler.spawn("b", 2);
+        let task_a = scheduler.spawn("a", 1, 1);
+        let task_b = scheduler.spawn("b", 2, 2);
         let mut queue = scheduler.create_wait_queue();
 
         assert_eq!(scheduler.start(), Some(task_a));
@@ -220,5 +267,35 @@ mod tests {
         assert_eq!(scheduler.wake_one(&mut queue), Some(task_a));
         assert_eq!(scheduler.blocked_count(), 0);
         assert_eq!(scheduler.yield_now(), Some(task_a));
+    }
+
+    #[test]
+    fn direct_block_and_wake_round_trip() {
+        let mut scheduler = Scheduler::new();
+        let task_a = scheduler.spawn("a", 1, 1);
+        let task_b = scheduler.spawn("b", 2, 2);
+        assert_eq!(scheduler.start(), Some(task_a));
+        assert_eq!(scheduler.block_current(), Some(task_a));
+        assert_eq!(scheduler.current_thread_id(), Some(task_b));
+        assert!(scheduler.wake_task(task_a));
+        assert_eq!(scheduler.yield_now(), Some(task_a));
+    }
+
+    #[test]
+    fn exit_group_removes_ready_and_blocked_tasks() {
+        let mut scheduler = Scheduler::new();
+        let task_a = scheduler.spawn("a", 1, 10);
+        let task_b = scheduler.spawn("b", 2, 20);
+        let task_c = scheduler.spawn("c", 3, 10);
+        let mut queue = scheduler.create_wait_queue();
+
+        assert_eq!(scheduler.start(), Some(task_a));
+        scheduler.block_current_on(&mut queue).unwrap();
+        assert_eq!(scheduler.current_thread_id(), Some(task_b));
+
+        let removed = scheduler.exit_group(10);
+        assert_eq!(removed, 2);
+        assert_eq!(scheduler.current_thread_id(), Some(task_b));
+        assert!(!scheduler.remove_task(task_c));
     }
 }

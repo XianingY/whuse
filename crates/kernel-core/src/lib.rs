@@ -3,7 +3,7 @@
 extern crate alloc;
 
 use core::fmt::{self, Write};
-use hal_api::{hal, ConsoleWriter};
+use hal_api::{hal, ConsoleWriter, PlatformArch};
 use mm::MemoryManager;
 use proc::ProcessTable;
 use syscall::{
@@ -48,7 +48,8 @@ impl Kernel {
         let _ = user_init::seed_filesystem(&mut vfs);
 
         let mut processes = ProcessTable::new();
-        let init_entry = user_init::builtin_program("/bin/init")
+        let init_entry = user_init::builtin_program("/sbin/init")
+            .or_else(|| user_init::builtin_program("/bin/init"))
             .map(|program| program.image.as_ptr() as usize + program.entry)
             .unwrap_or(0);
         let init_pid = processes.spawn_init("init", init_entry);
@@ -142,8 +143,12 @@ impl Kernel {
             Err(_) => return,
         };
 
-        match scause {
-            8 => {
+        let is_syscall = match hal().platform.architecture() {
+            PlatformArch::Riscv64 => scause == 8,
+            PlatformArch::LoongArch64 => scause == 11,
+        };
+
+        if is_syscall {
                 let result = self.syscalls.dispatch(
                     sysno,
                     SyscallArgs(args),
@@ -157,21 +162,20 @@ impl Kernel {
                         process.trap_frame.sepc = sepc + 4;
                     }
                 }
-            }
-            _ => {
-                logln(format_args!(
-                    "whuse: pid {} trapped with scause={} stval={:#x}",
-                    pid,
-                    scause,
-                    self.processes
-                        .current()
-                        .map(|process| process.trap_frame.stval)
-                        .unwrap_or(0),
-                ));
-                let _ = self.processes.exit_current(-1);
-                self.scheduler.exit_current();
-            }
+                return;
         }
+
+        logln(format_args!(
+            "whuse: pid {} trapped with scause={} stval={:#x}",
+            pid,
+            scause,
+            self.processes
+                .current()
+                .map(|process| process.trap_frame.stval)
+                .unwrap_or(0),
+        ));
+        let _ = self.processes.exit_current(-1);
+        self.scheduler.exit_current();
     }
 }
 

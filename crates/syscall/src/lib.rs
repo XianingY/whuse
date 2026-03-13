@@ -1,6 +1,17 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+mod fs_domain;
+mod io_mpx_domain;
+mod ipc_domain;
+mod mm_domain;
+mod net_domain;
+mod resources_domain;
+mod signal_domain;
+mod sys_domain;
+mod task_domain;
+mod time_domain;
+
 use alloc::format;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -183,6 +194,13 @@ pub struct SyscallArgs(pub [usize; 6]);
 
 pub struct SyscallDispatcher;
 
+pub(crate) struct DispatchContext<'a> {
+    pub dispatcher: &'a SyscallDispatcher,
+    pub procs: &'a mut ProcessTable,
+    pub scheduler: &'a mut Scheduler,
+    pub vfs: &'a mut KernelVfs,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct IoVec {
@@ -246,153 +264,23 @@ impl SyscallDispatcher {
         scheduler: &mut Scheduler,
         vfs: &mut KernelVfs,
     ) -> isize {
-        let result = match sysno {
-            SYS_EVENTFD2 => self.sys_eventfd2(args, procs, vfs),
-            SYS_EPOLL_CREATE1 => self.sys_epoll_create1(args, procs, vfs),
-            SYS_EPOLL_CTL => self.sys_epoll_ctl(args, procs, vfs),
-            SYS_EPOLL_PWAIT | SYS_EPOLL_PWAIT2 => self.sys_epoll_pwait(args, procs, vfs),
-            SYS_GETCWD => self.sys_getcwd(args, procs),
-            SYS_DUP => self.sys_dup(args, procs),
-            SYS_DUP2 => self.sys_dup3(args, procs),
-            SYS_FCNTL => self.sys_fcntl(args, procs),
-            SYS_IOCTL => self.sys_ioctl(args, procs),
-            SYS_FLOCK => self.sys_flock(args, procs),
-            SYS_MKDIR => self.sys_mkdir(args, procs, vfs),
-            SYS_UNLINKAT => self.sys_unlinkat(args, procs, vfs),
-            SYS_SYMLINKAT => self.sys_symlinkat(args, procs, vfs),
-            SYS_LINKAT => self.sys_linkat(args, procs, vfs),
-            SYS_RENAMEAT => self.sys_renameat(args, procs, vfs),
-            SYS_SYNC => self.sys_sync(),
-            SYS_FSYNC => self.sys_fsync(args, procs),
-            SYS_FDATASYNC => self.sys_fsync(args, procs),
-            SYS_MOUNT => self.sys_mount(args, procs, vfs),
-            SYS_UMOUNT2 => self.sys_umount(args, procs, vfs),
-            SYS_STATFS => self.sys_statfs(args, procs, vfs),
-            SYS_FSTATFS => self.sys_fstatfs(args, procs, vfs),
-            SYS_TRUNCATE => self.sys_truncate(args, procs, vfs),
-            SYS_FTRUNCATE => self.sys_ftruncate(args, procs, vfs),
-            SYS_FALLOCATE => self.sys_fallocate(args, procs, vfs),
-            SYS_UTIMENSAT => self.sys_utimensat(args, procs, vfs),
-            SYS_FACCESSAT | SYS_FACCESSAT2 => self.sys_faccessat(args, procs, vfs),
-            SYS_FCHDIR => self.sys_fchdir(args, procs, vfs),
-            SYS_CHROOT => self.sys_chroot(args, procs, vfs),
-            SYS_FCHMOD => self.sys_fchmod(args, procs),
-            SYS_FCHMODAT | SYS_FCHMODAT2 => self.sys_fchmodat(args, procs, vfs),
-            SYS_FCHOWNAT => self.sys_fchownat(args, procs, vfs),
-            SYS_FCHOWN => self.sys_fchown(args, procs),
-            SYS_OPENAT => self.sys_openat(args, procs, vfs),
-            SYS_CLOSE => self.sys_close(args, procs),
-            SYS_CLOSE_RANGE => self.sys_close_range(args, procs),
-            SYS_PIPE => self.sys_pipe(args, procs, vfs),
-            SYS_GETDENTS64 => self.sys_getdents64(args, procs, vfs),
-            SYS_LSEEK => self.sys_lseek(args, procs, vfs),
-            SYS_READ => self.sys_read(args, procs, vfs),
-            SYS_WRITE => self.sys_write(args, procs, vfs),
-            SYS_READV => self.sys_readv(args, procs, vfs),
-            SYS_WRITEV => self.sys_writev(args, procs, vfs),
-            SYS_PREAD64 => self.sys_pread64(args, procs, vfs),
-            SYS_PWRITE64 => self.sys_pwrite64(args, procs, vfs),
-            SYS_PREADV => self.sys_preadv(args, procs, vfs),
-            SYS_PWRITEV => self.sys_pwritev(args, procs, vfs),
-            SYS_PREADV2 => self.sys_preadv(args, procs, vfs),
-            SYS_PWRITEV2 => self.sys_pwritev(args, procs, vfs),
-            SYS_SENDFILE => self.sys_sendfile(args, procs, vfs),
-            SYS_PPOLL => self.sys_ppoll(args, procs),
-            SYS_PSELECT6 => self.sys_pselect6(args, procs),
-            SYS_SPLICE => self.sys_splice(args, procs, vfs),
-            SYS_READLINKAT => self.sys_readlinkat(args, procs, vfs),
-            SYS_FSTATAT => self.sys_fstatat(args, procs, vfs),
-            SYS_SET_TID_ADDRESS => self.sys_set_tid_address(args, procs),
-            SYS_FUTEX => self.sys_futex(args, procs),
-            SYS_SET_ROBUST_LIST => self.sys_set_robust_list(args, procs),
-            SYS_GET_ROBUST_LIST => self.sys_get_robust_list(args, procs),
-            SYS_SLEEP => self.sys_nanosleep(args),
-            SYS_GETITIMER => self.sys_getitimer(args, procs),
-            SYS_SETITIMER => self.sys_setitimer(args, procs),
-            SYS_SCHED_YIELD => self.sys_sched_yield(scheduler),
-            SYS_CLOCK_GETTIME => self.sys_clock_gettime(args, procs),
-            SYS_CLOCK_GETRES => self.sys_clock_getres(args, procs),
-            SYS_CLOCK_NANOSLEEP => self.sys_clock_nanosleep(args),
-            SYS_SYSLOG => self.sys_syslog(args, procs),
-            SYS_KILL | SYS_TGKILL => self.sys_kill(args, procs),
-            SYS_SIGALTSTACK => self.sys_sigaltstack(args, procs),
-            SYS_RT_SIGSUSPEND => self.sys_rt_sigsuspend(args, procs),
-            SYS_SIGACTION => self.sys_sigaction(args, procs),
-            SYS_SIGPROCMASK => self.sys_sigprocmask(args, procs),
-            SYS_RT_SIGPENDING => self.sys_rt_sigpending(args, procs),
-            SYS_RT_SIGTIMEDWAIT => self.sys_rt_sigtimedwait(args, procs),
-            SYS_RT_SIGRETURN => self.sys_rt_sigreturn(),
-            SYS_SETGID => self.sys_setgid(args, procs),
-            SYS_SETUID => self.sys_setuid(args, procs),
-            SYS_GETPRIORITY => self.sys_getpriority(),
-            SYS_TIMES => self.sys_times(args, procs),
-            SYS_SETPGID => self.sys_setpgid(args, procs),
-            SYS_GETPGID => self.sys_getpgid(args, procs),
-            SYS_GETSID => self.sys_getsid(args, procs),
-            SYS_SETSID => self.sys_setsid(procs),
-            SYS_UNAME => self.sys_uname(args, procs),
-            SYS_UMASK => self.sys_umask(args, procs),
-            SYS_PRCTL => self.sys_prctl(),
-            SYS_GETRUSAGE => self.sys_getrusage(args, procs),
-            SYS_GETTIMEOFDAY => self.sys_gettimeofday(args, procs),
-            SYS_EXIT => self.sys_exit(args, procs, scheduler),
-            SYS_EXIT_GROUP => self.sys_exit(args, procs, scheduler),
-            SYS_GETPID => self.sys_getpid(procs),
-            SYS_GETPPID => self.sys_getppid(procs),
-            SYS_GETUID => self.sys_getuid(procs),
-            SYS_GETEUID => self.sys_geteuid(procs),
-            SYS_GETGID => self.sys_getgid(procs),
-            SYS_GETEGID => self.sys_getegid(procs),
-            SYS_GETGROUPS => self.sys_getgroups(args, procs),
-            SYS_SETGROUPS => self.sys_setgroups(args, procs),
-            SYS_GETTID => self.sys_gettid(procs),
-            SYS_SYSINFO => self.sys_sysinfo(args, procs, scheduler),
-            SYS_SHMGET => self.sys_shmget(args),
-            SYS_SHMCTL => self.sys_shmctl(args, procs),
-            SYS_SHMAT => self.sys_shmat(args, procs),
-            SYS_SHMDT => self.sys_shmdt(),
-            SYS_SOCKET => self.sys_socket(args, procs, vfs),
-            SYS_SOCKETPAIR => self.sys_socketpair(args, procs, vfs),
-            SYS_BIND => self.sys_bind(args, procs, vfs),
-            SYS_LISTEN => self.sys_listen(args, procs, vfs),
-            SYS_ACCEPT | SYS_ACCEPT4 => self.sys_accept(args, procs, vfs),
-            SYS_CONNECT => self.sys_connect(args, procs, vfs),
-            SYS_GETSOCKNAME | SYS_GETPEERNAME => self.sys_getsockname(args, procs),
-            SYS_SENDTO => self.sys_sendto(args, procs, vfs),
-            SYS_RECVFROM => self.sys_recvfrom(args, procs, vfs),
-            SYS_SETSOCKOPT => self.sys_setsockopt(args),
-            SYS_GETSOCKOPT => self.sys_getsockopt(args, procs),
-            SYS_SHUTDOWN => self.sys_shutdown(args),
-            SYS_SENDMSG => self.sys_sendmsg(args, procs, vfs),
-            SYS_RECVMSG => self.sys_recvmsg(args, procs, vfs),
-            SYS_FSTAT => self.sys_fstat(args, procs, vfs),
-            SYS_CHDIR => self.sys_chdir(args, procs, vfs),
-            SYS_BRK => self.sys_brk(args, procs),
-            SYS_MREMAP => self.sys_mremap(args, procs),
-            SYS_CLONE => self.sys_fork(procs, scheduler),
-            SYS_EXECVE => self.sys_execve(args, procs),
-            SYS_MMAP => self.sys_mmap(args, procs),
-            SYS_MUNMAP => self.sys_munmap(args, procs),
-            SYS_MPROTECT => self.sys_mprotect(args, procs),
-            SYS_MSYNC => Ok(0),
-            SYS_MLOCK | SYS_MLOCK2 => Ok(0),
-            SYS_MADVISE => Ok(0),
-            SYS_WAIT => self.sys_wait(args, procs),
-            SYS_PRLIMIT64 => self.sys_prlimit64(args, procs),
-            SYS_RENAMEAT2 => self.sys_renameat2(args, procs, vfs),
-            SYS_GETRANDOM => self.sys_getrandom(args, procs),
-            SYS_MEMFD_CREATE => self.sys_memfd_create(args, procs, vfs),
-            SYS_COPY_FILE_RANGE => self.sys_copy_file_range(args, procs, vfs),
-            SYS_STATX => self.sys_statx(args, procs, vfs),
-            SYS_PIDFD_SEND_SIGNAL => self.sys_pidfd_send_signal(args, procs, vfs),
-            SYS_PIDFD_OPEN => self.sys_pidfd_open(args, procs, vfs),
-            SYS_PIDFD_GETFD => self.sys_pidfd_getfd(args, procs, vfs),
-            SYS_CLONE3 => Err(ENOSYS),
-            SYS_SECCOMP => Ok(0),
-            SYS_RISCV_FLUSH_ICACHE => Ok(0),
-            SYS_POWER_OFF => Ok(0),
-            _ => Err(ENOSYS),
+        let mut ctx = DispatchContext {
+            dispatcher: self,
+            procs,
+            scheduler,
+            vfs,
         };
+        let result = fs_domain::dispatch(&mut ctx, sysno, args)
+            .or_else(|| io_mpx_domain::dispatch(&mut ctx, sysno, args))
+            .or_else(|| ipc_domain::dispatch(&mut ctx, sysno, args))
+            .or_else(|| mm_domain::dispatch(&mut ctx, sysno, args))
+            .or_else(|| net_domain::dispatch(&mut ctx, sysno, args))
+            .or_else(|| resources_domain::dispatch(&mut ctx, sysno, args))
+            .or_else(|| signal_domain::dispatch(&mut ctx, sysno, args))
+            .or_else(|| sys_domain::dispatch(&mut ctx, sysno, args))
+            .or_else(|| task_domain::dispatch(&mut ctx, sysno, args))
+            .or_else(|| time_domain::dispatch(&mut ctx, sysno, args))
+            .unwrap_or(Err(ENOSYS));
 
         match result {
             Ok(value) => value as isize,
@@ -2446,8 +2334,8 @@ mod tests {
         SYS_WAIT, SYS_WRITE, SYS_WRITEV,
     };
     use hal_api::{
-        register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalMemory, HalTimer,
-        MemoryRegion, Timespec, TrapFrame, VmSpaceToken,
+        register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalMemory, HalPlatform,
+        HalTimer, MemoryRegion, PlatformArch, Timespec, TrapFrame, VmSpaceToken,
     };
     use proc::ProcessTable;
     use spin::Once;
@@ -2458,11 +2346,13 @@ mod tests {
     struct TestMemory;
     struct TestTimer;
     struct TestConsole;
+    struct TestPlatform;
 
     static TEST_CPU: TestCpu = TestCpu;
     static TEST_MEMORY: TestMemory = TestMemory;
     static TEST_TIMER: TestTimer = TestTimer;
     static TEST_CONSOLE: TestConsole = TestConsole;
+    static TEST_PLATFORM: TestPlatform = TestPlatform;
     static TEST_REGIONS: [MemoryRegion; 1] = [MemoryRegion {
         start: 0x8000_0000,
         size: 0x100000,
@@ -2500,9 +2390,15 @@ mod tests {
         fn get_byte(&self) -> Option<u8> { None }
     }
 
+    impl HalPlatform for TestPlatform {
+        fn platform_name(&self) -> &'static str { "test-platform" }
+        fn architecture(&self) -> PlatformArch { PlatformArch::Riscv64 }
+    }
+
     fn ensure_test_hal() {
         INIT_HAL.call_once(|| {
             let _ = register_hal(HalBundle {
+                platform: &TEST_PLATFORM,
                 cpu: &TEST_CPU,
                 memory: &TEST_MEMORY,
                 timer: &TEST_TIMER,

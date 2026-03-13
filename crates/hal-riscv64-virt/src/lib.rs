@@ -1,10 +1,13 @@
 #![cfg_attr(not(test), no_std)]
 
+#[cfg(target_arch = "riscv64")]
+use core::arch::global_asm;
+#[cfg(target_arch = "riscv64")]
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hal_api::{
     register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalMemory, HalTimer,
-    MemoryRegion, Timespec, VmSpaceToken,
+    MemoryRegion, Timespec, TrapFrame, VmSpaceToken,
 };
 
 pub const UART0_BASE: usize = 0x1000_0000;
@@ -19,6 +22,140 @@ static TIMER: VirtTimer = VirtTimer::new();
 static UART: Ns16550 = Ns16550::new(UART0_BASE);
 static VIRTIO_BLK: VirtioBlockStub = VirtioBlockStub;
 static BLOCK_DEVS: [&'static dyn HalBlockDevice; 1] = [&VIRTIO_BLK];
+
+#[cfg(target_arch = "riscv64")]
+#[no_mangle]
+static mut __whuse_current_frame: usize = 0;
+
+#[cfg(target_arch = "riscv64")]
+#[no_mangle]
+static mut __whuse_kernel_ra: usize = 0;
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(
+    r#"
+    .section .text
+    .globl __whuse_run_user
+__whuse_run_user:
+    la t0, __whuse_current_frame
+    sd a0, 0(t0)
+    la t0, __whuse_kernel_ra
+    sd ra, 0(t0)
+    la t0, __whuse_user_trap_entry
+    csrw stvec, t0
+    csrw sscratch, sp
+
+    mv t6, a0
+
+    ld ra,   8(t6)
+    ld sp,  16(t6)
+    ld gp,  24(t6)
+    ld tp,  32(t6)
+    ld t1,  48(t6)
+    ld t2,  56(t6)
+    ld s1,  72(t6)
+    ld a0,  80(t6)
+    ld a1,  88(t6)
+    ld a2,  96(t6)
+    ld a3, 104(t6)
+    ld a4, 112(t6)
+    ld a5, 120(t6)
+    ld a6, 128(t6)
+    ld a7, 136(t6)
+    ld s2, 144(t6)
+    ld s3, 152(t6)
+    ld s4, 160(t6)
+    ld s5, 168(t6)
+    ld s6, 176(t6)
+    ld s7, 184(t6)
+    ld s8, 192(t6)
+    ld s9, 200(t6)
+    ld s10, 208(t6)
+    ld s11, 216(t6)
+    ld t3, 224(t6)
+    ld t4, 232(t6)
+    ld t5, 240(t6)
+
+    ld t0, 256(t6)
+    csrw sepc, t0
+    ld t0, 264(t6)
+    li t2, -257
+    and t0, t0, t2
+    ori t0, t0, 32
+    csrw sstatus, t0
+
+    ld s0,  64(t6)
+    ld t0,  40(t6)
+    ld t6, 248(t6)
+    sret
+
+    .align 4
+    .globl __whuse_user_trap_entry
+__whuse_user_trap_entry:
+    csrrw sp, sscratch, sp
+    addi sp, sp, -16
+    sd t0, 0(sp)
+    sd t1, 8(sp)
+
+    la t0, __whuse_current_frame
+    ld t0, 0(t0)
+
+    sd zero, 0(t0)
+    sd ra,   8(t0)
+    csrr t1, sscratch
+    sd t1,  16(t0)
+    sd gp,  24(t0)
+    sd tp,  32(t0)
+    ld t1,   0(sp)
+    sd t1,  40(t0)
+    ld t1,   8(sp)
+    sd t1,  48(t0)
+    sd t2,  56(t0)
+    sd s0,  64(t0)
+    sd s1,  72(t0)
+    sd a0,  80(t0)
+    sd a1,  88(t0)
+    sd a2,  96(t0)
+    sd a3, 104(t0)
+    sd a4, 112(t0)
+    sd a5, 120(t0)
+    sd a6, 128(t0)
+    sd a7, 136(t0)
+    sd s2, 144(t0)
+    sd s3, 152(t0)
+    sd s4, 160(t0)
+    sd s5, 168(t0)
+    sd s6, 176(t0)
+    sd s7, 184(t0)
+    sd s8, 192(t0)
+    sd s9, 200(t0)
+    sd s10, 208(t0)
+    sd s11, 216(t0)
+    sd t3, 224(t0)
+    sd t4, 232(t0)
+    sd t5, 240(t0)
+    sd t6, 248(t0)
+
+    csrr t1, sepc
+    sd t1, 256(t0)
+    csrr t1, sstatus
+    sd t1, 264(t0)
+    csrr t1, scause
+    sd t1, 272(t0)
+    csrr t1, stval
+    sd t1, 280(t0)
+
+    addi sp, sp, 16
+    la t0, __whuse_kernel_ra
+    ld ra, 0(t0)
+    ret
+"#
+);
+
+#[cfg(target_arch = "riscv64")]
+unsafe extern "C" {
+    fn __whuse_run_user(frame: *mut TrapFrame);
+}
 
 static MEMORY_MAP: [MemoryRegion; 2] = [
     MemoryRegion {
@@ -80,6 +217,17 @@ impl HalCpu for VirtCpu {
             core::arch::asm!("wfi");
         }
     }
+
+    fn run_user(&self, frame: &mut TrapFrame) {
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            __whuse_run_user(frame as *mut TrapFrame);
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = frame;
+        }
+    }
 }
 
 struct VirtMemory;
@@ -131,6 +279,7 @@ impl HalTimer for VirtTimer {
 }
 
 struct Ns16550 {
+    #[allow(dead_code)]
     base: usize,
 }
 
@@ -189,4 +338,3 @@ impl HalBlockDevice for VirtioBlockStub {
         Err(95)
     }
 }
-

@@ -8,5 +8,5 @@ license.workspace = true
 hal-api = { path = "../hal-api" }
 proc = { path = "../proc" }
 task = { path = "../task" }
+user-init = { path = "../user-init" }
 vfs = { path = "../vfs" }
-

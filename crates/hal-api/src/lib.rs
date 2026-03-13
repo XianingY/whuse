@@ -1,0 +1,115 @@
+#![cfg_attr(not(test), no_std)]
+
+use core::fmt;
+use spin::Once;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmSpaceToken(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryRegion {
+    pub start: usize,
+    pub size: usize,
+    pub usable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Timespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+impl Timespec {
+    pub const fn from_nanos(total_nanos: u64) -> Self {
+        Self {
+            tv_sec: (total_nanos / 1_000_000_000) as i64,
+            tv_nsec: (total_nanos % 1_000_000_000) as i64,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrapFrame {
+    pub regs: [usize; 32],
+    pub sepc: usize,
+    pub sstatus: usize,
+}
+
+impl TrapFrame {
+    pub fn a(&self, index: usize) -> usize {
+        self.regs[10 + index]
+    }
+
+    pub fn set_a(&mut self, index: usize, value: usize) {
+        self.regs[10 + index] = value;
+    }
+}
+
+pub trait HalCpu: Send + Sync {
+    fn cpu_id(&self) -> usize;
+    fn enable_interrupts(&self);
+    fn disable_interrupts(&self);
+    fn interrupts_enabled(&self) -> bool;
+    fn switch_address_space(&self, token: VmSpaceToken);
+    fn wait_for_interrupt(&self);
+}
+
+pub trait HalMemory: Send + Sync {
+    fn memory_regions(&self) -> &'static [MemoryRegion];
+    fn phys_to_virt(&self, phys: usize) -> usize;
+    fn virt_to_phys(&self, virt: usize) -> usize;
+    fn mmio_base(&self) -> usize;
+}
+
+pub trait HalTimer: Send + Sync {
+    fn monotonic_time(&self) -> Timespec;
+    fn monotonic_nanos(&self) -> u64;
+    fn program_oneshot(&self, deadline_nanos: u64);
+}
+
+pub trait HalBlockDevice: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn sector_size(&self) -> usize;
+    fn sector_count(&self) -> usize;
+    fn read_sector(&self, sector: usize, buf: &mut [u8]) -> Result<(), i32>;
+    fn write_sector(&self, sector: usize, buf: &[u8]) -> Result<(), i32>;
+}
+
+pub trait HalCharDevice: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn put_byte(&self, byte: u8);
+    fn get_byte(&self) -> Option<u8>;
+}
+
+pub struct HalBundle {
+    pub cpu: &'static dyn HalCpu,
+    pub memory: &'static dyn HalMemory,
+    pub timer: &'static dyn HalTimer,
+    pub console: &'static dyn HalCharDevice,
+    pub block_devices: &'static [&'static dyn HalBlockDevice],
+}
+
+static HAL_BUNDLE: Once<HalBundle> = Once::new();
+
+pub fn register_hal(bundle: HalBundle) -> &'static HalBundle {
+    HAL_BUNDLE.call_once(|| bundle)
+}
+
+pub fn hal() -> &'static HalBundle {
+    HAL_BUNDLE
+        .get()
+        .expect("HAL bundle must be registered before kernel bootstrap")
+}
+
+pub struct ConsoleWriter;
+
+impl fmt::Write for ConsoleWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            hal().console.put_byte(byte);
+        }
+        Ok(())
+    }
+}
+

@@ -1,0 +1,10 @@
+[package]
+name = "user-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+proc = { path = "../proc" }
+vfs = { path = "../vfs" }
+

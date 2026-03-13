@@ -1,0 +1,12 @@
+[package]
+name = "syscall"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hal-api = { path = "../hal-api" }
+proc = { path = "../proc" }
+task = { path = "../task" }
+vfs = { path = "../vfs" }
+

@@ -1,0 +1,10 @@
+[package]
+name = "proc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mm = { path = "../mm" }
+vfs = { path = "../vfs" }
+

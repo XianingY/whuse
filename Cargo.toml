@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "tools/xtask",
+    "platform/riscv64-virt",
+    "crates/hal-api",
+    "crates/hal-riscv64-virt",
+    "crates/kernel-core",
+    "crates/mm",
+    "crates/task",
+    "crates/proc",
+    "crates/vfs",
+    "crates/syscall",
+    "crates/user-init",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+authors = ["Codex"]
+
+[workspace.dependencies]
+spin = "0.9"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

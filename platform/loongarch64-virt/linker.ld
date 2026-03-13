@@ -3,7 +3,7 @@ ENTRY(_start)
 
 MEMORY
 {
-  RAM : ORIGIN = 0x80000000, LENGTH = 128M
+  RAM : ORIGIN = 0x90000000, LENGTH = 128M
 }
 
 SECTIONS
@@ -24,9 +24,11 @@ SECTIONS
   } > RAM
 
   .bss : ALIGN(4K) {
+    _bss_start = .;
     *(.bss.stack)
     *(.bss .bss.*)
     *(COMMON)
+    _bss_end = .;
   } > RAM
 
   /DISCARD/ : {

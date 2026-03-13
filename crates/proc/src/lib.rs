@@ -124,7 +124,8 @@ impl Process {
         let user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
         let sp = user_stack.as_ptr() as usize + user_stack.len() - 16;
         let address_space = AddressSpace::new_user();
-        let _ = address_space.install_host_range(user_stack.as_ptr() as usize, user_stack.len(), 0b11);
+        let _ =
+            address_space.install_host_range(user_stack.as_ptr() as usize, user_stack.len(), 0b11);
         Self {
             pid,
             tid: pid,
@@ -193,10 +194,13 @@ impl Process {
     pub fn reset_image(&mut self, entry: usize, stack_pointer: Option<usize>) {
         self.address_space.clear();
         self.user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
-        let _ = self
-            .address_space
-            .install_host_range(self.user_stack.as_ptr() as usize, self.user_stack.len(), 0b11);
-        let sp = stack_pointer.unwrap_or_else(|| self.user_stack.as_ptr() as usize + self.user_stack.len() - 16);
+        let _ = self.address_space.install_host_range(
+            self.user_stack.as_ptr() as usize,
+            self.user_stack.len(),
+            0b11,
+        );
+        let sp = stack_pointer
+            .unwrap_or_else(|| self.user_stack.as_ptr() as usize + self.user_stack.len() - 16);
         self.trap_frame = TrapFrame::new_user(entry, sp);
         self.state = ProcessState::Ready;
         self.exit_code = None;
@@ -274,7 +278,8 @@ impl Process {
             trap_frame.regs[4] = tls;
         }
         let address_space = self.address_space.clone();
-        let _ = address_space.install_host_range(user_stack.as_ptr() as usize, user_stack.len(), 0b11);
+        let _ =
+            address_space.install_host_range(user_stack.as_ptr() as usize, user_stack.len(), 0b11);
         Self {
             pid: tid,
             tid,
@@ -391,7 +396,8 @@ impl ProcessTable {
     }
 
     pub fn has_pid(&self, pid: usize) -> bool {
-        self.processes.contains_key(&pid) || self.processes.values().any(|process| process.tgid == pid)
+        self.processes.contains_key(&pid)
+            || self.processes.values().any(|process| process.tgid == pid)
     }
 
     pub fn current_mut(&mut self) -> KernelResult<&mut Process> {
@@ -417,7 +423,11 @@ impl ProcessTable {
     }
 
     pub fn wait(&mut self, parent_pid: usize, pid: i32) -> KernelResult<(usize, i32)> {
-        self.wait_child(parent_pid, selector_from_wait_pid(pid, self.find_process_by_pid(parent_pid)?.pgid), 0)
+        self.wait_child(
+            parent_pid,
+            selector_from_wait_pid(pid, self.find_process_by_pid(parent_pid)?.pgid),
+            0,
+        )
     }
 
     pub fn exit_current(&mut self, code: i32) -> KernelResult<()> {
@@ -425,20 +435,28 @@ impl ProcessTable {
         Ok(())
     }
 
-    pub fn wait_child(&mut self, parent_tgid: usize, selector: WaitSelector, options: u32) -> KernelResult<(usize, i32)> {
+    pub fn wait_child(
+        &mut self,
+        parent_tgid: usize,
+        selector: WaitSelector,
+        options: u32,
+    ) -> KernelResult<(usize, i32)> {
         let child_tid = self
             .processes
             .values()
             .filter(|process| !process.is_thread)
             .filter(|process| process.parent == Some(parent_tgid))
-            .find(|process| process.state == ProcessState::Exited && selector_matches(selector, process))
+            .find(|process| {
+                process.state == ProcessState::Exited && selector_matches(selector, process)
+            })
             .map(|process| process.tgid);
 
         let Some(child_tid) = child_tid else {
-            let has_any_child = self
-                .processes
-                .values()
-                .any(|process| !process.is_thread && process.parent == Some(parent_tgid) && selector_matches(selector, process));
+            let has_any_child = self.processes.values().any(|process| {
+                !process.is_thread
+                    && process.parent == Some(parent_tgid)
+                    && selector_matches(selector, process)
+            });
             if options & WNOHANG != 0 && has_any_child {
                 return Ok((0, 0));
             }
@@ -466,7 +484,11 @@ impl ProcessTable {
         Ok(pid)
     }
 
-    pub fn clone_thread_from_current(&mut self, stack: usize, tls: Option<usize>) -> KernelResult<usize> {
+    pub fn clone_thread_from_current(
+        &mut self,
+        stack: usize,
+        tls: Option<usize>,
+    ) -> KernelResult<usize> {
         let tid = self.next_id();
         let thread = self.current()?.clone_thread_from(tid, stack, tls);
         self.processes.insert(tid, thread);
@@ -477,7 +499,11 @@ impl ProcessTable {
         self.execve_current_image(entry, None)
     }
 
-    pub fn execve_current_image(&mut self, entry: usize, stack_pointer: Option<usize>) -> KernelResult<()> {
+    pub fn execve_current_image(
+        &mut self,
+        entry: usize,
+        stack_pointer: Option<usize>,
+    ) -> KernelResult<()> {
         let current_tgid = self.current_tgid()?;
         let current_tid = self.current_tid()?;
         let other_threads = self
@@ -532,7 +558,11 @@ impl ProcessTable {
     }
 
     pub fn getpgid(&self, pid: usize) -> KernelResult<usize> {
-        let target = if pid == 0 { self.current()? } else { self.find_process_by_pid(pid)? };
+        let target = if pid == 0 {
+            self.current()?
+        } else {
+            self.find_process_by_pid(pid)?
+        };
         Ok(target.pgid)
     }
 
@@ -544,13 +574,21 @@ impl ProcessTable {
     }
 
     pub fn getsid(&self, pid: usize) -> KernelResult<usize> {
-        let target = if pid == 0 { self.current()? } else { self.find_process_by_pid(pid)? };
+        let target = if pid == 0 {
+            self.current()?
+        } else {
+            self.find_process_by_pid(pid)?
+        };
         Ok(target.sid)
     }
 
     pub fn setsid_current(&mut self) -> KernelResult<usize> {
         let pid = self.current_tgid()?;
-        for process in self.processes.values_mut().filter(|process| process.tgid == pid) {
+        for process in self
+            .processes
+            .values_mut()
+            .filter(|process| process.tgid == pid)
+        {
             process.sid = pid;
             process.pgid = pid;
         }
@@ -559,7 +597,11 @@ impl ProcessTable {
 
     pub fn setuid_current(&mut self, uid: u32) -> KernelResult<()> {
         let tgid = self.current_tgid()?;
-        for process in self.processes.values_mut().filter(|process| process.tgid == tgid) {
+        for process in self
+            .processes
+            .values_mut()
+            .filter(|process| process.tgid == tgid)
+        {
             process.uid = uid;
             process.euid = uid;
         }
@@ -568,7 +610,11 @@ impl ProcessTable {
 
     pub fn setgid_current(&mut self, gid: u32) -> KernelResult<()> {
         let tgid = self.current_tgid()?;
-        for process in self.processes.values_mut().filter(|process| process.tgid == tgid) {
+        for process in self
+            .processes
+            .values_mut()
+            .filter(|process| process.tgid == tgid)
+        {
             process.gid = gid;
             process.egid = gid;
         }
@@ -581,7 +627,11 @@ impl ProcessTable {
 
     pub fn setgroups_current(&mut self, groups: &[u32]) -> KernelResult<()> {
         let tgid = self.current_tgid()?;
-        for process in self.processes.values_mut().filter(|process| process.tgid == tgid) {
+        for process in self
+            .processes
+            .values_mut()
+            .filter(|process| process.tgid == tgid)
+        {
             process.groups = groups.to_vec();
         }
         Ok(())
@@ -652,7 +702,11 @@ impl ProcessTable {
             return Err(EINVAL);
         }
         let tgid = self.current_tgid()?;
-        for process in self.processes.values_mut().filter(|process| process.tgid == tgid) {
+        for process in self
+            .processes
+            .values_mut()
+            .filter(|process| process.tgid == tgid)
+        {
             process.signal_actions.insert(signal, action);
         }
         Ok(())
@@ -662,7 +716,12 @@ impl ProcessTable {
         if signal == 0 || signal > 64 {
             return Err(EINVAL);
         }
-        Ok(self.current()?.signal_actions.get(&signal).copied().unwrap_or_default())
+        Ok(self
+            .current()?
+            .signal_actions
+            .get(&signal)
+            .copied()
+            .unwrap_or_default())
     }
 
     pub fn dequeue_unmasked_signal(&mut self) -> KernelResult<Option<usize>> {
@@ -698,7 +757,13 @@ impl ProcessTable {
         woke
     }
 
-    pub fn requeue_futex(&mut self, from: usize, to: usize, wake_count: usize, requeue_count: usize) -> Vec<usize> {
+    pub fn requeue_futex(
+        &mut self,
+        from: usize,
+        to: usize,
+        wake_count: usize,
+        requeue_count: usize,
+    ) -> Vec<usize> {
         let woke = self.wake_futex(from, wake_count);
         let mut moved = VecDeque::new();
         if let Some(waiters) = self.futex_waiters.get_mut(&from) {
@@ -724,7 +789,9 @@ impl ProcessTable {
         let parent_tgid = self.current()?.parent;
         let clear_child_tid = self.current()?.clear_child_tid;
         if let Some(addr) = clear_child_tid {
-            let _ = self.current_mut()?.write_user_bytes(addr, &0u32.to_le_bytes());
+            let _ = self
+                .current_mut()?
+                .write_user_bytes(addr, &0u32.to_le_bytes());
         }
         self.remove_futex_waiter(current_tid);
         {
@@ -733,12 +800,17 @@ impl ProcessTable {
             process.exit_code = Some(code);
         }
 
-        let group_alive = self
-            .processes
-            .values()
-            .any(|process| process.tgid == current_tgid && process.tid != current_tid && process.state != ProcessState::Exited);
+        let group_alive = self.processes.values().any(|process| {
+            process.tgid == current_tgid
+                && process.tid != current_tid
+                && process.state != ProcessState::Exited
+        });
         if !group_alive {
-            for process in self.processes.values_mut().filter(|process| process.tgid == current_tgid) {
+            for process in self
+                .processes
+                .values_mut()
+                .filter(|process| process.tgid == current_tgid)
+            {
                 process.state = ProcessState::Exited;
                 process.exit_code = Some(code);
             }
@@ -828,7 +900,11 @@ impl ProcessTable {
     fn find_process_by_pid(&self, pid: usize) -> KernelResult<&Process> {
         self.processes
             .get(&pid)
-            .or_else(|| self.processes.values().find(|process| !process.is_thread && process.tgid == pid))
+            .or_else(|| {
+                self.processes
+                    .values()
+                    .find(|process| !process.is_thread && process.tgid == pid)
+            })
             .ok_or(ENOENT)
     }
 
@@ -888,7 +964,17 @@ mod tests {
         table.set_tid_address(0x4000).unwrap();
         table.setgroups_current(&[10, 20]).unwrap();
         table.send_signal(pid, 10).unwrap();
-        table.set_sigaction(10, SigAction { handler: 1, flags: 2, restorer: 3, mask: 4 }).unwrap();
+        table
+            .set_sigaction(
+                10,
+                SigAction {
+                    handler: 1,
+                    flags: 2,
+                    restorer: 3,
+                    mask: 4,
+                },
+            )
+            .unwrap();
 
         let process = table.current().unwrap();
         let creds = process.credentials();
@@ -910,12 +996,30 @@ mod tests {
         let mut table = ProcessTable::new();
         let leader = table.spawn_init("init", 0x1000);
         table.set_current(leader).unwrap();
-        let addr = table.current().unwrap().address_space.map_anonymous(4096, 0b11).unwrap();
-        table.current_mut().unwrap().address_space.write_bytes(addr, b"x").unwrap();
+        let addr = table
+            .current()
+            .unwrap()
+            .address_space
+            .map_anonymous(4096, 0b11)
+            .unwrap();
+        table
+            .current_mut()
+            .unwrap()
+            .address_space
+            .write_bytes(addr, b"x")
+            .unwrap();
 
         let thread = table.clone_thread_from_current(0, None).unwrap();
         table.set_current(thread).unwrap();
-        assert_eq!(table.current().unwrap().address_space.read_bytes(addr, 1).unwrap(), b"x");
+        assert_eq!(
+            table
+                .current()
+                .unwrap()
+                .address_space
+                .read_bytes(addr, 1)
+                .unwrap(),
+            b"x"
+        );
         assert_eq!(table.current().unwrap().tgid, leader);
         assert_ne!(table.gettid().unwrap(), table.current_pid().unwrap());
 
@@ -924,7 +1028,9 @@ mod tests {
         table.set_current(child).unwrap();
         table.exit_current_thread(7).unwrap();
         table.set_current(leader).unwrap();
-        let (waited, status) = table.wait_child(leader, WaitSelector::Pid(child), 0).unwrap();
+        let (waited, status) = table
+            .wait_child(leader, WaitSelector::Pid(child), 0)
+            .unwrap();
         assert_eq!(waited, child);
         assert_eq!(status, 7 << 8);
     }

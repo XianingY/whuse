@@ -1,0 +1,9 @@
+[package]
+name = "hal-loongarch64-virt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hal-api = { path = "../hal-api" }
+spin.workspace = true

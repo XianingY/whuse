@@ -1,0 +1,9 @@
+[package]
+name = "whuse-loongarch64-virt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hal-loongarch64-virt = { path = "../../crates/hal-loongarch64-virt" }
+kernel-core = { path = "../../crates/kernel-core" }

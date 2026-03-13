@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hal-loongarch64-virt"
+version = "0.1.0"
+dependencies = [
+ "hal-api",
+ "spin",
+]
+
+[[package]]
 name = "hal-riscv64-virt"
 version = "0.1.0"
 dependencies = [
@@ -99,6 +107,14 @@ name = "vfs"
 version = "0.1.0"
 dependencies = [
  "spin",
+]
+
+[[package]]
+name = "whuse-loongarch64-virt"
+version = "0.1.0"
+dependencies = [
+ "hal-loongarch64-virt",
+ "kernel-core",
 ]
 
 [[package]]

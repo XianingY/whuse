@@ -2,13 +2,13 @@
 
 extern crate alloc;
 
+use alloc::format;
+use alloc::string::String;
 use core::fmt::{self, Write};
 use hal_api::{hal, ConsoleWriter, PlatformArch};
 use mm::MemoryManager;
 use proc::ProcessTable;
-use syscall::{
-    SyscallArgs, SyscallDispatcher, SYS_EXECVE,
-};
+use syscall::{SyscallArgs, SyscallDispatcher, SYS_EXECVE};
 use task::Scheduler;
 use vfs::KernelVfs;
 
@@ -31,7 +31,10 @@ pub struct Kernel {
 impl Kernel {
     pub fn bootstrap(info: BootInfo) -> Self {
         logln(format_args!("whuse: booting on {}", info.platform));
-        logln(format_args!("whuse: hart={} dtb={:#x}", info.hart_id, info.dtb_pa));
+        logln(format_args!(
+            "whuse: hart={} dtb={:#x}",
+            info.hart_id, info.dtb_pa
+        ));
         logln(format_args!(
             "whuse: hal platform={} arch={:?}",
             hal().platform.platform_name(),
@@ -46,15 +49,50 @@ impl Kernel {
 
         let mut vfs = KernelVfs::new();
         let _ = user_init::seed_filesystem(&mut vfs);
+        let mut rootfs_summary = String::from("builtin tmpfs/devfs/procfs-lite");
+        if let Some(device) = hal().block_devices.first().copied() {
+            match vfs.mount_ext4(device.name(), "/", device) {
+                Ok(label) => {
+                    let display = if label.is_empty() {
+                        device.name()
+                    } else {
+                        label.as_str()
+                    };
+                    logln(format_args!(
+                        "whuse: mounted ext4 root from {} label={}",
+                        device.name(),
+                        display,
+                    ));
+                    rootfs_summary = format!("ext4({display}) over builtin special mounts");
+                }
+                Err(err) => {
+                    logln(format_args!(
+                        "whuse: ext4 root mount from {} unavailable ({})",
+                        device.name(),
+                        err,
+                    ));
+                }
+            }
+        }
 
         let mut processes = ProcessTable::new();
-        let init_entry = user_init::builtin_program("/sbin/init")
-            .or_else(|| user_init::builtin_program("/bin/init"))
+        let init_program = user_init::builtin_program("/sbin/init")
+            .or_else(|| user_init::builtin_program("/bin/init"));
+        let init_entry = init_program
+            .as_ref()
             .map(|program| program.image.as_ptr() as usize + program.entry)
             .unwrap_or(0);
         let init_pid = processes.spawn_init("init", init_entry);
-        processes.set_current(init_pid).expect("init tid must exist");
-        if init_entry == 0 {
+        processes
+            .set_current(init_pid)
+            .expect("init tid must exist");
+        if let Some(program) = init_program {
+            let start = program.image.as_ptr() as usize;
+            let process = processes.current_mut().expect("init process must exist");
+            let _ = process
+                .address_space
+                .install_host_range(start, program.image.len(), 0b101);
+        } else {
             user_init::seed_process(processes.current_mut().expect("init process must exist"));
         }
 
@@ -64,7 +102,7 @@ impl Kernel {
 
         let memory = MemoryManager::from_hal(hal().memory);
         logln(format_args!("whuse: memory initialized"));
-        logln(format_args!("whuse: rootfs mounted with devfs/procfs-lite"));
+        logln(format_args!("whuse: rootfs mounted {}", rootfs_summary));
 
         let kernel = Self {
             info,
@@ -117,7 +155,9 @@ impl Kernel {
                 Ok(process) => process,
                 Err(_) => return,
             };
-            hal().cpu.switch_address_space(process.address_space.token());
+            hal()
+                .cpu
+                .switch_address_space(process.address_space.token());
         }
 
         {
@@ -149,20 +189,20 @@ impl Kernel {
         };
 
         if is_syscall {
-                let result = self.syscalls.dispatch(
-                    sysno,
-                    SyscallArgs(args),
-                    &mut self.processes,
-                    &mut self.scheduler,
-                    &mut self.vfs,
-                );
-                if let Ok(process) = self.processes.current_mut() {
-                    process.trap_frame.set_retval(result as usize);
-                    if sysno != SYS_EXECVE {
-                        process.trap_frame.sepc = sepc + 4;
-                    }
+            let result = self.syscalls.dispatch(
+                sysno,
+                SyscallArgs(args),
+                &mut self.processes,
+                &mut self.scheduler,
+                &mut self.vfs,
+            );
+            if let Ok(process) = self.processes.current_mut() {
+                process.trap_frame.set_retval(result as usize);
+                if sysno != SYS_EXECVE || (result as i32) < 0 {
+                    process.trap_frame.sepc = sepc + 4;
                 }
-                return;
+            }
+            return;
         }
 
         logln(format_args!(

@@ -318,6 +318,10 @@ pub fn seed_filesystem(vfs: &mut KernelVfs) -> KernelResult<()> {
     vfs.create_file("/", "/etc/motd", INIT_BANNER.as_bytes())?;
     vfs.create_file("/", "/bin/init", b"builtin /sbin/init\n")?;
     vfs.create_file("/", "/bin/child", b"builtin-child")?;
+    vfs.create_file("/", "/bin/init-runner", b"builtin /sbin/init\n")?;
+    vfs.create_file("/", "/bin/fork-exec-wait", b"builtin /sbin/init\n")?;
+    vfs.create_file("/", "/bin/thread-futex", b"builtin /sbin/init\n")?;
+    vfs.create_file("/", "/bin/signal-basic", b"builtin /bin/child\n")?;
     vfs.create_file("/", "/proc/version", b"whuse-riscv64-virt")?;
     Ok(())
 }
@@ -349,6 +353,26 @@ pub fn builtin_program(path: &str) -> Option<BuiltinProgram> {
                 &whuse_user_init_end,
             )),
             "/bin/child" => Some(program_from_symbols(
+                &whuse_user_child_start,
+                &whuse_user_child_entry,
+                &whuse_user_child_end,
+            )),
+            "/bin/init-runner" => Some(program_from_symbols(
+                &whuse_user_init_start,
+                &whuse_user_init_entry,
+                &whuse_user_init_end,
+            )),
+            "/bin/fork-exec-wait" => Some(program_from_symbols(
+                &whuse_user_init_start,
+                &whuse_user_init_entry,
+                &whuse_user_init_end,
+            )),
+            "/bin/thread-futex" => Some(program_from_symbols(
+                &whuse_user_init_start,
+                &whuse_user_init_entry,
+                &whuse_user_init_end,
+            )),
+            "/bin/signal-basic" => Some(program_from_symbols(
                 &whuse_user_child_start,
                 &whuse_user_child_entry,
                 &whuse_user_child_end,

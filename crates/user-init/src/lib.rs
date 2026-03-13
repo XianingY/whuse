@@ -2,10 +2,13 @@
 
 extern crate alloc;
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 use core::arch::global_asm;
+use alloc::string::String;
 use proc::Process;
 use vfs::{KernelResult, KernelVfs};
+
+include!(concat!(env!("OUT_DIR"), "/generated_rootfs.rs"));
 
 pub const INIT_BANNER: &str = "whuse: init process bootstrapped\n";
 
@@ -245,7 +248,55 @@ whuse_user_child_end:
 "#
 );
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(target_arch = "loongarch64")]
+global_asm!(
+    r#"
+    .section .text.whuse_user_init, "ax"
+    .balign 8
+    .global whuse_user_init_start
+    .global whuse_user_init_entry
+    .global whuse_user_init_end
+whuse_user_init_start:
+whuse_user_init_entry:
+    addi.d $sp, $sp, -32
+    ori $a0, $zero, 1
+    la.local $a1, init_msg
+    la.local $a2, init_msg_end
+    sub.d $a2, $a2, $a1
+    ori $a7, $zero, 64
+    syscall 0
+    ori $a0, $zero, 0
+    ori $a7, $zero, 93
+    syscall 0
+init_msg:
+    .ascii "user:init entered (loongarch)\n"
+init_msg_end:
+whuse_user_init_end:
+
+    .section .text.whuse_user_child, "ax"
+    .balign 8
+    .global whuse_user_child_start
+    .global whuse_user_child_entry
+    .global whuse_user_child_end
+whuse_user_child_start:
+whuse_user_child_entry:
+    ori $a0, $zero, 1
+    la.local $a1, child_msg
+    la.local $a2, child_msg_end
+    sub.d $a2, $a2, $a1
+    ori $a7, $zero, 64
+    syscall 0
+    ori $a0, $zero, 42
+    ori $a7, $zero, 93
+    syscall 0
+child_msg:
+    .ascii "user:child exec ok (loongarch)\n"
+child_msg_end:
+whuse_user_child_end:
+"#
+);
+
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 unsafe extern "C" {
     static whuse_user_init_start: u8;
     static whuse_user_init_entry: u8;
@@ -256,8 +307,16 @@ unsafe extern "C" {
 }
 
 pub fn seed_filesystem(vfs: &mut KernelVfs) -> KernelResult<()> {
+    for (path, data) in ROOTFS_ENTRIES {
+        if let Some(parent) = path.rsplit_once('/') {
+            if !parent.0.is_empty() {
+                create_dir_chain(vfs, parent.0)?;
+            }
+        }
+        let _ = vfs.create_file("/", path, data);
+    }
     vfs.create_file("/", "/etc/motd", INIT_BANNER.as_bytes())?;
-    vfs.create_file("/", "/bin/init", b"builtin-init")?;
+    vfs.create_file("/", "/bin/init", b"builtin /sbin/init\n")?;
     vfs.create_file("/", "/bin/child", b"builtin-child")?;
     vfs.create_file("/", "/proc/version", b"whuse-riscv64-virt")?;
     Ok(())
@@ -271,10 +330,20 @@ pub fn seed_process(process: &mut Process) {
 }
 
 pub fn builtin_program(path: &str) -> Option<BuiltinProgram> {
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     unsafe {
         return match path {
+            "/sbin/init" => Some(program_from_symbols(
+                &whuse_user_init_start,
+                &whuse_user_init_entry,
+                &whuse_user_init_end,
+            )),
             "/bin/init" => Some(program_from_symbols(
+                &whuse_user_init_start,
+                &whuse_user_init_entry,
+                &whuse_user_init_end,
+            )),
+            "/bin/sh" => Some(program_from_symbols(
                 &whuse_user_init_start,
                 &whuse_user_init_entry,
                 &whuse_user_init_end,
@@ -288,14 +357,14 @@ pub fn builtin_program(path: &str) -> Option<BuiltinProgram> {
         };
     }
 
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     {
         let _ = path;
         None
     }
 }
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 unsafe fn program_from_symbols(start: &u8, entry: &u8, end: &u8) -> BuiltinProgram {
     let start_ptr = start as *const u8 as usize;
     let end_ptr = end as *const u8 as usize;
@@ -304,4 +373,16 @@ unsafe fn program_from_symbols(start: &u8, entry: &u8, end: &u8) -> BuiltinProgr
         entry: entry_ptr - start_ptr,
         image: core::slice::from_raw_parts(start as *const u8, end_ptr - start_ptr),
     }
+}
+
+fn create_dir_chain(vfs: &mut KernelVfs, path: &str) -> KernelResult<()> {
+    let mut current = String::new();
+    for component in path.split('/').filter(|segment| !segment.is_empty()) {
+        current.push('/');
+        current.push_str(component);
+        if current != "/" {
+            let _ = vfs.mkdir("/", &current, 0o755);
+        }
+    }
+    Ok(())
 }

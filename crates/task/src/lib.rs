@@ -209,7 +209,11 @@ impl Scheduler {
 
     pub fn exit_group(&mut self, process_id: usize) -> usize {
         let mut removed = 0;
-        if self.current.as_ref().is_some_and(|task| task.process_id == process_id) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|task| task.process_id == process_id)
+        {
             self.current = None;
             removed += 1;
         }

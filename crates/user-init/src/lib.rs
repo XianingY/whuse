@@ -2,9 +2,9 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 use core::arch::global_asm;
-use alloc::string::String;
 use proc::Process;
 use vfs::{KernelResult, KernelVfs};
 
@@ -162,9 +162,55 @@ whuse_user_init_entry:
     li a7, 64
     ecall
 
+    addi s8, sp, 96
+    sw zero, 0(s8)
+    li a0, 0x310f00
+    li a1, 0
+    mv a2, s8
+    mv a3, s8
+    li a4, 0
     li a7, 220
     ecall
     beqz a0, 1f
+    mv s9, a0
+    mv a0, s8
+    li a1, 0
+    mv a2, s9
+    li a3, 0
+    li a4, 0
+    li a5, 0
+    li a7, 98
+    ecall
+    lw t0, 0(s8)
+    bnez t0, 3f
+    li a0, 1
+    la a1, clone_msg
+    li a2, clone_msg_end - clone_msg
+    li a7, 64
+    ecall
+    j 2f
+1:
+    li a0, 0
+    li a7, 93
+    ecall
+3:
+    li a0, 1
+    la a1, clone_fail_msg
+    li a2, clone_fail_msg_end - clone_fail_msg
+    li a7, 64
+    ecall
+    li a0, 98
+    li a7, 94
+    ecall
+2:
+    li a0, 1
+    la a1, fork_msg
+    li a2, fork_msg_end - fork_msg
+    li a7, 64
+    ecall
+    li a7, 220
+    ecall
+    beqz a0, 4f
     mv s0, a0
     li a7, 124
     ecall
@@ -177,21 +223,21 @@ whuse_user_init_entry:
     li a2, parent_msg_end - parent_msg
     li a7, 64
     ecall
+    li a0, 1
+    la a1, final_msg
+    li a2, final_msg_end - final_msg
+    li a7, 64
+    ecall
     li a0, 0
     li a7, 94
     ecall
-1:
-    la a0, child_path
-    li a1, 0
-    li a2, 0
-    li a7, 221
-    ecall
+4:
     li a0, 1
-    la a1, exec_fail_msg
-    li a2, exec_fail_msg_end - exec_fail_msg
+    la a1, fork_child_msg
+    li a2, fork_child_msg_end - fork_child_msg
     li a7, 64
     ecall
-    li a0, 99
+    li a0, 42
     li a7, 94
     ecall
 
@@ -210,14 +256,24 @@ signal_msg_end:
 shm_msg:
     .ascii "user:shm ok\n"
 shm_msg_end:
+clone_msg:
+    .ascii "user:clone futex ok\n"
+clone_msg_end:
+clone_fail_msg:
+    .ascii "user:clone futex failed\n"
+clone_fail_msg_end:
+fork_msg:
+    .ascii "user:fork start\n"
+fork_msg_end:
+fork_child_msg:
+    .ascii "user:fork child ok\n"
+fork_child_msg_end:
 parent_msg:
     .ascii "user:init wait complete\n"
 parent_msg_end:
-exec_fail_msg:
-    .ascii "user:init execve failed\n"
-exec_fail_msg_end:
-child_path:
-    .asciz "/bin/child"
+final_msg:
+    .ascii "user:integration ok\n"
+final_msg_end:
 one64:
     .dword 1
 sock_payload:
@@ -328,8 +384,12 @@ pub fn seed_filesystem(vfs: &mut KernelVfs) -> KernelResult<()> {
 
 pub fn seed_process(process: &mut Process) {
     process.address_space.install_bytes(0x1000, b"/etc/motd\0");
-    process.address_space.install_bytes(0x2000, b"/tmp/boot.log\0");
-    process.address_space.install_bytes(0x3000, b"hello from init\n\0");
+    process
+        .address_space
+        .install_bytes(0x2000, b"/tmp/boot.log\0");
+    process
+        .address_space
+        .install_bytes(0x3000, b"hello from init\n\0");
     process.address_space.install_bytes(0x4000, &[0; 256]);
 }
 

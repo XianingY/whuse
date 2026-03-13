@@ -113,10 +113,19 @@ pub trait HalInterrupt: Send + Sync {
 
 pub trait HalBlockDevice: Send + Sync {
     fn name(&self) -> &'static str;
+    fn init(&self) -> Result<(), i32> {
+        Ok(())
+    }
+    fn is_ready(&self) -> bool {
+        self.sector_count() != 0
+    }
     fn sector_size(&self) -> usize;
     fn sector_count(&self) -> usize;
     fn read_sector(&self, sector: usize, buf: &mut [u8]) -> Result<(), i32>;
     fn write_sector(&self, sector: usize, buf: &[u8]) -> Result<(), i32>;
+    fn flush(&self) -> Result<(), i32> {
+        Ok(())
+    }
 }
 
 pub trait HalCharDevice: Send + Sync {
@@ -127,12 +136,21 @@ pub trait HalCharDevice: Send + Sync {
 
 pub trait HalNetDevice: Send + Sync {
     fn name(&self) -> &'static str;
+    fn init(&self) -> Result<(), i32> {
+        Ok(())
+    }
+    fn is_ready(&self) -> bool {
+        self.can_send() || self.can_recv()
+    }
     fn mac_address(&self) -> [u8; 6];
     fn mtu(&self) -> usize;
     fn can_send(&self) -> bool;
     fn can_recv(&self) -> bool;
     fn send_frame(&self, frame: &[u8]) -> Result<usize, i32>;
     fn recv_frame(&self, frame: &mut [u8]) -> Result<usize, i32>;
+    fn poll(&self) -> Result<(), i32> {
+        Ok(())
+    }
 }
 
 pub trait HalPlatform: Send + Sync {

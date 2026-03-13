@@ -9,6 +9,7 @@ use alloc::string::{String, ToString};
 pub enum TaskState {
     Ready,
     Running,
+    Blocked,
     Exited,
 }
 
@@ -52,6 +53,14 @@ impl Scheduler {
         self.schedule_next()
     }
 
+    pub fn ensure_current(&mut self) -> Option<usize> {
+        if let Some(current) = &self.current {
+            Some(current.id)
+        } else {
+            self.schedule_next()
+        }
+    }
+
     pub fn yield_now(&mut self) -> Option<usize> {
         if let Some(mut current) = self.current.take() {
             if current.state != TaskState::Exited {
@@ -70,6 +79,10 @@ impl Scheduler {
 
     pub fn current(&self) -> Option<&Task> {
         self.current.as_ref()
+    }
+
+    pub fn current_process_id(&self) -> Option<usize> {
+        self.current.as_ref().map(|task| task.process_id)
     }
 
     fn schedule_next(&mut self) -> Option<usize> {
@@ -94,4 +107,3 @@ mod tests {
         assert_eq!(scheduler.yield_now(), Some(b));
     }
 }
-

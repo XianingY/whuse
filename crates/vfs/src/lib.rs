@@ -69,9 +69,43 @@ pub struct FileHandle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectKind {
+    Regular,
+    Directory,
+    Pipe,
+    EventFd,
+    Epoll,
+    MemFd,
+    PidFd,
+    SocketLocal,
+    CharDevice,
+    Procfs,
+    Symlink,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EpollWatch {
     pub fd: i32,
     pub events: u32,
+}
+
+pub trait KernelObject {
+    fn object_kind(&self) -> ObjectKind;
+    fn read_object(&mut self, len: usize) -> KernelResult<Vec<u8>>;
+    fn write_object(&mut self, data: &[u8]) -> KernelResult<usize>;
+    fn seek_object(&mut self, offset: isize, whence: u32) -> KernelResult<usize>;
+    fn poll_read_ready(&self) -> bool;
+    fn poll_write_ready(&self) -> bool;
+    fn stat_object(&self) -> KernelResult<FileStat>;
+    fn ioctl_object(&mut self, _cmd: usize, _arg: usize) -> KernelResult<usize> {
+        Err(EINVAL)
+    }
+    fn fcntl_object(&mut self, _cmd: usize, _arg: usize) -> KernelResult<usize> {
+        Err(EINVAL)
+    }
+    fn close_object(&mut self) -> KernelResult<()> {
+        Ok(())
+    }
 }
 
 struct Node {
@@ -202,98 +236,15 @@ impl KernelVfs {
     }
 
     pub fn read(&self, handle: &mut FileHandle, len: usize) -> KernelResult<Vec<u8>> {
-        match &mut *handle.node.data.lock() {
-            NodeData::Directory(_) => Err(EISDIR),
-            NodeData::File(buf) | NodeData::ProcFile(buf) => {
-                let start = handle.offset.min(buf.len());
-                let end = (start + len).min(buf.len());
-                handle.offset = end;
-                Ok(buf[start..end].to_vec())
-            }
-            NodeData::Pipe(buf) => {
-                let end = len.min(buf.len());
-                Ok(buf.drain(..end).collect())
-            }
-            NodeData::Symlink(target) => Ok(target.as_bytes()[..target.len().min(len)].to_vec()),
-            NodeData::Event(counter) => {
-                if len < 8 {
-                    return Err(EINVAL);
-                }
-                let value = *counter;
-                *counter = 0;
-                Ok(value.to_le_bytes().to_vec())
-            }
-            NodeData::Epoll(_) | NodeData::SocketPending(_) | NodeData::PidFd(_) => Err(EINVAL),
-            NodeData::SocketConnected { channel, side } => {
-                let mut guard = channel.lock();
-                let inbox = &mut guard.inbox[*side];
-                let end = len.min(inbox.len());
-                Ok(inbox.drain(..end).collect())
-            }
-            NodeData::CharDevice => Ok(Vec::new()),
-        }
+        handle.read_object(len)
     }
 
     pub fn write(&mut self, handle: &mut FileHandle, data: &[u8]) -> KernelResult<usize> {
-        match &mut *handle.node.data.lock() {
-            NodeData::Directory(_) => Err(EISDIR),
-            NodeData::File(buf) | NodeData::ProcFile(buf) => {
-                if handle.offset > buf.len() {
-                    buf.resize(handle.offset, 0);
-                }
-                if handle.offset + data.len() > buf.len() {
-                    buf.resize(handle.offset + data.len(), 0);
-                }
-                buf[handle.offset..handle.offset + data.len()].copy_from_slice(data);
-                handle.offset += data.len();
-                Ok(data.len())
-            }
-            NodeData::Pipe(buf) => {
-                buf.extend_from_slice(data);
-                Ok(data.len())
-            }
-            NodeData::Symlink(_) | NodeData::Epoll(_) | NodeData::SocketPending(_) | NodeData::PidFd(_) => {
-                Err(EINVAL)
-            }
-            NodeData::Event(counter) => {
-                if data.len() < 8 {
-                    return Err(EINVAL);
-                }
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&data[..8]);
-                *counter = counter.saturating_add(u64::from_le_bytes(bytes));
-                Ok(8)
-            }
-            NodeData::SocketConnected { channel, side } => {
-                let mut guard = channel.lock();
-                let peer = 1 - *side;
-                guard.inbox[peer].extend(data.iter().copied());
-                Ok(data.len())
-            }
-            NodeData::CharDevice => Ok(data.len()),
-        }
+        handle.write_object(data)
     }
 
     pub fn seek(&self, handle: &mut FileHandle, offset: isize, whence: u32) -> KernelResult<usize> {
-        if matches!(
-            handle.node.kind,
-            NodeKind::Pipe | NodeKind::Event | NodeKind::Epoll | NodeKind::Socket | NodeKind::PidFd
-        ) {
-            return Err(EINVAL);
-        }
-        let size = self.stat(&handle.node)?.size as isize;
-        let base = match whence {
-            0 => 0,
-            1 => handle.offset as isize,
-            2 => size,
-            _ => return Err(EINVAL),
-        };
-        let new_offset = base.checked_add(offset).ok_or(EINVAL)?;
-        if new_offset < 0 {
-            return Err(EINVAL);
-        }
-        handle.offset = new_offset as usize;
-        Ok(handle.offset)
+        handle.seek_object(offset, whence)
     }
 
     pub fn getdents(&self, handle: &mut FileHandle) -> KernelResult<Vec<u8>> {
@@ -673,25 +624,15 @@ impl KernelVfs {
     }
 
     pub fn is_read_ready(&self, handle: &FileHandle) -> bool {
-        match &*handle.node.data.lock() {
-            NodeData::Directory(_) => true,
-            NodeData::File(_) | NodeData::ProcFile(_) | NodeData::CharDevice => true,
-            NodeData::Pipe(buf) => !buf.is_empty(),
-            NodeData::Symlink(_) => true,
-            NodeData::Event(counter) => *counter != 0,
-            NodeData::Epoll(_) => true,
-            NodeData::SocketPending(state) => !state.pending.is_empty(),
-            NodeData::SocketConnected { channel, side } => !channel.lock().inbox[*side].is_empty(),
-            NodeData::PidFd(_) => true,
-        }
+        handle.poll_read_ready()
     }
 
     pub fn is_write_ready(&self, handle: &FileHandle) -> bool {
-        !matches!(&*handle.node.data.lock(), NodeData::Directory(_) | NodeData::PidFd(_))
+        handle.poll_write_ready()
     }
 
     pub fn stat_handle(&self, handle: &FileHandle) -> KernelResult<FileStat> {
-        self.stat(&handle.node)
+        handle.stat_object()
     }
 
     pub fn is_pipe(&self, handle: &FileHandle) -> bool {
@@ -781,6 +722,177 @@ impl KernelVfs {
             size,
             nlink: 1,
         })
+    }
+}
+
+impl FileHandle {
+    fn stat_from_locked(&self) -> FileStat {
+        let size = match &*self.node.data.lock() {
+            NodeData::Directory(entries) => entries.len() as u64,
+            NodeData::File(buf) | NodeData::ProcFile(buf) => buf.len() as u64,
+            NodeData::Pipe(buf) => buf.len() as u64,
+            NodeData::Symlink(target) => target.len() as u64,
+            NodeData::Event(_) => 8,
+            NodeData::Epoll(watches) => watches.len() as u64,
+            NodeData::SocketPending(state) => state.pending.len() as u64,
+            NodeData::SocketConnected { channel, side } => channel.lock().inbox[*side].len() as u64,
+            NodeData::PidFd(_) => 0,
+            NodeData::CharDevice => 0,
+        };
+        let mode = match self.node.kind {
+            NodeKind::Directory => S_IFDIR | 0o755,
+            NodeKind::File | NodeKind::Proc => S_IFREG | 0o644,
+            NodeKind::CharDevice => S_IFCHR | 0o600,
+            NodeKind::Pipe => S_IFIFO | 0o644,
+            NodeKind::Symlink => S_IFLNK | 0o777,
+            NodeKind::Event | NodeKind::Epoll | NodeKind::Socket => S_IFSOCK | 0o644,
+            NodeKind::PidFd => S_IFREG | 0o444,
+        };
+        FileStat {
+            mode,
+            size,
+            nlink: 1,
+        }
+    }
+}
+
+impl KernelObject for FileHandle {
+    fn object_kind(&self) -> ObjectKind {
+        match self.node.kind {
+            NodeKind::Directory => ObjectKind::Directory,
+            NodeKind::File => {
+                if self.path.starts_with("memfd:") {
+                    ObjectKind::MemFd
+                } else {
+                    ObjectKind::Regular
+                }
+            }
+            NodeKind::CharDevice => ObjectKind::CharDevice,
+            NodeKind::Proc => ObjectKind::Procfs,
+            NodeKind::Pipe => ObjectKind::Pipe,
+            NodeKind::Symlink => ObjectKind::Symlink,
+            NodeKind::Event => ObjectKind::EventFd,
+            NodeKind::Epoll => ObjectKind::Epoll,
+            NodeKind::Socket => ObjectKind::SocketLocal,
+            NodeKind::PidFd => ObjectKind::PidFd,
+        }
+    }
+
+    fn read_object(&mut self, len: usize) -> KernelResult<Vec<u8>> {
+        match &mut *self.node.data.lock() {
+            NodeData::Directory(_) => Err(EISDIR),
+            NodeData::File(buf) | NodeData::ProcFile(buf) => {
+                let start = self.offset.min(buf.len());
+                let end = (start + len).min(buf.len());
+                self.offset = end;
+                Ok(buf[start..end].to_vec())
+            }
+            NodeData::Pipe(buf) => {
+                let end = len.min(buf.len());
+                Ok(buf.drain(..end).collect())
+            }
+            NodeData::Symlink(target) => Ok(target.as_bytes()[..target.len().min(len)].to_vec()),
+            NodeData::Event(counter) => {
+                if len < 8 {
+                    return Err(EINVAL);
+                }
+                let value = *counter;
+                *counter = 0;
+                Ok(value.to_le_bytes().to_vec())
+            }
+            NodeData::Epoll(_) | NodeData::SocketPending(_) | NodeData::PidFd(_) => Err(EINVAL),
+            NodeData::SocketConnected { channel, side } => {
+                let mut guard = channel.lock();
+                let inbox = &mut guard.inbox[*side];
+                let end = len.min(inbox.len());
+                Ok(inbox.drain(..end).collect())
+            }
+            NodeData::CharDevice => Ok(Vec::new()),
+        }
+    }
+
+    fn write_object(&mut self, data: &[u8]) -> KernelResult<usize> {
+        match &mut *self.node.data.lock() {
+            NodeData::Directory(_) => Err(EISDIR),
+            NodeData::File(buf) | NodeData::ProcFile(buf) => {
+                if self.offset > buf.len() {
+                    buf.resize(self.offset, 0);
+                }
+                if self.offset + data.len() > buf.len() {
+                    buf.resize(self.offset + data.len(), 0);
+                }
+                buf[self.offset..self.offset + data.len()].copy_from_slice(data);
+                self.offset += data.len();
+                Ok(data.len())
+            }
+            NodeData::Pipe(buf) => {
+                buf.extend_from_slice(data);
+                Ok(data.len())
+            }
+            NodeData::Symlink(_) | NodeData::Epoll(_) | NodeData::SocketPending(_) | NodeData::PidFd(_) => {
+                Err(EINVAL)
+            }
+            NodeData::Event(counter) => {
+                if data.len() < 8 {
+                    return Err(EINVAL);
+                }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&data[..8]);
+                *counter = counter.saturating_add(u64::from_le_bytes(bytes));
+                Ok(8)
+            }
+            NodeData::SocketConnected { channel, side } => {
+                let mut guard = channel.lock();
+                let peer = 1 - *side;
+                guard.inbox[peer].extend(data.iter().copied());
+                Ok(data.len())
+            }
+            NodeData::CharDevice => Ok(data.len()),
+        }
+    }
+
+    fn seek_object(&mut self, offset: isize, whence: u32) -> KernelResult<usize> {
+        if matches!(
+            self.node.kind,
+            NodeKind::Pipe | NodeKind::Event | NodeKind::Epoll | NodeKind::Socket | NodeKind::PidFd
+        ) {
+            return Err(EINVAL);
+        }
+        let size = self.stat_from_locked().size as isize;
+        let base = match whence {
+            0 => 0,
+            1 => self.offset as isize,
+            2 => size,
+            _ => return Err(EINVAL),
+        };
+        let new_offset = base.checked_add(offset).ok_or(EINVAL)?;
+        if new_offset < 0 {
+            return Err(EINVAL);
+        }
+        self.offset = new_offset as usize;
+        Ok(self.offset)
+    }
+
+    fn poll_read_ready(&self) -> bool {
+        match &*self.node.data.lock() {
+            NodeData::Directory(_) => true,
+            NodeData::File(_) | NodeData::ProcFile(_) | NodeData::CharDevice => true,
+            NodeData::Pipe(buf) => !buf.is_empty(),
+            NodeData::Symlink(_) => true,
+            NodeData::Event(counter) => *counter != 0,
+            NodeData::Epoll(_) => true,
+            NodeData::SocketPending(state) => !state.pending.is_empty(),
+            NodeData::SocketConnected { channel, side } => !channel.lock().inbox[*side].is_empty(),
+            NodeData::PidFd(_) => true,
+        }
+    }
+
+    fn poll_write_ready(&self) -> bool {
+        !matches!(&*self.node.data.lock(), NodeData::Directory(_) | NodeData::PidFd(_))
+    }
+
+    fn stat_object(&self) -> KernelResult<FileStat> {
+        Ok(self.stat_from_locked())
     }
 }
 
@@ -924,7 +1036,7 @@ fn align_up(value: usize, alignment: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{KernelVfs, O_CREAT, O_RDWR};
+    use super::{KernelObject, KernelVfs, ObjectKind, O_CREAT, O_RDWR};
 
     #[test]
     fn vfs_file_round_trip() {
@@ -934,5 +1046,23 @@ mod tests {
         vfs.seek(&mut file, 0, 0).unwrap();
         assert_eq!(vfs.read(&mut file, 5).unwrap(), b"hello");
         assert_eq!(vfs.chdir("/", "/tmp").unwrap(), "/tmp");
+    }
+
+    #[test]
+    fn object_layer_reports_backend_kind() {
+        let mut vfs = KernelVfs::new();
+
+        let event = vfs.create_eventfd(1).unwrap();
+        assert_eq!(event.object_kind(), ObjectKind::EventFd);
+        assert!(event.poll_read_ready());
+
+        let mut memfd = vfs.create_memfd("demo").unwrap();
+        assert_eq!(memfd.object_kind(), ObjectKind::MemFd);
+        memfd.write_object(b"abc").unwrap();
+        memfd.seek_object(0, 0).unwrap();
+        assert_eq!(memfd.read_object(3).unwrap(), b"abc");
+
+        let regular = vfs.open("/", "/tmp/object.txt", O_CREAT | O_RDWR, 0o644).unwrap();
+        assert_eq!(regular.object_kind(), ObjectKind::Regular);
     }
 }

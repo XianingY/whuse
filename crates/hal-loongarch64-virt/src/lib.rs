@@ -4,12 +4,28 @@
 use core::arch::global_asm;
 #[cfg(target_arch = "loongarch64")]
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use hal_api::{
     register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
     HalNetDevice, HalPlatform, HalPlatformLifecycle, HalTimer, MemoryRegion, PlatformArch,
     Timespec, TrapFrame, VmSpaceToken,
 };
+use hal_virtio::{
+    LoongArchInterruptConfig, LoongArchVirtioDiscovery, PciHostConfig, PciHostWindow,
+    VirtioBlockConfig, VirtioDmaArena, parse_loongarch_virtio_discovery,
+    virtio_error_to_errno,
+};
+use spin::{Mutex, Once};
+use virtio_drivers::BufferDirection;
+use virtio_drivers::Hal as VirtioHal;
+use virtio_drivers::device::blk::{BlkReq, BlkResp, SECTOR_SIZE, VirtIOBlk};
+use virtio_drivers::transport::InterruptStatus;
+use virtio_drivers::transport::SomeTransport;
+use virtio_drivers::transport::pci::bus::{
+    BarInfo, Cam, Command, ConfigurationAccess, DeviceFunction, MemoryBarType, MmioCam, PciRoot,
+};
+use virtio_drivers::transport::pci::{PciTransport, virtio_device_type};
 
 #[cfg(target_arch = "loongarch64")]
 #[no_mangle]
@@ -144,18 +160,24 @@ pub const MMIO_PHYS_BASE: usize = 0x1000_0000;
 pub const UART0_BASE: usize = UART0_PHYS_BASE;
 pub const PHYS_MEM_BASE: usize = 0x9000_0000;
 pub const PHYS_MEM_SIZE: usize = 128 * 1024 * 1024;
+const DMA_ARENA_BYTES: usize = 2 * 1024 * 1024;
+const DMA_ARENA_WORDS: usize = DMA_ARENA_BYTES / SECTOR_SIZE / 64;
+const ENODEV: i32 = 19;
+const EINVAL: i32 = 22;
+const EROFS: i32 = 30;
 
 static CPU: VirtCpu = VirtCpu::new();
-static INTERRUPT: VirtInterruptController = VirtInterruptController;
+static INTERRUPT: VirtInterruptController = VirtInterruptController::new();
 static PLATFORM: VirtPlatform = VirtPlatform;
 static LIFECYCLE: VirtLifecycle = VirtLifecycle;
 static MEMORY: VirtMemory = VirtMemory;
 static TIMER: VirtTimer = VirtTimer::new();
 static UART: Ns16550 = Ns16550::new(UART0_BASE);
-static VIRTIO_BLK: VirtioBlockStub = VirtioBlockStub;
+static VIRTIO_BLK: VirtioBlockDevice = VirtioBlockDevice::new();
 static VIRTIO_NET: VirtioNetStub = VirtioNetStub;
 static BLOCK_DEVS: [&'static dyn HalBlockDevice; 1] = [&VIRTIO_BLK];
 static NET_DEVS: [&'static dyn HalNetDevice; 1] = [&VIRTIO_NET];
+static DMA_ARENA: VirtioDmaArena<DMA_ARENA_BYTES, DMA_ARENA_WORDS> = VirtioDmaArena::new();
 
 static MEMORY_MAP: [MemoryRegion; 2] = [
     MemoryRegion {
@@ -170,7 +192,16 @@ static MEMORY_MAP: [MemoryRegion; 2] = [
     },
 ];
 
-pub fn bootstrap() {
+pub fn bootstrap(dtb_pa: usize) {
+    let discovery = if dtb_pa != 0 {
+        parse_loongarch_virtio_discovery(dtb_pa)
+    } else {
+        Some(qemu_virt_fallback())
+    };
+    if let Some(discovery) = discovery {
+        INTERRUPT.configure(&discovery);
+        VIRTIO_BLK.bootstrap(&discovery);
+    }
     register_hal(HalBundle {
         platform: &PLATFORM,
         lifecycle: &LIFECYCLE,
@@ -188,9 +219,46 @@ struct VirtCpu {
     interrupts_enabled: AtomicBool,
 }
 
-struct VirtInterruptController;
+struct VirtInterruptController {
+    base: AtomicUsize,
+}
+
 struct VirtPlatform;
 struct VirtLifecycle;
+struct VirtMemory;
+
+struct VirtioBlockState {
+    driver: VirtIOBlk<LoongArchVirtioHal, SomeTransport<'static>>,
+}
+
+struct VirtioBlockDevice {
+    state: Once<Mutex<VirtioBlockState>>,
+    init_error: AtomicI32,
+    capacity_sectors: AtomicUsize,
+    readonly: AtomicBool,
+}
+
+struct VirtioNetStub;
+
+struct VirtTimer {
+    ticks: AtomicU64,
+}
+
+struct Ns16550 {
+    #[allow(dead_code)]
+    base: usize,
+}
+
+struct PciBarAllocator {
+    mmio_next: u64,
+    mmio_limit: u64,
+    io_next: u32,
+    io_limit: u32,
+    used_mem: bool,
+    used_io: bool,
+}
+
+struct LoongArchVirtioHal;
 
 impl HalPlatform for VirtPlatform {
     fn platform_name(&self) -> &'static str {
@@ -214,9 +282,31 @@ impl HalPlatformLifecycle for VirtLifecycle {
     }
 }
 
+impl VirtInterruptController {
+    const fn new() -> Self {
+        Self {
+            base: AtomicUsize::new(0),
+        }
+    }
+
+    fn configure(&self, discovery: &LoongArchVirtioDiscovery) {
+        if let Some(config) = discovery.interrupt {
+            self.base.store(config.pch_pic_base, Ordering::Relaxed);
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.base.load(Ordering::Relaxed) != 0
+    }
+}
+
 impl HalInterrupt for VirtInterruptController {
     fn name(&self) -> &'static str {
-        "platic-stub"
+        if self.is_ready() {
+            "ls7a-pch-pic"
+        } else {
+            "ls7a-pch-pic-unavailable"
+        }
     }
 
     fn enable_irq(&self, _irq: usize) {}
@@ -278,8 +368,6 @@ impl HalCpu for VirtCpu {
     }
 }
 
-struct VirtMemory;
-
 impl HalMemory for VirtMemory {
     fn memory_regions(&self) -> &'static [MemoryRegion] {
         &MEMORY_MAP
@@ -296,10 +384,6 @@ impl HalMemory for VirtMemory {
     fn mmio_base(&self) -> usize {
         MMIO_PHYS_BASE
     }
-}
-
-struct VirtTimer {
-    ticks: AtomicU64,
 }
 
 impl VirtTimer {
@@ -320,11 +404,6 @@ impl HalTimer for VirtTimer {
     }
 
     fn program_oneshot(&self, _deadline_nanos: u64) {}
-}
-
-struct Ns16550 {
-    #[allow(dead_code)]
-    base: usize,
 }
 
 impl Ns16550 {
@@ -363,31 +442,185 @@ impl HalCharDevice for Ns16550 {
     }
 }
 
-struct VirtioBlockStub;
+impl VirtioBlockDevice {
+    const fn new() -> Self {
+        Self {
+            state: Once::new(),
+            init_error: AtomicI32::new(ENODEV),
+            capacity_sectors: AtomicUsize::new(0),
+            readonly: AtomicBool::new(false),
+        }
+    }
 
-impl HalBlockDevice for VirtioBlockStub {
+    fn bootstrap(&self, discovery: &LoongArchVirtioDiscovery) {
+        if self.state.get().is_some() {
+            return;
+        }
+        let Some(host) = discovery.pci_host else {
+            return;
+        };
+        let _ = self.try_init_pci(host);
+    }
+
+    fn try_init_pci(&self, host: PciHostConfig) -> Result<(), i32> {
+        let enum_cam = unsafe { MmioCam::new(host.ecam_base as *mut u8, Cam::Ecam) };
+        let mut raw_cam = unsafe { MmioCam::new(host.ecam_base as *mut u8, Cam::Ecam) };
+        let enum_root = PciRoot::new(enum_cam);
+        let mut cfg_root = PciRoot::new(unsafe { MmioCam::new(host.ecam_base as *mut u8, Cam::Ecam) });
+        let mut allocator = PciBarAllocator::new(&host).ok_or(ENODEV)?;
+        for bus in host.bus_start..=host.bus_end {
+            for (device_function, info) in enum_root.enumerate_bus(bus) {
+                if virtio_device_type(&info) != Some(virtio_drivers::transport::DeviceType::Block) {
+                    continue;
+                }
+                let command =
+                    allocate_virtio_bars(&mut cfg_root, &mut raw_cam, device_function, &mut allocator)?;
+                cfg_root.set_command(device_function, command);
+                let transport =
+                    PciTransport::new::<LoongArchVirtioHal, _>(&mut cfg_root, device_function)
+                        .map_err(|_| ENODEV)?;
+                let mut driver =
+                    VirtIOBlk::<LoongArchVirtioHal, _>::new(SomeTransport::from(transport))
+                        .map_err(virtio_error_to_errno)?;
+                driver.enable_interrupts();
+                let info = VirtioBlockConfig {
+                    transport: hal_virtio::TransportKind::Pci,
+                    irq: None,
+                    capacity_sectors: driver.capacity() as usize,
+                    readonly: driver.readonly(),
+                };
+                self.capacity_sectors
+                    .store(info.capacity_sectors, Ordering::Relaxed);
+                self.readonly.store(info.readonly, Ordering::Relaxed);
+                self.init_error.store(0, Ordering::Relaxed);
+                let _ = self.state.call_once(|| Mutex::new(VirtioBlockState { driver }));
+                return Ok(());
+            }
+        }
+        Err(ENODEV)
+    }
+
+    fn with_state(&self) -> Result<&Mutex<VirtioBlockState>, i32> {
+        self.state
+            .get()
+            .ok_or_else(|| self.init_error.load(Ordering::Relaxed))
+    }
+
+    fn wait_for_completion(
+        &self,
+        state: &Mutex<VirtioBlockState>,
+        token: u16,
+    ) -> Result<(), i32> {
+        let mut saw_interrupt = false;
+        for _ in 0..1_000_000usize {
+            let mut guard = state.lock();
+            if guard
+                .driver
+                .ack_interrupt()
+                .contains(InterruptStatus::QUEUE_INTERRUPT)
+            {
+                saw_interrupt = true;
+            }
+            if saw_interrupt && guard.driver.peek_used() == Some(token) {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(5)
+    }
+}
+
+impl HalBlockDevice for VirtioBlockDevice {
     fn name(&self) -> &'static str {
         "virtio-blk0"
     }
 
+    fn init(&self) -> Result<(), i32> {
+        if self.state.get().is_some() {
+            return Ok(());
+        }
+        Err(self.init_error.load(Ordering::Relaxed))
+    }
+
+    fn is_ready(&self) -> bool {
+        self.state.get().is_some() && self.capacity_sectors.load(Ordering::Relaxed) != 0
+    }
+
     fn sector_size(&self) -> usize {
-        512
+        SECTOR_SIZE
     }
 
     fn sector_count(&self) -> usize {
-        0
+        self.capacity_sectors.load(Ordering::Relaxed)
     }
 
-    fn read_sector(&self, _sector: usize, _buf: &mut [u8]) -> Result<(), i32> {
-        Err(95)
+    fn ack_interrupt(&self) -> bool {
+        let Ok(state) = self.with_state() else {
+            return false;
+        };
+        state
+            .lock()
+            .driver
+            .ack_interrupt()
+            .contains(InterruptStatus::QUEUE_INTERRUPT)
     }
 
-    fn write_sector(&self, _sector: usize, _buf: &[u8]) -> Result<(), i32> {
-        Err(95)
+    fn read_sector(&self, sector: usize, buf: &mut [u8]) -> Result<(), i32> {
+        if buf.len() != SECTOR_SIZE {
+            return Err(EINVAL);
+        }
+        let state = self.with_state()?;
+        let mut request = BlkReq::default();
+        let mut response = BlkResp::default();
+        let token = {
+            let mut guard = state.lock();
+            unsafe { guard.driver.read_blocks_nb(sector, &mut request, buf, &mut response) }
+                .map_err(virtio_error_to_errno)?
+        };
+        self.wait_for_completion(state, token)?;
+        let mut guard = state.lock();
+        unsafe {
+            guard
+                .driver
+                .complete_read_blocks(token, &request, buf, &mut response)
+        }
+        .map_err(virtio_error_to_errno)
+    }
+
+    fn write_sector(&self, sector: usize, buf: &[u8]) -> Result<(), i32> {
+        if self.readonly.load(Ordering::Relaxed) {
+            return Err(EROFS);
+        }
+        if buf.len() != SECTOR_SIZE {
+            return Err(EINVAL);
+        }
+        let state = self.with_state()?;
+        let mut request = BlkReq::default();
+        let mut response = BlkResp::default();
+        let token = {
+            let mut guard = state.lock();
+            unsafe { guard.driver.write_blocks_nb(sector, &mut request, buf, &mut response) }
+                .map_err(virtio_error_to_errno)?
+        };
+        self.wait_for_completion(state, token)?;
+        let mut guard = state.lock();
+        unsafe {
+            guard
+                .driver
+                .complete_write_blocks(token, &request, buf, &mut response)
+        }
+        .map_err(virtio_error_to_errno)
+    }
+
+    fn flush(&self) -> Result<(), i32> {
+        let state = self.with_state()?;
+        state
+            .lock()
+            .driver
+            .flush()
+            .map_err(virtio_error_to_errno)
     }
 }
-
-struct VirtioNetStub;
 
 impl HalNetDevice for VirtioNetStub {
     fn name(&self) -> &'static str {
@@ -416,5 +649,184 @@ impl HalNetDevice for VirtioNetStub {
 
     fn recv_frame(&self, _frame: &mut [u8]) -> Result<usize, i32> {
         Err(11)
+    }
+}
+
+impl PciBarAllocator {
+    fn new(host: &PciHostConfig) -> Option<Self> {
+        let mmio = host.mmio?;
+        let io = host.io.unwrap_or(hal_virtio::PciHostWindow { base: 0, size: 0 });
+        Some(Self {
+            mmio_next: mmio.base as u64,
+            mmio_limit: mmio.base as u64 + mmio.size as u64,
+            io_next: io.base as u32,
+            io_limit: io.base as u32 + io.size as u32,
+            used_mem: false,
+            used_io: false,
+        })
+    }
+
+    fn alloc_memory(&mut self, size: u64, address_type: MemoryBarType) -> Option<u64> {
+        let align = size.max(0x1000);
+        let start = align_up_u64(self.mmio_next, align);
+        if matches!(address_type, MemoryBarType::Below1MiB) && start + size > 0x10_0000 {
+            return None;
+        }
+        if start.checked_add(size)? > self.mmio_limit {
+            return None;
+        }
+        self.mmio_next = start + size;
+        self.used_mem = true;
+        Some(start)
+    }
+
+    fn alloc_io(&mut self, size: u32) -> Option<u32> {
+        if self.io_limit == 0 {
+            return None;
+        }
+        let start = align_up_u32(self.io_next, size.max(4));
+        if start.checked_add(size)? > self.io_limit {
+            return None;
+        }
+        self.io_next = start + size;
+        self.used_io = true;
+        Some(start)
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::BUS_MASTER;
+        if self.used_mem {
+            command |= Command::MEMORY_SPACE;
+        }
+        if self.used_io {
+            command |= Command::IO_SPACE;
+        }
+        command
+    }
+}
+
+fn allocate_virtio_bars(
+    root: &mut PciRoot<MmioCam<'static>>,
+    raw_cam: &mut MmioCam<'static>,
+    device_function: DeviceFunction,
+    allocator: &mut PciBarAllocator,
+) -> Result<Command, i32> {
+    let bars = root.bars(device_function).map_err(|_| ENODEV)?;
+    let mut bar_index = 0usize;
+    while bar_index < bars.len() {
+        let Some(bar) = bars[bar_index].as_ref() else {
+            bar_index += 1;
+            continue;
+        };
+        match bar {
+            BarInfo::Memory {
+                address_type,
+                prefetchable,
+                size,
+                ..
+            } => {
+                let address = allocator
+                    .alloc_memory(*size, *address_type)
+                    .ok_or(ENODEV)?;
+                let flags = ((u8::from(*address_type) as u32) << 1)
+                    | if *prefetchable { 0x8 } else { 0 };
+                write_memory_bar(raw_cam, device_function, bar_index as u8, address, flags);
+                bar_index += if bar.takes_two_entries() { 2 } else { 1 };
+            }
+            BarInfo::IO { size, .. } => {
+                let address = allocator.alloc_io(*size).ok_or(ENODEV)?;
+                raw_cam.write_word(device_function, 0x10 + 4 * bar_index as u8, address | 0x1);
+                bar_index += 1;
+            }
+        }
+    }
+    Ok(allocator.command())
+}
+
+fn write_memory_bar(
+    raw_cam: &mut MmioCam<'static>,
+    device_function: DeviceFunction,
+    bar_index: u8,
+    address: u64,
+    flags: u32,
+) {
+    raw_cam.write_word(
+        device_function,
+        0x10 + 4 * bar_index,
+        ((address as u32) & !0xf) | flags,
+    );
+    if flags & 0b100 != 0 {
+        raw_cam.write_word(device_function, 0x10 + 4 * (bar_index + 1), (address >> 32) as u32);
+    }
+}
+
+fn align_up_u64(value: u64, align: u64) -> u64 {
+    (value + align - 1) & !(align - 1)
+}
+
+fn align_up_u32(value: u32, align: u32) -> u32 {
+    (value + align - 1) & !(align - 1)
+}
+
+unsafe impl VirtioHal for LoongArchVirtioHal {
+    fn dma_alloc(
+        pages: usize,
+        _direction: BufferDirection,
+    ) -> (virtio_drivers::PhysAddr, NonNull<u8>) {
+        DMA_ARENA
+            .alloc(pages)
+            .unwrap_or((0, NonNull::dangling()))
+    }
+
+    unsafe fn dma_dealloc(
+        paddr: virtio_drivers::PhysAddr,
+        _vaddr: NonNull<u8>,
+        pages: usize,
+    ) -> i32 {
+        DMA_ARENA.dealloc(paddr, pages)
+    }
+
+    unsafe fn mmio_phys_to_virt(
+        paddr: virtio_drivers::PhysAddr,
+        _size: usize,
+    ) -> NonNull<u8> {
+        NonNull::new(paddr as usize as *mut u8).unwrap()
+    }
+
+    unsafe fn share(
+        buffer: NonNull<[u8]>,
+        _direction: BufferDirection,
+    ) -> virtio_drivers::PhysAddr {
+        buffer.as_ptr() as *mut u8 as usize as u64
+    }
+
+    unsafe fn unshare(
+        _paddr: virtio_drivers::PhysAddr,
+        _buffer: NonNull<[u8]>,
+        _direction: BufferDirection,
+    ) {
+    }
+}
+
+fn qemu_virt_fallback() -> LoongArchVirtioDiscovery {
+    LoongArchVirtioDiscovery {
+        pci_host: Some(PciHostConfig {
+            ecam_base: 0x2000_0000,
+            ecam_size: 0x0800_0000,
+            bus_start: 0,
+            bus_end: 0x7f,
+            io: Some(PciHostWindow {
+                base: 0x1800_4000,
+                size: 0x0000_c000,
+            }),
+            mmio: Some(PciHostWindow {
+                base: 0x4000_0000,
+                size: 0x4000_0000,
+            }),
+        }),
+        interrupt: Some(LoongArchInterruptConfig {
+            pch_pic_base: 0x1000_0000,
+            pch_pic_size: 0x1000,
+        }),
     }
 }

@@ -19,11 +19,39 @@ const ENOEXEC: i32 = 8;
 const ENOMEM: i32 = 12;
 
 const USER_HEAP_BASE: usize = 0x4000_0000;
-const USER_STACK_TOP: usize = 0x8000_0000;
 const USER_STACK_SIZE: usize = 0x20_000;
+const USER_STACK_TOP: usize = 0x7fff_f000;
 const USER_MMAP_BASE: usize = 0x5000_0000;
 const DEFAULT_PROT: usize = 0b11;
 const PAGE_SIZE: usize = 4096;
+
+const RISCV_PTE_V: u64 = 1 << 0;
+const RISCV_PTE_R: u64 = 1 << 1;
+const RISCV_PTE_W: u64 = 1 << 2;
+const RISCV_PTE_X: u64 = 1 << 3;
+const RISCV_PTE_U: u64 = 1 << 4;
+const RISCV_PTE_A: u64 = 1 << 6;
+const RISCV_PTE_D: u64 = 1 << 7;
+
+const LA_PTE_V: u64 = 1 << 0;
+const LA_PTE_D: u64 = 1 << 1;
+const LA_PTE_PLVL: u64 = 1 << 2;
+const LA_PTE_PLVH: u64 = 1 << 3;
+const LA_PTE_MATL: u64 = 1 << 4;
+const LA_PTE_MATH: u64 = 1 << 5;
+const LA_PTE_GH: u64 = 1 << 6;
+const LA_PTE_P: u64 = 1 << 7;
+const LA_PTE_W: u64 = 1 << 8;
+const LA_PTE_NR: u64 = 1 << 61;
+const LA_PTE_NX: u64 = 1 << 62;
+const LA_PTE_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+
+const RISCV_MMIO_BASE: usize = 0x0200_0000;
+const RISCV_MMIO_SIZE: usize = 0x1e00_0000;
+const LOONGARCH_MMIO_BASE: usize = 0x1000_0000;
+const LOONGARCH_MMIO_SIZE: usize = 0x1000_0000;
+const LOONGARCH_PHYS_BASE: usize = 0x9000_0000;
+const LOONGARCH_PHYS_SIZE: usize = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct MappingArea {
@@ -74,7 +102,7 @@ impl FrameAllocator {
 
 #[derive(Clone, Debug)]
 enum SegmentStorage {
-    Owned(Vec<u8>),
+    Owned { bytes: Vec<u8>, ptr: usize },
     Host { ptr: usize, len: usize },
 }
 
@@ -84,12 +112,29 @@ struct Segment {
     storage: SegmentStorage,
 }
 
+#[repr(align(4096))]
+#[derive(Clone, Debug)]
+struct PageTablePage([u64; 512]);
+
+impl PageTablePage {
+    fn new() -> Self {
+        Self([0; 512])
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PageTableSpace {
+    root_phys: usize,
+    pages: Vec<alloc::boxed::Box<PageTablePage>>,
+}
+
 #[derive(Clone, Debug)]
 struct AddressSpaceInner {
     token: VmSpaceToken,
     mappings: BTreeMap<usize, Segment>,
     program_break: usize,
     next_mapping_base: usize,
+    page_table: Option<PageTableSpace>,
 }
 
 #[derive(Clone, Debug)]
@@ -136,13 +181,16 @@ impl BinaryLoader for ElfBinaryLoader {
 
 impl AddressSpace {
     pub fn new_user() -> Self {
+        let mut inner = AddressSpaceInner {
+            token: VmSpaceToken(0),
+            mappings: BTreeMap::new(),
+            program_break: USER_HEAP_BASE,
+            next_mapping_base: USER_MMAP_BASE,
+            page_table: None,
+        };
+        inner.rebuild_page_table();
         Self {
-            inner: alloc::sync::Arc::new(Mutex::new(AddressSpaceInner {
-                token: VmSpaceToken(0),
-                mappings: BTreeMap::new(),
-                program_break: USER_HEAP_BASE,
-                next_mapping_base: USER_MMAP_BASE,
-            })),
+            inner: alloc::sync::Arc::new(Mutex::new(inner)),
         }
     }
 
@@ -210,6 +258,7 @@ impl AddressSpace {
             return Err(EINVAL);
         }
         inner.mappings.remove(&addr);
+        inner.rebuild_page_table();
         Ok(())
     }
 
@@ -223,18 +272,30 @@ impl AddressSpace {
             return Err(EINVAL);
         }
         segment.area.prot = prot;
+        inner.rebuild_page_table();
         Ok(())
     }
 
     pub fn brk(&self, new_break: Option<usize>) -> KernelResult<usize> {
-        let mut inner = self.inner.lock();
-        if let Some(new_break) = new_break {
-            if new_break < USER_HEAP_BASE {
-                return Err(EINVAL);
-            }
-            inner.program_break = align_up(new_break, 16);
+        let Some(requested_break) = new_break else {
+            return Ok(self.inner.lock().program_break);
+        };
+        if requested_break < USER_HEAP_BASE {
+            return Err(EINVAL);
         }
-        Ok(inner.program_break)
+
+        let new_break = align_up(requested_break, 16);
+        let old_break = self.inner.lock().program_break;
+        if new_break > old_break {
+            let map_start = align_up(old_break, PAGE_SIZE);
+            let map_end = align_up(new_break, PAGE_SIZE);
+            if map_end > map_start {
+                self.map_fixed_bytes(map_start, &[], map_end - map_start, DEFAULT_PROT)?;
+            }
+        }
+
+        self.inner.lock().program_break = new_break;
+        Ok(new_break)
     }
 
     pub fn clear(&self) {
@@ -242,13 +303,16 @@ impl AddressSpace {
         inner.mappings.clear();
         inner.program_break = USER_HEAP_BASE;
         inner.next_mapping_base = USER_MMAP_BASE;
+        inner.rebuild_page_table();
     }
 
     pub fn read_bytes(&self, addr: usize, len: usize) -> KernelResult<Vec<u8>> {
         let inner = self.inner.lock();
         let (segment, offset) = find_segment(&inner.mappings, addr, len)?;
         match &segment.storage {
-            SegmentStorage::Owned(bytes) => Ok(bytes[offset..offset + len].to_vec()),
+            SegmentStorage::Owned { ptr, .. } => unsafe {
+                Ok(core::slice::from_raw_parts((ptr + offset) as *const u8, len).to_vec())
+            },
             SegmentStorage::Host { ptr, .. } => unsafe {
                 Ok(core::slice::from_raw_parts((ptr + offset) as *const u8, len).to_vec())
             },
@@ -259,8 +323,10 @@ impl AddressSpace {
         let mut inner = self.inner.lock();
         let (segment, offset) = find_segment_mut(&mut inner.mappings, addr, bytes.len())?;
         match &mut segment.storage {
-            SegmentStorage::Owned(buffer) => {
-                buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
+            SegmentStorage::Owned { ptr, .. } => {
+                unsafe {
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), (*ptr + offset) as *mut u8, bytes.len());
+                }
                 Ok(())
             }
             SegmentStorage::Host { ptr, len } => {
@@ -296,9 +362,15 @@ impl AddressSpace {
         let mut mappings = BTreeMap::new();
         for (start, segment) in &inner.mappings {
             let storage = match &segment.storage {
-                SegmentStorage::Owned(bytes) => SegmentStorage::Owned(bytes.clone()),
+                SegmentStorage::Owned { ptr, .. } => {
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(*ptr as *const u8, segment.area.len).to_vec()
+                    };
+                    create_owned_storage(*start, bytes)
+                }
                 SegmentStorage::Host { ptr, len } => unsafe {
-                    SegmentStorage::Owned(
+                    create_owned_storage(
+                        *start,
                         core::slice::from_raw_parts(*ptr as *const u8, *len).to_vec(),
                     )
                 },
@@ -312,13 +384,22 @@ impl AddressSpace {
             );
         }
         Self {
-            inner: alloc::sync::Arc::new(Mutex::new(AddressSpaceInner {
-                token: inner.token,
-                mappings,
-                program_break: inner.program_break,
-                next_mapping_base: inner.next_mapping_base,
+            inner: alloc::sync::Arc::new(Mutex::new({
+                let mut cloned = AddressSpaceInner {
+                    token: VmSpaceToken(0),
+                    mappings,
+                    program_break: inner.program_break,
+                    next_mapping_base: inner.next_mapping_base,
+                    page_table: None,
+                };
+                cloned.rebuild_page_table();
+                cloned
             })),
         }
+    }
+
+    pub fn is_shared(&self) -> bool {
+        alloc::sync::Arc::strong_count(&self.inner) > 1
     }
 
     pub fn load_static_elf(
@@ -346,13 +427,11 @@ impl AddressSpace {
 
         self.clear();
         let mut highest_end = USER_HEAP_BASE;
+        let mut load_segments = 0usize;
         for index in 0..header.program_header_num {
             let offset = header.program_header_offset + index * header.program_header_size;
             let ph = ProgramHeader::parse(image, offset)?;
             if ph.segment_type != 1 {
-                if ph.segment_type == 3 {
-                    return Err(ENOEXEC);
-                }
                 continue;
             }
             if ph.file_size > ph.mem_size {
@@ -363,31 +442,40 @@ impl AddressSpace {
                 return Err(ENOEXEC);
             }
             let bytes = &image[ph.offset..data_end];
-            self.map_fixed_bytes(ph.vaddr, bytes, ph.mem_size, ph.flags)?;
-            highest_end = highest_end.max(align_up(ph.vaddr + ph.mem_size, PAGE_SIZE));
+            self.map_fixed_bytes(ph.vaddr, bytes, ph.mem_size, elf_flags_to_prot(ph.flags))?;
+            let seg_end = ph.vaddr.checked_add(ph.mem_size).ok_or(ENOEXEC)?;
+            highest_end = highest_end.max(align_up(seg_end, PAGE_SIZE));
+            load_segments += 1;
+        }
+        if load_segments == 0 {
+            return Err(ENOEXEC);
         }
 
         {
             let mut inner = self.inner.lock();
             inner.program_break = highest_end.max(USER_HEAP_BASE);
         }
-        let stack_base = USER_STACK_TOP - USER_STACK_SIZE;
-        let stack_image = build_initial_stack(args, envs, stack_base, USER_STACK_TOP)?;
-        self.map_fixed_bytes(stack_base, &stack_image, USER_STACK_SIZE, DEFAULT_PROT)?;
+        let stack_top = USER_STACK_TOP;
+        let stack_base = stack_top - USER_STACK_SIZE;
+        self.map_fixed_bytes(stack_base, &[], USER_STACK_SIZE, DEFAULT_PROT)?;
+        let stack_image = build_initial_stack(args, envs, stack_top)?;
+        let used = stack_image.len();
+        self.write_bytes(stack_top - used, &stack_image)?;
         Ok(LoadedImage {
             entry: header.entry,
-            stack_pointer: USER_STACK_TOP - stack_image.len(),
+            stack_pointer: stack_top - used,
         })
     }
 
     fn map_owned(&self, addr: usize, bytes: Vec<u8>, prot: usize) -> KernelResult<()> {
+        let len = bytes.len().max(1);
         self.insert_segment(Segment {
             area: MappingArea {
                 start: addr,
-                len: bytes.len().max(1),
+                len,
                 prot,
             },
-            storage: SegmentStorage::Owned(bytes),
+            storage: create_owned_storage(addr, bytes),
         })
     }
 
@@ -408,7 +496,402 @@ impl AddressSpace {
             }
         }
         inner.mappings.insert(segment.area.start, segment);
+        inner.rebuild_page_table();
         Ok(())
+    }
+}
+
+impl AddressSpaceInner {
+    fn rebuild_page_table(&mut self) {
+        if cfg!(target_arch = "riscv64") {
+            self.build_riscv_page_table();
+            return;
+        }
+        if cfg!(target_arch = "loongarch64") {
+            self.build_loongarch_page_table();
+            return;
+        }
+        self.token = VmSpaceToken(0);
+        self.page_table = None;
+    }
+
+    fn build_riscv_page_table(&mut self) {
+        let mut builder = Sv39PageTableBuilder::new();
+        builder.map_identity_2m(
+            0x8000_0000,
+            0x1_0000_0000,
+            RISCV_PTE_R | RISCV_PTE_W | RISCV_PTE_X | RISCV_PTE_A | RISCV_PTE_D,
+        );
+        builder.map_identity_2m(
+            RISCV_MMIO_BASE,
+            RISCV_MMIO_BASE + RISCV_MMIO_SIZE,
+            RISCV_PTE_R | RISCV_PTE_W | RISCV_PTE_A | RISCV_PTE_D,
+        );
+        for segment in self.mappings.values() {
+            map_segment_pages_riscv(&mut builder, segment);
+        }
+        let root_phys = builder.root_phys();
+        self.token = VmSpaceToken(root_phys);
+        self.page_table = Some(PageTableSpace {
+            root_phys,
+            pages: builder.into_pages(),
+        });
+    }
+
+    fn build_loongarch_page_table(&mut self) {
+        let mut builder = LoongPageTableBuilder::new();
+        builder.map_identity_2m(
+            LOONGARCH_PHYS_BASE,
+            LOONGARCH_PHYS_BASE + LOONGARCH_PHYS_SIZE,
+            loong_kernel_pte_flags(true, true, true, false),
+        );
+        builder.map_identity_2m(
+            LOONGARCH_MMIO_BASE,
+            LOONGARCH_MMIO_BASE + LOONGARCH_MMIO_SIZE,
+            loong_kernel_pte_flags(true, true, false, true),
+        );
+        for segment in self.mappings.values() {
+            map_segment_pages_loongarch(&mut builder, segment);
+        }
+        let root_phys = builder.root_phys();
+        self.token = VmSpaceToken(root_phys);
+        self.page_table = Some(PageTableSpace {
+            root_phys,
+            pages: builder.into_pages(),
+        });
+    }
+}
+
+struct Sv39PageTableBuilder {
+    root_phys: usize,
+    pages: Vec<alloc::boxed::Box<PageTablePage>>,
+}
+
+impl Sv39PageTableBuilder {
+    fn new() -> Self {
+        let mut root = alloc::boxed::Box::new(PageTablePage::new());
+        let root_phys = (&mut *root as *mut PageTablePage) as usize;
+        Self {
+            root_phys,
+            pages: vec![root],
+        }
+    }
+
+    fn root_phys(&self) -> usize {
+        self.root_phys
+    }
+
+    fn into_pages(self) -> Vec<alloc::boxed::Box<PageTablePage>> {
+        self.pages
+    }
+
+    fn map_identity_2m(&mut self, start: usize, end: usize, flags: u64) {
+        let mut cursor = align_down(start, 1 << 21);
+        let limit = align_up(end, 1 << 21);
+        while cursor < limit {
+            self.map_2m(cursor, cursor, flags);
+            cursor += 1 << 21;
+        }
+    }
+
+    fn map_2m(&mut self, vaddr: usize, paddr: usize, flags: u64) {
+        if (vaddr | paddr) & ((1 << 21) - 1) != 0 {
+            return;
+        }
+        let vpn2 = (vaddr >> 30) & 0x1ff;
+        let vpn1 = (vaddr >> 21) & 0x1ff;
+        let l1_phys = self.ensure_next_table(self.root_phys, vpn2);
+        let pte = riscv_make_leaf_pte(paddr, flags);
+        let table = self.table_mut(l1_phys);
+        table[vpn1] = pte;
+    }
+
+    fn map_4k(&mut self, vaddr: usize, paddr: usize, flags: u64) {
+        if (vaddr | paddr) & (PAGE_SIZE - 1) != 0 {
+            return;
+        }
+        let vpn2 = (vaddr >> 30) & 0x1ff;
+        let vpn1 = (vaddr >> 21) & 0x1ff;
+        let vpn0 = (vaddr >> 12) & 0x1ff;
+
+        let l1_phys = self.ensure_next_table(self.root_phys, vpn2);
+        if l1_phys == 0 {
+            return;
+        }
+        let l0_phys = self.ensure_next_table(l1_phys, vpn1);
+        if l0_phys == 0 {
+            return;
+        }
+        let table = self.table_mut(l0_phys);
+        table[vpn0] = riscv_make_leaf_pte(paddr, flags);
+    }
+
+    fn ensure_next_table(&mut self, table_phys: usize, index: usize) -> usize {
+        let existing = self.table_mut(table_phys)[index];
+        if existing & RISCV_PTE_V != 0
+            && existing & (RISCV_PTE_R | RISCV_PTE_W | RISCV_PTE_X) == 0
+        {
+            return ((existing >> 10) as usize) << 12;
+        }
+        if existing & RISCV_PTE_V != 0 {
+            return 0;
+        }
+        let mut next = alloc::boxed::Box::new(PageTablePage::new());
+        let next_phys = (&mut *next as *mut PageTablePage) as usize;
+        self.pages.push(next);
+        self.table_mut(table_phys)[index] = riscv_make_table_pte(next_phys);
+        next_phys
+    }
+
+    fn table_mut(&mut self, phys: usize) -> &mut [u64; 512] {
+        unsafe { &mut (*(phys as *mut PageTablePage)).0 }
+    }
+}
+
+struct LoongPageTableBuilder {
+    root_phys: usize,
+    pages: Vec<alloc::boxed::Box<PageTablePage>>,
+}
+
+impl LoongPageTableBuilder {
+    fn new() -> Self {
+        let mut root = alloc::boxed::Box::new(PageTablePage::new());
+        let root_phys = (&mut *root as *mut PageTablePage) as usize;
+        Self {
+            root_phys,
+            pages: vec![root],
+        }
+    }
+
+    fn root_phys(&self) -> usize {
+        self.root_phys
+    }
+
+    fn into_pages(self) -> Vec<alloc::boxed::Box<PageTablePage>> {
+        self.pages
+    }
+
+    fn map_identity_2m(&mut self, start: usize, end: usize, flags: u64) {
+        let mut cursor = align_down(start, 1 << 21);
+        let limit = align_up(end, 1 << 21);
+        while cursor < limit {
+            self.map_2m(cursor, cursor, flags);
+            cursor += 1 << 21;
+        }
+    }
+
+    fn map_2m(&mut self, vaddr: usize, paddr: usize, flags: u64) {
+        if (vaddr | paddr) & ((1 << 21) - 1) != 0 {
+            return;
+        }
+        let dir3 = (vaddr >> 39) & 0x1ff;
+        let dir2 = (vaddr >> 30) & 0x1ff;
+        let dir1 = (vaddr >> 21) & 0x1ff;
+
+        let l2_phys = self.ensure_next_table(self.root_phys, dir3);
+        if l2_phys == 0 {
+            return;
+        }
+        let l1_phys = self.ensure_next_table(l2_phys, dir2);
+        if l1_phys == 0 {
+            return;
+        }
+        let table = self.table_mut(l1_phys);
+        table[dir1] = loong_make_leaf_pte(paddr, flags | LA_PTE_GH);
+    }
+
+    fn map_4k(&mut self, vaddr: usize, paddr: usize, flags: u64) {
+        if (vaddr | paddr) & (PAGE_SIZE - 1) != 0 {
+            return;
+        }
+        let dir3 = (vaddr >> 39) & 0x1ff;
+        let dir2 = (vaddr >> 30) & 0x1ff;
+        let dir1 = (vaddr >> 21) & 0x1ff;
+        let pt = (vaddr >> 12) & 0x1ff;
+
+        let l2_phys = self.ensure_next_table(self.root_phys, dir3);
+        if l2_phys == 0 {
+            return;
+        }
+        let l1_phys = self.ensure_next_table(l2_phys, dir2);
+        if l1_phys == 0 {
+            return;
+        }
+        let l0_phys = self.ensure_next_table(l1_phys, dir1);
+        if l0_phys == 0 {
+            return;
+        }
+        let table = self.table_mut(l0_phys);
+        table[pt] = loong_make_leaf_pte(paddr, flags);
+    }
+
+    fn ensure_next_table(&mut self, table_phys: usize, index: usize) -> usize {
+        let existing = self.table_mut(table_phys)[index];
+        if existing == 0 {
+            let mut next = alloc::boxed::Box::new(PageTablePage::new());
+            let next_phys = (&mut *next as *mut PageTablePage) as usize;
+            self.pages.push(next);
+            self.table_mut(table_phys)[index] = loong_make_table_pte(next_phys);
+            return next_phys;
+        }
+        if existing & (LA_PTE_P | LA_PTE_V) != 0 {
+            return 0;
+        }
+        (existing as usize) & !(PAGE_SIZE - 1)
+    }
+
+    fn table_mut(&mut self, phys: usize) -> &mut [u64; 512] {
+        unsafe { &mut (*(phys as *mut PageTablePage)).0 }
+    }
+}
+
+fn map_segment_pages_riscv(builder: &mut Sv39PageTableBuilder, segment: &Segment) {
+    let Some(phys_base) = segment_phys_base(segment) else {
+        return;
+    };
+    let start = align_down(segment.area.start, PAGE_SIZE);
+    let end = align_up(segment.area.start + segment.area.len, PAGE_SIZE);
+    if (0x8000_0000..0x1_0000_0000).contains(&start) && phys_base == start {
+        return;
+    }
+    let flags = riscv_segment_pte_flags(segment.area.prot);
+    let mut vaddr = start;
+    while vaddr < end {
+        builder.map_4k(vaddr, phys_base + (vaddr - start), flags);
+        vaddr += PAGE_SIZE;
+    }
+}
+
+fn map_segment_pages_loongarch(builder: &mut LoongPageTableBuilder, segment: &Segment) {
+    let Some(phys_base) = segment_phys_base(segment) else {
+        return;
+    };
+    let start = align_down(segment.area.start, PAGE_SIZE);
+    let end = align_up(segment.area.start + segment.area.len, PAGE_SIZE);
+    if (LOONGARCH_PHYS_BASE..LOONGARCH_PHYS_BASE + LOONGARCH_PHYS_SIZE).contains(&start)
+        && phys_base == start
+    {
+        return;
+    }
+    let flags = loong_segment_pte_flags(segment.area.prot);
+    let mut vaddr = start;
+    while vaddr < end {
+        builder.map_4k(vaddr, phys_base + (vaddr - start), flags);
+        vaddr += PAGE_SIZE;
+    }
+}
+
+fn riscv_make_leaf_pte(paddr: usize, flags: u64) -> u64 {
+    ((paddr >> 12) as u64) << 10 | flags | RISCV_PTE_V
+}
+
+fn riscv_make_table_pte(paddr: usize) -> u64 {
+    ((paddr >> 12) as u64) << 10 | RISCV_PTE_V
+}
+
+fn riscv_segment_pte_flags(prot: usize) -> u64 {
+    let mut flags = RISCV_PTE_U | RISCV_PTE_A | RISCV_PTE_D;
+    if prot & 0b001 != 0 {
+        flags |= RISCV_PTE_R;
+    }
+    if prot & 0b010 != 0 {
+        flags |= RISCV_PTE_W;
+    }
+    if prot & 0b100 != 0 {
+        flags |= RISCV_PTE_X;
+    }
+    if flags & (RISCV_PTE_R | RISCV_PTE_W | RISCV_PTE_X) == 0 {
+        flags |= RISCV_PTE_R | RISCV_PTE_W;
+    }
+    flags
+}
+
+fn loong_make_leaf_pte(paddr: usize, flags: u64) -> u64 {
+    ((paddr as u64) & LA_PTE_ADDR_MASK) | flags
+}
+
+fn loong_make_table_pte(paddr: usize) -> u64 {
+    (paddr as u64) & LA_PTE_ADDR_MASK
+}
+
+fn loong_kernel_pte_flags(read: bool, write: bool, exec: bool, device: bool) -> u64 {
+    loong_pte_flags(read, write, exec, false, device)
+}
+
+fn loong_segment_pte_flags(prot: usize) -> u64 {
+    let mut read = prot & 0b001 != 0;
+    let write = prot & 0b010 != 0;
+    let exec = prot & 0b100 != 0;
+    if !read && !write && !exec {
+        read = true;
+    }
+    loong_pte_flags(read, write, exec, true, false)
+}
+
+fn loong_pte_flags(read: bool, write: bool, exec: bool, user: bool, device: bool) -> u64 {
+    let mut flags = LA_PTE_V | LA_PTE_P;
+    if !read {
+        flags |= LA_PTE_NR;
+    }
+    if write {
+        flags |= LA_PTE_W | LA_PTE_D;
+    }
+    if !exec {
+        flags |= LA_PTE_NX;
+    }
+    if user {
+        flags |= LA_PTE_PLVL | LA_PTE_PLVH;
+    }
+    if device {
+        flags |= LA_PTE_MATH;
+    } else {
+        flags |= LA_PTE_MATL;
+    }
+    flags
+}
+
+fn segment_phys_base(segment: &Segment) -> Option<usize> {
+    let page_offset = segment.area.start & (PAGE_SIZE - 1);
+    match segment.storage {
+        SegmentStorage::Owned { ptr, .. } => Some(ptr.saturating_sub(page_offset)),
+        SegmentStorage::Host { ptr, .. } => {
+            ((ptr & (PAGE_SIZE - 1)) == page_offset).then_some(ptr.saturating_sub(page_offset))
+        }
+    }
+}
+
+fn create_owned_storage(addr: usize, mut data: Vec<u8>) -> SegmentStorage {
+    if data.is_empty() {
+        data.push(0);
+    }
+    let len = data.len();
+    let page_offset = addr & (PAGE_SIZE - 1);
+    let map_len = align_up(page_offset + len, PAGE_SIZE);
+    let mut bytes = vec![0u8; map_len + PAGE_SIZE];
+    let raw_ptr = bytes.as_mut_ptr() as usize;
+    let aligned_base = align_up(raw_ptr, PAGE_SIZE);
+    let ptr = aligned_base + page_offset;
+    unsafe {
+        ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, len);
+    }
+    SegmentStorage::Owned { bytes, ptr }
+}
+
+fn elf_flags_to_prot(flags: u32) -> usize {
+    let mut prot = 0usize;
+    if flags & 0b100 != 0 {
+        prot |= 0b001;
+    }
+    if flags & 0b010 != 0 {
+        prot |= 0b010;
+    }
+    if flags & 0b001 != 0 {
+        prot |= 0b100;
+    }
+    if prot == 0 {
+        DEFAULT_PROT
+    } else {
+        prot
     }
 }
 
@@ -462,7 +945,7 @@ impl ElfHeader {
 #[derive(Clone, Copy, Debug)]
 struct ProgramHeader {
     segment_type: u32,
-    flags: usize,
+    flags: u32,
     offset: usize,
     vaddr: usize,
     file_size: usize,
@@ -476,7 +959,7 @@ impl ProgramHeader {
         }
         Ok(Self {
             segment_type: read_u32(image, offset)?,
-            flags: read_u32(image, offset + 4)? as usize,
+            flags: read_u32(image, offset + 4)?,
             offset: read_u64(image, offset + 8)? as usize,
             vaddr: read_u64(image, offset + 16)? as usize,
             file_size: read_u64(image, offset + 32)? as usize,
@@ -520,13 +1003,21 @@ fn find_segment_mut(
 fn build_initial_stack(
     args: &[String],
     envs: &[String],
-    stack_base: usize,
     stack_top: usize,
 ) -> KernelResult<Vec<u8>> {
     let pointer_size = size_of::<usize>();
     let strings = args.iter().chain(envs.iter()).collect::<Vec<_>>();
     let total_strings_len = strings.iter().map(|entry| entry.len() + 1).sum::<usize>();
-    let pointer_count = 1 + args.len() + 1 + envs.len() + 1;
+    let auxv = [
+        (6usize, PAGE_SIZE), // AT_PAGESZ
+        (11usize, 0usize),   // AT_UID
+        (12usize, 0usize),   // AT_EUID
+        (13usize, 0usize),   // AT_GID
+        (14usize, 0usize),   // AT_EGID
+        (23usize, 0usize),   // AT_SECURE
+        (0usize, 0usize),    // AT_NULL
+    ];
+    let pointer_count = 1 + args.len() + 1 + envs.len() + 1 + auxv.len() * 2;
     let mut stack = vec![0u8; align_up(total_strings_len + pointer_count * pointer_size, 16)];
 
     let mut string_cursor = stack.len();
@@ -544,22 +1035,33 @@ fn build_initial_stack(
     }
     pointers.push(0);
 
+    let mut head = vec![0u8; pointer_size * pointer_count];
     let argc = args.len();
-    let mut head = vec![0u8; pointer_size * (1 + pointers.len())];
+    let mut cursor = 0usize;
     head[..pointer_size].copy_from_slice(&argc.to_le_bytes()[..pointer_size]);
-    for (index, value) in pointers.iter().enumerate() {
-        let start = pointer_size * (index + 1);
-        head[start..start + pointer_size].copy_from_slice(&value.to_le_bytes()[..pointer_size]);
+    cursor += pointer_size;
+    for value in &pointers {
+        head[cursor..cursor + pointer_size].copy_from_slice(&value.to_le_bytes()[..pointer_size]);
+        cursor += pointer_size;
+    }
+    for (key, value) in auxv {
+        head[cursor..cursor + pointer_size].copy_from_slice(&key.to_le_bytes()[..pointer_size]);
+        cursor += pointer_size;
+        head[cursor..cursor + pointer_size]
+            .copy_from_slice(&value.to_le_bytes()[..pointer_size]);
+        cursor += pointer_size;
     }
 
-    let total = head.len() + (stack.len() - string_cursor);
-    if total > USER_STACK_SIZE || stack_base >= stack_top {
+    let strings_len = stack.len() - string_cursor;
+    let total = head.len() + strings_len;
+    if total > USER_STACK_SIZE {
         return Err(ENOMEM);
     }
-    let mut out = vec![0u8; USER_STACK_SIZE];
-    let start = USER_STACK_SIZE - total;
-    out[start..start + head.len()].copy_from_slice(&head);
-    out[start + head.len()..].copy_from_slice(&stack[string_cursor..]);
+    let aligned_total = align_up(total, 16);
+    let pad = aligned_total - total;
+    let mut out = vec![0u8; aligned_total];
+    out[..head.len()].copy_from_slice(&head);
+    out[head.len() + pad..].copy_from_slice(&stack[string_cursor..]);
     Ok(out)
 }
 
@@ -590,6 +1092,10 @@ fn read_u64(bytes: &[u8], offset: usize) -> KernelResult<u64> {
 
 fn align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
+}
+
+fn align_down(value: usize, alignment: usize) -> usize {
+    value & !(alignment - 1)
 }
 
 #[cfg(test)]

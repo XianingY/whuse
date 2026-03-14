@@ -2,8 +2,8 @@
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use fdt::Fdt;
 use fdt::properties::interrupts::pci::{PciAddress, PciAddressSpace};
+use fdt::Fdt;
 use spin::Mutex;
 use virtio_drivers::Error as VirtioError;
 
@@ -136,12 +136,7 @@ impl<const BYTES: usize, const WORDS: usize> VirtioDmaArena<BYTES, WORDS> {
             return -1;
         }
         let mut bitmap = self.bitmap.lock();
-        set_range(
-            &mut bitmap[..],
-            offset / DMA_PAGE_SIZE,
-            pages,
-            false,
-        );
+        set_range(&mut bitmap[..], offset / DMA_PAGE_SIZE, pages, false);
         0
     }
 
@@ -154,6 +149,13 @@ impl<const BYTES: usize, const WORDS: usize> VirtioDmaArena<BYTES, WORDS> {
 
     pub fn virt_to_phys(&self, ptr: NonNull<u8>) -> u64 {
         ptr.as_ptr() as usize as u64
+    }
+
+    pub fn phys_to_virt(&self, paddr: u64) -> Option<NonNull<u8>> {
+        if !self.contains(paddr) {
+            return None;
+        }
+        NonNull::new(paddr as usize as *mut u8)
     }
 
     fn base_ptr(&self) -> *mut u8 {
@@ -185,11 +187,7 @@ pub fn parse_riscv_virtio_discovery(dtb_pa: usize) -> Option<RiscvVirtioDiscover
             let base = first_u64(reg.value)?;
             let size = second_u64(reg.value)?;
             let irq = first_u32(interrupts.value)? as usize;
-            discovery.mmio_devices[mmio_index] = Some(VirtioMmioConfig {
-                base,
-                size,
-                irq,
-            });
+            discovery.mmio_devices[mmio_index] = Some(VirtioMmioConfig { base, size, irq });
             mmio_index += 1;
             continue;
         }
@@ -235,7 +233,8 @@ pub fn parse_loongarch_virtio_discovery(dtb_pa: usize) -> Option<LoongArchVirtio
         if discovery.pci_host.is_none() {
             let compatible = node.raw_property("compatible");
             let device_type = node.raw_property("device_type");
-            if compatible.is_some_and(|prop| compatible_contains(prop.value, b"pci-host-ecam-generic"))
+            if compatible
+                .is_some_and(|prop| compatible_contains(prop.value, b"pci-host-ecam-generic"))
                 && device_type.is_some_and(|prop| compatible_contains(prop.value, b"pci"))
             {
                 let Some(reg) = node.raw_property("reg") else {
@@ -305,7 +304,9 @@ pub fn virtio_error_to_errno(err: VirtioError) -> i32 {
     match err {
         VirtioError::QueueFull | VirtioError::NotReady => 11,
         VirtioError::AlreadyUsed => 16,
-        VirtioError::InvalidParam | VirtioError::ConfigSpaceTooSmall | VirtioError::ConfigSpaceMissing => 22,
+        VirtioError::InvalidParam
+        | VirtioError::ConfigSpaceTooSmall
+        | VirtioError::ConfigSpaceMissing => 22,
         VirtioError::DmaError => 12,
         VirtioError::IoError | VirtioError::WrongToken | VirtioError::SocketDeviceError(_) => 5,
         VirtioError::Unsupported => 95,

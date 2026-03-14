@@ -128,6 +128,16 @@ pub trait HalBlockDevice: Send + Sync {
         false
     }
     fn read_sector(&self, sector: usize, buf: &mut [u8]) -> Result<(), i32>;
+    fn read_sectors(&self, start_sector: usize, buf: &mut [u8]) -> Result<(), i32> {
+        let sector_size = self.sector_size();
+        if sector_size == 0 || buf.len() % sector_size != 0 {
+            return Err(22);
+        }
+        for (index, chunk) in buf.chunks_exact_mut(sector_size).enumerate() {
+            self.read_sector(start_sector + index, chunk)?;
+        }
+        Ok(())
+    }
     fn write_sector(&self, sector: usize, buf: &[u8]) -> Result<(), i32>;
     fn flush(&self) -> Result<(), i32> {
         Ok(())

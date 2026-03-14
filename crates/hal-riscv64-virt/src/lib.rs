@@ -1,10 +1,12 @@
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 #[cfg(target_arch = "riscv64")]
 use core::arch::global_asm;
+use core::ptr::NonNull;
 #[cfg(target_arch = "riscv64")]
 use core::ptr::{read_volatile, write_volatile};
-use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use hal_api::{
     register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
@@ -12,17 +14,17 @@ use hal_api::{
     Timespec, TrapFrame, VmSpaceToken,
 };
 use hal_virtio::{
-    RiscvVirtioDiscovery, VirtioBlockConfig, VirtioDmaArena, parse_riscv_virtio_discovery,
-    virtio_error_to_errno,
+    parse_riscv_virtio_discovery, virtio_error_to_errno, RiscvVirtioDiscovery, VirtioBlockConfig,
+    VirtioDmaArena,
 };
 use spin::{Mutex, Once};
-use virtio_drivers::BufferDirection;
-use virtio_drivers::Hal as VirtioHal;
-use virtio_drivers::device::blk::{BlkReq, BlkResp, SECTOR_SIZE, VirtIOBlk};
+use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
+use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 use virtio_drivers::transport::InterruptStatus;
 use virtio_drivers::transport::SomeTransport;
 use virtio_drivers::transport::Transport;
-use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
+use virtio_drivers::BufferDirection;
+use virtio_drivers::Hal as VirtioHal;
 
 pub const UART0_BASE: usize = 0x1000_0000;
 pub const VIRTIO0_BASE: usize = 0x1000_1000;
@@ -31,6 +33,7 @@ pub const PHYS_MEM_BASE: usize = 0x8000_0000;
 pub const PHYS_MEM_SIZE: usize = 128 * 1024 * 1024;
 const DMA_ARENA_BYTES: usize = 2 * 1024 * 1024;
 const DMA_ARENA_WORDS: usize = DMA_ARENA_BYTES / SECTOR_SIZE / 64;
+const EIO: i32 = 5;
 const ENODEV: i32 = 19;
 const EINVAL: i32 = 22;
 const EROFS: i32 = 30;
@@ -442,7 +445,23 @@ impl HalCpu for VirtCpu {
         self.interrupts_enabled.load(Ordering::Relaxed)
     }
 
-    fn switch_address_space(&self, _token: VmSpaceToken) {}
+    fn switch_address_space(&self, token: VmSpaceToken) {
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            const SATP_MODE_SV39: usize = 8usize << 60;
+            let satp = if token.0 == 0 {
+                0
+            } else {
+                SATP_MODE_SV39 | (token.0 >> 12)
+            };
+            core::arch::asm!("csrw satp, {}", in(reg) satp);
+            core::arch::asm!("sfence.vma zero, zero");
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = token;
+        }
+    }
 
     fn wait_for_interrupt(&self) {
         #[cfg(target_arch = "riscv64")]
@@ -562,8 +581,7 @@ impl VirtioBlockDevice {
 
     fn try_init_mmio(&self, config: hal_virtio::VirtioMmioConfig) -> Result<(), i32> {
         let header = NonNull::new(config.base as *mut VirtIOHeader).ok_or(ENODEV)?;
-        let transport =
-            unsafe { MmioTransport::new(header, config.size) }.map_err(|_| ENODEV)?;
+        let transport = unsafe { MmioTransport::new(header, config.size) }.map_err(|_| ENODEV)?;
         if transport.device_type() != virtio_drivers::transport::DeviceType::Block {
             return Err(ENODEV);
         }
@@ -581,7 +599,9 @@ impl VirtioBlockDevice {
         self.readonly.store(info.readonly, Ordering::Relaxed);
         self.irq.store(config.irq, Ordering::Relaxed);
         self.init_error.store(0, Ordering::Relaxed);
-        let _ = self.state.call_once(|| Mutex::new(VirtioBlockState { driver }));
+        let _ = self
+            .state
+            .call_once(|| Mutex::new(VirtioBlockState { driver }));
         INTERRUPT.enable_irq(config.irq);
         Ok(())
     }
@@ -590,47 +610,6 @@ impl VirtioBlockDevice {
         self.state
             .get()
             .ok_or_else(|| self.init_error.load(Ordering::Relaxed))
-    }
-
-    fn wait_for_completion(
-        &self,
-        state: &Mutex<VirtioBlockState>,
-        token: u16,
-    ) -> Result<(), i32> {
-        let mut saw_interrupt = false;
-        for _ in 0..1_000_000usize {
-            if let Some(irq) = self.irq_line() {
-                if let Some(pending) = INTERRUPT.next_pending() {
-                    let mut guard = state.lock();
-                    if pending == irq
-                        && guard
-                            .driver
-                            .ack_interrupt()
-                            .contains(InterruptStatus::QUEUE_INTERRUPT)
-                    {
-                        saw_interrupt = true;
-                    }
-                    let ready = pending == irq && saw_interrupt && guard.driver.peek_used() == Some(token);
-                    INTERRUPT.ack_irq(pending);
-                    if ready {
-                        return Ok(());
-                    }
-                }
-            }
-            let mut guard = state.lock();
-            if guard
-                .driver
-                .ack_interrupt()
-                .contains(InterruptStatus::QUEUE_INTERRUPT)
-            {
-                saw_interrupt = true;
-            }
-            if saw_interrupt && guard.driver.peek_used() == Some(token) {
-                return Ok(());
-            }
-            core::hint::spin_loop();
-        }
-        Err(5)
     }
 }
 
@@ -678,22 +657,26 @@ impl HalBlockDevice for VirtioBlockDevice {
         if buf.len() != SECTOR_SIZE {
             return Err(EINVAL);
         }
-        let state = self.with_state()?;
-        let mut request = BlkReq::default();
-        let mut response = BlkResp::default();
-        let token = {
-            let mut guard = state.lock();
-            unsafe { guard.driver.read_blocks_nb(sector, &mut request, buf, &mut response) }
-                .map_err(virtio_error_to_errno)?
-        };
-        self.wait_for_completion(state, token)?;
-        let mut guard = state.lock();
-        unsafe {
-            guard
-                .driver
-                .complete_read_blocks(token, &request, buf, &mut response)
+        if sector >= self.capacity_sectors.load(Ordering::Relaxed) {
+            return Err(EINVAL);
         }
-        .map_err(virtio_error_to_errno)
+        let state = self.with_state()?;
+        for _ in 0..3 {
+            if state.lock().driver.read_blocks(sector, buf).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(EIO)
+    }
+
+    fn read_sectors(&self, start_sector: usize, buf: &mut [u8]) -> Result<(), i32> {
+        if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+            return Err(EINVAL);
+        }
+        for (index, chunk) in buf.chunks_exact_mut(SECTOR_SIZE).enumerate() {
+            self.read_sector(start_sector + index, chunk)?;
+        }
+        Ok(())
     }
 
     fn write_sector(&self, sector: usize, buf: &[u8]) -> Result<(), i32> {
@@ -703,31 +686,21 @@ impl HalBlockDevice for VirtioBlockDevice {
         if buf.len() != SECTOR_SIZE {
             return Err(EINVAL);
         }
-        let state = self.with_state()?;
-        let mut request = BlkReq::default();
-        let mut response = BlkResp::default();
-        let token = {
-            let mut guard = state.lock();
-            unsafe { guard.driver.write_blocks_nb(sector, &mut request, buf, &mut response) }
-                .map_err(virtio_error_to_errno)?
-        };
-        self.wait_for_completion(state, token)?;
-        let mut guard = state.lock();
-        unsafe {
-            guard
-                .driver
-                .complete_write_blocks(token, &request, buf, &mut response)
+        if sector >= self.capacity_sectors.load(Ordering::Relaxed) {
+            return Err(EINVAL);
         }
-        .map_err(virtio_error_to_errno)
+        let state = self.with_state()?;
+        for _ in 0..3 {
+            if state.lock().driver.write_blocks(sector, buf).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(EIO)
     }
 
     fn flush(&self) -> Result<(), i32> {
         let state = self.with_state()?;
-        state
-            .lock()
-            .driver
-            .flush()
-            .map_err(virtio_error_to_errno)
+        state.lock().driver.flush().map_err(virtio_error_to_errno)
     }
 }
 
@@ -766,9 +739,7 @@ unsafe impl VirtioHal for RiscvVirtioHal {
         pages: usize,
         _direction: BufferDirection,
     ) -> (virtio_drivers::PhysAddr, NonNull<u8>) {
-        DMA_ARENA
-            .alloc(pages)
-            .unwrap_or((0, NonNull::dangling()))
+        DMA_ARENA.alloc(pages).unwrap_or((0, NonNull::dangling()))
     }
 
     unsafe fn dma_dealloc(
@@ -779,24 +750,50 @@ unsafe impl VirtioHal for RiscvVirtioHal {
         DMA_ARENA.dealloc(paddr, pages)
     }
 
-    unsafe fn mmio_phys_to_virt(
-        paddr: virtio_drivers::PhysAddr,
-        _size: usize,
-    ) -> NonNull<u8> {
+    unsafe fn mmio_phys_to_virt(paddr: virtio_drivers::PhysAddr, _size: usize) -> NonNull<u8> {
         NonNull::new(paddr as usize as *mut u8).unwrap()
     }
 
-    unsafe fn share(
-        buffer: NonNull<[u8]>,
-        _direction: BufferDirection,
-    ) -> virtio_drivers::PhysAddr {
-        buffer.as_ptr() as *mut u8 as usize as u64
+    unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> virtio_drivers::PhysAddr {
+        let len = buffer.len();
+        if len == 0 {
+            return 0;
+        }
+        let pages = len.div_ceil(hal_virtio::DMA_PAGE_SIZE);
+        let Some((paddr, vaddr)) = DMA_ARENA.alloc(pages) else {
+            return 0;
+        };
+        if matches!(
+            direction,
+            BufferDirection::DriverToDevice | BufferDirection::Both
+        ) {
+            core::ptr::copy_nonoverlapping(buffer.as_ptr().cast::<u8>(), vaddr.as_ptr(), len);
+        }
+        paddr
     }
 
     unsafe fn unshare(
-        _paddr: virtio_drivers::PhysAddr,
-        _buffer: NonNull<[u8]>,
-        _direction: BufferDirection,
+        paddr: virtio_drivers::PhysAddr,
+        buffer: NonNull<[u8]>,
+        direction: BufferDirection,
     ) {
+        let len = buffer.len();
+        if len == 0 || paddr == 0 {
+            return;
+        }
+        let pages = len.div_ceil(hal_virtio::DMA_PAGE_SIZE);
+        if matches!(
+            direction,
+            BufferDirection::DeviceToDriver | BufferDirection::Both
+        ) {
+            if let Some(vaddr) = DMA_ARENA.phys_to_virt(paddr) {
+                core::ptr::copy_nonoverlapping(
+                    vaddr.as_ptr(),
+                    buffer.as_ptr().cast::<u8>(),
+                    len,
+                );
+            }
+        }
+        let _ = DMA_ARENA.dealloc(paddr, pages);
     }
 }

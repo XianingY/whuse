@@ -1,10 +1,12 @@
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 #[cfg(target_arch = "loongarch64")]
 use core::arch::global_asm;
+use core::ptr::NonNull;
 #[cfg(target_arch = "loongarch64")]
 use core::ptr::{read_volatile, write_volatile};
-use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use hal_api::{
     register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
@@ -12,20 +14,19 @@ use hal_api::{
     Timespec, TrapFrame, VmSpaceToken,
 };
 use hal_virtio::{
-    LoongArchInterruptConfig, LoongArchVirtioDiscovery, PciHostConfig, PciHostWindow,
-    VirtioBlockConfig, VirtioDmaArena, parse_loongarch_virtio_discovery,
-    virtio_error_to_errno,
+    parse_loongarch_virtio_discovery, virtio_error_to_errno, LoongArchInterruptConfig,
+    LoongArchVirtioDiscovery, PciHostConfig, PciHostWindow, VirtioBlockConfig, VirtioDmaArena,
 };
 use spin::{Mutex, Once};
-use virtio_drivers::BufferDirection;
-use virtio_drivers::Hal as VirtioHal;
-use virtio_drivers::device::blk::{BlkReq, BlkResp, SECTOR_SIZE, VirtIOBlk};
-use virtio_drivers::transport::InterruptStatus;
-use virtio_drivers::transport::SomeTransport;
+use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
 use virtio_drivers::transport::pci::bus::{
     BarInfo, Cam, Command, ConfigurationAccess, DeviceFunction, MemoryBarType, MmioCam, PciRoot,
 };
-use virtio_drivers::transport::pci::{PciTransport, virtio_device_type};
+use virtio_drivers::transport::pci::{virtio_device_type, PciTransport};
+use virtio_drivers::transport::InterruptStatus;
+use virtio_drivers::transport::SomeTransport;
+use virtio_drivers::BufferDirection;
+use virtio_drivers::Hal as VirtioHal;
 
 #[cfg(target_arch = "loongarch64")]
 #[no_mangle]
@@ -48,8 +49,6 @@ __whuse_run_user:
     la.local $t0, __whuse_user_trap_entry
     csrwr $t0, 0xc
 
-    ld.d $t0, $a0, 80
-    csrwr $t0, 0x30
     move $t0, $sp
     csrwr $t0, 0x31
 
@@ -89,7 +88,12 @@ __whuse_run_user:
     bnez $t0, 1f
     li.d $t0, 3
 1:
+    li.d $t1, -4
+    and $t0, $t0, $t1
+    ori $t0, $t0, 0x3
     csrwr $t0, 0x1
+    ld.d $t0, $a0, 80
+    csrwr $t0, 0x30
     csrwr $a0, 0x30
     ertn
 
@@ -142,16 +146,64 @@ __whuse_user_trap_entry:
     csrrd $t0, 0x7
     st.d $t0, $a0, 280
 
+    csrwr $a0, 0x30
+    csrrd $t0, 0x1
+    li.d $t1, -5
+    and $t0, $t0, $t1
+    csrwr $t0, 0x1
     la.local $t0, __whuse_kernel_ra
     ld.d $ra, $t0, 0
     jirl $zero, $ra, 0
+
+    .balign 4096
+    .globl __whuse_tlb_refill_entry
+__whuse_tlb_refill_entry:
+    csrwr   $t0, 0x8b
+    csrrd   $t0, 0x1b
+
+    lddir   $t0, $t0, 3
+    beqz    $t0, 2f
+
+    lddir   $t0, $t0, 2
+    beqz    $t0, 2f
+
+    lddir   $t0, $t0, 1
+    beqz    $t0, 2f
+
+    ldpte   $t0, 0
+    ldpte   $t0, 1
+    b       3f
+
+2:
+    csrrd   $t0, 0x8e
+    ori     $t0, $t0, 0xC
+    csrwr   $t0, 0x8e
+
+    rotri.d $t0, $t0, 61
+    ori     $t0, $t0, 3
+    rotri.d $t0, $t0, 3
+
+    csrwr   $t0, 0x8c
+    csrrd   $t0, 0x8c
+    csrwr   $t0, 0x8d
+
+3:
+    tlbfill
+    csrrd   $t0, 0x8b
+    ertn
 "#
 );
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
     fn __whuse_run_user(frame: *mut TrapFrame);
+    fn __whuse_tlb_refill_entry();
 }
+
+#[cfg(target_arch = "loongarch64")]
+const LA_PWCL_VALUE: usize = 12 | (9 << 5) | (21 << 10) | (9 << 15) | (30 << 20) | (9 << 25);
+#[cfg(target_arch = "loongarch64")]
+const LA_PWCH_VALUE: usize = (39 | (9 << 6)) | (1 << 24);
 
 pub const DMWIN_UNCACHED_BASE: usize = 0x8000_0000_0000_0000;
 pub const DMWIN_CACHED_BASE: usize = 0x9000_0000_0000_0000;
@@ -159,9 +211,10 @@ pub const UART0_PHYS_BASE: usize = 0x1fe0_01e0;
 pub const MMIO_PHYS_BASE: usize = 0x1000_0000;
 pub const UART0_BASE: usize = UART0_PHYS_BASE;
 pub const PHYS_MEM_BASE: usize = 0x9000_0000;
-pub const PHYS_MEM_SIZE: usize = 128 * 1024 * 1024;
+pub const PHYS_MEM_SIZE: usize = 512 * 1024 * 1024;
 const DMA_ARENA_BYTES: usize = 2 * 1024 * 1024;
 const DMA_ARENA_WORDS: usize = DMA_ARENA_BYTES / SECTOR_SIZE / 64;
+const EIO: i32 = 5;
 const ENODEV: i32 = 19;
 const EINVAL: i32 = 22;
 const EROFS: i32 = 30;
@@ -192,6 +245,26 @@ static MEMORY_MAP: [MemoryRegion; 2] = [
     },
 ];
 
+#[cfg(target_arch = "loongarch64")]
+fn init_loongarch_mmu() {
+    unsafe {
+        let tlbrentry = __whuse_tlb_refill_entry as *const () as usize;
+        core::arch::asm!(
+            "csrwr {pwcl}, 0x1c",
+            "csrwr {pwch}, 0x1d",
+            "csrwr {tlbrentry}, 0x88",
+            "dbar 0",
+            "invtlb 0x00, $r0, $r0",
+            pwcl = in(reg) LA_PWCL_VALUE,
+            pwch = in(reg) LA_PWCH_VALUE,
+            tlbrentry = in(reg) tlbrentry,
+        );
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn init_loongarch_mmu() {}
+
 pub fn bootstrap(dtb_pa: usize) {
     let discovery = if dtb_pa != 0 {
         parse_loongarch_virtio_discovery(dtb_pa)
@@ -202,6 +275,7 @@ pub fn bootstrap(dtb_pa: usize) {
         INTERRUPT.configure(&discovery);
         VIRTIO_BLK.bootstrap(&discovery);
     }
+    init_loongarch_mmu();
     register_hal(HalBundle {
         platform: &PLATFORM,
         lifecycle: &LIFECYCLE,
@@ -345,7 +419,29 @@ impl HalCpu for VirtCpu {
         self.interrupts_enabled.load(Ordering::Relaxed)
     }
 
-    fn switch_address_space(&self, _token: VmSpaceToken) {}
+    fn switch_address_space(&self, token: VmSpaceToken) {
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            let root = token.0;
+            let mut crmd: usize;
+            core::arch::asm!("csrrd {}, 0x0", out(reg) crmd);
+            crmd &= !0x1e8; // clear DA/DATF/DATM
+            crmd |= 0xb0; // PG=1, DATF=01, DATM=01
+            core::arch::asm!(
+                "csrwr {root}, 0x19",
+                "csrwr {root}, 0x1a",
+                "csrwr {crmd}, 0x0",
+                "dbar 0",
+                "invtlb 0x00, $r0, $r0",
+                root = in(reg) root,
+                crmd = in(reg) crmd,
+            );
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            let _ = token;
+        }
+    }
 
     fn wait_for_interrupt(&self) {
         #[cfg(target_arch = "loongarch64")]
@@ -466,15 +562,20 @@ impl VirtioBlockDevice {
         let enum_cam = unsafe { MmioCam::new(host.ecam_base as *mut u8, Cam::Ecam) };
         let mut raw_cam = unsafe { MmioCam::new(host.ecam_base as *mut u8, Cam::Ecam) };
         let enum_root = PciRoot::new(enum_cam);
-        let mut cfg_root = PciRoot::new(unsafe { MmioCam::new(host.ecam_base as *mut u8, Cam::Ecam) });
+        let mut cfg_root =
+            PciRoot::new(unsafe { MmioCam::new(host.ecam_base as *mut u8, Cam::Ecam) });
         let mut allocator = PciBarAllocator::new(&host).ok_or(ENODEV)?;
         for bus in host.bus_start..=host.bus_end {
             for (device_function, info) in enum_root.enumerate_bus(bus) {
                 if virtio_device_type(&info) != Some(virtio_drivers::transport::DeviceType::Block) {
                     continue;
                 }
-                let command =
-                    allocate_virtio_bars(&mut cfg_root, &mut raw_cam, device_function, &mut allocator)?;
+                let command = allocate_virtio_bars(
+                    &mut cfg_root,
+                    &mut raw_cam,
+                    device_function,
+                    &mut allocator,
+                )?;
                 cfg_root.set_command(device_function, command);
                 let transport =
                     PciTransport::new::<LoongArchVirtioHal, _>(&mut cfg_root, device_function)
@@ -493,7 +594,9 @@ impl VirtioBlockDevice {
                     .store(info.capacity_sectors, Ordering::Relaxed);
                 self.readonly.store(info.readonly, Ordering::Relaxed);
                 self.init_error.store(0, Ordering::Relaxed);
-                let _ = self.state.call_once(|| Mutex::new(VirtioBlockState { driver }));
+                let _ = self
+                    .state
+                    .call_once(|| Mutex::new(VirtioBlockState { driver }));
                 return Ok(());
             }
         }
@@ -504,29 +607,6 @@ impl VirtioBlockDevice {
         self.state
             .get()
             .ok_or_else(|| self.init_error.load(Ordering::Relaxed))
-    }
-
-    fn wait_for_completion(
-        &self,
-        state: &Mutex<VirtioBlockState>,
-        token: u16,
-    ) -> Result<(), i32> {
-        let mut saw_interrupt = false;
-        for _ in 0..1_000_000usize {
-            let mut guard = state.lock();
-            if guard
-                .driver
-                .ack_interrupt()
-                .contains(InterruptStatus::QUEUE_INTERRUPT)
-            {
-                saw_interrupt = true;
-            }
-            if saw_interrupt && guard.driver.peek_used() == Some(token) {
-                return Ok(());
-            }
-            core::hint::spin_loop();
-        }
-        Err(5)
     }
 }
 
@@ -569,22 +649,26 @@ impl HalBlockDevice for VirtioBlockDevice {
         if buf.len() != SECTOR_SIZE {
             return Err(EINVAL);
         }
-        let state = self.with_state()?;
-        let mut request = BlkReq::default();
-        let mut response = BlkResp::default();
-        let token = {
-            let mut guard = state.lock();
-            unsafe { guard.driver.read_blocks_nb(sector, &mut request, buf, &mut response) }
-                .map_err(virtio_error_to_errno)?
-        };
-        self.wait_for_completion(state, token)?;
-        let mut guard = state.lock();
-        unsafe {
-            guard
-                .driver
-                .complete_read_blocks(token, &request, buf, &mut response)
+        if sector >= self.capacity_sectors.load(Ordering::Relaxed) {
+            return Err(EINVAL);
         }
-        .map_err(virtio_error_to_errno)
+        let state = self.with_state()?;
+        for _ in 0..3 {
+            if state.lock().driver.read_blocks(sector, buf).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(EIO)
+    }
+
+    fn read_sectors(&self, start_sector: usize, buf: &mut [u8]) -> Result<(), i32> {
+        if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+            return Err(EINVAL);
+        }
+        for (index, chunk) in buf.chunks_exact_mut(SECTOR_SIZE).enumerate() {
+            self.read_sector(start_sector + index, chunk)?;
+        }
+        Ok(())
     }
 
     fn write_sector(&self, sector: usize, buf: &[u8]) -> Result<(), i32> {
@@ -594,31 +678,21 @@ impl HalBlockDevice for VirtioBlockDevice {
         if buf.len() != SECTOR_SIZE {
             return Err(EINVAL);
         }
-        let state = self.with_state()?;
-        let mut request = BlkReq::default();
-        let mut response = BlkResp::default();
-        let token = {
-            let mut guard = state.lock();
-            unsafe { guard.driver.write_blocks_nb(sector, &mut request, buf, &mut response) }
-                .map_err(virtio_error_to_errno)?
-        };
-        self.wait_for_completion(state, token)?;
-        let mut guard = state.lock();
-        unsafe {
-            guard
-                .driver
-                .complete_write_blocks(token, &request, buf, &mut response)
+        if sector >= self.capacity_sectors.load(Ordering::Relaxed) {
+            return Err(EINVAL);
         }
-        .map_err(virtio_error_to_errno)
+        let state = self.with_state()?;
+        for _ in 0..3 {
+            if state.lock().driver.write_blocks(sector, buf).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(EIO)
     }
 
     fn flush(&self) -> Result<(), i32> {
         let state = self.with_state()?;
-        state
-            .lock()
-            .driver
-            .flush()
-            .map_err(virtio_error_to_errno)
+        state.lock().driver.flush().map_err(virtio_error_to_errno)
     }
 }
 
@@ -655,7 +729,9 @@ impl HalNetDevice for VirtioNetStub {
 impl PciBarAllocator {
     fn new(host: &PciHostConfig) -> Option<Self> {
         let mmio = host.mmio?;
-        let io = host.io.unwrap_or(hal_virtio::PciHostWindow { base: 0, size: 0 });
+        let io = host
+            .io
+            .unwrap_or(hal_virtio::PciHostWindow { base: 0, size: 0 });
         Some(Self {
             mmio_next: mmio.base as u64,
             mmio_limit: mmio.base as u64 + mmio.size as u64,
@@ -725,11 +801,9 @@ fn allocate_virtio_bars(
                 size,
                 ..
             } => {
-                let address = allocator
-                    .alloc_memory(*size, *address_type)
-                    .ok_or(ENODEV)?;
-                let flags = ((u8::from(*address_type) as u32) << 1)
-                    | if *prefetchable { 0x8 } else { 0 };
+                let address = allocator.alloc_memory(*size, *address_type).ok_or(ENODEV)?;
+                let flags =
+                    ((u8::from(*address_type) as u32) << 1) | if *prefetchable { 0x8 } else { 0 };
                 write_memory_bar(raw_cam, device_function, bar_index as u8, address, flags);
                 bar_index += if bar.takes_two_entries() { 2 } else { 1 };
             }
@@ -756,7 +830,11 @@ fn write_memory_bar(
         ((address as u32) & !0xf) | flags,
     );
     if flags & 0b100 != 0 {
-        raw_cam.write_word(device_function, 0x10 + 4 * (bar_index + 1), (address >> 32) as u32);
+        raw_cam.write_word(
+            device_function,
+            0x10 + 4 * (bar_index + 1),
+            (address >> 32) as u32,
+        );
     }
 }
 
@@ -773,9 +851,7 @@ unsafe impl VirtioHal for LoongArchVirtioHal {
         pages: usize,
         _direction: BufferDirection,
     ) -> (virtio_drivers::PhysAddr, NonNull<u8>) {
-        DMA_ARENA
-            .alloc(pages)
-            .unwrap_or((0, NonNull::dangling()))
+        DMA_ARENA.alloc(pages).unwrap_or((0, NonNull::dangling()))
     }
 
     unsafe fn dma_dealloc(
@@ -786,25 +862,51 @@ unsafe impl VirtioHal for LoongArchVirtioHal {
         DMA_ARENA.dealloc(paddr, pages)
     }
 
-    unsafe fn mmio_phys_to_virt(
-        paddr: virtio_drivers::PhysAddr,
-        _size: usize,
-    ) -> NonNull<u8> {
+    unsafe fn mmio_phys_to_virt(paddr: virtio_drivers::PhysAddr, _size: usize) -> NonNull<u8> {
         NonNull::new(paddr as usize as *mut u8).unwrap()
     }
 
-    unsafe fn share(
-        buffer: NonNull<[u8]>,
-        _direction: BufferDirection,
-    ) -> virtio_drivers::PhysAddr {
-        buffer.as_ptr() as *mut u8 as usize as u64
+    unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> virtio_drivers::PhysAddr {
+        let len = buffer.len();
+        if len == 0 {
+            return 0;
+        }
+        let pages = len.div_ceil(hal_virtio::DMA_PAGE_SIZE);
+        let Some((paddr, vaddr)) = DMA_ARENA.alloc(pages) else {
+            return 0;
+        };
+        if matches!(
+            direction,
+            BufferDirection::DriverToDevice | BufferDirection::Both
+        ) {
+            core::ptr::copy_nonoverlapping(buffer.as_ptr().cast::<u8>(), vaddr.as_ptr(), len);
+        }
+        paddr
     }
 
     unsafe fn unshare(
-        _paddr: virtio_drivers::PhysAddr,
-        _buffer: NonNull<[u8]>,
-        _direction: BufferDirection,
+        paddr: virtio_drivers::PhysAddr,
+        buffer: NonNull<[u8]>,
+        direction: BufferDirection,
     ) {
+        let len = buffer.len();
+        if len == 0 || paddr == 0 {
+            return;
+        }
+        let pages = len.div_ceil(hal_virtio::DMA_PAGE_SIZE);
+        if matches!(
+            direction,
+            BufferDirection::DeviceToDriver | BufferDirection::Both
+        ) {
+            if let Some(vaddr) = DMA_ARENA.phys_to_virt(paddr) {
+                core::ptr::copy_nonoverlapping(
+                    vaddr.as_ptr(),
+                    buffer.as_ptr().cast::<u8>(),
+                    len,
+                );
+            }
+        }
+        let _ = DMA_ARENA.dealloc(paddr, pages);
     }
 }
 

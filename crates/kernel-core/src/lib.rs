@@ -5,6 +5,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use core::fmt::{self, Write};
+use fs_ext4::Ext4Mount;
 use hal_api::{hal, ConsoleWriter, PlatformArch};
 use mm::MemoryManager;
 use proc::ProcessTable;
@@ -51,6 +52,35 @@ impl Kernel {
         let _ = user_init::seed_filesystem(&mut vfs);
         let mut rootfs_summary = String::from("builtin tmpfs/devfs/procfs-lite");
         if let Some(device) = hal().block_devices.first().copied() {
+            match device.init() {
+                Ok(()) => {
+                    let capacity_bytes = device.sector_count().saturating_mul(device.sector_size());
+                    match device.irq_line() {
+                        Some(irq) => logln(format_args!(
+                            "whuse: block device {} ready sectors={} sector_size={} capacity={} irq={}",
+                            device.name(),
+                            device.sector_count(),
+                            device.sector_size(),
+                            capacity_bytes,
+                            irq,
+                        )),
+                        None => logln(format_args!(
+                            "whuse: block device {} ready sectors={} sector_size={} capacity={} irq=n/a",
+                            device.name(),
+                            device.sector_count(),
+                            device.sector_size(),
+                            capacity_bytes,
+                        )),
+                    }
+                }
+                Err(err) => {
+                    logln(format_args!(
+                        "whuse: block device {} unavailable ({})",
+                        device.name(),
+                        err,
+                    ));
+                }
+            }
             match vfs.mount_ext4(device.name(), "/", device) {
                 Ok(label) => {
                     let display = if label.is_empty() {
@@ -63,6 +93,7 @@ impl Kernel {
                         device.name(),
                         display,
                     ));
+                    log_rootfs_smoke(device);
                     rootfs_summary = format!("ext4({display}) over builtin special mounts");
                 }
                 Err(err) => {
@@ -187,6 +218,18 @@ impl Kernel {
             PlatformArch::Riscv64 => scause == 8,
             PlatformArch::LoongArch64 => scause == 11,
         };
+        let is_external_interrupt = match hal().platform.architecture() {
+            PlatformArch::Riscv64 => {
+                let interrupt_bit = 1usize << (usize::BITS as usize - 1);
+                (scause & interrupt_bit) != 0 && (scause & !interrupt_bit) == 9
+            }
+            PlatformArch::LoongArch64 => scause == 0,
+        };
+
+        if is_external_interrupt {
+            self.service_irqs();
+            return;
+        }
 
         if is_syscall {
             let result = self.syscalls.dispatch(
@@ -218,10 +261,52 @@ impl Kernel {
             self.scheduler.remove_task(exit.tid);
         }
     }
+
+    fn service_irqs(&mut self) {
+        while let Some(irq) = hal().interrupt.next_pending() {
+            for device in hal().block_devices {
+                if device.irq_line() == Some(irq) {
+                    let _ = device.ack_interrupt();
+                }
+            }
+            hal().interrupt.ack_irq(irq);
+        }
+        for device in hal().block_devices {
+            let _ = device.ack_interrupt();
+        }
+    }
 }
 
 pub fn logln(args: fmt::Arguments<'_>) {
     let mut writer = ConsoleWriter;
     let _ = writer.write_fmt(args);
     let _ = writer.write_str("\n");
+}
+
+fn log_rootfs_smoke(device: &'static dyn hal_api::HalBlockDevice) {
+    let Ok(mount) = Ext4Mount::probe(device) else {
+        logln(format_args!("whuse: rootfs smoke read unavailable"));
+        return;
+    };
+    let mut last_error = None;
+    for path in ["/etc/issue", "/bin/sh"] {
+        match mount.read(path) {
+            Ok(bytes) => {
+                logln(format_args!(
+                    "whuse: rootfs smoke read success path={} bytes={}",
+                    path,
+                    bytes.len(),
+                ));
+                return;
+            }
+            Err(err) => last_error = Some((path, err)),
+        }
+    }
+    match last_error {
+        Some((path, err)) => logln(format_args!(
+            "whuse: rootfs smoke read unavailable last_path={} err={}",
+            path, err
+        )),
+        None => logln(format_args!("whuse: rootfs smoke read unavailable")),
+    }
 }

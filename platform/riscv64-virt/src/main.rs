@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 global_asm!(include_str!("entry.S"));
 
 #[cfg(target_os = "none")]
-const HEAP_SIZE: usize = 1024 * 1024;
+const HEAP_SIZE: usize = 192 * 1024 * 1024;
 
 #[cfg(target_os = "none")]
 #[repr(align(16))]

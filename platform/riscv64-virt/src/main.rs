@@ -73,7 +73,7 @@ static ALLOCATOR: BumpAllocator = BumpAllocator::new();
 #[cfg(target_os = "none")]
 #[no_mangle]
 pub extern "C" fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
-    hal_riscv64_virt::bootstrap();
+    hal_riscv64_virt::bootstrap(dtb_pa);
     kernel_core::boot_forever(kernel_core::BootInfo {
         hart_id,
         dtb_pa,
@@ -93,7 +93,7 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 
 #[cfg(not(target_os = "none"))]
 fn main() {
-    hal_riscv64_virt::bootstrap();
+    hal_riscv64_virt::bootstrap(0);
     let _kernel = kernel_core::Kernel::bootstrap(kernel_core::BootInfo {
         hart_id: 0,
         dtb_pa: 0,

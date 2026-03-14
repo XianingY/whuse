@@ -17,8 +17,6 @@ _start:
     b 1b
 2:
     la.local $sp, boot_stack_top
-    move $a0, $zero
-    move $a1, $zero
     bl rust_main
 3:
     idle 0

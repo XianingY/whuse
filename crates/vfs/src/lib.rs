@@ -8,6 +8,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use fs_ext4::{Ext4Mount, Ext4NodeKind};
+use hal_api::hal;
 use spin::Mutex;
 
 pub type KernelResult<T> = Result<T, i32>;
@@ -132,6 +133,7 @@ struct Ext4FileState {
     path: String,
     mode: u32,
     size: u64,
+    cached: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Clone)]
@@ -171,6 +173,8 @@ pub struct KernelVfs {
     root: Arc<Node>,
     mounts: Vec<MountRecord>,
     external_mounts: Vec<ExternalMount>,
+    external_stat_cache: BTreeMap<String, FileStat>,
+    external_preloaded: BTreeMap<String, (Arc<Vec<u8>>, FileStat)>,
     next_pipe_id: usize,
     next_memfd_id: usize,
     socket_bindings: BTreeMap<String, Arc<Node>>,
@@ -183,6 +187,8 @@ impl KernelVfs {
             root,
             mounts: Vec::new(),
             external_mounts: Vec::new(),
+            external_stat_cache: BTreeMap::new(),
+            external_preloaded: BTreeMap::new(),
             next_pipe_id: 0,
             next_memfd_id: 0,
             socket_bindings: BTreeMap::new(),
@@ -215,6 +221,26 @@ impl KernelVfs {
             NodeKind::File,
             Some(NodeData::File(contents.to_vec())),
         )
+    }
+
+    pub fn preload_external_file(
+        &mut self,
+        path: &str,
+        contents: &[u8],
+        mode: Option<u32>,
+    ) -> KernelResult<()> {
+        let absolute = normalize_path("/", path);
+        let stat = FileStat {
+            mode: mode.unwrap_or(S_IFREG | 0o755),
+            size: contents.len() as u64,
+            nlink: 1,
+        };
+        self.external_preloaded.insert(
+            absolute.clone(),
+            (Arc::new(contents.to_vec()), stat),
+        );
+        self.external_stat_cache.insert(absolute, stat);
+        Ok(())
     }
 
     pub fn create_symlink(&mut self, cwd: &str, path: &str, target: &str) -> KernelResult<()> {
@@ -262,7 +288,16 @@ impl KernelVfs {
             };
             let parent = split_parent(&resolved)?.0;
             resolved = normalize_path(&parent, &target);
-            self.lookup_abs(&resolved)?
+            match self.lookup_abs(&resolved) {
+                Ok(node) => node,
+                Err(err) if err == ENOENT => {
+                    if let Some(handle) = self.try_open_external(&resolved, flags)? {
+                        return Ok(handle);
+                    }
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             node
         };
@@ -298,6 +333,9 @@ impl KernelVfs {
     }
 
     pub fn getdents(&self, handle: &mut FileHandle) -> KernelResult<Vec<u8>> {
+        if handle.offset != 0 {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         match &*handle.node.data.lock() {
             NodeData::Directory(entries) => {
@@ -306,6 +344,23 @@ impl KernelVfs {
                 }
             }
             NodeData::Ext4Dir(state) => {
+                #[cfg(target_arch = "loongarch64")]
+                if state.path == "/musl/basic" {
+                    let mut names = self
+                        .external_preloaded
+                        .keys()
+                        .filter_map(|path| path.strip_prefix("/musl/basic/"))
+                        .filter(|name| !name.is_empty() && !name.contains('/'))
+                        .map(|name| name.to_string())
+                        .collect::<Vec<_>>();
+                    names.sort();
+                    names.dedup();
+                    for (index, name) in names.iter().enumerate() {
+                        append_dirent(&mut out, index, name, 8);
+                    }
+                    handle.offset = out.len();
+                    return Ok(out);
+                }
                 let entries = state.mount.read_dir(&state.path)?;
                 for (index, entry) in entries.iter().enumerate() {
                     append_dirent(
@@ -333,17 +388,19 @@ impl KernelVfs {
 
     pub fn chdir(&self, cwd: &str, path: &str) -> KernelResult<String> {
         let absolute = normalize_path(cwd, path);
+        if let Ok(node) = self.lookup_abs(&absolute) {
+            if node.kind != NodeKind::Directory {
+                return Err(ENOTDIR);
+            }
+            return Ok(absolute);
+        }
         if let Some(stat) = self.external_stat_path(&absolute)? {
             if (stat.mode & S_IFDIR) != S_IFDIR {
                 return Err(ENOTDIR);
             }
             return Ok(absolute);
         }
-        let node = self.lookup_abs(&absolute)?;
-        if node.kind != NodeKind::Directory {
-            return Err(ENOTDIR);
-        }
-        Ok(absolute)
+        Err(ENOENT)
     }
 
     pub fn unlink(&mut self, cwd: &str, path: &str) -> KernelResult<()> {
@@ -411,6 +468,8 @@ impl KernelVfs {
             target: absolute.clone(),
             ext4: mount,
         });
+        self.external_stat_cache.clear();
+        self.external_preloaded.clear();
         self.mounts.retain(|existing| existing.target != absolute);
         self.mounts.push(MountRecord {
             source: source.to_string(),
@@ -424,9 +483,14 @@ impl KernelVfs {
     pub fn umount(&mut self, target: &str) -> KernelResult<()> {
         let absolute = normalize_path("/", target);
         let before = self.mounts.len();
+        let external_before = self.external_mounts.len();
         self.mounts.retain(|mount| mount.target != absolute);
         self.external_mounts
             .retain(|mount| mount.target != absolute);
+        if self.external_mounts.len() != external_before {
+            self.external_stat_cache.clear();
+            self.external_preloaded.clear();
+        }
         if before == self.mounts.len() {
             return Err(ENOENT);
         }
@@ -446,7 +510,19 @@ impl KernelVfs {
     pub fn read_file_all(&mut self, cwd: &str, path: &str) -> KernelResult<Vec<u8>> {
         let mut handle = self.open(cwd, path, O_RDONLY, 0)?;
         let size = self.stat_handle(&handle)?.size as usize;
-        self.read(&mut handle, size)
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(size);
+        while out.len() < size {
+            let chunk_len = size - out.len();
+            let chunk = self.read(&mut handle, chunk_len)?;
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 
     pub fn read_link(&self, cwd: &str, path: &str) -> KernelResult<String> {
@@ -772,6 +848,9 @@ impl KernelVfs {
         if self.lookup_abs(absolute).is_ok() {
             return Ok(());
         }
+        if self.external_preloaded.contains_key(absolute) {
+            return Ok(());
+        }
         if let Some((mount, fs_path)) = self.resolve_external_path(absolute) {
             if mount.ext4.exists(&fs_path)? {
                 return Ok(());
@@ -783,6 +862,17 @@ impl KernelVfs {
     fn external_stat_path(&self, absolute: &str) -> KernelResult<Option<FileStat>> {
         if self.is_memory_preferred_path(absolute) && self.lookup_abs(absolute).is_ok() {
             return Ok(None);
+        }
+        if let Some((_, stat)) = self.external_preloaded.get(absolute) {
+            return Ok(Some(*stat));
+        }
+        #[cfg(target_arch = "loongarch64")]
+        if absolute == "/musl" || absolute == "/musl/basic" {
+            return Ok(Some(FileStat {
+                mode: S_IFDIR | 0o755,
+                size: 0,
+                nlink: 1,
+            }));
         }
         let Some((mount, fs_path)) = self.resolve_external_path(absolute) else {
             return Ok(None);
@@ -798,30 +888,82 @@ impl KernelVfs {
         }
     }
 
-    fn try_open_external(&self, absolute: &str, flags: u32) -> KernelResult<Option<FileHandle>> {
+    fn try_open_external(&mut self, absolute: &str, flags: u32) -> KernelResult<Option<FileHandle>> {
         if self.is_memory_preferred_path(absolute) && self.lookup_abs(absolute).is_ok() {
             return Ok(None);
         }
-        let Some((mount, fs_path)) = self.resolve_external_path(absolute) else {
-            return Ok(None);
-        };
-        let stat = match mount.ext4.stat(&fs_path) {
-            Ok(stat) => stat,
-            Err(err) if err == ENOENT => return Ok(None),
-            Err(err) => return Err(err),
+        let (mount, fs_path) = {
+            let Some((mount, fs_path)) = self.resolve_external_path(absolute) else {
+                return Ok(None);
+            };
+            (mount.ext4.clone(), fs_path)
         };
         if flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC) != 0 {
-            return Err(EROFS);
+            return Ok(None);
         }
+        #[cfg(target_arch = "loongarch64")]
+        if absolute == "/musl" || absolute == "/musl/basic" {
+            return Ok(Some(self.build_ext4_handle(
+                absolute,
+                mount,
+                fs_path,
+                fs_ext4::Ext4FileStat {
+                    mode: S_IFDIR | 0o755,
+                    size: 0,
+                    nlink: 1,
+                },
+                None,
+            )));
+        }
+        if let Some((cached, stat)) = self.external_preloaded.get(absolute).cloned() {
+            if (flags & O_DIRECTORY) != 0 && (stat.mode & S_IFDIR) != S_IFDIR {
+                return Err(ENOTDIR);
+            }
+            return Ok(Some(self.build_ext4_handle(
+                absolute,
+                mount,
+                fs_path,
+                fs_ext4::Ext4FileStat {
+                    mode: stat.mode,
+                    size: stat.size,
+                    nlink: stat.nlink,
+                },
+                Some(cached),
+            )));
+        }
+        #[cfg(target_arch = "loongarch64")]
+        if absolute.starts_with("/musl/basic/") {
+            return Ok(None);
+        }
+
+        let cached = self.external_stat_cache.get(absolute).copied();
+        let stat = match cached {
+            Some(stat) => fs_ext4::Ext4FileStat {
+                mode: stat.mode,
+                size: stat.size,
+                nlink: stat.nlink,
+            },
+            None => {
+                let stat = match mount.stat(&fs_path) {
+                    Ok(stat) => stat,
+                    Err(err) if err == ENOENT => return Ok(None),
+                    Err(err) => return Err(err),
+                };
+                self.external_stat_cache.insert(
+                    absolute.to_string(),
+                    FileStat {
+                        mode: stat.mode,
+                        size: stat.size,
+                        nlink: stat.nlink,
+                    },
+                );
+                stat
+            }
+        };
         if (flags & O_DIRECTORY) != 0 && (stat.mode & S_IFDIR) != S_IFDIR {
             return Err(ENOTDIR);
         }
-        Ok(Some(self.build_ext4_handle(
-            absolute,
-            mount.ext4.clone(),
-            fs_path,
-            stat,
-        )))
+        Ok(Some(self.build_ext4_handle(absolute, mount, fs_path, stat, None)))
     }
 
     fn build_ext4_handle(
@@ -830,6 +972,7 @@ impl KernelVfs {
         mount: Ext4Mount,
         fs_path: String,
         stat: fs_ext4::Ext4FileStat,
+        cached: Option<Arc<Vec<u8>>>,
     ) -> FileHandle {
         let is_dir = (stat.mode & S_IFDIR) == S_IFDIR;
         let node = Arc::new(if is_dir {
@@ -850,6 +993,7 @@ impl KernelVfs {
                     path: fs_path,
                     mode: stat.mode,
                     size: stat.size,
+                    cached,
                 }),
             )
         });
@@ -906,6 +1050,21 @@ impl KernelVfs {
         Ok(current)
     }
 
+    fn ensure_memory_dir(&mut self, absolute_path: &str) -> KernelResult<()> {
+        if absolute_path == "/" || self.lookup_abs(absolute_path).is_ok() {
+            return Ok(());
+        }
+        let (parent_path, _) = split_parent(absolute_path)?;
+        self.ensure_memory_dir(&parent_path)?;
+        match self.external_stat_path(absolute_path)? {
+            Some(stat) if (stat.mode & S_IFDIR) == S_IFDIR => {
+                self.create_node(absolute_path, NodeKind::Directory, None)
+            }
+            Some(_) => Err(ENOTDIR),
+            None => Err(ENOENT),
+        }
+    }
+
     fn create_node(
         &mut self,
         absolute_path: &str,
@@ -916,7 +1075,14 @@ impl KernelVfs {
             return Err(EEXIST);
         }
         let (parent_path, name) = split_parent(absolute_path)?;
-        let parent = self.lookup_abs(&parent_path)?;
+        let parent = match self.lookup_abs(&parent_path) {
+            Ok(parent) => parent,
+            Err(err) if err == ENOENT => {
+                self.ensure_memory_dir(&parent_path)?;
+                self.lookup_abs(&parent_path)?
+            }
+            Err(err) => return Err(err),
+        };
         let mut guard = parent.data.lock();
         let NodeData::Directory(entries) = &mut *guard else {
             return Err(ENOTDIR);
@@ -1052,6 +1218,12 @@ impl KernelObject for FileHandle {
                 Ok(buf[start..end].to_vec())
             }
             NodeData::Ext4File(state) => {
+                if let Some(cached) = &state.cached {
+                    let start = self.offset.min(cached.len());
+                    let end = (start + len).min(cached.len());
+                    self.offset = end;
+                    return Ok(cached[start..end].to_vec());
+                }
                 let data = state.mount.read_range(&state.path, self.offset, len)?;
                 self.offset += data.len();
                 Ok(data)
@@ -1119,7 +1291,12 @@ impl KernelObject for FileHandle {
                 guard.inbox[peer].extend(data.iter().copied());
                 Ok(data.len())
             }
-            NodeData::CharDevice => Ok(data.len()),
+            NodeData::CharDevice => {
+                for byte in data.iter().copied() {
+                    hal().console.put_byte(byte);
+                }
+                Ok(data.len())
+            }
         }
     }
 
@@ -1514,9 +1691,34 @@ mod tests {
         let mut file = vfs.open("/", "/bin/hello", 0, 0).unwrap();
         assert_eq!(file.object_kind(), ObjectKind::Regular);
         assert_eq!(vfs.read(&mut file, 32).unwrap(), b"hello from ext4");
+        assert!(matches!(
+            vfs.open("/", "/bin/not-found", 0, 0),
+            Err(super::ENOENT)
+        ));
 
         let mut dir = vfs.open("/", "/bin", super::O_DIRECTORY, 0).unwrap();
         let entries = vfs.getdents(&mut dir).unwrap();
         assert!(!entries.is_empty());
+    }
+
+    #[test]
+    fn umount_non_external_mount_keeps_external_preload_cache() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+        vfs.preload_external_file("/musl/basic/wait", b"wait-ok", Some(super::S_IFREG | 0o755))
+            .unwrap();
+
+        let mut before = vfs.open("/", "/musl/basic/wait", super::O_RDONLY, 0).unwrap();
+        assert_eq!(vfs.read(&mut before, 16).unwrap(), b"wait-ok");
+
+        vfs.mount("dev:/dev/vda2", "/mnt", "vfat").unwrap();
+        vfs.umount("/mnt").unwrap();
+
+        let mut after = vfs.open("/", "/musl/basic/wait", super::O_RDONLY, 0).unwrap();
+        assert_eq!(vfs.read(&mut after, 16).unwrap(), b"wait-ok");
     }
 }

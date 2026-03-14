@@ -18,9 +18,9 @@ const ECHILD: i32 = 10;
 const ENOENT: i32 = 2;
 const EINVAL: i32 = 22;
 const ESRCH: i32 = 3;
-const WNOHANG: u32 = 1;
 
 const USER_STACK_SIZE: usize = 8192;
+const USER_STACK_TOP: usize = 0x7fff_f000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessState {
@@ -122,10 +122,10 @@ pub struct ProcessTable {
 impl Process {
     pub fn new(name: &str, pid: usize, parent: Option<usize>, entry: usize) -> Self {
         let user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
-        let sp = user_stack.as_ptr() as usize + user_stack.len() - 16;
         let address_space = AddressSpace::new_user();
-        let _ =
-            address_space.install_host_range(user_stack.as_ptr() as usize, user_stack.len(), 0b11);
+        let stack_base = USER_STACK_TOP - USER_STACK_SIZE;
+        let _ = address_space.map_fixed_bytes(stack_base, &[], USER_STACK_SIZE, 0b11);
+        let sp = USER_STACK_TOP - 16;
         Self {
             pid,
             tid: pid,
@@ -194,13 +194,11 @@ impl Process {
     pub fn reset_image(&mut self, entry: usize, stack_pointer: Option<usize>) {
         self.address_space.clear();
         self.user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
-        let _ = self.address_space.install_host_range(
-            self.user_stack.as_ptr() as usize,
-            self.user_stack.len(),
-            0b11,
-        );
-        let sp = stack_pointer
-            .unwrap_or_else(|| self.user_stack.as_ptr() as usize + self.user_stack.len() - 16);
+        let stack_base = USER_STACK_TOP - USER_STACK_SIZE;
+        let _ = self
+            .address_space
+            .map_fixed_bytes(stack_base, &[], USER_STACK_SIZE, 0b11);
+        let sp = stack_pointer.unwrap_or(USER_STACK_TOP - 16);
         self.trap_frame = TrapFrame::new_user(entry, sp);
         self.state = ProcessState::Ready;
         self.exit_code = None;
@@ -213,15 +211,7 @@ impl Process {
 
     fn fork_from(&self, pid: usize) -> Self {
         let user_stack = self.user_stack.to_vec().into_boxed_slice();
-        let old_base = self.user_stack.as_ptr() as usize;
-        let new_base = user_stack.as_ptr() as usize;
-        let stack_len = self.user_stack.len();
-        let old_sp = self.trap_frame.regs[2];
-        let new_sp = if (old_base..=old_base + stack_len).contains(&old_sp) {
-            new_base + (old_sp - old_base)
-        } else {
-            old_sp
-        };
+        let new_sp = self.trap_frame.regs[2];
 
         let mut trap_frame = self.trap_frame;
         trap_frame.regs[2] = new_sp;
@@ -229,7 +219,49 @@ impl Process {
         trap_frame.sepc += 4;
 
         let address_space = self.address_space.clone_private();
-        let _ = address_space.install_host_range(new_base, user_stack.len(), 0b11);
+
+        Self {
+            pid,
+            tid: pid,
+            tgid: pid,
+            pgid: self.pgid,
+            sid: self.sid,
+            parent: Some(self.tgid),
+            name: self.name.clone(),
+            cwd: self.cwd.clone(),
+            uid: self.uid,
+            euid: self.euid,
+            gid: self.gid,
+            egid: self.egid,
+            groups: self.groups.clone(),
+            umask: self.umask,
+            state: ProcessState::Ready,
+            exit_code: None,
+            address_space,
+            fds: self.fds.clone(),
+            trap_frame,
+            user_stack,
+            tid_address: self.tid_address,
+            clear_child_tid: self.clear_child_tid,
+            robust_list: self.robust_list,
+            signal_mask: self.signal_mask,
+            pending_signals: 0,
+            sigaltstack: self.sigaltstack,
+            signal_actions: self.signal_actions.clone(),
+            is_thread: false,
+        }
+    }
+
+    fn fork_from_shared(&self, pid: usize) -> Self {
+        let user_stack = self.user_stack.to_vec().into_boxed_slice();
+        let new_sp = self.trap_frame.regs[2];
+
+        let mut trap_frame = self.trap_frame;
+        trap_frame.regs[2] = new_sp;
+        trap_frame.set_retval(0);
+        trap_frame.sepc += 4;
+
+        let address_space = self.address_space.clone();
 
         Self {
             pid,
@@ -265,7 +297,15 @@ impl Process {
 
     fn clone_thread_from(&self, tid: usize, stack: usize, tls: Option<usize>) -> Self {
         let user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
-        let fallback_sp = user_stack.as_ptr() as usize + user_stack.len() - 16;
+        let address_space = self.address_space.clone();
+        let fallback_sp = if stack == 0 {
+            address_space
+                .map_anonymous(USER_STACK_SIZE, 0b11)
+                .map(|base| base + USER_STACK_SIZE - 16)
+                .unwrap_or(USER_STACK_TOP - 16)
+        } else {
+            USER_STACK_TOP - 16
+        };
         let mut trap_frame = self.trap_frame;
         trap_frame.set_retval(0);
         trap_frame.sepc += 4;
@@ -277,9 +317,6 @@ impl Process {
         if let Some(tls) = tls {
             trap_frame.regs[4] = tls;
         }
-        let address_space = self.address_space.clone();
-        let _ =
-            address_space.install_host_range(user_stack.as_ptr() as usize, user_stack.len(), 0b11);
         Self {
             pid: tid,
             tid,
@@ -439,7 +476,7 @@ impl ProcessTable {
         &mut self,
         parent_tgid: usize,
         selector: WaitSelector,
-        options: u32,
+        _options: u32,
     ) -> KernelResult<(usize, i32)> {
         let child_tid = self
             .processes
@@ -457,7 +494,7 @@ impl ProcessTable {
                     && process.parent == Some(parent_tgid)
                     && selector_matches(selector, process)
             });
-            if options & WNOHANG != 0 && has_any_child {
+            if has_any_child {
                 return Ok((0, 0));
             }
             return Err(ECHILD);
@@ -484,6 +521,13 @@ impl ProcessTable {
         Ok(pid)
     }
 
+    pub fn fork_process_from_current_shared(&mut self) -> KernelResult<usize> {
+        let pid = self.next_id();
+        let parent = self.current()?.fork_from_shared(pid);
+        self.processes.insert(pid, parent);
+        Ok(pid)
+    }
+
     pub fn clone_thread_from_current(
         &mut self,
         stack: usize,
@@ -493,6 +537,12 @@ impl ProcessTable {
         let thread = self.current()?.clone_thread_from(tid, stack, tls);
         self.processes.insert(tid, thread);
         Ok(tid)
+    }
+
+    pub fn set_thread_stack_pointer(&mut self, tid: usize, stack_pointer: usize) -> KernelResult<()> {
+        let process = self.processes.get_mut(&tid).ok_or(EBADF)?;
+        process.trap_frame.regs[2] = stack_pointer;
+        Ok(())
     }
 
     pub fn execve_current(&mut self, entry: usize) -> KernelResult<()> {
@@ -518,6 +568,9 @@ impl ProcessTable {
             self.remove_futex_waiter(tid);
         }
         let process = self.current_mut()?;
+        if process.address_space.is_shared() {
+            process.address_space = process.address_space.clone_private();
+        }
         process.reset_image(entry, stack_pointer);
         process.is_thread = false;
         process.pid = process.tgid;

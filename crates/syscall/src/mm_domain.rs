@@ -11,7 +11,7 @@ pub(crate) fn dispatch(
     Some(match sysno {
         SYS_BRK => ctx.dispatcher.sys_brk(args, ctx.procs),
         SYS_MREMAP => ctx.dispatcher.sys_mremap(args, ctx.procs),
-        SYS_MMAP => ctx.dispatcher.sys_mmap(args, ctx.procs),
+        SYS_MMAP => ctx.dispatcher.sys_mmap(args, ctx.procs, ctx.vfs),
         SYS_MUNMAP => ctx.dispatcher.sys_munmap(args, ctx.procs),
         SYS_MPROTECT => ctx.dispatcher.sys_mprotect(args, ctx.procs),
         SYS_MSYNC => Ok(0),

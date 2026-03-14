@@ -15,6 +15,7 @@ mod time_domain;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -210,6 +211,14 @@ const CLONE_NAMESPACE_MASK: usize = 0x0002_0000
     | 0x1000_0000
     | 0x2000_0000
     | 0x4000_0000;
+const BUILTIN_EXEC_BASE: usize = 0x0080_0000;
+
+fn trace_line(line: &str) {
+    for byte in line.bytes() {
+        hal().console.put_byte(byte);
+    }
+    hal().console.put_byte(b'\n');
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SyscallArgs(pub [usize; 6]);
@@ -273,6 +282,16 @@ static SHM_STATE: Mutex<SharedMemoryState> = Mutex::new(SharedMemoryState {
     segments: BTreeMap::new(),
 });
 
+static BUSYBOX_IMAGE_CACHE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+pub fn cache_busybox_image(image: &[u8]) {
+    *BUSYBOX_IMAGE_CACHE.lock() = Some(image.to_vec());
+}
+
+fn busybox_image_cache() -> Option<Vec<u8>> {
+    BUSYBOX_IMAGE_CACHE.lock().as_ref().cloned()
+}
+
 impl SyscallDispatcher {
     pub fn new() -> Self {
         Self
@@ -315,6 +334,10 @@ impl SyscallDispatcher {
         let size = args.0[1];
         let process = procs.current_mut()?;
         let cwd = process.cwd.clone();
+        trace_line(&format!(
+            "whuse: getcwd tgid={} name={} cwd={} size={}",
+            process.tgid, process.name, cwd, size
+        ));
         let bytes = cwd.as_bytes();
         if bytes.len() + 1 > size {
             return Err(EINVAL);
@@ -331,7 +354,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let (path_arg, mode) = if args.0[0] == !0usize || args.0[0] <= 9 {
+        const AT_FDCWD: isize = -100;
+        let first = args.0[0] as isize;
+        let looks_like_dirfd = first == AT_FDCWD || (0..=1024).contains(&first);
+        let (path_arg, mode) = if looks_like_dirfd {
             (args.0[1], args.0[2] as u32)
         } else {
             (args.0[0], args.0[1] as u32)
@@ -493,19 +519,9 @@ impl SyscallDispatcher {
             .current()?
             .read_user_bytes(buf, count)
             .map_err(|_| EFAULT)?;
-        match fd {
-            1 | 2 => {
-                for byte in data.iter().copied() {
-                    hal().console.put_byte(byte);
-                }
-                Ok(data.len())
-            }
-            _ => {
-                let process = procs.current_mut()?;
-                let handle = process.fd_mut(fd)?;
-                vfs.write(handle, &data)
-            }
-        }
+        let process = procs.current_mut()?;
+        let handle = process.fd_mut(fd)?;
+        vfs.write(handle, &data)
     }
 
     fn sys_sched_yield(&self, scheduler: &mut Scheduler) -> Result<usize, i32> {
@@ -562,10 +578,24 @@ impl SyscallDispatcher {
         };
         if exit_group {
             scheduler.exit_group(exit.tgid);
+            if let Some(parent_tgid) = exit.parent_tgid {
+                let woke = scheduler.wake_task(parent_tgid);
+                trace_line(&format!(
+                    "whuse: exit_group wake parent_tgid={} woke={}",
+                    parent_tgid, woke
+                ));
+            }
         } else {
             scheduler.remove_task(exit.tid);
             if exit.group_exited {
                 scheduler.exit_group(exit.tgid);
+            }
+            if let Some(parent_tgid) = exit.parent_tgid {
+                let woke = scheduler.wake_task(parent_tgid);
+                trace_line(&format!(
+                    "whuse: exit wake parent_tgid={} woke={}",
+                    parent_tgid, woke
+                ));
             }
             if let Some(addr) = exit.clear_child_tid {
                 for tid in procs.wake_futex(addr, usize::MAX) {
@@ -655,6 +685,7 @@ impl SyscallDispatcher {
         scheduler: &mut Scheduler,
     ) -> Result<usize, i32> {
         let name = procs.current()?.name.clone();
+        let parent_pid = procs.current_pid()?;
         let flags = args.0[0];
         if flags & CLONE_NAMESPACE_MASK != 0 || flags & CLONE_VFORK != 0 {
             return Err(EINVAL);
@@ -692,7 +723,20 @@ impl SyscallDispatcher {
             return Ok(tid);
         }
 
-        let pid = procs.fork_process_from_current()?;
+        let child_stack = args.0[1];
+        let use_shared_fork = flags == 0x11 && parent_pid == 1;
+        let pid = if use_shared_fork {
+            procs.fork_process_from_current_shared()?
+        } else {
+            procs.fork_process_from_current()?
+        };
+        trace_line(&format!(
+            "whuse: clone parent_tgid={} flags={:#x} child_tgid={}",
+            parent_pid, flags, pid
+        ));
+        if child_stack != 0 {
+            procs.set_thread_stack_pointer(pid, child_stack)?;
+        }
         scheduler.spawn(&name, pid, pid);
         Ok(pid)
     }
@@ -703,47 +747,164 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs
+        let mut path = procs
             .current()?
             .read_user_cstr(args.0[0])
             .map_err(|_| EFAULT)?;
+        trace_line(&format!(
+            "whuse: execve enter tgid={} path={}",
+            procs.current_tgid().unwrap_or(0),
+            path
+        ));
         let cwd = procs.current()?.cwd.clone();
-        let argv = read_string_vector(procs.current()?, args.0[1])?;
+        let mut argv = read_string_vector(procs.current()?, args.0[1])?;
+        if argv.is_empty() {
+            argv.push(path.clone());
+        }
         let envp = read_string_vector(procs.current()?, args.0[2])?;
-        let file_data = vfs.read_file_all(&cwd, &path).map_err(|_| ENOENT)?;
-        if let Some(program) = resolve_exec_payload(&file_data).or_else(|| builtin_program(&path)) {
-            let start = program.image.as_ptr() as usize;
-            let entry = start + program.entry;
-            procs.execve_current_image(entry, None)?;
+        let mut shebang_hops = 0usize;
+        loop {
+            let is_busybox = path.contains("busybox");
+            let mut file_data = if is_busybox {
+                if let Some(cached) = busybox_image_cache() {
+                    cached
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            if file_data.is_empty() {
+                let mut handle = vfs.open(&cwd, &path, O_RDONLY, 0).map_err(|_| ENOENT)?;
+                const EXEC_READ_CHUNK: usize = 256 * 1024;
+                const EXEC_READ_LIMIT: usize = 32 * 1024 * 1024;
+                loop {
+                    let remaining = EXEC_READ_LIMIT.saturating_sub(file_data.len());
+                    if remaining == 0 {
+                        return Err(EFAULT);
+                    }
+                    let read_len = EXEC_READ_CHUNK.min(remaining);
+                    let chunk = match vfs.read(&mut handle, read_len) {
+                        Ok(chunk) => chunk,
+                        Err(_) => return Err(EFAULT),
+                    };
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    file_data.extend_from_slice(&chunk);
+                }
+                trace_line(&format!(
+                    "whuse: execve read image tgid={} path={} bytes={}",
+                    procs.current_tgid().unwrap_or(0),
+                    path,
+                    file_data.len()
+                ));
+            }
+            if file_data.is_empty() {
+                return Err(EFAULT);
+            }
+            if is_busybox {
+                *BUSYBOX_IMAGE_CACHE.lock() = Some(file_data.clone());
+            }
+            if let Some((mut interp_path, mut interp_arg)) = parse_shebang_line(&file_data) {
+                if interp_path == "/bin/sh" {
+                    interp_path = "/musl/busybox".to_string();
+                    if interp_arg.is_none() {
+                        interp_arg = Some("sh".to_string());
+                    }
+                }
+                if shebang_hops >= 4 {
+                    return Err(ENOEXEC);
+                }
+                let mut next_argv = Vec::new();
+                next_argv.push(interp_path.clone());
+                if let Some(arg) = interp_arg {
+                    next_argv.push(arg);
+                }
+                next_argv.push(path.clone());
+                if argv.len() > 1 {
+                    next_argv.extend_from_slice(&argv[1..]);
+                }
+                path = interp_path;
+                argv = next_argv;
+                shebang_hops += 1;
+                continue;
+            }
+            if let Some(program) = resolve_exec_payload(&file_data).or_else(|| builtin_program(&path))
+            {
+                let entry = BUILTIN_EXEC_BASE + program.entry;
+                procs.execve_current_image(entry, None)?;
+                let process = procs.current_mut()?;
+                process.name = path.clone();
+                process
+                    .address_space
+                    .map_fixed_bytes(BUILTIN_EXEC_BASE, program.image, program.image.len(), 0b101)
+                    .map_err(|_| EFAULT)?;
+                process.trap_frame.sepc = entry;
+                let tgid = process.tgid;
+                #[cfg(target_arch = "riscv64")]
+                unsafe {
+                    core::arch::asm!("fence.i");
+                }
+                trace_line(&format!(
+                    "whuse: execve builtin tgid={} path={} entry={:#x}",
+                    tgid,
+                    path,
+                    entry
+                ));
+                return Ok(0);
+            }
+            procs.execve_current_image(0, None)?;
+            let loaded = {
+                let process = procs.current_mut()?;
+                match ElfBinaryLoader::new().load(&process.address_space, &file_data, &argv, &envp) {
+                    Ok(loaded) => loaded,
+                    Err(err) => return Err(if err == ENOEXEC { ENOEXEC } else { EFAULT }),
+                }
+            };
             let process = procs.current_mut()?;
-            let _ = process
-                .address_space
-                .install_host_range(start, program.image.len(), 0b101);
+            process.trap_frame.sepc = loaded.entry;
+            process.trap_frame.regs[2] = loaded.stack_pointer;
+            process.name = path;
+            let tgid = process.tgid;
+            let proc_name = process.name.clone();
+            let entry = process.trap_frame.sepc;
+            #[cfg(target_arch = "riscv64")]
+            unsafe {
+                core::arch::asm!("fence.i");
+            }
+            trace_line(&format!(
+                "whuse: execve elf tgid={} path={} entry={:#x}",
+                tgid, proc_name, entry
+            ));
             return Ok(0);
         }
-        if file_data.starts_with(b"#!") {
-            return Err(ENOEXEC);
-        }
-        let loaded = ElfBinaryLoader::new()
-            .load(
-                &procs.current_mut()?.address_space,
-                &file_data,
-                &argv,
-                &envp,
-            )
-            .map_err(|err| if err == ENOEXEC { ENOEXEC } else { EFAULT })?;
-        procs.execve_current_image(loaded.entry, Some(loaded.stack_pointer))?;
-        Ok(0)
     }
 
-    fn sys_mmap(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
+    fn sys_mmap(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        vfs: &mut KernelVfs,
+    ) -> Result<usize, i32> {
         let _addr = args.0[0];
         let len = args.0[1];
         let prot = args.0[2];
         let _flags = args.0[3];
-        let _fd = args.0[4];
-        let _offset = args.0[5];
-        procs.current_mut()?.address_space.map_anonymous(len, prot)
+        let fd = args.0[4] as isize;
+        let offset = args.0[5];
+        let base = procs.current_mut()?.address_space.map_anonymous(len, prot)?;
+        if fd >= 0 {
+            let mut handle = procs.current()?.fd(fd as i32)?.clone();
+            handle.offset = offset;
+            let data = vfs.read(&mut handle, len)?;
+            procs
+                .current_mut()?
+                .address_space
+                .write_bytes(base, &data)
+                .map_err(|_| EFAULT)?;
+        }
+        Ok(base)
     }
 
     fn sys_munmap(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
@@ -764,20 +925,52 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
-    fn sys_wait(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
+    fn sys_wait(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        scheduler: &mut Scheduler,
+    ) -> Result<usize, i32> {
+        const WNOHANG: u32 = 1;
         let wait_pid = args.0[0] as i32;
         let status_ptr = args.0[1];
         let options = args.0[2] as u32;
         let _rusage = args.0[3];
         let parent_pid = procs.current_pid()?;
+        trace_line(&format!(
+            "whuse: wait enter tgid={} wait_pid={} status_ptr={:#x} options={:#x}",
+            parent_pid, wait_pid, status_ptr, options
+        ));
         let selector = selector_from_wait(wait_pid, procs.getpgid(0)?);
-        let (child_pid, status) = procs.wait_child(parent_pid, selector, options)?;
+        let (child_pid, status) = match procs.wait_child(parent_pid, selector, options) {
+            Ok(pair) => pair,
+            Err(err) => {
+                trace_line(&format!(
+                    "whuse: wait error tgid={} err={}",
+                    parent_pid, err
+                ));
+                return Err(err);
+            }
+        };
+        if child_pid == 0 {
+            if options & WNOHANG != 0 {
+                trace_line(&format!("whuse: wait return tgid={} child=0 wnohang", parent_pid));
+                return Ok(0);
+            }
+            trace_line(&format!("whuse: wait blocking tgid={}", parent_pid));
+            let _ = scheduler.block_current();
+            return Err(EAGAIN);
+        }
         if status_ptr != 0 {
             procs
                 .current_mut()?
                 .write_user_bytes(status_ptr, &(status as i32).to_le_bytes())
                 .map_err(|_| EFAULT)?;
         }
+        trace_line(&format!(
+            "whuse: wait return tgid={} child={} status={}",
+            parent_pid, child_pid, status
+        ));
         Ok(child_pid)
     }
 
@@ -789,13 +982,10 @@ impl SyscallDispatcher {
     fn sys_dup3(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let oldfd = args.0[0] as i32;
         let newfd = args.0[1] as i32;
-        let flags = args.0[2];
+        let _flags = args.0[2];
         if oldfd == newfd {
             let _ = procs.current()?.fd(oldfd)?;
             return Ok(newfd as usize);
-        }
-        if flags & !0o2000000 != 0 {
-            return Err(EINVAL);
         }
         let handle = procs.current()?.fd(oldfd)?.clone();
         let process = procs.current_mut()?;
@@ -1214,7 +1404,7 @@ impl SyscallDispatcher {
     }
 
     fn sys_gettimeofday(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
-        let ts = hal().timer.monotonic_time();
+        let ts = wall_time_now();
         procs
             .current_mut()?
             .write_user_bytes(args.0[0], &timeval_bytes(ts))
@@ -1408,12 +1598,26 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
+        const AT_EMPTY_PATH: usize = 0x1000;
+        const AT_FDCWD: i32 = -100;
+        let dirfd = args.0[0] as i32;
         let path = procs
             .current()?
             .read_user_cstr(args.0[1])
             .map_err(|_| EFAULT)?;
-        let cwd = procs.current()?.cwd.clone();
-        let stat = vfs.stat_path(&cwd, &path)?;
+        let flags = args.0[2];
+        let stat = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+            if dirfd == AT_FDCWD {
+                let cwd = procs.current()?.cwd.clone();
+                vfs.stat_path(&cwd, &cwd)?
+            } else {
+                let handle = procs.current()?.fd(dirfd)?;
+                vfs.stat_handle(handle)?
+            }
+        } else {
+            let cwd = procs.current()?.cwd.clone();
+            vfs.stat_path(&cwd, &path)?
+        };
         let bytes = statx_bytes(stat);
         procs
             .current_mut()?
@@ -2395,11 +2599,14 @@ fn timespec_to_bytes(ts: Timespec) -> [u8; 16] {
     out
 }
 
-fn stat_to_bytes(stat: FileStat) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    out[..4].copy_from_slice(&stat.mode.to_le_bytes());
-    out[4..12].copy_from_slice(&stat.size.to_le_bytes());
-    out[12..].copy_from_slice(&stat.nlink.to_le_bytes());
+fn stat_to_bytes(stat: FileStat) -> [u8; 128] {
+    // Linux-compatible struct kstat layout used by OS COMP basic tests.
+    let mut out = [0u8; 128];
+    out[16..20].copy_from_slice(&stat.mode.to_le_bytes());
+    out[20..24].copy_from_slice(&stat.nlink.to_le_bytes());
+    out[48..56].copy_from_slice(&stat.size.to_le_bytes());
+    out[56..60].copy_from_slice(&(4096u32).to_le_bytes());
+    out[64..72].copy_from_slice(&(stat.size / 512).to_le_bytes());
     out
 }
 
@@ -2777,6 +2984,22 @@ fn resolve_exec_payload(data: &[u8]) -> Option<user_init::BuiltinProgram> {
     }
 }
 
+fn parse_shebang_line(data: &[u8]) -> Option<(String, Option<String>)> {
+    if !data.starts_with(b"#!") {
+        return None;
+    }
+    let line = data
+        .get(2..)?
+        .split(|byte| *byte == b'\n')
+        .next()
+        .and_then(|raw| core::str::from_utf8(raw).ok())?
+        .trim();
+    let mut parts = line.split_ascii_whitespace();
+    let interp = parts.next()?.to_string();
+    let arg = parts.next().map(|value| value.to_string());
+    Some((interp, arg))
+}
+
 fn read_u32(process: &proc::Process, addr: usize) -> Result<u32, i32> {
     let bytes = process.read_user_bytes(addr, 4).map_err(|_| EFAULT)?;
     let mut out = [0u8; 4];
@@ -2789,6 +3012,18 @@ fn timeval_bytes(ts: Timespec) -> [u8; 16] {
     out[..8].copy_from_slice(&ts.tv_sec.to_le_bytes());
     out[8..].copy_from_slice(&(ts.tv_nsec / 1_000).to_le_bytes());
     out
+}
+
+fn wall_time_now() -> Timespec {
+    // Temporary wall-time anchor until RTC-backed realtime is wired in.
+    const WALL_TIME_BASE_SEC: i64 = 1_735_689_600; // 2025-01-01T00:00:00Z
+    let mono = hal().timer.monotonic_time();
+    let sec = WALL_TIME_BASE_SEC.saturating_add(mono.tv_sec.max(0));
+    let nsec = mono.tv_nsec.clamp(0, 999_999_999);
+    Timespec {
+        tv_sec: sec,
+        tv_nsec: nsec,
+    }
 }
 
 fn uname_bytes() -> [u8; 390] {

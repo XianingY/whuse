@@ -5,6 +5,7 @@ members = [
     "platform/loongarch64-bootrom",
     "platform/loongarch64-virt",
     "crates/hal-api",
+    "crates/hal-virtio",
     "crates/hal-riscv64-virt",
     "crates/hal-loongarch64-virt",
     "crates/kernel-core",
@@ -27,6 +28,8 @@ authors = ["Codex"]
 [workspace.dependencies]
 spin = "0.9"
 ext4-view = { version = "0.9.3", default-features = false }
+fdt = "0.2.0-alpha1"
+virtio-drivers = "0.13.0"
 
 [profile.dev]
 panic = "abort"

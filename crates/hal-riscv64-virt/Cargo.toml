@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 hal-api = { path = "../hal-api" }
+hal-virtio = { path = "../hal-virtio" }
 spin.workspace = true
-
+virtio-drivers.workspace = true

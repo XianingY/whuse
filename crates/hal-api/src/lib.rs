@@ -121,6 +121,12 @@ pub trait HalBlockDevice: Send + Sync {
     }
     fn sector_size(&self) -> usize;
     fn sector_count(&self) -> usize;
+    fn irq_line(&self) -> Option<usize> {
+        None
+    }
+    fn ack_interrupt(&self) -> bool {
+        false
+    }
     fn read_sector(&self, sector: usize, buf: &mut [u8]) -> Result<(), i32>;
     fn write_sector(&self, sector: usize, buf: &[u8]) -> Result<(), i32>;
     fn flush(&self) -> Result<(), i32> {

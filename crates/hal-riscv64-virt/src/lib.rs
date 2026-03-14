@@ -4,30 +4,49 @@
 use core::arch::global_asm;
 #[cfg(target_arch = "riscv64")]
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use hal_api::{
     register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
     HalNetDevice, HalPlatform, HalPlatformLifecycle, HalTimer, MemoryRegion, PlatformArch,
     Timespec, TrapFrame, VmSpaceToken,
 };
+use hal_virtio::{
+    RiscvVirtioDiscovery, VirtioBlockConfig, VirtioDmaArena, parse_riscv_virtio_discovery,
+    virtio_error_to_errno,
+};
+use spin::{Mutex, Once};
+use virtio_drivers::BufferDirection;
+use virtio_drivers::Hal as VirtioHal;
+use virtio_drivers::device::blk::{BlkReq, BlkResp, SECTOR_SIZE, VirtIOBlk};
+use virtio_drivers::transport::InterruptStatus;
+use virtio_drivers::transport::SomeTransport;
+use virtio_drivers::transport::Transport;
+use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 pub const UART0_BASE: usize = 0x1000_0000;
 pub const VIRTIO0_BASE: usize = 0x1000_1000;
 pub const MMIO_BASE: usize = 0x1000_0000;
 pub const PHYS_MEM_BASE: usize = 0x8000_0000;
 pub const PHYS_MEM_SIZE: usize = 128 * 1024 * 1024;
+const DMA_ARENA_BYTES: usize = 2 * 1024 * 1024;
+const DMA_ARENA_WORDS: usize = DMA_ARENA_BYTES / SECTOR_SIZE / 64;
+const ENODEV: i32 = 19;
+const EINVAL: i32 = 22;
+const EROFS: i32 = 30;
 
 static CPU: VirtCpu = VirtCpu::new();
-static INTERRUPT: VirtInterruptController = VirtInterruptController;
+static INTERRUPT: VirtInterruptController = VirtInterruptController::new();
 static PLATFORM: VirtPlatform = VirtPlatform;
 static LIFECYCLE: VirtLifecycle = VirtLifecycle;
 static MEMORY: VirtMemory = VirtMemory;
 static TIMER: VirtTimer = VirtTimer::new();
 static UART: Ns16550 = Ns16550::new(UART0_BASE);
-static VIRTIO_BLK: VirtioBlockStub = VirtioBlockStub;
+static VIRTIO_BLK: VirtioBlockDevice = VirtioBlockDevice::new();
 static VIRTIO_NET: VirtioNetStub = VirtioNetStub;
 static BLOCK_DEVS: [&'static dyn HalBlockDevice; 1] = [&VIRTIO_BLK];
 static NET_DEVS: [&'static dyn HalNetDevice; 1] = [&VIRTIO_NET];
+static DMA_ARENA: VirtioDmaArena<DMA_ARENA_BYTES, DMA_ARENA_WORDS> = VirtioDmaArena::new();
 
 #[cfg(target_arch = "riscv64")]
 #[no_mangle]
@@ -176,7 +195,13 @@ static MEMORY_MAP: [MemoryRegion; 2] = [
     },
 ];
 
-pub fn bootstrap() {
+pub fn bootstrap(dtb_pa: usize) {
+    if dtb_pa != 0 {
+        if let Some(discovery) = parse_riscv_virtio_discovery(dtb_pa) {
+            INTERRUPT.configure(discovery.plic);
+            VIRTIO_BLK.bootstrap(&discovery);
+        }
+    }
     register_hal(HalBundle {
         platform: &PLATFORM,
         lifecycle: &LIFECYCLE,
@@ -194,9 +219,41 @@ struct VirtCpu {
     interrupts_enabled: AtomicBool,
 }
 
-struct VirtInterruptController;
+struct VirtInterruptController {
+    base: AtomicUsize,
+    context: AtomicUsize,
+    sources: AtomicUsize,
+}
+
 struct VirtPlatform;
 struct VirtLifecycle;
+
+struct VirtioBlockState {
+    driver: VirtIOBlk<RiscvVirtioHal, SomeTransport<'static>>,
+}
+
+struct VirtioBlockDevice {
+    state: Once<Mutex<VirtioBlockState>>,
+    init_error: AtomicI32,
+    capacity_sectors: AtomicUsize,
+    readonly: AtomicBool,
+    irq: AtomicUsize,
+}
+
+struct VirtioNetStub;
+struct VirtMemory;
+
+struct VirtTimer {
+    ticks: AtomicU64,
+    deadline: AtomicU64,
+}
+
+struct Ns16550 {
+    #[allow(dead_code)]
+    base: usize,
+}
+
+struct RiscvVirtioHal;
 
 impl HalPlatform for VirtPlatform {
     fn platform_name(&self) -> &'static str {
@@ -225,18 +282,137 @@ impl HalPlatformLifecycle for VirtLifecycle {
     }
 }
 
-impl HalInterrupt for VirtInterruptController {
-    fn name(&self) -> &'static str {
-        "plic-stub"
+#[allow(dead_code)]
+impl VirtInterruptController {
+    const fn new() -> Self {
+        Self {
+            base: AtomicUsize::new(0),
+            context: AtomicUsize::new(0),
+            sources: AtomicUsize::new(0),
+        }
     }
 
-    fn enable_irq(&self, _irq: usize) {}
+    fn configure(&self, config: Option<hal_virtio::VirtioPlicConfig>) {
+        let Some(config) = config else {
+            return;
+        };
+        self.base.store(config.base, Ordering::Relaxed);
+        self.context
+            .store(config.supervisor_context, Ordering::Relaxed);
+        self.sources.store(config.sources, Ordering::Relaxed);
+        self.write_threshold(0);
+    }
 
-    fn disable_irq(&self, _irq: usize) {}
+    fn is_ready(&self) -> bool {
+        self.base.load(Ordering::Relaxed) != 0
+    }
 
-    fn ack_irq(&self, _irq: usize) {}
+    fn enable_ptr(&self, irq: usize) -> Option<*mut u32> {
+        if !self.is_ready() || irq == 0 || irq > self.sources.load(Ordering::Relaxed) {
+            return None;
+        }
+        let base = self.base.load(Ordering::Relaxed);
+        let context = self.context.load(Ordering::Relaxed);
+        let word = irq / 32;
+        Some((base + 0x2000 + context * 0x80 + word * 4) as *mut u32)
+    }
+
+    fn priority_ptr(&self, irq: usize) -> Option<*mut u32> {
+        if !self.is_ready() || irq == 0 || irq > self.sources.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some((self.base.load(Ordering::Relaxed) + irq * 4) as *mut u32)
+    }
+
+    fn claim_complete_ptr(&self) -> Option<*mut u32> {
+        if !self.is_ready() {
+            return None;
+        }
+        let base = self.base.load(Ordering::Relaxed);
+        let context = self.context.load(Ordering::Relaxed);
+        Some((base + 0x20_0000 + context * 0x1000 + 4) as *mut u32)
+    }
+
+    fn threshold_ptr(&self) -> Option<*mut u32> {
+        if !self.is_ready() {
+            return None;
+        }
+        let base = self.base.load(Ordering::Relaxed);
+        let context = self.context.load(Ordering::Relaxed);
+        Some((base + 0x20_0000 + context * 0x1000) as *mut u32)
+    }
+
+    fn write_threshold(&self, value: u32) {
+        #[cfg(target_arch = "riscv64")]
+        if let Some(ptr) = self.threshold_ptr() {
+            unsafe {
+                write_volatile(ptr, value);
+            }
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        let _ = value;
+    }
+}
+
+impl HalInterrupt for VirtInterruptController {
+    fn name(&self) -> &'static str {
+        if self.is_ready() {
+            "plic"
+        } else {
+            "plic-unavailable"
+        }
+    }
+
+    fn enable_irq(&self, irq: usize) {
+        #[cfg(target_arch = "riscv64")]
+        {
+            if let Some(priority) = self.priority_ptr(irq) {
+                unsafe {
+                    write_volatile(priority, 1);
+                }
+            }
+            if let Some(enable) = self.enable_ptr(irq) {
+                let bit = 1u32 << (irq % 32);
+                unsafe {
+                    let current = read_volatile(enable);
+                    write_volatile(enable, current | bit);
+                }
+            }
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        let _ = irq;
+    }
+
+    fn disable_irq(&self, irq: usize) {
+        #[cfg(target_arch = "riscv64")]
+        if let Some(enable) = self.enable_ptr(irq) {
+            let bit = 1u32 << (irq % 32);
+            unsafe {
+                let current = read_volatile(enable);
+                write_volatile(enable, current & !bit);
+            }
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        let _ = irq;
+    }
+
+    fn ack_irq(&self, irq: usize) {
+        #[cfg(target_arch = "riscv64")]
+        if let Some(claim) = self.claim_complete_ptr() {
+            unsafe {
+                write_volatile(claim, irq as u32);
+            }
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        let _ = irq;
+    }
 
     fn next_pending(&self) -> Option<usize> {
+        #[cfg(target_arch = "riscv64")]
+        if let Some(claim) = self.claim_complete_ptr() {
+            let irq = unsafe { read_volatile(claim) as usize };
+            return (irq != 0).then_some(irq);
+        }
         None
     }
 }
@@ -273,6 +449,8 @@ impl HalCpu for VirtCpu {
         unsafe {
             core::arch::asm!("wfi");
         }
+        #[cfg(not(target_arch = "riscv64"))]
+        core::hint::spin_loop();
     }
 
     fn run_user(&self, frame: &mut TrapFrame) {
@@ -286,8 +464,6 @@ impl HalCpu for VirtCpu {
         }
     }
 }
-
-struct VirtMemory;
 
 impl HalMemory for VirtMemory {
     fn memory_regions(&self) -> &'static [MemoryRegion] {
@@ -305,11 +481,6 @@ impl HalMemory for VirtMemory {
     fn mmio_base(&self) -> usize {
         MMIO_BASE
     }
-}
-
-struct VirtTimer {
-    ticks: AtomicU64,
-    deadline: AtomicU64,
 }
 
 impl VirtTimer {
@@ -333,11 +504,6 @@ impl HalTimer for VirtTimer {
     fn program_oneshot(&self, deadline_nanos: u64) {
         self.deadline.store(deadline_nanos, Ordering::Relaxed);
     }
-}
-
-struct Ns16550 {
-    #[allow(dead_code)]
-    base: usize,
 }
 
 impl Ns16550 {
@@ -372,31 +538,198 @@ impl HalCharDevice for Ns16550 {
     }
 }
 
-struct VirtioBlockStub;
+impl VirtioBlockDevice {
+    const fn new() -> Self {
+        Self {
+            state: Once::new(),
+            init_error: AtomicI32::new(ENODEV),
+            capacity_sectors: AtomicUsize::new(0),
+            readonly: AtomicBool::new(false),
+            irq: AtomicUsize::new(0),
+        }
+    }
 
-impl HalBlockDevice for VirtioBlockStub {
+    fn bootstrap(&self, discovery: &RiscvVirtioDiscovery) {
+        if self.state.get().is_some() {
+            return;
+        }
+        for config in discovery.mmio_devices.iter().flatten().copied() {
+            if self.try_init_mmio(config).is_ok() {
+                break;
+            }
+        }
+    }
+
+    fn try_init_mmio(&self, config: hal_virtio::VirtioMmioConfig) -> Result<(), i32> {
+        let header = NonNull::new(config.base as *mut VirtIOHeader).ok_or(ENODEV)?;
+        let transport =
+            unsafe { MmioTransport::new(header, config.size) }.map_err(|_| ENODEV)?;
+        if transport.device_type() != virtio_drivers::transport::DeviceType::Block {
+            return Err(ENODEV);
+        }
+        let mut driver = VirtIOBlk::<RiscvVirtioHal, _>::new(SomeTransport::from(transport))
+            .map_err(virtio_error_to_errno)?;
+        driver.enable_interrupts();
+        let info = VirtioBlockConfig {
+            transport: hal_virtio::TransportKind::Mmio,
+            irq: Some(config.irq),
+            capacity_sectors: driver.capacity() as usize,
+            readonly: driver.readonly(),
+        };
+        self.capacity_sectors
+            .store(info.capacity_sectors, Ordering::Relaxed);
+        self.readonly.store(info.readonly, Ordering::Relaxed);
+        self.irq.store(config.irq, Ordering::Relaxed);
+        self.init_error.store(0, Ordering::Relaxed);
+        let _ = self.state.call_once(|| Mutex::new(VirtioBlockState { driver }));
+        INTERRUPT.enable_irq(config.irq);
+        Ok(())
+    }
+
+    fn with_state(&self) -> Result<&Mutex<VirtioBlockState>, i32> {
+        self.state
+            .get()
+            .ok_or_else(|| self.init_error.load(Ordering::Relaxed))
+    }
+
+    fn wait_for_completion(
+        &self,
+        state: &Mutex<VirtioBlockState>,
+        token: u16,
+    ) -> Result<(), i32> {
+        let mut saw_interrupt = false;
+        for _ in 0..1_000_000usize {
+            if let Some(irq) = self.irq_line() {
+                if let Some(pending) = INTERRUPT.next_pending() {
+                    let mut guard = state.lock();
+                    if pending == irq
+                        && guard
+                            .driver
+                            .ack_interrupt()
+                            .contains(InterruptStatus::QUEUE_INTERRUPT)
+                    {
+                        saw_interrupt = true;
+                    }
+                    let ready = pending == irq && saw_interrupt && guard.driver.peek_used() == Some(token);
+                    INTERRUPT.ack_irq(pending);
+                    if ready {
+                        return Ok(());
+                    }
+                }
+            }
+            let mut guard = state.lock();
+            if guard
+                .driver
+                .ack_interrupt()
+                .contains(InterruptStatus::QUEUE_INTERRUPT)
+            {
+                saw_interrupt = true;
+            }
+            if saw_interrupt && guard.driver.peek_used() == Some(token) {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(5)
+    }
+}
+
+impl HalBlockDevice for VirtioBlockDevice {
     fn name(&self) -> &'static str {
         "virtio-blk0"
     }
 
+    fn init(&self) -> Result<(), i32> {
+        if self.state.get().is_some() {
+            return Ok(());
+        }
+        Err(self.init_error.load(Ordering::Relaxed))
+    }
+
+    fn is_ready(&self) -> bool {
+        self.state.get().is_some() && self.capacity_sectors.load(Ordering::Relaxed) != 0
+    }
+
     fn sector_size(&self) -> usize {
-        512
+        SECTOR_SIZE
     }
 
     fn sector_count(&self) -> usize {
-        0
+        self.capacity_sectors.load(Ordering::Relaxed)
     }
 
-    fn read_sector(&self, _sector: usize, _buf: &mut [u8]) -> Result<(), i32> {
-        Err(95)
+    fn irq_line(&self) -> Option<usize> {
+        let irq = self.irq.load(Ordering::Relaxed);
+        (irq != 0).then_some(irq)
     }
 
-    fn write_sector(&self, _sector: usize, _buf: &[u8]) -> Result<(), i32> {
-        Err(95)
+    fn ack_interrupt(&self) -> bool {
+        let Ok(state) = self.with_state() else {
+            return false;
+        };
+        state
+            .lock()
+            .driver
+            .ack_interrupt()
+            .contains(InterruptStatus::QUEUE_INTERRUPT)
+    }
+
+    fn read_sector(&self, sector: usize, buf: &mut [u8]) -> Result<(), i32> {
+        if buf.len() != SECTOR_SIZE {
+            return Err(EINVAL);
+        }
+        let state = self.with_state()?;
+        let mut request = BlkReq::default();
+        let mut response = BlkResp::default();
+        let token = {
+            let mut guard = state.lock();
+            unsafe { guard.driver.read_blocks_nb(sector, &mut request, buf, &mut response) }
+                .map_err(virtio_error_to_errno)?
+        };
+        self.wait_for_completion(state, token)?;
+        let mut guard = state.lock();
+        unsafe {
+            guard
+                .driver
+                .complete_read_blocks(token, &request, buf, &mut response)
+        }
+        .map_err(virtio_error_to_errno)
+    }
+
+    fn write_sector(&self, sector: usize, buf: &[u8]) -> Result<(), i32> {
+        if self.readonly.load(Ordering::Relaxed) {
+            return Err(EROFS);
+        }
+        if buf.len() != SECTOR_SIZE {
+            return Err(EINVAL);
+        }
+        let state = self.with_state()?;
+        let mut request = BlkReq::default();
+        let mut response = BlkResp::default();
+        let token = {
+            let mut guard = state.lock();
+            unsafe { guard.driver.write_blocks_nb(sector, &mut request, buf, &mut response) }
+                .map_err(virtio_error_to_errno)?
+        };
+        self.wait_for_completion(state, token)?;
+        let mut guard = state.lock();
+        unsafe {
+            guard
+                .driver
+                .complete_write_blocks(token, &request, buf, &mut response)
+        }
+        .map_err(virtio_error_to_errno)
+    }
+
+    fn flush(&self) -> Result<(), i32> {
+        let state = self.with_state()?;
+        state
+            .lock()
+            .driver
+            .flush()
+            .map_err(virtio_error_to_errno)
     }
 }
-
-struct VirtioNetStub;
 
 impl HalNetDevice for VirtioNetStub {
     fn name(&self) -> &'static str {
@@ -425,5 +758,45 @@ impl HalNetDevice for VirtioNetStub {
 
     fn recv_frame(&self, _frame: &mut [u8]) -> Result<usize, i32> {
         Err(11)
+    }
+}
+
+unsafe impl VirtioHal for RiscvVirtioHal {
+    fn dma_alloc(
+        pages: usize,
+        _direction: BufferDirection,
+    ) -> (virtio_drivers::PhysAddr, NonNull<u8>) {
+        DMA_ARENA
+            .alloc(pages)
+            .unwrap_or((0, NonNull::dangling()))
+    }
+
+    unsafe fn dma_dealloc(
+        paddr: virtio_drivers::PhysAddr,
+        _vaddr: NonNull<u8>,
+        pages: usize,
+    ) -> i32 {
+        DMA_ARENA.dealloc(paddr, pages)
+    }
+
+    unsafe fn mmio_phys_to_virt(
+        paddr: virtio_drivers::PhysAddr,
+        _size: usize,
+    ) -> NonNull<u8> {
+        NonNull::new(paddr as usize as *mut u8).unwrap()
+    }
+
+    unsafe fn share(
+        buffer: NonNull<[u8]>,
+        _direction: BufferDirection,
+    ) -> virtio_drivers::PhysAddr {
+        buffer.as_ptr() as *mut u8 as usize as u64
+    }
+
+    unsafe fn unshare(
+        _paddr: virtio_drivers::PhysAddr,
+        _buffer: NonNull<[u8]>,
+        _direction: BufferDirection,
+    ) {
     }
 }

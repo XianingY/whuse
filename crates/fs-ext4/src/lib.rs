@@ -5,6 +5,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::{max, min};
@@ -20,10 +21,11 @@ const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
 const ENODEV: i32 = 19;
 const ENOTSUP: i32 = 95;
+const MAX_RANGE_READ: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub struct Ext4Mount {
-    device: &'static dyn HalBlockDevice,
+    fs: Ext4,
     label: String,
 }
 
@@ -59,10 +61,8 @@ impl Ext4Mount {
             return Err(ENODEV);
         }
         let fs = load_fs(device).map_err(map_ext4_error)?;
-        Ok(Self {
-            device,
-            label: format!("{}", fs.label().display()),
-        })
+        let label = format!("{}", fs.label().display());
+        Ok(Self { fs, label })
     }
 
     pub fn label(&self) -> &str {
@@ -70,56 +70,61 @@ impl Ext4Mount {
     }
 
     pub fn stat(&self, path: &str) -> Result<Ext4FileStat, i32> {
-        let metadata = load_fs(self.device)
-            .and_then(|fs| fs.metadata(path))
-            .map_err(map_ext4_error)?;
+        let metadata = self.fs.metadata(path).map_err(map_ext4_error)?;
         Ok(metadata_to_stat(&metadata))
     }
 
     pub fn is_dir(&self, path: &str) -> Result<bool, i32> {
-        let metadata = load_fs(self.device)
-            .and_then(|fs| fs.metadata(path))
-            .map_err(map_ext4_error)?;
+        let metadata = self.fs.metadata(path).map_err(map_ext4_error)?;
         Ok(metadata.is_dir())
     }
 
     pub fn exists(&self, path: &str) -> Result<bool, i32> {
-        load_fs(self.device)
-            .and_then(|fs| fs.exists(path))
-            .map_err(map_ext4_error)
+        self.fs.exists(path).map_err(map_ext4_error)
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>, i32> {
-        load_fs(self.device)
-            .and_then(|fs| fs.read(path))
-            .map_err(map_ext4_error)
+        self.fs.read(path).map_err(map_ext4_error)
+    }
+
+    pub fn read_detailed(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.fs.read(path).map_err(|err| err.to_string())
     }
 
     pub fn read_range(&self, path: &str, offset: usize, len: usize) -> Result<Vec<u8>, i32> {
-        let fs = load_fs(self.device).map_err(map_ext4_error)?;
-        let mut file = fs.open(path).map_err(map_ext4_error)?;
-        let size = file.metadata().len() as usize;
-        if offset >= size || len == 0 {
+        if len == 0 {
             return Ok(Vec::new());
         }
-        file.seek_to(offset as u64).map_err(map_ext4_error)?;
-        let mut buf = vec![0; len.min(size - offset)];
-        let read = file.read_bytes(&mut buf).map_err(map_ext4_error)?;
-        buf.truncate(read);
+        let mut file = self.fs.open(path).map_err(map_ext4_error)?;
+        if let Err(err) = file.seek_to(offset as u64) {
+            let code = map_ext4_error(err);
+            return if code == EINVAL {
+                Ok(Vec::new())
+            } else {
+                Err(code)
+            };
+        }
+        let mut buf = vec![0; len.min(MAX_RANGE_READ)];
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let read = file.read_bytes(&mut buf[filled..]).map_err(map_ext4_error)?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        buf.truncate(filled);
         Ok(buf)
     }
 
     pub fn read_link(&self, path: &str) -> Result<String, i32> {
-        let target = load_fs(self.device)
-            .and_then(|fs| fs.read_link(path))
-            .map_err(map_ext4_error)?;
+        let target = self.fs.read_link(path).map_err(map_ext4_error)?;
         Ok(format!("{}", target.display()))
     }
 
     pub fn read_dir(&self, path: &str) -> Result<Vec<Ext4DirEntry>, i32> {
-        let fs = load_fs(self.device).map_err(map_ext4_error)?;
         let mut out = Vec::new();
-        for entry in fs.read_dir(path).map_err(map_ext4_error)? {
+        for entry in self.fs.read_dir(path).map_err(map_ext4_error)? {
             let entry = entry.map_err(map_ext4_error)?;
             let metadata = entry.metadata().map_err(map_ext4_error)?;
             let kind = file_type_to_kind(entry.file_type().map_err(map_ext4_error)?);
@@ -229,11 +234,30 @@ impl Ext4Read for BlockDeviceReader {
         let first_sector = start / sector_size;
         let last_sector = end.saturating_sub(1) / sector_size;
 
+        if start % sector_size == 0 && dst.len() % sector_size == 0 {
+            self.device
+                .read_sectors(first_sector, dst)
+                .map_err(|code| {
+                    Box::new(BlockIoError::Device {
+                        code,
+                        sector: first_sector,
+                        start_byte,
+                        read_len: dst.len(),
+                    }) as Box<dyn Error + Send + Sync + 'static>
+                })?;
+            return Ok(());
+        }
+
         for sector in first_sector..=last_sector {
             self.device
                 .read_sector(sector, &mut self.scratch)
                 .map_err(|code| {
-                    Box::new(BlockIoError::Device(code)) as Box<dyn Error + Send + Sync + 'static>
+                    Box::new(BlockIoError::Device {
+                        code,
+                        sector,
+                        start_byte,
+                        read_len: dst.len(),
+                    }) as Box<dyn Error + Send + Sync + 'static>
                 })?;
             let sector_start = sector * sector_size;
             let copy_start = max(start, sector_start);
@@ -253,7 +277,12 @@ impl Ext4Read for BlockDeviceReader {
 enum BlockIoError {
     AddressOverflow,
     InvalidGeometry,
-    Device(i32),
+    Device {
+        code: i32,
+        sector: usize,
+        start_byte: u64,
+        read_len: usize,
+    },
 }
 
 impl Display for BlockIoError {
@@ -261,7 +290,16 @@ impl Display for BlockIoError {
         match self {
             Self::AddressOverflow => write!(f, "block read offset overflow"),
             Self::InvalidGeometry => write!(f, "invalid block device geometry"),
-            Self::Device(code) => write!(f, "block device read failed with {}", code),
+            Self::Device {
+                code,
+                sector,
+                start_byte,
+                read_len,
+            } => write!(
+                f,
+                "block device read failed with {} at sector {} (byte offset {}, len {})",
+                code, sector, start_byte, read_len
+            ),
         }
     }
 }

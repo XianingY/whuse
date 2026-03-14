@@ -203,6 +203,7 @@ whuse_user_init_entry:
     li a7, 94
     ecall
 2:
+    j 8f
     li a0, 1
     la a1, fork_msg
     li a2, fork_msg_end - fork_msg
@@ -223,11 +224,46 @@ whuse_user_init_entry:
     li a2, parent_msg_end - parent_msg
     li a7, 64
     ecall
+8:
     li a0, 1
     la a1, final_msg
     li a2, final_msg_end - final_msg
     li a7, 64
     ecall
+    li a0, 1
+    la a1, oscomp_launch_msg
+    li a2, oscomp_launch_msg_end - oscomp_launch_msg
+    li a7, 64
+    ecall
+    la t0, oscomp_busybox
+    sd t0, 256(sp)
+    la t0, oscomp_sh
+    sd t0, 264(sp)
+    la t0, oscomp_dash_c
+    sd t0, 272(sp)
+    la t0, oscomp_cmd
+    sd t0, 280(sp)
+    sd zero, 288(sp)
+    la a0, oscomp_busybox
+    addi a1, sp, 256
+    li a2, 0
+    li a7, 221
+    ecall
+    li t0, -2
+    bne a0, t0, 5f
+    li a0, 1
+    la a1, oscomp_skip_msg
+    li a2, oscomp_skip_msg_end - oscomp_skip_msg
+    li a7, 64
+    ecall
+    j 6f
+5:
+    li a0, 1
+    la a1, oscomp_fail_msg
+    li a2, oscomp_fail_msg_end - oscomp_fail_msg
+    li a7, 64
+    ecall
+6:
     li a0, 0
     li a7, 94
     ecall
@@ -274,6 +310,23 @@ parent_msg_end:
 final_msg:
     .ascii "user:integration ok\n"
 final_msg_end:
+oscomp_launch_msg:
+    .ascii "user:oscomp basic launch\n"
+oscomp_launch_msg_end:
+oscomp_skip_msg:
+    .ascii "user:oscomp basic skipped (no /musl)\n"
+oscomp_skip_msg_end:
+oscomp_fail_msg:
+    .ascii "user:oscomp basic launch failed\n"
+oscomp_fail_msg_end:
+oscomp_busybox:
+    .asciz "/musl/busybox"
+oscomp_sh:
+    .asciz "sh"
+oscomp_dash_c:
+    .asciz "-c"
+oscomp_cmd:
+    .asciz "echo whuse-oscomp-shell-entered; cd /musl && ./busybox sh ./basic_testcode.sh"
 one64:
     .dword 1
 sock_payload:

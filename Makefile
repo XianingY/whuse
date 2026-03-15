@@ -27,3 +27,6 @@ oscomp-riscv:
 
 oscomp-loongarch:
 	cargo xtask oscomp-loongarch
+
+oscomp-images:
+	cargo xtask oscomp-images

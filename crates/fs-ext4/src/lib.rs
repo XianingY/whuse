@@ -104,17 +104,25 @@ impl Ext4Mount {
                 Err(code)
             };
         }
-        let mut buf = vec![0; len.min(MAX_RANGE_READ)];
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            let read = file.read_bytes(&mut buf[filled..]).map_err(map_ext4_error)?;
-            if read == 0 {
-                break;
+        let mut out = Vec::new();
+        while out.len() < len {
+            let chunk_len = (len - out.len()).min(MAX_RANGE_READ);
+            let mut chunk = vec![0u8; chunk_len];
+            let mut filled = 0usize;
+            while filled < chunk_len {
+                let read = file
+                    .read_bytes(&mut chunk[filled..chunk_len])
+                    .map_err(map_ext4_error)?;
+                if read == 0 {
+                    chunk.truncate(filled);
+                    out.extend_from_slice(&chunk);
+                    return Ok(out);
+                }
+                filled += read;
             }
-            filled += read;
+            out.extend_from_slice(&chunk);
         }
-        buf.truncate(filled);
-        Ok(buf)
+        Ok(out)
     }
 
     pub fn read_link(&self, path: &str) -> Result<String, i32> {

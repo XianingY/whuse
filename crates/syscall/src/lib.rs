@@ -29,9 +29,11 @@ use vfs::{FileStat, KernelVfs, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_TRUNC, 
 
 const EAFNOSUPPORT: i32 = 97;
 const EAGAIN: i32 = 11;
+const EBADF: i32 = 9;
 const EFAULT: i32 = 14;
 const EINVAL: i32 = 22;
 const ENOENT: i32 = 2;
+const ENOTTY: i32 = 25;
 const ENOSYS: i32 = 38;
 const EPROTOTYPE: i32 = 91;
 const ENOEXEC: i32 = 8;
@@ -211,9 +213,30 @@ const CLONE_NAMESPACE_MASK: usize = 0x0002_0000
     | 0x1000_0000
     | 0x2000_0000
     | 0x4000_0000;
+const PAGE_SIZE: usize = 4096;
+const MAP_SHARED: usize = 0x01;
+const MAP_PRIVATE: usize = 0x02;
+const MAP_TYPE_MASK: usize = 0x0f;
+const MAP_FIXED: usize = 0x10;
+const MAP_ANONYMOUS: usize = 0x20;
 const BUILTIN_EXEC_BASE: usize = 0x0080_0000;
+const SYSCALL_TRACE: bool = false;
+const ENOSYS_TRACE: bool = true;
 
 fn trace_line(line: &str) {
+    if !SYSCALL_TRACE {
+        return;
+    }
+    for byte in line.bytes() {
+        hal().console.put_byte(byte);
+    }
+    hal().console.put_byte(b'\n');
+}
+
+fn trace_enosys(line: &str) {
+    if !ENOSYS_TRACE {
+        return;
+    }
     for byte in line.bytes() {
         hal().console.put_byte(byte);
     }
@@ -281,7 +304,6 @@ static SHM_STATE: Mutex<SharedMemoryState> = Mutex::new(SharedMemoryState {
     keys: BTreeMap::new(),
     segments: BTreeMap::new(),
 });
-
 static BUSYBOX_IMAGE_CACHE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 pub fn cache_busybox_image(image: &[u8]) {
@@ -322,6 +344,27 @@ impl SyscallDispatcher {
             .or_else(|| task_domain::dispatch(&mut ctx, sysno, args))
             .or_else(|| time_domain::dispatch(&mut ctx, sysno, args))
             .unwrap_or(Err(ENOSYS));
+        if result == Err(ENOSYS) {
+            if let Ok(process) = procs.current() {
+                trace_enosys(&format!(
+                    "whuse: enosys tgid={} name={} sysno={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    process.tgid,
+                    process.name,
+                    sysno,
+                    args.0[0],
+                    args.0[1],
+                    args.0[2],
+                    args.0[3],
+                    args.0[4],
+                    args.0[5]
+                ));
+            } else {
+                trace_enosys(&format!(
+                    "whuse: enosys sysno={} (no current process)",
+                    sysno
+                ));
+            }
+        }
 
         match result {
             Ok(value) => value as isize,
@@ -687,20 +730,27 @@ impl SyscallDispatcher {
         let name = procs.current()?.name.clone();
         let parent_pid = procs.current_pid()?;
         let flags = args.0[0];
-        if flags & CLONE_NAMESPACE_MASK != 0 || flags & CLONE_VFORK != 0 {
+        if flags & CLONE_NAMESPACE_MASK != 0 {
             return Err(EINVAL);
         }
-        if (flags & CLONE_THREAD) != 0 {
+        let compat_flags = flags & !CLONE_VFORK;
+        if flags & CLONE_VFORK != 0 {
+            trace_line(&format!(
+                "whuse: clone parent_tgid={} flags={:#x} downgraded_vfork=true",
+                parent_pid, flags
+            ));
+        }
+        if (compat_flags & CLONE_THREAD) != 0 {
             let required = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
-            if flags & required != required {
+            if compat_flags & required != required {
                 return Err(EINVAL);
             }
             let stack = args.0[1];
             let parent_tid = args.0[2];
-            let tls = ((flags & CLONE_SETTLS) != 0).then_some(args.0[4]);
+            let tls = ((compat_flags & CLONE_SETTLS) != 0).then_some(args.0[4]);
             let child_tid_ptr = args.0[3];
             let tid = procs.clone_thread_from_current(stack, tls)?;
-            if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
+            if compat_flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
                 procs
                     .current_mut()?
                     .write_user_bytes(parent_tid, &(tid as u32).to_le_bytes())
@@ -708,13 +758,13 @@ impl SyscallDispatcher {
             }
             let current_tid = procs.current_tid()?;
             procs.set_current(tid)?;
-            if flags & CLONE_CHILD_SETTID != 0 && child_tid_ptr != 0 {
+            if compat_flags & CLONE_CHILD_SETTID != 0 && child_tid_ptr != 0 {
                 procs
                     .current_mut()?
                     .write_user_bytes(child_tid_ptr, &(tid as u32).to_le_bytes())
                     .map_err(|_| EFAULT)?;
             }
-            if flags & CLONE_CHILD_CLEARTID != 0 && child_tid_ptr != 0 {
+            if compat_flags & CLONE_CHILD_CLEARTID != 0 && child_tid_ptr != 0 {
                 procs.set_clear_child_tid(Some(child_tid_ptr))?;
             }
             let tgid = procs.current_tgid()?;
@@ -724,15 +774,15 @@ impl SyscallDispatcher {
         }
 
         let child_stack = args.0[1];
-        let use_shared_fork = flags == 0x11 && parent_pid == 1;
-        let pid = if use_shared_fork {
+        let shared_vm = (compat_flags & CLONE_VM) != 0;
+        let pid = if shared_vm {
             procs.fork_process_from_current_shared()?
         } else {
             procs.fork_process_from_current()?
         };
         trace_line(&format!(
-            "whuse: clone parent_tgid={} flags={:#x} child_tgid={}",
-            parent_pid, flags, pid
+            "whuse: clone parent_tgid={} flags={:#x} child_tgid={} shared_vm={}",
+            parent_pid, flags, pid, shared_vm
         ));
         if child_stack != 0 {
             procs.set_thread_stack_pointer(pid, child_stack)?;
@@ -751,6 +801,7 @@ impl SyscallDispatcher {
             .current()?
             .read_user_cstr(args.0[0])
             .map_err(|_| EFAULT)?;
+        let display_path = path.clone();
         trace_line(&format!(
             "whuse: execve enter tgid={} path={}",
             procs.current_tgid().unwrap_or(0),
@@ -764,13 +815,8 @@ impl SyscallDispatcher {
         let envp = read_string_vector(procs.current()?, args.0[2])?;
         let mut shebang_hops = 0usize;
         loop {
-            let is_busybox = path.contains("busybox");
-            let mut file_data = if is_busybox {
-                if let Some(cached) = busybox_image_cache() {
-                    cached
-                } else {
-                    Vec::new()
-                }
+            let mut file_data = if path.contains("busybox") {
+                busybox_image_cache().unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -803,11 +849,11 @@ impl SyscallDispatcher {
             if file_data.is_empty() {
                 return Err(EFAULT);
             }
-            if is_busybox {
-                *BUSYBOX_IMAGE_CACHE.lock() = Some(file_data.clone());
-            }
             if let Some((mut interp_path, mut interp_arg)) = parse_shebang_line(&file_data) {
-                if interp_path == "/bin/sh" {
+                if interp_path == "/bin/sh"
+                    || interp_path == "/bin/bash"
+                    || interp_path == "/busybox"
+                {
                     interp_path = "/musl/busybox".to_string();
                     if interp_arg.is_none() {
                         interp_arg = Some("sh".to_string());
@@ -830,12 +876,55 @@ impl SyscallDispatcher {
                 shebang_hops += 1;
                 continue;
             }
-            if let Some(program) = resolve_exec_payload(&file_data).or_else(|| builtin_program(&path))
+            if path.ends_with(".sh") {
+                if shebang_hops >= 4 {
+                    return Err(ENOEXEC);
+                }
+                let shell = "/musl/busybox";
+                if vfs.access("/", shell).is_ok() {
+                    let mut next_argv = Vec::new();
+                    next_argv.push(shell.to_string());
+                    next_argv.push("sh".to_string());
+                    next_argv.push(path.clone());
+                    if argv.len() > 1 {
+                        next_argv.extend_from_slice(&argv[1..]);
+                    }
+                    path = shell.to_string();
+                    argv = next_argv;
+                    shebang_hops += 1;
+                    continue;
+                }
+            }
+            if let Some(mut interp_path) = parse_elf_interp(&file_data) {
+                if shebang_hops >= 4 {
+                    return Err(ENOEXEC);
+                }
+                if vfs.access("/", &interp_path).is_err() {
+                    let fallback = "/musl/lib/libc.so";
+                    if vfs.access("/", fallback).is_ok() {
+                        interp_path = fallback.to_string();
+                    } else {
+                        return Err(ENOENT);
+                    }
+                }
+                let mut next_argv = Vec::new();
+                next_argv.push(interp_path.clone());
+                next_argv.push(path.clone());
+                if argv.len() > 1 {
+                    next_argv.extend_from_slice(&argv[1..]);
+                }
+                path = interp_path;
+                argv = next_argv;
+                shebang_hops += 1;
+                continue;
+            }
+            if let Some(program) =
+                resolve_exec_payload(&file_data).or_else(|| builtin_program(&path))
             {
                 let entry = BUILTIN_EXEC_BASE + program.entry;
                 procs.execve_current_image(entry, None)?;
                 let process = procs.current_mut()?;
-                process.name = path.clone();
+                process.name = display_path.clone();
                 process
                     .address_space
                     .map_fixed_bytes(BUILTIN_EXEC_BASE, program.image, program.image.len(), 0b101)
@@ -848,16 +937,15 @@ impl SyscallDispatcher {
                 }
                 trace_line(&format!(
                     "whuse: execve builtin tgid={} path={} entry={:#x}",
-                    tgid,
-                    path,
-                    entry
+                    tgid, path, entry
                 ));
                 return Ok(0);
             }
             procs.execve_current_image(0, None)?;
             let loaded = {
                 let process = procs.current_mut()?;
-                match ElfBinaryLoader::new().load(&process.address_space, &file_data, &argv, &envp) {
+                match ElfBinaryLoader::new().load(&process.address_space, &file_data, &argv, &envp)
+                {
                     Ok(loaded) => loaded,
                     Err(err) => return Err(if err == ENOEXEC { ENOEXEC } else { EFAULT }),
                 }
@@ -865,7 +953,7 @@ impl SyscallDispatcher {
             let process = procs.current_mut()?;
             process.trap_frame.sepc = loaded.entry;
             process.trap_frame.regs[2] = loaded.stack_pointer;
-            process.name = path;
+            process.name = display_path;
             let tgid = process.tgid;
             let proc_name = process.name.clone();
             let entry = process.trap_frame.sepc;
@@ -887,23 +975,88 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let _addr = args.0[0];
+        let addr = args.0[0];
         let len = args.0[1];
         let prot = args.0[2];
-        let _flags = args.0[3];
+        let flags = args.0[3];
         let fd = args.0[4] as isize;
         let offset = args.0[5];
-        let base = procs.current_mut()?.address_space.map_anonymous(len, prot)?;
-        if fd >= 0 {
-            let mut handle = procs.current()?.fd(fd as i32)?.clone();
-            handle.offset = offset;
-            let data = vfs.read(&mut handle, len)?;
+        if len == 0 {
+            return Err(EINVAL);
+        }
+        if offset & (PAGE_SIZE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let mapping_type = flags & MAP_TYPE_MASK;
+        if mapping_type != MAP_PRIVATE && mapping_type != MAP_SHARED {
+            return Err(EINVAL);
+        }
+        let aligned_len = len.checked_add(PAGE_SIZE - 1).ok_or(EINVAL)? & !(PAGE_SIZE - 1);
+        let anonymous = (flags & MAP_ANONYMOUS) != 0;
+        let fixed = (flags & MAP_FIXED) != 0;
+
+        let hinted = if fixed || addr != 0 {
+            let aligned = addr & !(PAGE_SIZE - 1);
+            if fixed && aligned != addr {
+                return Err(EINVAL);
+            }
+            Some(aligned)
+        } else {
+            None
+        };
+        let target = match hinted {
+            Some(hint) if fixed => Some(hint),
+            Some(hint) => {
+                if procs
+                    .current()?
+                    .address_space
+                    .is_range_available(hint, aligned_len)?
+                {
+                    Some(hint)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        if anonymous {
+            let base = if let Some(target) = target {
+                procs
+                    .current_mut()?
+                    .address_space
+                    .map_anonymous_at(target, aligned_len, prot)?
+            } else {
+                procs
+                    .current_mut()?
+                    .address_space
+                    .map_anonymous(aligned_len, prot)?
+            };
+            return Ok(base);
+        }
+
+        if fd < 0 {
+            return Err(EBADF);
+        }
+        let mut handle = procs.current()?.fd(fd as i32)?.clone();
+        handle.offset = offset;
+        let data = vfs.read(&mut handle, len)?;
+        if let Some(target) = target {
             procs
                 .current_mut()?
                 .address_space
-                .write_bytes(base, &data)
-                .map_err(|_| EFAULT)?;
+                .map_fixed_bytes(target, &data, aligned_len, prot)?;
+            return Ok(target);
         }
+        let base = procs
+            .current_mut()?
+            .address_space
+            .map_anonymous(aligned_len, prot)?;
+        procs
+            .current_mut()?
+            .address_space
+            .write_bytes(base, &data)
+            .map_err(|_| EFAULT)?;
         Ok(base)
     }
 
@@ -954,7 +1107,10 @@ impl SyscallDispatcher {
         };
         if child_pid == 0 {
             if options & WNOHANG != 0 {
-                trace_line(&format!("whuse: wait return tgid={} child=0 wnohang", parent_pid));
+                trace_line(&format!(
+                    "whuse: wait return tgid={} child=0 wnohang",
+                    parent_pid
+                ));
                 return Ok(0);
             }
             trace_line(&format!("whuse: wait blocking tgid={}", parent_pid));
@@ -1025,19 +1181,41 @@ impl SyscallDispatcher {
 
     fn sys_ioctl(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         const TIOCGWINSZ: usize = 0x5413;
-        let _fd = args.0[0] as i32;
+        const RTC_RD_TIME: usize = 0x8024_7009;
+        let fd = args.0[0] as i32;
         let cmd = args.0[1];
         let arg = args.0[2];
-        if cmd == TIOCGWINSZ && arg != 0 {
-            let mut winsz = [0u8; 8];
-            winsz[..2].copy_from_slice(&24u16.to_le_bytes());
-            winsz[2..4].copy_from_slice(&80u16.to_le_bytes());
-            procs
-                .current_mut()?
-                .write_user_bytes(arg, &winsz)
-                .map_err(|_| EFAULT)?;
+        let handle_path = procs.current()?.fd(fd)?.path.clone();
+        match cmd {
+            TIOCGWINSZ => {
+                if arg != 0 {
+                    let mut winsz = [0u8; 8];
+                    winsz[..2].copy_from_slice(&24u16.to_le_bytes());
+                    winsz[2..4].copy_from_slice(&80u16.to_le_bytes());
+                    procs
+                        .current_mut()?
+                        .write_user_bytes(arg, &winsz)
+                        .map_err(|_| EFAULT)?;
+                }
+                Ok(0)
+            }
+            RTC_RD_TIME => {
+                if arg == 0 {
+                    return Err(EFAULT);
+                }
+                if handle_path != "/dev/rtc0" {
+                    return Err(ENOTTY);
+                }
+                let now = wall_time_now();
+                let bytes = rtc_time_bytes(now);
+                procs
+                    .current_mut()?
+                    .write_user_bytes(arg, &bytes)
+                    .map_err(|_| EFAULT)?;
+                Ok(0)
+            }
+            _ => Ok(0),
         }
-        Ok(0)
     }
 
     fn sys_flock(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
@@ -3000,6 +3178,56 @@ fn parse_shebang_line(data: &[u8]) -> Option<(String, Option<String>)> {
     Some((interp, arg))
 }
 
+fn parse_elf_interp(data: &[u8]) -> Option<String> {
+    const PT_INTERP: u32 = 3;
+    if data.len() < 64 || &data[..4] != b"\x7fELF" {
+        return None;
+    }
+    if data[4] != 2 || data[5] != 1 {
+        return None;
+    }
+    let phoff = usize::try_from(u64::from_le_bytes(data.get(32..40)?.try_into().ok()?)).ok()?;
+    let phentsize = usize::from(u16::from_le_bytes(data.get(54..56)?.try_into().ok()?));
+    let phnum = usize::from(u16::from_le_bytes(data.get(56..58)?.try_into().ok()?));
+    if phentsize < 56 {
+        return None;
+    }
+    for index in 0..phnum {
+        let off = phoff.checked_add(index.checked_mul(phentsize)?)?;
+        let end = off.checked_add(phentsize)?;
+        if end > data.len() {
+            return None;
+        }
+        let p_type = u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?);
+        if p_type != PT_INTERP {
+            continue;
+        }
+        let p_offset = usize::try_from(u64::from_le_bytes(
+            data.get(off + 8..off + 16)?.try_into().ok()?,
+        ))
+        .ok()?;
+        let p_filesz = usize::try_from(u64::from_le_bytes(
+            data.get(off + 32..off + 40)?.try_into().ok()?,
+        ))
+        .ok()?;
+        let interp_end = p_offset.checked_add(p_filesz)?;
+        if interp_end > data.len() || p_filesz == 0 {
+            return None;
+        }
+        let raw = data.get(p_offset..interp_end)?;
+        let nul = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+        if nul == 0 {
+            return None;
+        }
+        let interp = core::str::from_utf8(&raw[..nul]).ok()?.trim();
+        if interp.is_empty() {
+            return None;
+        }
+        return Some(interp.to_string());
+    }
+    None
+}
+
 fn read_u32(process: &proc::Process, addr: usize) -> Result<u32, i32> {
     let bytes = process.read_user_bytes(addr, 4).map_err(|_| EFAULT)?;
     let mut out = [0u8; 4];
@@ -3026,14 +3254,91 @@ fn wall_time_now() -> Timespec {
     }
 }
 
+fn rtc_time_bytes(ts: Timespec) -> [u8; 36] {
+    let (year, month, day, hour, minute, second, weekday, yearday) =
+        unix_seconds_to_calendar(ts.tv_sec);
+    let fields = [
+        second,
+        minute,
+        hour,
+        day,
+        month - 1,
+        year - 1900,
+        weekday,
+        yearday,
+        0,
+    ];
+    let mut out = [0u8; 36];
+    for (index, field) in fields.into_iter().enumerate() {
+        let start = index * 4;
+        out[start..start + 4].copy_from_slice(&field.to_le_bytes());
+    }
+    out
+}
+
+fn unix_seconds_to_calendar(secs: i64) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
+    let day_seconds = 86_400;
+    let days = secs.div_euclid(day_seconds);
+    let remain = secs.rem_euclid(day_seconds);
+    let hour = (remain / 3_600) as i32;
+    let minute = ((remain % 3_600) / 60) as i32;
+    let second = (remain % 60) as i32;
+
+    let (year, month, day) = civil_from_days(days);
+    let weekday = ((days + 4).rem_euclid(7)) as i32; // 1970-01-01 was Thursday (4).
+    let yearday = day_of_year(year, month, day) - 1;
+
+    (year, month, day, hour, minute, second, weekday, yearday)
+}
+
+fn civil_from_days(days: i64) -> (i32, i32, i32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(m <= 2);
+    (year as i32, m as i32, d as i32)
+}
+
+fn day_of_year(year: i32, month: i32, day: i32) -> i32 {
+    let month_index = month.saturating_sub(1).min(11) as usize;
+    const CUMULATIVE: [i32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let mut yday = CUMULATIVE[month_index] + day;
+    if month > 2 && is_leap_year(year) {
+        yday += 1;
+    }
+    yday
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
 fn uname_bytes() -> [u8; 390] {
     let mut out = [0u8; 390];
+    #[cfg(target_arch = "riscv64")]
+    let arch = "riscv64";
+    #[cfg(target_arch = "loongarch64")]
+    let arch = "loongarch64";
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+    let arch = "unknown";
+    #[cfg(target_arch = "riscv64")]
+    let platform = "whuse-riscv64-virt";
+    #[cfg(target_arch = "loongarch64")]
+    let platform = "whuse-loongarch64-virt";
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+    let platform = "whuse-unknown";
     let fields = [
         "Linux",
         "whuse",
         "6.8.0-whuse",
-        "whuse-riscv64-virt",
-        "riscv64",
+        platform,
+        arch,
         "localdomain",
     ];
     for (index, field) in fields.iter().enumerate() {

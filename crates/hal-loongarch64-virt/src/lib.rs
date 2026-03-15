@@ -899,11 +899,7 @@ unsafe impl VirtioHal for LoongArchVirtioHal {
             BufferDirection::DeviceToDriver | BufferDirection::Both
         ) {
             if let Some(vaddr) = DMA_ARENA.phys_to_virt(paddr) {
-                core::ptr::copy_nonoverlapping(
-                    vaddr.as_ptr(),
-                    buffer.as_ptr().cast::<u8>(),
-                    len,
-                );
+                core::ptr::copy_nonoverlapping(vaddr.as_ptr(), buffer.as_ptr().cast::<u8>(), len);
             }
         }
         let _ = DMA_ARENA.dealloc(paddr, pages);

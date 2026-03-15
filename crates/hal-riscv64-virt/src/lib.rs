@@ -4,6 +4,8 @@ extern crate alloc;
 
 #[cfg(target_arch = "riscv64")]
 use core::arch::global_asm;
+#[cfg(target_arch = "riscv64")]
+use core::fmt::Write;
 use core::ptr::NonNull;
 #[cfg(target_arch = "riscv64")]
 use core::ptr::{read_volatile, write_volatile};
@@ -37,6 +39,10 @@ const EIO: i32 = 5;
 const ENODEV: i32 = 19;
 const EINVAL: i32 = 22;
 const EROFS: i32 = 30;
+const RISCV_TIMEBASE_HZ: u64 = 10_000_000;
+const SBI_EXT_TIME: usize = 0x5449_4d45;
+const SBI_FID_SET_TIMER: usize = 0;
+const SBI_EXT_LEGACY_SET_TIMER: usize = 0x00;
 
 static CPU: VirtCpu = VirtCpu::new();
 static INTERRUPT: VirtInterruptController = VirtInterruptController::new();
@@ -79,8 +85,6 @@ __whuse_run_user:
     ld sp,  16(t6)
     ld gp,  24(t6)
     ld tp,  32(t6)
-    ld t1,  48(t6)
-    ld t2,  56(t6)
     ld s1,  72(t6)
     ld a0,  80(t6)
     ld a1,  88(t6)
@@ -110,9 +114,48 @@ __whuse_run_user:
     li t2, -257
     and t0, t0, t2
     ori t0, t0, 32
+    li t2, 0x6000
+    or t0, t0, t2
     csrw sstatus, t0
 
+    fld f0,  288(t6)
+    fld f1,  296(t6)
+    fld f2,  304(t6)
+    fld f3,  312(t6)
+    fld f4,  320(t6)
+    fld f5,  328(t6)
+    fld f6,  336(t6)
+    fld f7,  344(t6)
+    fld f8,  352(t6)
+    fld f9,  360(t6)
+    fld f10, 368(t6)
+    fld f11, 376(t6)
+    fld f12, 384(t6)
+    fld f13, 392(t6)
+    fld f14, 400(t6)
+    fld f15, 408(t6)
+    fld f16, 416(t6)
+    fld f17, 424(t6)
+    fld f18, 432(t6)
+    fld f19, 440(t6)
+    fld f20, 448(t6)
+    fld f21, 456(t6)
+    fld f22, 464(t6)
+    fld f23, 472(t6)
+    fld f24, 480(t6)
+    fld f25, 488(t6)
+    fld f26, 496(t6)
+    fld f27, 504(t6)
+    fld f28, 512(t6)
+    fld f29, 520(t6)
+    fld f30, 528(t6)
+    fld f31, 536(t6)
+    ld t1, 544(t6)
+    csrw fcsr, t1
+
     ld s0,  64(t6)
+    ld t1,  48(t6)
+    ld t2,  56(t6)
     ld t0,  40(t6)
     ld t6, 248(t6)
     sret
@@ -172,6 +215,40 @@ __whuse_user_trap_entry:
     sd t1, 272(t0)
     csrr t1, stval
     sd t1, 280(t0)
+    fsd f0,  288(t0)
+    fsd f1,  296(t0)
+    fsd f2,  304(t0)
+    fsd f3,  312(t0)
+    fsd f4,  320(t0)
+    fsd f5,  328(t0)
+    fsd f6,  336(t0)
+    fsd f7,  344(t0)
+    fsd f8,  352(t0)
+    fsd f9,  360(t0)
+    fsd f10, 368(t0)
+    fsd f11, 376(t0)
+    fsd f12, 384(t0)
+    fsd f13, 392(t0)
+    fsd f14, 400(t0)
+    fsd f15, 408(t0)
+    fsd f16, 416(t0)
+    fsd f17, 424(t0)
+    fsd f18, 432(t0)
+    fsd f19, 440(t0)
+    fsd f20, 448(t0)
+    fsd f21, 456(t0)
+    fsd f22, 464(t0)
+    fsd f23, 472(t0)
+    fsd f24, 480(t0)
+    fsd f25, 488(t0)
+    fsd f26, 496(t0)
+    fsd f27, 504(t0)
+    fsd f28, 512(t0)
+    fsd f29, 520(t0)
+    fsd f30, 528(t0)
+    fsd f31, 536(t0)
+    csrr t1, fcsr
+    sd t1, 544(t0)
 
     addi sp, sp, 16
     la t0, __whuse_kernel_ra
@@ -511,17 +588,93 @@ impl VirtTimer {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
+fn read_time_ticks() -> u64 {
+    let ticks: u64;
+    unsafe {
+        core::arch::asm!("rdtime {}", out(reg) ticks);
+    }
+    ticks
+}
+
+#[cfg(target_arch = "riscv64")]
+fn nanos_to_time_ticks(nanos: u64) -> u64 {
+    nanos.saturating_mul(RISCV_TIMEBASE_HZ) / 1_000_000_000
+}
+
+#[cfg(target_arch = "riscv64")]
+fn sbi_set_timer_v02(timer_ticks: u64) -> isize {
+    let error: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") timer_ticks as usize => error,
+            in("a6") SBI_FID_SET_TIMER,
+            in("a7") SBI_EXT_TIME,
+            lateout("a1") _,
+        );
+    }
+    error
+}
+
+#[cfg(target_arch = "riscv64")]
+fn sbi_set_timer_legacy(timer_ticks: u64) -> isize {
+    let error: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") timer_ticks as usize => error,
+            in("a7") SBI_EXT_LEGACY_SET_TIMER,
+            lateout("a1") _,
+            lateout("a2") _,
+            lateout("a3") _,
+            lateout("a4") _,
+            lateout("a5") _,
+            lateout("a6") _,
+        );
+    }
+    error
+}
+
 impl HalTimer for VirtTimer {
     fn monotonic_time(&self) -> Timespec {
         Timespec::from_nanos(self.monotonic_nanos())
     }
 
     fn monotonic_nanos(&self) -> u64 {
-        self.ticks.fetch_add(1_000_000, Ordering::Relaxed)
+        let ticks = read_time_ticks();
+        ticks.saturating_mul(1_000_000_000) / RISCV_TIMEBASE_HZ
     }
 
     fn program_oneshot(&self, deadline_nanos: u64) {
         self.deadline.store(deadline_nanos, Ordering::Relaxed);
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            // Enable supervisor timer interrupts before arming next deadline.
+            const STIE: usize = 1 << 5;
+            core::arch::asm!("csrs sie, {}", in(reg) STIE);
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            let ticks = nanos_to_time_ticks(deadline_nanos);
+            // QEMU virt exposes SSTC in OpenSBI; direct stimecmp programming
+            // keeps periodic preemption reliable during long user loops.
+            unsafe {
+                core::arch::asm!("csrw 0x14d, {}", in(reg) ticks);
+            }
+            let err_v02 = sbi_set_timer_v02(ticks);
+            if err_v02 != 0 {
+                let err_legacy = sbi_set_timer_legacy(ticks);
+                if err_legacy != 0 {
+                    let mut console = hal_api::ConsoleWriter;
+                    let _ = writeln!(
+                        console,
+                        "whuse: warn timer arm failed v0.2={} legacy={}",
+                        err_v02, err_legacy
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -787,11 +940,7 @@ unsafe impl VirtioHal for RiscvVirtioHal {
             BufferDirection::DeviceToDriver | BufferDirection::Both
         ) {
             if let Some(vaddr) = DMA_ARENA.phys_to_virt(paddr) {
-                core::ptr::copy_nonoverlapping(
-                    vaddr.as_ptr(),
-                    buffer.as_ptr().cast::<u8>(),
-                    len,
-                );
+                core::ptr::copy_nonoverlapping(vaddr.as_ptr(), buffer.as_ptr().cast::<u8>(), len);
             }
         }
         let _ = DMA_ARENA.dealloc(paddr, pages);

@@ -42,6 +42,10 @@ pub struct TrapFrame {
     pub sstatus: usize,
     pub scause: usize,
     pub stval: usize,
+    #[cfg(target_arch = "riscv64")]
+    pub fregs: [u64; 32],
+    #[cfg(target_arch = "riscv64")]
+    pub fcsr: usize,
 }
 
 impl TrapFrame {

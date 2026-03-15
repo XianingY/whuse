@@ -34,6 +34,11 @@ const S_IFCHR: u32 = 0o020000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFLNK: u32 = 0o120000;
 const S_IFSOCK: u32 = 0o140000;
+const PROC_MEMINFO: &[u8] = b"MemTotal:       1048576 kB\nMemFree:         524288 kB\nMemAvailable:    524288 kB\nBuffers:              0 kB\nCached:               0 kB\nSwapTotal:            0 kB\nSwapFree:             0 kB\n";
+const PROC_UPTIME: &[u8] = b"1.00 1.00\n";
+const PROC_STAT: &[u8] = b"cpu  1 0 1 1 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 1735689600\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n";
+const PROC_VERSION: &[u8] = b"Linux version 6.8.0-whuse (whuse@localdomain) #1 SMP PREEMPT\n";
+const PROC_SELF_STAT: &[u8] = b"1 (self) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 1 4096 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeKind {
@@ -197,7 +202,14 @@ impl KernelVfs {
             let _ = vfs.mkdir("/", dir, 0o755);
         }
         let _ = vfs.create_char_device("/dev/console", "console");
+        let _ = vfs.create_char_device("/dev/rtc0", "rtc0");
         let _ = vfs.create_proc_file("/proc/mounts", b"");
+        let _ = vfs.create_proc_file("/proc/meminfo", PROC_MEMINFO);
+        let _ = vfs.create_proc_file("/proc/uptime", PROC_UPTIME);
+        let _ = vfs.create_proc_file("/proc/stat", PROC_STAT);
+        let _ = vfs.create_proc_file("/proc/version", PROC_VERSION);
+        let _ = vfs.mkdir("/", "/proc/self", 0o755);
+        let _ = vfs.create_proc_file("/proc/self/stat", PROC_SELF_STAT);
         vfs
     }
 
@@ -235,10 +247,8 @@ impl KernelVfs {
             size: contents.len() as u64,
             nlink: 1,
         };
-        self.external_preloaded.insert(
-            absolute.clone(),
-            (Arc::new(contents.to_vec()), stat),
-        );
+        self.external_preloaded
+            .insert(absolute.clone(), (Arc::new(contents.to_vec()), stat));
         self.external_stat_cache.insert(absolute, stat);
         Ok(())
     }
@@ -344,23 +354,6 @@ impl KernelVfs {
                 }
             }
             NodeData::Ext4Dir(state) => {
-                #[cfg(target_arch = "loongarch64")]
-                if state.path == "/musl/basic" {
-                    let mut names = self
-                        .external_preloaded
-                        .keys()
-                        .filter_map(|path| path.strip_prefix("/musl/basic/"))
-                        .filter(|name| !name.is_empty() && !name.contains('/'))
-                        .map(|name| name.to_string())
-                        .collect::<Vec<_>>();
-                    names.sort();
-                    names.dedup();
-                    for (index, name) in names.iter().enumerate() {
-                        append_dirent(&mut out, index, name, 8);
-                    }
-                    handle.offset = out.len();
-                    return Ok(out);
-                }
                 let entries = state.mount.read_dir(&state.path)?;
                 for (index, entry) in entries.iter().enumerate() {
                     append_dirent(
@@ -866,14 +859,6 @@ impl KernelVfs {
         if let Some((_, stat)) = self.external_preloaded.get(absolute) {
             return Ok(Some(*stat));
         }
-        #[cfg(target_arch = "loongarch64")]
-        if absolute == "/musl" || absolute == "/musl/basic" {
-            return Ok(Some(FileStat {
-                mode: S_IFDIR | 0o755,
-                size: 0,
-                nlink: 1,
-            }));
-        }
         let Some((mount, fs_path)) = self.resolve_external_path(absolute) else {
             return Ok(None);
         };
@@ -888,7 +873,11 @@ impl KernelVfs {
         }
     }
 
-    fn try_open_external(&mut self, absolute: &str, flags: u32) -> KernelResult<Option<FileHandle>> {
+    fn try_open_external(
+        &mut self,
+        absolute: &str,
+        flags: u32,
+    ) -> KernelResult<Option<FileHandle>> {
         if self.is_memory_preferred_path(absolute) && self.lookup_abs(absolute).is_ok() {
             return Ok(None);
         }
@@ -900,20 +889,6 @@ impl KernelVfs {
         };
         if flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC) != 0 {
             return Ok(None);
-        }
-        #[cfg(target_arch = "loongarch64")]
-        if absolute == "/musl" || absolute == "/musl/basic" {
-            return Ok(Some(self.build_ext4_handle(
-                absolute,
-                mount,
-                fs_path,
-                fs_ext4::Ext4FileStat {
-                    mode: S_IFDIR | 0o755,
-                    size: 0,
-                    nlink: 1,
-                },
-                None,
-            )));
         }
         if let Some((cached, stat)) = self.external_preloaded.get(absolute).cloned() {
             if (flags & O_DIRECTORY) != 0 && (stat.mode & S_IFDIR) != S_IFDIR {
@@ -930,10 +905,6 @@ impl KernelVfs {
                 },
                 Some(cached),
             )));
-        }
-        #[cfg(target_arch = "loongarch64")]
-        if absolute.starts_with("/musl/basic/") {
-            return Ok(None);
         }
 
         let cached = self.external_stat_cache.get(absolute).copied();
@@ -963,7 +934,9 @@ impl KernelVfs {
         if (flags & O_DIRECTORY) != 0 && (stat.mode & S_IFDIR) != S_IFDIR {
             return Err(ENOTDIR);
         }
-        Ok(Some(self.build_ext4_handle(absolute, mount, fs_path, stat, None)))
+        Ok(Some(
+            self.build_ext4_handle(absolute, mount, fs_path, stat, None),
+        ))
     }
 
     fn build_ext4_handle(
@@ -1712,13 +1685,17 @@ mod tests {
         vfs.preload_external_file("/musl/basic/wait", b"wait-ok", Some(super::S_IFREG | 0o755))
             .unwrap();
 
-        let mut before = vfs.open("/", "/musl/basic/wait", super::O_RDONLY, 0).unwrap();
+        let mut before = vfs
+            .open("/", "/musl/basic/wait", super::O_RDONLY, 0)
+            .unwrap();
         assert_eq!(vfs.read(&mut before, 16).unwrap(), b"wait-ok");
 
         vfs.mount("dev:/dev/vda2", "/mnt", "vfat").unwrap();
         vfs.umount("/mnt").unwrap();
 
-        let mut after = vfs.open("/", "/musl/basic/wait", super::O_RDONLY, 0).unwrap();
+        let mut after = vfs
+            .open("/", "/musl/basic/wait", super::O_RDONLY, 0)
+            .unwrap();
         assert_eq!(vfs.read(&mut after, 16).unwrap(), b"wait-ok");
     }
 }

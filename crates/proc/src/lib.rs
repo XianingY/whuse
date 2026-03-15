@@ -81,6 +81,23 @@ pub struct ThreadExit {
     pub parent_tgid: Option<usize>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GroupExit {
+    pub tgid: usize,
+    pub tids: Vec<usize>,
+    pub clear_child_tids: Vec<usize>,
+    pub parent_tgid: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessSnapshot {
+    pub tid: usize,
+    pub tgid: usize,
+    pub name: String,
+    pub state: ProcessState,
+    pub is_thread: bool,
+}
+
 pub struct Process {
     pub pid: usize,
     pub tid: usize,
@@ -539,7 +556,11 @@ impl ProcessTable {
         Ok(tid)
     }
 
-    pub fn set_thread_stack_pointer(&mut self, tid: usize, stack_pointer: usize) -> KernelResult<()> {
+    pub fn set_thread_stack_pointer(
+        &mut self,
+        tid: usize,
+        stack_pointer: usize,
+    ) -> KernelResult<()> {
         let process = self.processes.get_mut(&tid).ok_or(EBADF)?;
         process.trap_frame.regs[2] = stack_pointer;
         Ok(())
@@ -918,6 +939,56 @@ impl ProcessTable {
             .values()
             .filter(|process| !process.is_thread && process.state != ProcessState::Exited)
             .count()
+    }
+
+    pub fn process_snapshots(&self) -> Vec<ProcessSnapshot> {
+        self.processes
+            .values()
+            .filter(|process| process.state != ProcessState::Exited)
+            .map(|process| ProcessSnapshot {
+                tid: process.tid,
+                tgid: process.tgid,
+                name: process.name.clone(),
+                state: process.state,
+                is_thread: process.is_thread,
+            })
+            .collect()
+    }
+
+    pub fn force_exit_group(&mut self, tgid: usize, code: i32) -> KernelResult<Option<GroupExit>> {
+        let tids = self
+            .processes
+            .iter()
+            .filter_map(|(tid, process)| (process.tgid == tgid).then_some(*tid))
+            .collect::<Vec<_>>();
+        if tids.is_empty() {
+            return Ok(None);
+        }
+        let parent_tgid = self
+            .processes
+            .get(&tids[0])
+            .and_then(|process| process.parent);
+        let mut clear_child_tids = Vec::new();
+        for tid in &tids {
+            if let Some(process) = self.processes.get_mut(tid) {
+                if let Some(addr) = process.clear_child_tid {
+                    let _ = process.write_user_bytes(addr, &0u32.to_le_bytes());
+                    clear_child_tids.push(addr);
+                }
+                process.state = ProcessState::Exited;
+                process.exit_code = Some(code);
+            }
+            self.remove_futex_waiter(*tid);
+        }
+        if let Some(parent_tgid) = parent_tgid {
+            let _ = self.send_signal(parent_tgid, 17);
+        }
+        Ok(Some(GroupExit {
+            tgid,
+            tids,
+            clear_child_tids,
+            parent_tgid,
+        }))
     }
 
     fn next_id(&mut self) -> usize {

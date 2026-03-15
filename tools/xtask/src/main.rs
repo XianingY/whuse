@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         "check" => cargo(&["check", "--workspace"]),
         "qemu" | "qemu-riscv" => qemu_riscv(),
         "qemu-loongarch" => qemu_loongarch(),
+        "oscomp-images" => prepare_oscomp_images(),
         "oscomp-riscv" => oscomp_riscv(),
         "oscomp-loongarch" => oscomp_loongarch(),
         other => {
@@ -249,19 +250,19 @@ fn copy_tree(src: &PathBuf, dst: &PathBuf) -> io::Result<()> {
 }
 
 fn oscomp_riscv() -> ExitCode {
-    let image_status = build_rootfs_image("riscv64");
+    let image_status = prepare_oscomp_images();
     if image_status != ExitCode::SUCCESS {
         return image_status;
     }
-    qemu_riscv_with_disk(Some(rootfs_image_path("riscv64")))
+    qemu_riscv_with_disk(Some(oscomp_image_path("rv")))
 }
 
 fn oscomp_loongarch() -> ExitCode {
-    let image_status = build_rootfs_image("loongarch64");
+    let image_status = prepare_oscomp_images();
     if image_status != ExitCode::SUCCESS {
         return image_status;
     }
-    qemu_loongarch_with_disk(Some(rootfs_image_path("loongarch64")))
+    qemu_loongarch_with_disk(Some(oscomp_image_path("la")))
 }
 
 fn qemu_riscv() -> ExitCode {
@@ -269,6 +270,10 @@ fn qemu_riscv() -> ExitCode {
         env::var("WHUSE_DISK_IMAGE")
             .ok()
             .map(PathBuf::from)
+            .or_else(|| {
+                let image = oscomp_image_path("rv");
+                image.exists().then_some(image)
+            })
             .or_else(|| {
                 let image = rootfs_image_path("riscv64");
                 image.exists().then_some(image)
@@ -280,6 +285,18 @@ fn qemu_riscv_with_disk(disk: Option<PathBuf>) -> ExitCode {
     let build_status = build_kernel(RISCV_PACKAGE, RISCV_TARGET);
     if build_status != ExitCode::SUCCESS {
         return build_status;
+    }
+    if let Some(disk) = disk.as_ref() {
+        if let Some((pid, cmdline)) = detect_qemu_disk_holder(disk) {
+            eprintln!(
+                "disk image {} is currently in use by pid {} ({})",
+                disk.display(),
+                pid,
+                cmdline
+            );
+            eprintln!("stop the running qemu process (or use a different image) and retry");
+            return ExitCode::from(1);
+        }
     }
 
     let kernel = PathBuf::from("target")
@@ -329,6 +346,10 @@ fn qemu_loongarch() -> ExitCode {
             .ok()
             .map(PathBuf::from)
             .or_else(|| {
+                let image = oscomp_image_path("la");
+                image.exists().then_some(image)
+            })
+            .or_else(|| {
                 let image = rootfs_image_path("loongarch64");
                 image.exists().then_some(image)
             }),
@@ -343,6 +364,18 @@ fn qemu_loongarch_with_disk(disk: Option<PathBuf>) -> ExitCode {
     let build_status = build_kernel(LOONGARCH_PACKAGE, LOONGARCH_TARGET);
     if build_status != ExitCode::SUCCESS {
         return build_status;
+    }
+    if let Some(disk) = disk.as_ref() {
+        if let Some((pid, cmdline)) = detect_qemu_disk_holder(disk) {
+            eprintln!(
+                "disk image {} is currently in use by pid {} ({})",
+                disk.display(),
+                pid,
+                cmdline
+            );
+            eprintln!("stop the running qemu process (or use a different image) and retry");
+            return ExitCode::from(1);
+        }
     }
 
     let bootrom_elf = PathBuf::from("target")
@@ -413,4 +446,301 @@ fn qemu_loongarch_with_disk(disk: Option<PathBuf>) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn oscomp_image_path(tag: &str) -> PathBuf {
+    repo_root()
+        .join("target")
+        .join("oscomp")
+        .join(format!("sdcard-{tag}.img"))
+}
+
+fn testsuits_root() -> PathBuf {
+    env::var("WHUSE_OSCOMP_TESTSUITS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            repo_root()
+                .parent()
+                .expect("workspace has parent directory")
+                .join("testsuits-for-oskernel")
+        })
+}
+
+fn prepare_oscomp_images() -> ExitCode {
+    let testsuits = testsuits_root();
+    if !testsuits.exists() {
+        eprintln!(
+            "testsuits directory does not exist: {} (set WHUSE_OSCOMP_TESTSUITS_DIR)",
+            testsuits.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    if env::var("WHUSE_OSCOMP_SKIP_BUILD").is_err() {
+        if !build_oscomp_sdcard(&testsuits) {
+            eprintln!(
+                "warning: oscomp sdcard build failed; will try to use existing images under {}",
+                testsuits.display()
+            );
+        }
+    }
+
+    let src_rv = match ensure_oscomp_source_image(&testsuits, "rv") {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+    let src_la = match ensure_oscomp_source_image(&testsuits, "la") {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let target_dir = repo_root().join("target").join("oscomp");
+    if let Err(err) = fs::create_dir_all(&target_dir) {
+        eprintln!(
+            "failed to create target oscomp directory {}: {err}",
+            target_dir.display()
+        );
+        return ExitCode::from(1);
+    }
+    let dst_rv = oscomp_image_path("rv");
+    let dst_la = oscomp_image_path("la");
+    if let Err(err) = fs::copy(&src_rv, &dst_rv) {
+        eprintln!(
+            "failed to copy {} -> {}: {err}",
+            src_rv.display(),
+            dst_rv.display()
+        );
+        return ExitCode::from(1);
+    }
+    if let Err(err) = fs::copy(&src_la, &dst_la) {
+        eprintln!(
+            "failed to copy {} -> {}: {err}",
+            src_la.display(),
+            dst_la.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    let rv_ok = validate_oscomp_full_image(&dst_rv, "riscv64");
+    let la_ok = validate_oscomp_full_image(&dst_la, "loongarch64");
+    if !rv_ok || !la_ok {
+        return ExitCode::from(1);
+    }
+    println!(
+        "prepared oscomp images:\n  {}\n  {}",
+        dst_rv.display(),
+        dst_la.display()
+    );
+    ExitCode::SUCCESS
+}
+
+fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
+    let status = Command::new("make")
+        .arg("sdcard")
+        .current_dir(testsuits)
+        .status();
+    match status {
+        Ok(status) if status.success() => return true,
+        Ok(status) => eprintln!(
+            "host make sdcard failed in {} (exit code {:?}), trying docker fallback",
+            testsuits.display(),
+            status.code()
+        ),
+        Err(err) => eprintln!(
+            "failed to execute host make sdcard in {} ({err}), trying docker fallback",
+            testsuits.display()
+        ),
+    }
+
+    let docker_image = env::var("WHUSE_OSCOMP_DOCKER_IMAGE")
+        .unwrap_or_else(|_| "docker.educg.net/cg/os-contest:20250614".to_string());
+    let mount_arg = format!("{}:/code", testsuits.display());
+    let status = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            mount_arg.as_str(),
+            "--entrypoint",
+            "bash",
+            "-w",
+            "/code",
+            "--privileged",
+            docker_image.as_str(),
+            "-lc",
+            "make sdcard",
+        ])
+        .status();
+    match status {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!(
+                "docker make sdcard failed in {} (exit code {:?})",
+                testsuits.display(),
+                status.code()
+            );
+            false
+        }
+        Err(err) => {
+            eprintln!(
+                "failed to execute docker make sdcard in {} ({err})",
+                testsuits.display()
+            );
+            false
+        }
+    }
+}
+
+fn ensure_oscomp_source_image(testsuits: &PathBuf, tag: &str) -> Result<PathBuf, String> {
+    let raw = testsuits.join(format!("sdcard-{tag}.img"));
+    if raw.exists() {
+        return Ok(raw);
+    }
+    let compressed = testsuits.join(format!("sdcard-{tag}.img.xz"));
+    if !compressed.exists() {
+        return Err(format!(
+            "missing oscomp image source {}, and compressed archive {}",
+            raw.display(),
+            compressed.display()
+        ));
+    }
+    let status = Command::new("xz")
+        .args(["-dk", compressed.to_string_lossy().as_ref()])
+        .status()
+        .map_err(|err| format!("failed to execute xz for {}: {err}", compressed.display()))?;
+    if !status.success() {
+        return Err(format!(
+            "failed to decompress {} (exit code {:?})",
+            compressed.display(),
+            status.code()
+        ));
+    }
+    if raw.exists() {
+        Ok(raw)
+    } else {
+        Err(format!(
+            "decompressed archive but image still missing: {}",
+            raw.display()
+        ))
+    }
+}
+
+fn validate_oscomp_full_image(image: &PathBuf, arch: &str) -> bool {
+    let musl_listing = match debugfs_list(image, "/musl") {
+        Ok(listing) => listing,
+        Err(err) => {
+            eprintln!(
+                "failed to run debugfs for {} ({}): {err}",
+                arch,
+                image.display()
+            );
+            return false;
+        }
+    };
+    let basic_listing = match debugfs_list(image, "/musl/basic") {
+        Ok(listing) => listing,
+        Err(err) => {
+            eprintln!(
+                "failed to read /musl/basic via debugfs for {} ({}): {err}",
+                arch,
+                image.display()
+            );
+            return false;
+        }
+    };
+
+    let required_musl = [
+        "busybox",
+        "busybox_testcode.sh",
+        "busybox_cmd.txt",
+        "iozone_testcode.sh",
+        "libctest_testcode.sh",
+        "libc-bench",
+        "lmbench_testcode.sh",
+        "lua_testcode.sh",
+        "unixbench_testcode.sh",
+        "netperf_testcode.sh",
+        "iperf_testcode.sh",
+        "cyclictest_testcode.sh",
+    ];
+    let mut missing = Vec::new();
+    for entry in required_musl {
+        if !musl_listing.contains(entry) {
+            missing.push(format!("/musl/{entry}"));
+        }
+    }
+    if !musl_listing.contains("test_all.sh") && !basic_listing.contains("run-all.sh") {
+        missing.push("/musl/test_all.sh(or /musl/basic/run-all.sh)".to_string());
+    }
+    if !missing.is_empty() {
+        eprintln!(
+            "oscomp image {} ({}) is incomplete; missing {:?}",
+            arch,
+            image.display(),
+            missing
+        );
+        return false;
+    }
+    true
+}
+
+fn debugfs_list(image: &PathBuf, path: &str) -> Result<String, String> {
+    let output = Command::new("debugfs")
+        .args([
+            "-R",
+            &format!("ls -l {path}"),
+            image.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .map_err(|err| format!("failed to execute debugfs: {err}"))?;
+    if !output.status.success() {
+        return Err(format!("debugfs exit code {:?}", output.status.code()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn detect_qemu_disk_holder(disk: &PathBuf) -> Option<(u32, String)> {
+    let canonical_disk = fs::canonicalize(disk).unwrap_or_else(|_| disk.clone());
+    let canonical_str = canonical_disk.to_string_lossy().into_owned();
+    let raw_str = disk.to_string_lossy().into_owned();
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let pid_str = file_name.to_string_lossy();
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        let cmdline_path = entry.path().join("cmdline");
+        let Ok(raw_cmdline) = fs::read(cmdline_path) else {
+            continue;
+        };
+        if raw_cmdline.is_empty() {
+            continue;
+        }
+        let args = raw_cmdline
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect::<Vec<_>>();
+        if args.is_empty() {
+            continue;
+        }
+        let joined = args.join(" ");
+        if !joined.contains("qemu-system-") {
+            continue;
+        }
+        if joined.contains(&canonical_str) || joined.contains(&raw_str) {
+            return Some((pid, joined));
+        }
+    }
+    None
 }

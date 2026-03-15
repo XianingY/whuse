@@ -19,7 +19,7 @@ const ENOEXEC: i32 = 8;
 const ENOMEM: i32 = 12;
 
 const USER_HEAP_BASE: usize = 0x4000_0000;
-const USER_STACK_SIZE: usize = 0x20_000;
+const USER_STACK_SIZE: usize = 0x80_000;
 const USER_STACK_TOP: usize = 0x7fff_f000;
 const USER_MMAP_BASE: usize = 0x5000_0000;
 const DEFAULT_PROT: usize = 0b11;
@@ -205,12 +205,37 @@ impl AddressSpace {
         let aligned = align_up(len, PAGE_SIZE);
         let start = {
             let mut inner = self.inner.lock();
-            let start = inner.next_mapping_base;
-            inner.next_mapping_base = inner.next_mapping_base.checked_add(aligned).ok_or(ENOMEM)?;
-            start
+            let mut start = align_up(inner.next_mapping_base, PAGE_SIZE);
+            loop {
+                if let Some(overlap_end) = first_overlap_end(&inner.mappings, start, aligned) {
+                    start = align_up(overlap_end, PAGE_SIZE);
+                    continue;
+                }
+                let next = start.checked_add(aligned).ok_or(ENOMEM)?;
+                inner.next_mapping_base = next;
+                break start;
+            }
         };
         self.map_owned(start, vec![0; aligned], prot)?;
         Ok(start)
+    }
+
+    pub fn map_anonymous_at(&self, addr: usize, len: usize, prot: usize) -> KernelResult<usize> {
+        if len == 0 || addr & (PAGE_SIZE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let aligned = align_up(len, PAGE_SIZE);
+        self.map_fixed_bytes(addr, &[], aligned, prot)?;
+        Ok(addr)
+    }
+
+    pub fn is_range_available(&self, addr: usize, len: usize) -> KernelResult<bool> {
+        if len == 0 || addr & (PAGE_SIZE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let aligned = align_up(len, PAGE_SIZE);
+        let inner = self.inner.lock();
+        Ok(!overlaps(&inner.mappings, addr, aligned))
     }
 
     pub fn map_fixed_bytes(
@@ -249,29 +274,54 @@ impl AddressSpace {
     }
 
     pub fn unmap(&self, addr: usize, len: usize) -> KernelResult<()> {
-        let aligned = align_up(len, PAGE_SIZE);
-        let mut inner = self.inner.lock();
-        let Some(segment) = inner.mappings.get(&addr) else {
-            return Err(EINVAL);
-        };
-        if segment.area.len != aligned {
+        if len == 0 {
             return Err(EINVAL);
         }
-        inner.mappings.remove(&addr);
-        inner.rebuild_page_table();
-        Ok(())
+        let aligned = align_up(len, PAGE_SIZE);
+        let mut inner = self.inner.lock();
+        unmap_range_inner(&mut inner, addr, aligned)
     }
 
     pub fn mprotect(&self, addr: usize, len: usize, prot: usize) -> KernelResult<()> {
-        let aligned = align_up(len, PAGE_SIZE);
-        let mut inner = self.inner.lock();
-        let Some(segment) = inner.mappings.get_mut(&addr) else {
-            return Err(EINVAL);
-        };
-        if segment.area.len != aligned {
+        if len == 0 {
             return Err(EINVAL);
         }
-        segment.area.prot = prot;
+        let aligned = align_up(len, PAGE_SIZE);
+        let mut inner = self.inner.lock();
+        if !range_fully_mapped(&inner.mappings, addr, aligned) {
+            return Err(EINVAL);
+        }
+        let end = addr.checked_add(aligned).ok_or(EINVAL)?;
+        let keys = inner.mappings.keys().copied().collect::<Vec<_>>();
+        for key in keys {
+            let Some(segment) = inner.mappings.remove(&key) else {
+                continue;
+            };
+            let seg_start = segment.area.start;
+            let seg_end = seg_start + segment.area.len;
+            if end <= seg_start || addr >= seg_end {
+                inner.mappings.insert(seg_start, segment);
+                continue;
+            }
+            if addr > seg_start {
+                let left_len = addr - seg_start;
+                let left = slice_segment(&segment, seg_start, left_len, segment.area.prot);
+                inner.mappings.insert(left.area.start, left);
+            }
+
+            let mid_start = seg_start.max(addr);
+            let mid_end = seg_end.min(end);
+            let mid_len = mid_end - mid_start;
+            let mid = slice_segment(&segment, mid_start, mid_len, prot);
+            inner.mappings.insert(mid.area.start, mid);
+
+            if end < seg_end {
+                let right_start = end;
+                let right_len = seg_end - end;
+                let right = slice_segment(&segment, right_start, right_len, segment.area.prot);
+                inner.mappings.insert(right.area.start, right);
+            }
+        }
         inner.rebuild_page_table();
         Ok(())
     }
@@ -291,6 +341,13 @@ impl AddressSpace {
             let map_end = align_up(new_break, PAGE_SIZE);
             if map_end > map_start {
                 self.map_fixed_bytes(map_start, &[], map_end - map_start, DEFAULT_PROT)?;
+            }
+        } else if new_break < old_break {
+            let unmap_start = align_up(new_break, PAGE_SIZE);
+            let unmap_end = align_up(old_break, PAGE_SIZE);
+            if unmap_end > unmap_start {
+                let mut inner = self.inner.lock();
+                unmap_range_inner(&mut inner, unmap_start, unmap_end - unmap_start)?;
             }
         }
 
@@ -325,7 +382,11 @@ impl AddressSpace {
         match &mut segment.storage {
             SegmentStorage::Owned { ptr, .. } => {
                 unsafe {
-                    ptr::copy_nonoverlapping(bytes.as_ptr(), (*ptr + offset) as *mut u8, bytes.len());
+                    ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        (*ptr + offset) as *mut u8,
+                        bytes.len(),
+                    );
                 }
                 Ok(())
             }
@@ -418,6 +479,7 @@ impl AddressSpace {
         envs: &[String],
     ) -> KernelResult<LoadedImage> {
         let header = ElfHeader::parse(image)?;
+        let phdr_addr = find_phdr_vaddr(&header, image)?;
         if header.program_header_size != 56 || header.class != 2 || header.endianness != 1 {
             return Err(ENOEXEC);
         }
@@ -458,7 +520,21 @@ impl AddressSpace {
         let stack_top = USER_STACK_TOP;
         let stack_base = stack_top - USER_STACK_SIZE;
         self.map_fixed_bytes(stack_base, &[], USER_STACK_SIZE, DEFAULT_PROT)?;
-        let stack_image = build_initial_stack(args, envs, stack_top)?;
+        let auxv = [
+            (3usize, phdr_addr),                  // AT_PHDR
+            (4usize, header.program_header_size), // AT_PHENT
+            (5usize, header.program_header_num),  // AT_PHNUM
+            (6usize, PAGE_SIZE),                  // AT_PAGESZ
+            (7usize, 0usize),                     // AT_BASE
+            (8usize, 0usize),                     // AT_FLAGS
+            (9usize, header.entry),               // AT_ENTRY
+            (11usize, 0usize),                    // AT_UID
+            (12usize, 0usize),                    // AT_EUID
+            (13usize, 0usize),                    // AT_GID
+            (14usize, 0usize),                    // AT_EGID
+            (23usize, 0usize),                    // AT_SECURE
+        ];
+        let stack_image = build_initial_stack(args, envs, stack_top, &auxv)?;
         let used = stack_image.len();
         self.write_bytes(stack_top - used, &stack_image)?;
         Ok(LoadedImage {
@@ -482,18 +558,7 @@ impl AddressSpace {
     fn insert_segment(&self, segment: Segment) -> KernelResult<()> {
         let mut inner = self.inner.lock();
         if overlaps(&inner.mappings, segment.area.start, segment.area.len) {
-            let overlapping = inner
-                .mappings
-                .iter()
-                .filter_map(|(base, existing)| {
-                    let end = segment.area.start + segment.area.len;
-                    let existing_end = *base + existing.area.len;
-                    (segment.area.start < existing_end && *base < end).then_some(*base)
-                })
-                .collect::<Vec<_>>();
-            for base in overlapping {
-                inner.mappings.remove(&base);
-            }
+            unmap_range_inner(&mut inner, segment.area.start, segment.area.len)?;
         }
         inner.mappings.insert(segment.area.start, segment);
         inner.rebuild_page_table();
@@ -628,8 +693,7 @@ impl Sv39PageTableBuilder {
 
     fn ensure_next_table(&mut self, table_phys: usize, index: usize) -> usize {
         let existing = self.table_mut(table_phys)[index];
-        if existing & RISCV_PTE_V != 0
-            && existing & (RISCV_PTE_R | RISCV_PTE_W | RISCV_PTE_X) == 0
+        if existing & RISCV_PTE_V != 0 && existing & (RISCV_PTE_R | RISCV_PTE_W | RISCV_PTE_X) == 0
         {
             return ((existing >> 10) as usize) << 12;
         }
@@ -968,12 +1032,116 @@ impl ProgramHeader {
     }
 }
 
+fn find_phdr_vaddr(header: &ElfHeader, image: &[u8]) -> KernelResult<usize> {
+    let phoff = header.program_header_offset;
+    for index in 0..header.program_header_num {
+        let offset = header.program_header_offset + index * header.program_header_size;
+        let ph = ProgramHeader::parse(image, offset)?;
+        if ph.segment_type != 1 || ph.file_size == 0 {
+            continue;
+        }
+        let file_end = ph.offset.checked_add(ph.file_size).ok_or(ENOEXEC)?;
+        if phoff < ph.offset || phoff >= file_end {
+            continue;
+        }
+        let delta = phoff - ph.offset;
+        return ph.vaddr.checked_add(delta).ok_or(ENOEXEC);
+    }
+    Err(ENOEXEC)
+}
+
 fn overlaps(mappings: &BTreeMap<usize, Segment>, start: usize, len: usize) -> bool {
+    let end = start.saturating_add(len);
     mappings.iter().any(|(base, segment)| {
-        let end = start + len;
         let seg_end = *base + segment.area.len;
         start < seg_end && *base < end
     })
+}
+
+fn first_overlap_end(
+    mappings: &BTreeMap<usize, Segment>,
+    start: usize,
+    len: usize,
+) -> Option<usize> {
+    let end = start.saturating_add(len);
+    mappings.iter().find_map(|(base, segment)| {
+        let seg_end = *base + segment.area.len;
+        (start < seg_end && *base < end).then_some(seg_end)
+    })
+}
+
+fn range_fully_mapped(mappings: &BTreeMap<usize, Segment>, start: usize, len: usize) -> bool {
+    let end = start.saturating_add(len);
+    let mut cursor = start;
+    while cursor < end {
+        let Some((base, segment)) = mappings.range(..=cursor).next_back() else {
+            return false;
+        };
+        let seg_end = *base + segment.area.len;
+        if cursor < *base || cursor >= seg_end {
+            return false;
+        }
+        cursor = seg_end.min(end);
+    }
+    true
+}
+
+fn unmap_range_inner(inner: &mut AddressSpaceInner, start: usize, len: usize) -> KernelResult<()> {
+    if len == 0 {
+        return Err(EINVAL);
+    }
+    let end = start.checked_add(len).ok_or(EINVAL)?;
+    let keys = inner.mappings.keys().copied().collect::<Vec<_>>();
+    let mut changed = false;
+    for key in keys {
+        let Some(segment) = inner.mappings.remove(&key) else {
+            continue;
+        };
+        let seg_start = segment.area.start;
+        let seg_end = seg_start + segment.area.len;
+        if end <= seg_start || start >= seg_end {
+            inner.mappings.insert(seg_start, segment);
+            continue;
+        }
+        changed = true;
+        if start > seg_start {
+            let left_len = start - seg_start;
+            let left = slice_segment(&segment, seg_start, left_len, segment.area.prot);
+            inner.mappings.insert(left.area.start, left);
+        }
+        if end < seg_end {
+            let right_start = end;
+            let right_len = seg_end - end;
+            let right = slice_segment(&segment, right_start, right_len, segment.area.prot);
+            inner.mappings.insert(right.area.start, right);
+        }
+    }
+    if changed {
+        inner.rebuild_page_table();
+    }
+    Ok(())
+}
+
+fn slice_segment(segment: &Segment, start: usize, len: usize, prot: usize) -> Segment {
+    Segment {
+        area: MappingArea { start, len, prot },
+        storage: slice_segment_storage(segment, start, len),
+    }
+}
+
+fn slice_segment_storage(segment: &Segment, start: usize, len: usize) -> SegmentStorage {
+    let offset = start - segment.area.start;
+    match &segment.storage {
+        SegmentStorage::Owned { ptr, .. } => {
+            let bytes =
+                unsafe { core::slice::from_raw_parts((*ptr + offset) as *const u8, len).to_vec() };
+            create_owned_storage(start, bytes)
+        }
+        SegmentStorage::Host { ptr, .. } => SegmentStorage::Host {
+            ptr: ptr.saturating_add(offset),
+            len,
+        },
+    }
 }
 
 fn find_segment(
@@ -1004,20 +1172,12 @@ fn build_initial_stack(
     args: &[String],
     envs: &[String],
     stack_top: usize,
+    auxv: &[(usize, usize)],
 ) -> KernelResult<Vec<u8>> {
     let pointer_size = size_of::<usize>();
     let strings = args.iter().chain(envs.iter()).collect::<Vec<_>>();
     let total_strings_len = strings.iter().map(|entry| entry.len() + 1).sum::<usize>();
-    let auxv = [
-        (6usize, PAGE_SIZE), // AT_PAGESZ
-        (11usize, 0usize),   // AT_UID
-        (12usize, 0usize),   // AT_EUID
-        (13usize, 0usize),   // AT_GID
-        (14usize, 0usize),   // AT_EGID
-        (23usize, 0usize),   // AT_SECURE
-        (0usize, 0usize),    // AT_NULL
-    ];
-    let pointer_count = 1 + args.len() + 1 + envs.len() + 1 + auxv.len() * 2;
+    let pointer_count = 1 + args.len() + 1 + envs.len() + 1 + (auxv.len() + 1) * 2;
     let mut stack = vec![0u8; align_up(total_strings_len + pointer_count * pointer_size, 16)];
 
     let mut string_cursor = stack.len();
@@ -1044,13 +1204,15 @@ fn build_initial_stack(
         head[cursor..cursor + pointer_size].copy_from_slice(&value.to_le_bytes()[..pointer_size]);
         cursor += pointer_size;
     }
-    for (key, value) in auxv {
+    for &(key, value) in auxv {
         head[cursor..cursor + pointer_size].copy_from_slice(&key.to_le_bytes()[..pointer_size]);
         cursor += pointer_size;
-        head[cursor..cursor + pointer_size]
-            .copy_from_slice(&value.to_le_bytes()[..pointer_size]);
+        head[cursor..cursor + pointer_size].copy_from_slice(&value.to_le_bytes()[..pointer_size]);
         cursor += pointer_size;
     }
+    head[cursor..cursor + pointer_size].copy_from_slice(&0usize.to_le_bytes()[..pointer_size]);
+    cursor += pointer_size;
+    head[cursor..cursor + pointer_size].copy_from_slice(&0usize.to_le_bytes()[..pointer_size]);
 
     let strings_len = stack.len() - string_cursor;
     let total = head.len() + strings_len;

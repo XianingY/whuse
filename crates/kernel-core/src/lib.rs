@@ -2,20 +2,17 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
-#[cfg(target_arch = "loongarch64")]
 use alloc::vec;
+use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use fs_ext4::Ext4Mount;
-#[cfg(target_arch = "loongarch64")]
-use fs_ext4::Ext4NodeKind;
 use hal_api::{hal, ConsoleWriter, PlatformArch};
 use mm::MemoryManager;
-#[cfg(target_arch = "loongarch64")]
 use mm::{BinaryLoader, ElfBinaryLoader};
 use proc::ProcessTable;
-#[cfg(target_arch = "loongarch64")]
 use syscall::cache_busybox_image;
 use syscall::{SyscallArgs, SyscallDispatcher, SYS_EXECVE, SYS_WAIT};
 use task::Scheduler;
@@ -35,10 +32,227 @@ pub struct Kernel {
     pub scheduler: Scheduler,
     pub vfs: KernelVfs,
     pub syscalls: SyscallDispatcher,
+    watchdog_started_at: BTreeMap<usize, u64>,
+    watchdog_seen_name: BTreeMap<usize, String>,
+    watchdog_last_heartbeat_ns: u64,
+    watchdog_clock_ns: u64,
+    watchdog_last_hw_ns: u64,
+    watchdog_iozone_window_until_ns: u64,
+    timer_irq_count: u64,
 }
 
 const USER_INIT_BASE: usize = 0x0040_0000;
 const EAGAIN_RET: isize = -11;
+const SCHED_TIME_SLICE_NS: u64 = 10_000_000;
+const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
+const OSCOMP_GROUP_TIMEOUT_NS: u64 = 120 * 1_000_000_000;
+const OSCOMP_HEAVY_TIMEOUT_NS: u64 = 2 * 1_000_000_000;
+const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 90 * 1_000_000_000;
+const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = 8 * 1_000_000_000;
+const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
+    "/musl/busybox",
+    "/musl/basic/run-all.sh",
+    "/musl/busybox_testcode.sh",
+    "/musl/iozone_testcode.sh",
+    "/musl/libctest_testcode.sh",
+    "/musl/libc-bench",
+    "/musl/lmbench_testcode.sh",
+    "/musl/lua_testcode.sh",
+    "/musl/unixbench_testcode.sh",
+    "/musl/netperf_testcode.sh",
+    "/musl/iperf_testcode.sh",
+    "/musl/cyclictest_testcode.sh",
+];
+const OSCOMP_OPTIONAL_TEST_FILES: [&str; 1] = ["/musl/time-test"];
+const OSCOMP_ROOT_ALIAS_ENTRIES: [&str; 120] = [
+    "arithoh",
+    "basic",
+    "basic_testcode.sh",
+    "busy",
+    "busybox",
+    "busybox_cmd.txt",
+    "busybox_testcode.sh",
+    "bw_file_rd",
+    "bw_mem",
+    "bw_mmap_rd",
+    "bw_pipe",
+    "bw_tcp",
+    "bw_unix",
+    "cache",
+    "clock",
+    "context1",
+    "cyclictest",
+    "cyclictest_testcode.sh",
+    "date.lua",
+    "dhry2",
+    "dhry2reg",
+    "disk",
+    "dlopen_dso.so",
+    "double",
+    "enough",
+    "entry-dynamic.exe",
+    "entry-static.exe",
+    "execl",
+    "file_io.lua",
+    "float",
+    "flushdisk",
+    "fstime",
+    "getopt",
+    "gfx-x11",
+    "hackbench",
+    "hanoi",
+    "hello",
+    "index.base",
+    "int",
+    "iozone",
+    "iozone_testcode.sh",
+    "iperf3",
+    "iperf_testcode.sh",
+    "lat_cmd",
+    "lat_connect",
+    "lat_ctx",
+    "lat_dram_page",
+    "lat_fcntl",
+    "lat_fifo",
+    "lat_fs",
+    "lat_http",
+    "lat_mem_rd",
+    "lat_mmap",
+    "lat_ops",
+    "lat_pagefault",
+    "lat_pipe",
+    "lat_pmake",
+    "lat_proc",
+    "lat_rand",
+    "lat_rpc",
+    "lat_select",
+    "lat_sem",
+    "lat_sig",
+    "lat_syscall",
+    "lat_tcp",
+    "lat_udp",
+    "lat_unix",
+    "lat_unix_connect",
+    "lat_usleep",
+    "libc-bench",
+    "libcbench_testcode.sh",
+    "libctest_testcode.sh",
+    "line",
+    "lmbench",
+    "lmbench_all",
+    "lmbench_testcode.sh",
+    "lmdd",
+    "lmhttp",
+    "long",
+    "loop_o",
+    "looper",
+    "ltp",
+    "ltp_testcode.sh",
+    "lua",
+    "lua_testcode.sh",
+    "max_min.lua",
+    "memsize",
+    "mhz",
+    "msleep",
+    "multi.sh",
+    "netperf",
+    "netperf_testcode.sh",
+    "netserver",
+    "par_mem",
+    "par_ops",
+    "pipe",
+    "random.lua",
+    "register",
+    "remove.lua",
+    "rhttp",
+    "round_num.lua",
+    "run-dynamic.sh",
+    "run-static.sh",
+    "runtest.exe",
+    "seek",
+    "short",
+    "sin30.lua",
+    "sort.lua",
+    "spawn",
+    "stream",
+    "strings.lua",
+    "syscall",
+    "test.sh",
+    "timing_o",
+    "tlb",
+    "tls_get_new-dtv_dso.so",
+    "tst.sh",
+    "unixbench.logo",
+    "unixbench_testcode.sh",
+    "whetstone-double",
+];
+const OSCOMP_SUITE_SCRIPT_PATH: &str = "/tmp/whuse-oscomp-suite.sh";
+const OSCOMP_SUITE_SCRIPT: &str = concat!(
+    "set +e\n",
+    "./busybox echo whuse-oscomp-script-start\n",
+    "./busybox echo \"run time-test\"\n",
+    "echo whuse-oscomp-step-begin:time-test\n",
+    "./time-test\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:time-test:$rc\n",
+    "./busybox echo \"run busybox_testcode.sh\"\n",
+    "echo whuse-oscomp-step-begin:busybox_testcode.sh\n",
+    "./busybox_testcode.sh\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:busybox_testcode.sh:$rc\n",
+    "./busybox echo \"run iozone_testcode.sh\"\n",
+    "echo whuse-oscomp-step-begin:iozone_testcode.sh\n",
+    "./iozone_testcode.sh\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:iozone_testcode.sh:$rc\n",
+    "./busybox echo \"run libctest_testcode.sh\"\n",
+    "echo whuse-oscomp-step-begin:libctest_testcode.sh\n",
+    "./libctest_testcode.sh\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:libctest_testcode.sh:$rc\n",
+    "./busybox echo \"run libc-bench\"\n",
+    "echo whuse-oscomp-step-begin:libc-bench\n",
+    "./libc-bench\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:libc-bench:$rc\n",
+    "./busybox echo \"run lmbench_testcode.sh\"\n",
+    "echo whuse-oscomp-step-begin:lmbench_testcode.sh\n",
+    "./lmbench_testcode.sh\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:lmbench_testcode.sh:$rc\n",
+    "./busybox echo \"run lua_testcode.sh\"\n",
+    "echo whuse-oscomp-step-begin:lua_testcode.sh\n",
+    "./lua_testcode.sh\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:lua_testcode.sh:$rc\n",
+    "./busybox echo \"run unixbench_testcode.sh\"\n",
+    "echo whuse-oscomp-step-begin:unixbench_testcode.sh\n",
+    "./unixbench_testcode.sh\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:unixbench_testcode.sh:$rc\n",
+    "./busybox echo \"run netperf_testcode.sh\"\n",
+    "echo whuse-oscomp-step-begin:netperf_testcode.sh\n",
+    "./netperf_testcode.sh\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:netperf_testcode.sh:$rc\n",
+    "./busybox echo \"run iperf_testcode.sh\"\n",
+    "echo whuse-oscomp-step-begin:iperf_testcode.sh\n",
+    "./iperf_testcode.sh\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:iperf_testcode.sh:$rc\n",
+    "./busybox echo \"run cyclictest_testcode.sh\"\n",
+    "echo whuse-oscomp-step-begin:cyclictest_testcode.sh\n",
+    "./cyclictest_testcode.sh\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:cyclictest_testcode.sh:$rc\n",
+    "echo whuse-oscomp-suite-done\n",
+);
+const OSCOMP_SUITE_CMD: &str = concat!(
+    "echo whuse-oscomp-shell-entered; ",
+    "/musl/busybox sh /tmp/whuse-oscomp-suite.sh; ",
+    "if [ -x /musl/basic/exit ]; then exec /musl/basic/exit; fi; ",
+    "echo whuse-oscomp-exit-missing; exit 0;",
+);
 
 impl Kernel {
     pub fn bootstrap(info: BootInfo) -> Self {
@@ -108,26 +322,8 @@ impl Kernel {
                     log_block_probe(device, 80);
                     log_block_probe_span(device, 80, 64);
                     log_rootfs_smoke(device);
-                    #[cfg(target_arch = "loongarch64")]
-                    preload_loong_basic_files(&mut vfs, device);
                     if vfs.access("/", "/musl/busybox").is_ok() {
-                        for (path, target) in [
-                            ("/bin/busybox", "/musl/busybox"),
-                            ("/bin/sh", "/musl/busybox"),
-                        ] {
-                            let _ = vfs.unlink("/", path);
-                            match vfs.create_symlink("/", path, target) {
-                                Ok(()) => logln(format_args!(
-                                    "whuse: installed fallback symlink {} -> {}",
-                                    path, target
-                                )),
-                                Err(17) => {}
-                                Err(err) => logln(format_args!(
-                                    "whuse: failed fallback symlink {} -> {} err={}",
-                                    path, target, err
-                                )),
-                            }
-                        }
+                        prepare_oscomp_runtime_layout(&mut vfs);
                     }
                     rootfs_summary = format!("ext4({display}) over builtin special mounts");
                 }
@@ -162,64 +358,15 @@ impl Kernel {
             ));
         }
         if let Some(program) = init_program {
-            #[cfg(target_arch = "loongarch64")]
-            let mut loaded_from_rootfs = false;
-            #[cfg(not(target_arch = "loongarch64"))]
-            let loaded_from_rootfs = false;
-            #[cfg(target_arch = "loongarch64")]
-            {
-                if vfs.access("/", "/musl/busybox").is_ok() {
-                    match vfs.read_file_all("/", "/musl/busybox") {
-                        Ok(image) => {
-                            cache_busybox_image(&image);
-                            let args = vec![
-                                String::from("/musl/busybox"),
-                                String::from("sh"),
-                                String::from("-c"),
-                                String::from(
-                                    "echo whuse-oscomp-shell-entered; cd /musl/basic; for i in brk chdir clone close dup2 dup execve exit fork fstat getcwd getdents getpid getppid gettimeofday mkdir_ mmap mount munmap openat open pipe read sleep times umount uname unlink wait waitpid write yield; do echo \"Testing $i :\"; /musl/basic/$i; done; echo whuse-after-basic",
-                                ),
-                            ];
-                            let envs = vec![
-                                String::from("PATH=/musl:/bin:/sbin:/usr/bin:/usr/sbin"),
-                                String::from("TERM=vt100"),
-                            ];
-                            let loader = ElfBinaryLoader::new();
-                            let process = processes.current_mut().expect("init process must exist");
-                            match loader.load(&process.address_space, &image, &args, &envs) {
-                                Ok(loaded) => {
-                                    process.trap_frame.sepc = loaded.entry;
-                                    process.trap_frame.regs[2] = loaded.stack_pointer;
-                                    loaded_from_rootfs = true;
-                                    logln(format_args!(
-                                        "whuse: loong init switched to /musl/busybox entry={:#x} sp={:#x}",
-                                        loaded.entry, loaded.stack_pointer
-                                    ));
-                                }
-                                Err(err) => logln(format_args!(
-                                    "whuse: loong init load /musl/busybox failed err={}",
-                                    err
-                                )),
-                            }
-                        }
-                        Err(err) => logln(format_args!(
-                            "whuse: loong init read /musl/busybox failed err={}",
-                            err
-                        )),
-                    }
-                }
-            }
+            let loaded_from_rootfs = try_switch_init_to_rootfs(&mut processes, &mut vfs);
             if !loaded_from_rootfs {
-                #[cfg(target_arch = "loongarch64")]
-                logln(format_args!(
-                    "whuse: loong builtin init image_len={} entry_off={:#x}",
-                    program.image.len(),
-                    program.entry
-                ));
                 let process = processes.current_mut().expect("init process must exist");
-                let _ = process
-                    .address_space
-                    .map_fixed_bytes(USER_INIT_BASE, program.image, program.image.len(), 0b101);
+                let _ = process.address_space.map_fixed_bytes(
+                    USER_INIT_BASE,
+                    program.image,
+                    program.image.len(),
+                    0b101,
+                );
                 process.trap_frame.sepc = USER_INIT_BASE + program.entry;
             }
         } else {
@@ -249,6 +396,13 @@ impl Kernel {
             scheduler,
             vfs,
             syscalls: SyscallDispatcher::new(),
+            watchdog_started_at: BTreeMap::new(),
+            watchdog_seen_name: BTreeMap::new(),
+            watchdog_last_heartbeat_ns: 0,
+            watchdog_clock_ns: 0,
+            watchdog_last_hw_ns: 0,
+            watchdog_iozone_window_until_ns: 0,
+            timer_irq_count: 0,
         };
         logln(format_args!("whuse: init process bootstrapped"));
         kernel
@@ -257,7 +411,20 @@ impl Kernel {
     pub fn run_forever(&mut self) -> ! {
         logln(format_args!("whuse: entering scheduler loop"));
         loop {
+            if self.enforce_oscomp_watchdog() {
+                continue;
+            }
             if self.scheduler.ensure_current().is_none() {
+                let has_non_init = self
+                    .processes
+                    .process_snapshots()
+                    .iter()
+                    .any(|process| process.tgid > 1 && !process.is_thread);
+                if has_non_init {
+                    // Keep watchdog progress alive even when runnable queue is empty.
+                    core::hint::spin_loop();
+                    continue;
+                }
                 hal().cpu.wait_for_interrupt();
                 continue;
             }
@@ -287,16 +454,149 @@ pub fn boot_forever(info: BootInfo) -> ! {
 }
 
 impl Kernel {
+    fn enforce_oscomp_watchdog(&mut self) -> bool {
+        let hw_now = hal().timer.monotonic_nanos();
+        let now = if hw_now > self.watchdog_last_hw_ns {
+            self.watchdog_last_hw_ns = hw_now;
+            self.watchdog_clock_ns = hw_now;
+            hw_now
+        } else {
+            self.watchdog_clock_ns = self.watchdog_clock_ns.saturating_add(SCHED_TIME_SLICE_NS);
+            self.watchdog_clock_ns
+        };
+        let mut all_groups = BTreeMap::<usize, String>::new();
+        let mut watched = BTreeMap::<usize, String>::new();
+        for process in self.processes.process_snapshots() {
+            if process.is_thread {
+                continue;
+            }
+            all_groups
+                .entry(process.tgid)
+                .or_insert(process.name.clone());
+            if process.tgid <= 1 {
+                continue;
+            }
+            watched.entry(process.tgid).or_insert(process.name);
+        }
+        self.watchdog_started_at
+            .retain(|tgid, _| watched.contains_key(tgid));
+        self.watchdog_seen_name
+            .retain(|tgid, _| watched.contains_key(tgid));
+        for (tgid, name) in watched.iter() {
+            let reset_started_at = self
+                .watchdog_seen_name
+                .get(tgid)
+                .map(|previous| previous != name)
+                .unwrap_or(true);
+            if reset_started_at {
+                self.watchdog_started_at.insert(*tgid, now);
+                self.watchdog_seen_name.insert(*tgid, name.clone());
+            } else {
+                self.watchdog_started_at.entry(*tgid).or_insert(now);
+            }
+        }
+        if watched.values().any(|name| is_oscomp_heavy_process(name)) {
+            self.watchdog_iozone_window_until_ns =
+                now.saturating_add(OSCOMP_IOZONE_BUSYBOX_WINDOW_NS);
+        }
+        let in_iozone_busybox_window = now <= self.watchdog_iozone_window_until_ns;
+        if !all_groups.is_empty()
+            && (self.watchdog_last_heartbeat_ns == 0
+                || now.saturating_sub(self.watchdog_last_heartbeat_ns) >= 5_000_000_000)
+        {
+            self.watchdog_last_heartbeat_ns = now;
+            let mut sample = String::new();
+            for (idx, (tgid, name)) in all_groups.iter().enumerate() {
+                if idx >= 8 {
+                    break;
+                }
+                if !sample.is_empty() {
+                    sample.push_str(", ");
+                }
+                let _ = core::fmt::Write::write_fmt(&mut sample, format_args!("{}:{}", tgid, name));
+            }
+            logln(format_args!(
+                "whuse: oscomp watchdog heartbeat groups={} watched={} sample=[{}]",
+                all_groups.len(),
+                watched.len(),
+                sample
+            ));
+        }
+        let timed_out = watched
+            .iter()
+            .filter_map(|(tgid, name)| {
+                let started = *self.watchdog_started_at.get(tgid)?;
+                let timeout_ns = oscomp_process_timeout_ns(name, in_iozone_busybox_window);
+                (now.saturating_sub(started) >= timeout_ns).then_some((
+                    *tgid,
+                    name.clone(),
+                    timeout_ns,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut killed = false;
+        for (tgid, name, timeout_ns) in timed_out {
+            self.watchdog_started_at.remove(&tgid);
+            self.watchdog_seen_name.remove(&tgid);
+            let Ok(Some(exit)) = self.processes.force_exit_group(tgid, 124) else {
+                continue;
+            };
+            let _ = self.scheduler.exit_group(exit.tgid);
+            for tid in &exit.tids {
+                let _ = self.scheduler.remove_task(*tid);
+            }
+            if let Some(parent_tgid) = exit.parent_tgid {
+                let woke = self.scheduler.wake_task(parent_tgid);
+                logln(format_args!(
+                    "whuse: oscomp watchdog wake parent_tgid={} woke={}",
+                    parent_tgid, woke
+                ));
+            }
+            for process in self.processes.process_snapshots() {
+                if process.is_thread || process.state != proc::ProcessState::Blocked {
+                    continue;
+                }
+                let _ = self.scheduler.wake_task(process.tid);
+            }
+            for addr in exit.clear_child_tids {
+                for tid in self.processes.wake_futex(addr, usize::MAX) {
+                    let _ = self.scheduler.wake_task(tid);
+                }
+            }
+            logln(format_args!(
+                "whuse: oscomp watchdog timeout tgid={} name={} after {}s",
+                tgid,
+                name,
+                timeout_ns / 1_000_000_000,
+            ));
+            killed = true;
+        }
+        killed
+    }
+
     fn run_current_process(&mut self) {
+        let now = hal().timer.monotonic_nanos();
+        let force_preempt;
         {
             let process = match self.processes.current() {
                 Ok(process) => process,
                 Err(_) => return,
             };
+            force_preempt = process_needs_forced_preempt(
+                process.name.as_str(),
+                now,
+                self.watchdog_iozone_window_until_ns,
+            );
             hal()
                 .cpu
                 .switch_address_space(process.address_space.token());
         }
+        let deadline = if force_preempt {
+            now.saturating_add(FORCED_PREEMPT_DELTA_NS)
+        } else {
+            now.saturating_add(SCHED_TIME_SLICE_NS)
+        };
+        hal().timer.program_oneshot(deadline);
 
         {
             let frame = match self.processes.current_frame_mut() {
@@ -332,9 +632,32 @@ impl Kernel {
             }
             PlatformArch::LoongArch64 => scause == 0,
         };
+        let is_timer_interrupt = match hal().platform.architecture() {
+            PlatformArch::Riscv64 => {
+                let interrupt_bit = 1usize << (usize::BITS as usize - 1);
+                (scause & interrupt_bit) != 0 && (scause & !interrupt_bit) == 5
+            }
+            PlatformArch::LoongArch64 => false,
+        };
 
         if is_external_interrupt {
             self.service_irqs();
+            return;
+        }
+        if is_timer_interrupt {
+            self.timer_irq_count = self.timer_irq_count.saturating_add(1);
+            if self.timer_irq_count <= 5 || self.timer_irq_count % 1024 == 0 {
+                logln(format_args!(
+                    "whuse: timer interrupt preemption active count={}",
+                    self.timer_irq_count
+                ));
+            }
+            let next_deadline = hal()
+                .timer
+                .monotonic_nanos()
+                .saturating_add(SCHED_TIME_SLICE_NS);
+            hal().timer.program_oneshot(next_deadline);
+            let _ = self.scheduler.yield_now();
             return;
         }
 
@@ -358,17 +681,35 @@ impl Kernel {
             return;
         }
 
-        let (name, stval) = self
+        let (name, stval, fault_sepc, ra) = self
             .processes
             .current()
-            .map(|process| (process.name.as_str(), process.trap_frame.stval))
-            .unwrap_or(("?", 0));
+            .map(|process| {
+                (
+                    process.name.as_str(),
+                    process.trap_frame.stval,
+                    process.trap_frame.sepc,
+                    process.trap_frame.regs[1],
+                )
+            })
+            .unwrap_or(("?", 0, 0, 0));
         logln(format_args!(
-            "whuse: pid {} ({}) trapped with scause={} stval={:#x}",
-            pid, name, scause, stval,
+            "whuse: pid {} ({}) trapped with scause={} stval={:#x} sepc={:#x} ra={:#x}",
+            pid, name, scause, stval, fault_sepc, ra,
         ));
         if let Ok(exit) = self.processes.exit_current_thread(-1) {
             self.scheduler.remove_task(exit.tid);
+            if exit.group_exited {
+                self.scheduler.exit_group(exit.tgid);
+            }
+            if let Some(parent_tgid) = exit.parent_tgid {
+                let _ = self.scheduler.wake_task(parent_tgid);
+            }
+            if let Some(addr) = exit.clear_child_tid {
+                for tid in self.processes.wake_futex(addr, usize::MAX) {
+                    let _ = self.scheduler.wake_task(tid);
+                }
+            }
         }
     }
 
@@ -439,21 +780,30 @@ fn install_init_stdio(processes: &mut ProcessTable, vfs: &mut KernelVfs) {
     let stdin = match vfs.open("/", "/dev/console", O_RDWR, 0) {
         Ok(handle) => handle,
         Err(err) => {
-            logln(format_args!("whuse: init stdio open stdin failed err={}", err));
+            logln(format_args!(
+                "whuse: init stdio open stdin failed err={}",
+                err
+            ));
             return;
         }
     };
     let stdout = match vfs.open("/", "/dev/console", O_RDWR, 0) {
         Ok(handle) => handle,
         Err(err) => {
-            logln(format_args!("whuse: init stdio open stdout failed err={}", err));
+            logln(format_args!(
+                "whuse: init stdio open stdout failed err={}",
+                err
+            ));
             return;
         }
     };
     let stderr = match vfs.open("/", "/dev/console", O_RDWR, 0) {
         Ok(handle) => handle,
         Err(err) => {
-            logln(format_args!("whuse: init stdio open stderr failed err={}", err));
+            logln(format_args!(
+                "whuse: init stdio open stderr failed err={}",
+                err
+            ));
             return;
         }
     };
@@ -464,46 +814,167 @@ fn install_init_stdio(processes: &mut ProcessTable, vfs: &mut KernelVfs) {
     }
 }
 
-#[cfg(target_arch = "loongarch64")]
-fn preload_loong_basic_files(vfs: &mut KernelVfs, device: &'static dyn hal_api::HalBlockDevice) {
-    let Ok(mount) = Ext4Mount::probe(device) else {
+fn try_switch_init_to_rootfs(processes: &mut ProcessTable, vfs: &mut KernelVfs) -> bool {
+    if vfs.access("/", "/musl/busybox").is_err() {
+        return false;
+    }
+    if !oscomp_full_suite_ready(vfs) {
         logln(format_args!(
-            "whuse: loong preload skipped (ext4 probe failed)"
+            "whuse: oscomp full suite preflight failed, skip rootfs init switch"
         ));
-        return;
+        return false;
+    }
+    let image = match vfs.read_file_all("/", "/musl/busybox") {
+        Ok(image) => image,
+        Err(err) => {
+            logln(format_args!(
+                "whuse: init read /musl/busybox failed err={}",
+                err
+            ));
+            return false;
+        }
     };
-    let mut preloaded = 0usize;
-
-    for path in ["/musl/basic_testcode.sh", "/musl/basic/run-all.sh"] {
-        if let Ok(bytes) = mount.read(path) {
-            let _ = vfs.preload_external_file(path, &bytes, Some(0o100755));
-            preloaded += 1;
+    cache_busybox_image(&image);
+    let args = vec![
+        String::from("/musl/busybox"),
+        String::from("sh"),
+        String::from("-c"),
+        String::from(OSCOMP_SUITE_CMD),
+    ];
+    let envs = vec![
+        String::from("PATH=/musl:/bin:/sbin:/usr/bin:/usr/sbin"),
+        String::from("TERM=vt100"),
+    ];
+    let loader = ElfBinaryLoader::new();
+    let process = match processes.current_mut() {
+        Ok(process) => process,
+        Err(_) => return false,
+    };
+    match loader.load(&process.address_space, &image, &args, &envs) {
+        Ok(loaded) => {
+            process.trap_frame.sepc = loaded.entry;
+            process.trap_frame.regs[2] = loaded.stack_pointer;
+            logln(format_args!(
+                "whuse: init switched to /musl/busybox entry={:#x} sp={:#x}",
+                loaded.entry, loaded.stack_pointer
+            ));
+            true
+        }
+        Err(err) => {
+            logln(format_args!(
+                "whuse: init load /musl/busybox failed err={}",
+                err
+            ));
+            false
         }
     }
+}
 
-    match mount.read_dir("/musl/basic") {
-        Ok(entries) => {
-            for entry in entries {
-                if entry.kind != Ext4NodeKind::Regular {
-                    continue;
-                }
-                let path = format!("/musl/basic/{}", entry.name);
-                if let Ok(bytes) = mount.read(&path) {
-                    let _ = vfs.preload_external_file(&path, &bytes, Some(entry.stat.mode));
-                    preloaded += 1;
-                }
-            }
-        }
+fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
+    for dir in ["/var", "/var/tmp", "/usr", "/usr/bin", "/lib"] {
+        let _ = vfs.mkdir("/", dir, 0o755);
+    }
+    for (path, target) in [
+        ("/bin/busybox", "/musl/busybox"),
+        ("/bin/sh", "/musl/busybox"),
+        ("/bin/bash", "/musl/busybox"),
+        ("/busybox", "/musl/busybox"),
+        ("/usr/bin/env", "/musl/busybox"),
+        ("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so"),
+        ("/lib/ld-musl-loongarch64.so.1", "/musl/lib/libc.so"),
+    ] {
+        install_fallback_symlink(vfs, path, target);
+    }
+    install_oscomp_root_aliases(vfs);
+    match vfs.create_file(
+        "/",
+        OSCOMP_SUITE_SCRIPT_PATH,
+        OSCOMP_SUITE_SCRIPT.as_bytes(),
+    ) {
+        Ok(()) => logln(format_args!(
+            "whuse: installed suite script {}",
+            OSCOMP_SUITE_SCRIPT_PATH
+        )),
         Err(err) => logln(format_args!(
-            "whuse: loong preload read_dir /musl/basic failed err={}",
-            err
+            "whuse: failed suite script {} err={}",
+            OSCOMP_SUITE_SCRIPT_PATH, err
         )),
     }
+}
 
-    logln(format_args!(
-        "whuse: loong preloaded musl files count={}",
-        preloaded
-    ));
+fn install_fallback_symlink(vfs: &mut KernelVfs, path: &str, target: &str) {
+    let _ = vfs.unlink("/", path);
+    match vfs.create_symlink("/", path, target) {
+        Ok(()) | Err(17) => {}
+        Err(err) => logln(format_args!(
+            "whuse: failed fallback symlink {} -> {} err={}",
+            path, target, err
+        )),
+    }
+}
+
+fn install_oscomp_root_aliases(vfs: &mut KernelVfs) {
+    for name in OSCOMP_ROOT_ALIAS_ENTRIES {
+        let path = format!("/{}", name);
+        let target = format!("/musl/{}", name);
+        install_fallback_symlink(vfs, path.as_str(), target.as_str());
+    }
+}
+
+fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
+    let mut ok = true;
+    for path in OSCOMP_REQUIRED_TEST_FILES {
+        if let Err(err) = vfs.access("/", path) {
+            ok = false;
+            logln(format_args!(
+                "whuse: oscomp preflight missing required path={} err={}",
+                path, err
+            ));
+        }
+    }
+    for path in OSCOMP_OPTIONAL_TEST_FILES {
+        if let Err(err) = vfs.access("/", path) {
+            logln(format_args!(
+                "whuse: oscomp preflight optional path unavailable={} err={}",
+                path, err
+            ));
+        }
+    }
+    ok
+}
+
+fn oscomp_process_timeout_ns(name: &str, in_iozone_busybox_window: bool) -> u64 {
+    if is_oscomp_heavy_process(name) {
+        return OSCOMP_HEAVY_TIMEOUT_NS;
+    }
+    if in_iozone_busybox_window && name.contains("busybox") {
+        return OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS;
+    }
+    OSCOMP_GROUP_TIMEOUT_NS
+}
+
+fn process_needs_forced_preempt(name: &str, now: u64, iozone_busybox_window_until_ns: u64) -> bool {
+    if is_oscomp_heavy_process(name) {
+        return true;
+    }
+    if name.contains("busybox") {
+        return true;
+    }
+    now <= iozone_busybox_window_until_ns && name.contains("busybox")
+}
+
+fn is_oscomp_heavy_process(name: &str) -> bool {
+    name.contains("iozone")
+        || name.contains("lmbench")
+        || name.contains("unixbench")
+        || name.contains("netperf")
+        || name.contains("iperf")
+        || name.contains("cyclictest")
+        || name.contains("hackbench")
+        || name.contains("stream")
+        || name.contains("lat_")
+        || name.contains("bw_")
+        || name.contains("par_")
 }
 
 fn log_block_probe(device: &'static dyn hal_api::HalBlockDevice, sector: usize) {

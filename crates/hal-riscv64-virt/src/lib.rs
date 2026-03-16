@@ -113,6 +113,8 @@ __whuse_run_user:
     ld t0, 264(t6)
     li t2, -257
     and t0, t0, t2
+    li t2, -3
+    and t0, t0, t2
     ori t0, t0, 32
     li t2, 0x6000
     or t0, t0, t2
@@ -595,6 +597,11 @@ fn read_time_ticks() -> u64 {
         core::arch::asm!("rdtime {}", out(reg) ticks);
     }
     ticks
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn read_time_ticks() -> u64 {
+    0
 }
 
 #[cfg(target_arch = "riscv64")]

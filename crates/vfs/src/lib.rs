@@ -19,9 +19,11 @@ pub const O_DIRECTORY: u32 = 0o200000;
 pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
+pub const HANDLE_FLAG_CLOEXEC: u32 = 1 << 31;
 
 const ENOENT: i32 = 2;
 const EEXIST: i32 = 17;
+const EAGAIN: i32 = 11;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
@@ -39,6 +41,7 @@ const PROC_UPTIME: &[u8] = b"1.00 1.00\n";
 const PROC_STAT: &[u8] = b"cpu  1 0 1 1 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 1735689600\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n";
 const PROC_VERSION: &[u8] = b"Linux version 6.8.0-whuse (whuse@localdomain) #1 SMP PREEMPT\n";
 const PROC_SELF_STAT: &[u8] = b"1 (self) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 1 4096 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+const EXT4_DIR_STAT_CACHE_MAX_SIZE: u64 = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeKind {
@@ -68,12 +71,19 @@ pub struct MountRecord {
     pub fs_type: String,
 }
 
-#[derive(Clone)]
 pub struct FileHandle {
     node: Arc<Node>,
     pub offset: usize,
     pub flags: u32,
     pub path: String,
+    pipe_end: PipeEnd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipeEnd {
+    None,
+    Read,
+    Write,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,6 +157,13 @@ struct Ext4DirState {
     path: String,
     mode: u32,
     size: u64,
+    entries: Option<Arc<Vec<fs_ext4::Ext4DirEntryLite>>>,
+}
+
+struct PipeState {
+    buf: VecDeque<u8>,
+    readers: usize,
+    writers: usize,
 }
 
 enum NodeData {
@@ -156,7 +173,7 @@ enum NodeData {
     Ext4Dir(Ext4DirState),
     CharDevice,
     ProcFile(Vec<u8>),
-    Pipe(Vec<u8>),
+    Pipe(PipeState),
     Symlink(String),
     Event(u64),
     Epoll(Vec<EpollWatch>),
@@ -327,6 +344,7 @@ impl KernelVfs {
             offset: 0,
             flags,
             path: resolved,
+            pipe_end: PipeEnd::None,
         })
     }
 
@@ -342,31 +360,80 @@ impl KernelVfs {
         handle.seek_object(offset, whence)
     }
 
-    pub fn getdents(&self, handle: &mut FileHandle) -> KernelResult<Vec<u8>> {
-        if handle.offset != 0 {
+    pub fn getdents(&mut self, handle: &mut FileHandle, max_len: usize) -> KernelResult<Vec<u8>> {
+        if max_len == 0 {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        match &*handle.node.data.lock() {
+        let start = handle.offset;
+        let mut emitted = 0usize;
+        match &mut *handle.node.data.lock() {
             NodeData::Directory(entries) => {
-                for (index, (name, node)) in entries.iter().enumerate() {
+                for (index, (name, node)) in entries.iter().enumerate().skip(start) {
+                    let reclen = align_up(19 + name.len() + 1, 8);
+                    if emitted != 0 && out.len() + reclen > max_len {
+                        break;
+                    }
                     append_dirent(&mut out, index, name, node_kind_to_dirent_type(node.kind));
+                    emitted += 1;
                 }
             }
             NodeData::Ext4Dir(state) => {
-                let entries = state.mount.read_dir(&state.path)?;
-                for (index, entry) in entries.iter().enumerate() {
+                let entries = if let Some(entries) = &state.entries {
+                    entries.clone()
+                } else {
+                    let entries = if state.size <= EXT4_DIR_STAT_CACHE_MAX_SIZE {
+                        state
+                            .mount
+                            .read_dir(&state.path)?
+                            .into_iter()
+                            .filter(|entry| entry.name != "." && entry.name != "..")
+                            .map(|entry| {
+                                self.cache_external_dirent_stat(
+                                    &handle.path,
+                                    &entry.name,
+                                    entry.stat,
+                                );
+                                fs_ext4::Ext4DirEntryLite {
+                                    name: entry.name,
+                                    kind: entry.kind,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        state
+                            .mount
+                            .read_dir_lite(&state.path)?
+                            .into_iter()
+                            .filter(|entry| entry.name != "." && entry.name != "..")
+                            .collect::<Vec<_>>()
+                    };
+                    let entries = Arc::new(entries);
+                    state.entries = Some(entries.clone());
+                    entries
+                };
+                let Some(remaining) = entries.get(start..) else {
+                    handle.offset = entries.len();
+                    return Ok(out);
+                };
+                for (relative_index, entry) in remaining.iter().enumerate() {
+                    let logical_index = start + relative_index;
+                    let reclen = align_up(19 + entry.name.len() + 1, 8);
+                    if emitted != 0 && out.len() + reclen > max_len {
+                        break;
+                    }
                     append_dirent(
                         &mut out,
-                        index,
+                        logical_index,
                         &entry.name,
                         ext4_kind_to_dirent_type(entry.kind),
                     );
+                    emitted += 1;
                 }
             }
             _ => return Err(ENOTDIR),
         }
-        handle.offset = out.len();
+        handle.offset = handle.offset.saturating_add(emitted);
         Ok(out)
     }
 
@@ -586,6 +653,7 @@ impl KernelVfs {
             offset: 0,
             flags: O_RDWR,
             path: absolute,
+            pipe_end: PipeEnd::None,
         };
         self.truncate(&mut handle, len)
     }
@@ -618,12 +686,14 @@ impl KernelVfs {
             offset: 0,
             flags: O_RDONLY,
             path: path.clone(),
+            pipe_end: PipeEnd::Read,
         };
         let write_end = FileHandle {
             node,
             offset: 0,
             flags: O_WRONLY,
             path,
+            pipe_end: PipeEnd::Write,
         };
         Ok((read_end, write_end))
     }
@@ -636,6 +706,7 @@ impl KernelVfs {
             offset: 0,
             flags: O_RDWR,
             path,
+            pipe_end: PipeEnd::None,
         })
     }
 
@@ -647,6 +718,7 @@ impl KernelVfs {
             offset: 0,
             flags: O_RDWR,
             path,
+            pipe_end: PipeEnd::None,
         })
     }
 
@@ -701,6 +773,7 @@ impl KernelVfs {
             offset: 0,
             flags: O_RDWR,
             path,
+            pipe_end: PipeEnd::None,
         })
     }
 
@@ -711,6 +784,7 @@ impl KernelVfs {
             offset: 0,
             flags: O_RDONLY,
             path,
+            pipe_end: PipeEnd::None,
         })
     }
 
@@ -729,6 +803,7 @@ impl KernelVfs {
             offset: 0,
             flags: O_RDWR,
             path,
+            pipe_end: PipeEnd::None,
         })
     }
 
@@ -744,12 +819,14 @@ impl KernelVfs {
                 offset: 0,
                 flags: O_RDWR,
                 path: format!("{}:0", path),
+                pipe_end: PipeEnd::None,
             },
             FileHandle {
                 node: Arc::new(Node::socket_connected(&path, channel, 1)),
                 offset: 0,
                 flags: O_RDWR,
                 path: format!("{}:1", path),
+                pipe_end: PipeEnd::None,
             },
         ))
     }
@@ -818,6 +895,7 @@ impl KernelVfs {
             offset: 0,
             flags: O_RDWR,
             path: handle.path.clone(),
+            pipe_end: PipeEnd::None,
         })
     }
 
@@ -857,6 +935,9 @@ impl KernelVfs {
             return Ok(None);
         }
         if let Some((_, stat)) = self.external_preloaded.get(absolute) {
+            return Ok(Some(*stat));
+        }
+        if let Some(stat) = self.external_stat_cache.get(absolute) {
             return Ok(Some(*stat));
         }
         let Some((mount, fs_path)) = self.resolve_external_path(absolute) else {
@@ -956,6 +1037,7 @@ impl KernelVfs {
                     path: fs_path,
                     mode: stat.mode,
                     size: stat.size,
+                    entries: None,
                 }),
             )
         } else {
@@ -975,6 +1057,7 @@ impl KernelVfs {
             offset: 0,
             flags: O_RDONLY,
             path: absolute.to_string(),
+            pipe_end: PipeEnd::None,
         }
     }
 
@@ -985,6 +1068,23 @@ impl KernelVfs {
                 external_mount_path(&mount.target, absolute).map(|path| (mount, path))
             })
             .max_by_key(|(mount, _)| mount.target.len())
+    }
+
+    fn cache_external_dirent_stat(
+        &mut self,
+        dir_absolute: &str,
+        name: &str,
+        stat: fs_ext4::Ext4FileStat,
+    ) {
+        let absolute = join_absolute_path(dir_absolute, name);
+        self.external_stat_cache.insert(
+            absolute,
+            FileStat {
+                mode: stat.mode,
+                size: stat.size,
+                nlink: stat.nlink,
+            },
+        );
     }
 
     fn is_memory_preferred_path(&self, absolute: &str) -> bool {
@@ -1091,7 +1191,7 @@ impl KernelVfs {
             NodeData::File(buf) | NodeData::ProcFile(buf) => buf.len() as u64,
             NodeData::Ext4File(state) => state.size,
             NodeData::Ext4Dir(state) => state.size,
-            NodeData::Pipe(buf) => buf.len() as u64,
+            NodeData::Pipe(state) => state.buf.len() as u64,
             NodeData::Symlink(target) => target.len() as u64,
             NodeData::Event(_) => 8,
             NodeData::Epoll(watches) => watches.len() as u64,
@@ -1122,6 +1222,26 @@ impl KernelVfs {
 }
 
 impl FileHandle {
+    fn adjust_pipe_refcount(&self, delta: isize) {
+        if self.node.kind != NodeKind::Pipe || self.pipe_end == PipeEnd::None {
+            return;
+        }
+        let mut guard = self.node.data.lock();
+        let NodeData::Pipe(state) = &mut *guard else {
+            return;
+        };
+        let target = match self.pipe_end {
+            PipeEnd::Read => &mut state.readers,
+            PipeEnd::Write => &mut state.writers,
+            PipeEnd::None => return,
+        };
+        if delta > 0 {
+            *target = target.saturating_add(delta as usize);
+        } else {
+            *target = target.saturating_sub((-delta) as usize);
+        }
+    }
+
     fn stat_from_locked(&self) -> FileStat {
         let guard = self.node.data.lock();
         let size = match &*guard {
@@ -1129,7 +1249,7 @@ impl FileHandle {
             NodeData::File(buf) | NodeData::ProcFile(buf) => buf.len() as u64,
             NodeData::Ext4File(state) => state.size,
             NodeData::Ext4Dir(state) => state.size,
-            NodeData::Pipe(buf) => buf.len() as u64,
+            NodeData::Pipe(state) => state.buf.len() as u64,
             NodeData::Symlink(target) => target.len() as u64,
             NodeData::Event(_) => 8,
             NodeData::Epoll(watches) => watches.len() as u64,
@@ -1156,6 +1276,25 @@ impl FileHandle {
             size,
             nlink: 1,
         }
+    }
+}
+
+impl Clone for FileHandle {
+    fn clone(&self) -> Self {
+        self.adjust_pipe_refcount(1);
+        Self {
+            node: self.node.clone(),
+            offset: self.offset,
+            flags: self.flags,
+            path: self.path.clone(),
+            pipe_end: self.pipe_end,
+        }
+    }
+}
+
+impl Drop for FileHandle {
+    fn drop(&mut self) {
+        self.adjust_pipe_refcount(-1);
     }
 }
 
@@ -1202,9 +1341,24 @@ impl KernelObject for FileHandle {
                 Ok(data)
             }
             NodeData::Ext4Dir(_) => Err(EISDIR),
-            NodeData::Pipe(buf) => {
-                let end = len.min(buf.len());
-                Ok(buf.drain(..end).collect())
+            NodeData::Pipe(state) => {
+                if self.pipe_end == PipeEnd::Write {
+                    return Err(EINVAL);
+                }
+                if state.buf.is_empty() {
+                    if state.writers == 0 {
+                        return Ok(Vec::new());
+                    }
+                    return Err(EAGAIN);
+                }
+                let end = len.min(state.buf.len());
+                let mut out = Vec::with_capacity(end);
+                for _ in 0..end {
+                    if let Some(byte) = state.buf.pop_front() {
+                        out.push(byte);
+                    }
+                }
+                Ok(out)
             }
             NodeData::Symlink(target) => Ok(target.as_bytes()[..target.len().min(len)].to_vec()),
             NodeData::Event(counter) => {
@@ -1241,8 +1395,11 @@ impl KernelObject for FileHandle {
                 Ok(data.len())
             }
             NodeData::Ext4File(_) | NodeData::Ext4Dir(_) => Err(EROFS),
-            NodeData::Pipe(buf) => {
-                buf.extend_from_slice(data);
+            NodeData::Pipe(state) => {
+                if self.pipe_end == PipeEnd::Read {
+                    return Err(EINVAL);
+                }
+                state.buf.extend(data.iter().copied());
                 Ok(data.len())
             }
             NodeData::Symlink(_)
@@ -1303,7 +1460,7 @@ impl KernelObject for FileHandle {
             | NodeData::Ext4File(_)
             | NodeData::Ext4Dir(_)
             | NodeData::CharDevice => true,
-            NodeData::Pipe(buf) => !buf.is_empty(),
+            NodeData::Pipe(state) => !state.buf.is_empty() || state.writers == 0,
             NodeData::Symlink(_) => true,
             NodeData::Event(counter) => *counter != 0,
             NodeData::Epoll(_) => true,
@@ -1314,13 +1471,14 @@ impl KernelObject for FileHandle {
     }
 
     fn poll_write_ready(&self) -> bool {
-        !matches!(
-            &*self.node.data.lock(),
+        match &*self.node.data.lock() {
             NodeData::Directory(_)
-                | NodeData::Ext4File(_)
-                | NodeData::Ext4Dir(_)
-                | NodeData::PidFd(_)
-        )
+            | NodeData::Ext4File(_)
+            | NodeData::Ext4Dir(_)
+            | NodeData::PidFd(_) => false,
+            NodeData::Pipe(state) => state.readers != 0,
+            _ => true,
+        }
     }
 
     fn stat_object(&self) -> KernelResult<FileStat> {
@@ -1373,7 +1531,11 @@ impl Node {
         Self {
             _name: name.to_string(),
             kind: NodeKind::Pipe,
-            data: Mutex::new(NodeData::Pipe(Vec::new())),
+            data: Mutex::new(NodeData::Pipe(PipeState {
+                buf: VecDeque::new(),
+                readers: 1,
+                writers: 1,
+            })),
         }
     }
 
@@ -1483,13 +1645,20 @@ fn external_mount_path(target: &str, absolute: &str) -> Option<String> {
         .map(|suffix| format!("/{}", suffix))
 }
 
+fn join_absolute_path(dir: &str, name: &str) -> String {
+    if dir == "/" {
+        format!("/{}", name)
+    } else {
+        format!("{}/{}", dir.trim_end_matches('/'), name)
+    }
+}
+
 fn append_dirent(out: &mut Vec<u8>, index: usize, name: &str, file_type: u8) {
     let reclen = align_up(19 + name.len() + 1, 8) as u16;
     out.extend_from_slice(&(index as u64 + 1).to_le_bytes());
     out.extend_from_slice(&((index + 1) as u64).to_le_bytes());
     out.extend_from_slice(&reclen.to_le_bytes());
     out.push(file_type);
-    out.push(0);
     out.extend_from_slice(name.as_bytes());
     out.push(0);
     while out.len() % 8 != 0 {
@@ -1670,8 +1839,16 @@ mod tests {
         ));
 
         let mut dir = vfs.open("/", "/bin", super::O_DIRECTORY, 0).unwrap();
-        let entries = vfs.getdents(&mut dir).unwrap();
+        let entries = vfs.getdents(&mut dir, 4096).unwrap();
         assert!(!entries.is_empty());
+        assert_eq!(
+            vfs.external_stat_cache.get("/bin/hello"),
+            Some(&super::FileStat {
+                mode: super::S_IFREG | 0o644,
+                size: b"hello from ext4".len() as u64,
+                nlink: 1,
+            })
+        );
     }
 
     #[test]

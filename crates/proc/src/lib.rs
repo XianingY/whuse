@@ -9,7 +9,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use hal_api::TrapFrame;
 use mm::{AddressSpace, KernelResult as MmResult};
-use vfs::FileHandle;
+use vfs::{FileHandle, HANDLE_FLAG_CLOEXEC};
 
 pub type KernelResult<T> = Result<T, i32>;
 
@@ -117,6 +117,7 @@ pub struct Process {
     pub exit_code: Option<i32>,
     pub address_space: AddressSpace,
     pub fds: BTreeMap<i32, FileHandle>,
+    fd_alias: BTreeMap<i32, i32>,
     pub trap_frame: TrapFrame,
     pub user_stack: Box<[u8]>,
     pub tid_address: Option<usize>,
@@ -126,6 +127,14 @@ pub struct Process {
     pub pending_signals: u64,
     pub sigaltstack: Option<(usize, usize, u32)>,
     pub signal_actions: BTreeMap<usize, SigAction>,
+    pub sleep_deadline_ns: Option<u64>,
+    pub sleep_requested_ns: u64,
+    pub sleep_remain_ptr: Option<usize>,
+    pub sleep_absolute: bool,
+    pub futex_wait_addr: Option<usize>,
+    pub futex_wait_deadline_ns: Option<u64>,
+    pub epoll_wait_deadline_ns: Option<u64>,
+    pub sigsuspend_saved_mask: Option<u64>,
     pub is_thread: bool,
 }
 
@@ -162,6 +171,7 @@ impl Process {
             exit_code: None,
             address_space,
             fds: BTreeMap::new(),
+            fd_alias: BTreeMap::new(),
             trap_frame: TrapFrame::new_user(entry, sp),
             user_stack,
             tid_address: None,
@@ -171,6 +181,14 @@ impl Process {
             pending_signals: 0,
             sigaltstack: None,
             signal_actions: BTreeMap::new(),
+            sleep_deadline_ns: None,
+            sleep_requested_ns: 0,
+            sleep_remain_ptr: None,
+            sleep_absolute: false,
+            futex_wait_addr: None,
+            futex_wait_deadline_ns: None,
+            epoll_wait_deadline_ns: None,
+            sigsuspend_saved_mask: None,
             is_thread: false,
         }
     }
@@ -181,11 +199,36 @@ impl Process {
             fd += 1;
         }
         self.fds.insert(fd, handle);
+        self.fd_alias.insert(fd, fd);
         fd
     }
 
+    pub fn add_fd_from(&mut self, source_fd: i32, handle: FileHandle) -> KernelResult<i32> {
+        let new_fd = self.add_fd(handle);
+        let leader = self.fd_alias_leader(source_fd)?;
+        self.fd_alias.insert(new_fd, leader);
+        self.sync_fd_offset_from_alias(new_fd)?;
+        Ok(new_fd)
+    }
+
     pub fn close_fd(&mut self, fd: i32) -> KernelResult<()> {
-        self.fds.remove(&fd).map(|_| ()).ok_or(EBADF)
+        self.fds.remove(&fd).ok_or(EBADF)?;
+        self.fd_alias.remove(&fd);
+        if self.fd_alias.values().any(|leader| *leader == fd) {
+            let replacements = self
+                .fd_alias
+                .keys()
+                .copied()
+                .filter(|candidate| self.fd_alias.get(candidate).copied() == Some(fd))
+                .collect::<Vec<_>>();
+            if let Some(new_leader) = replacements.first().copied() {
+                self.fd_alias.insert(new_leader, new_leader);
+                for candidate in replacements.into_iter().skip(1) {
+                    self.fd_alias.insert(candidate, new_leader);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn fd(&self, fd: i32) -> KernelResult<&FileHandle> {
@@ -194,6 +237,54 @@ impl Process {
 
     pub fn fd_mut(&mut self, fd: i32) -> KernelResult<&mut FileHandle> {
         self.fds.get_mut(&fd).ok_or(EBADF)
+    }
+
+    pub fn fd_alias_leader(&self, fd: i32) -> KernelResult<i32> {
+        let _ = self.fd(fd)?;
+        let mut leader = self.fd_alias.get(&fd).copied().unwrap_or(fd);
+        for _ in 0..16 {
+            let Some(next) = self.fd_alias.get(&leader).copied() else {
+                break;
+            };
+            if next == leader {
+                break;
+            }
+            leader = next;
+        }
+        Ok(leader)
+    }
+
+    pub fn sync_fd_offset_from_alias(&mut self, fd: i32) -> KernelResult<()> {
+        let leader = self.fd_alias_leader(fd)?;
+        if leader == fd {
+            return Ok(());
+        }
+        let leader_offset = self.fd(leader)?.offset;
+        self.fd_mut(fd)?.offset = leader_offset;
+        Ok(())
+    }
+
+    pub fn sync_fd_offset_to_aliases(&mut self, fd: i32) -> KernelResult<()> {
+        let leader = self.fd_alias_leader(fd)?;
+        let offset = self.fd(fd)?.offset;
+        let peers = self
+            .fd_alias
+            .iter()
+            .filter_map(|(candidate, mapped_leader)| (*mapped_leader == leader).then_some(*candidate))
+            .collect::<Vec<_>>();
+        for peer in peers {
+            if let Some(handle) = self.fds.get_mut(&peer) {
+                handle.offset = offset;
+            }
+        }
+        if let Some(handle) = self.fds.get_mut(&leader) {
+            handle.offset = offset;
+        }
+        Ok(())
+    }
+
+    pub fn set_fd_alias(&mut self, fd: i32, leader: i32) {
+        self.fd_alias.insert(fd, leader);
     }
 
     pub fn read_user_bytes(&self, addr: usize, len: usize) -> MmResult<alloc::vec::Vec<u8>> {
@@ -224,6 +315,14 @@ impl Process {
         self.clear_child_tid = None;
         self.tid_address = None;
         self.robust_list = None;
+        self.sleep_deadline_ns = None;
+        self.sleep_requested_ns = 0;
+        self.sleep_remain_ptr = None;
+        self.sleep_absolute = false;
+        self.futex_wait_addr = None;
+        self.futex_wait_deadline_ns = None;
+        self.epoll_wait_deadline_ns = None;
+        self.sigsuspend_saved_mask = None;
     }
 
     fn fork_from(&self, pid: usize) -> Self {
@@ -256,6 +355,7 @@ impl Process {
             exit_code: None,
             address_space,
             fds: self.fds.clone(),
+            fd_alias: self.fd_alias.clone(),
             trap_frame,
             user_stack,
             tid_address: self.tid_address,
@@ -265,6 +365,14 @@ impl Process {
             pending_signals: 0,
             sigaltstack: self.sigaltstack,
             signal_actions: self.signal_actions.clone(),
+            sleep_deadline_ns: None,
+            sleep_requested_ns: 0,
+            sleep_remain_ptr: None,
+            sleep_absolute: false,
+            futex_wait_addr: None,
+            futex_wait_deadline_ns: None,
+            epoll_wait_deadline_ns: None,
+            sigsuspend_saved_mask: None,
             is_thread: false,
         }
     }
@@ -299,6 +407,7 @@ impl Process {
             exit_code: None,
             address_space,
             fds: self.fds.clone(),
+            fd_alias: self.fd_alias.clone(),
             trap_frame,
             user_stack,
             tid_address: self.tid_address,
@@ -308,6 +417,14 @@ impl Process {
             pending_signals: 0,
             sigaltstack: self.sigaltstack,
             signal_actions: self.signal_actions.clone(),
+            sleep_deadline_ns: None,
+            sleep_requested_ns: 0,
+            sleep_remain_ptr: None,
+            sleep_absolute: false,
+            futex_wait_addr: None,
+            futex_wait_deadline_ns: None,
+            epoll_wait_deadline_ns: None,
+            sigsuspend_saved_mask: None,
             is_thread: false,
         }
     }
@@ -353,6 +470,7 @@ impl Process {
             exit_code: None,
             address_space,
             fds: self.fds.clone(),
+            fd_alias: self.fd_alias.clone(),
             trap_frame,
             user_stack,
             tid_address: None,
@@ -362,6 +480,14 @@ impl Process {
             pending_signals: 0,
             sigaltstack: self.sigaltstack,
             signal_actions: self.signal_actions.clone(),
+            sleep_deadline_ns: None,
+            sleep_requested_ns: 0,
+            sleep_remain_ptr: None,
+            sleep_absolute: false,
+            futex_wait_addr: None,
+            futex_wait_deadline_ns: None,
+            epoll_wait_deadline_ns: None,
+            sigsuspend_saved_mask: None,
             is_thread: true,
         }
     }
@@ -456,6 +582,10 @@ impl ProcessTable {
 
     pub fn current_mut(&mut self) -> KernelResult<&mut Process> {
         self.processes.get_mut(&self.current_tid).ok_or(EBADF)
+    }
+
+    pub fn find_by_tid_mut(&mut self, tid: usize) -> KernelResult<&mut Process> {
+        self.processes.get_mut(&tid).ok_or(ENOENT)
     }
 
     pub fn current_frame_mut(&mut self) -> KernelResult<&mut TrapFrame> {
@@ -592,6 +722,9 @@ impl ProcessTable {
         if process.address_space.is_shared() {
             process.address_space = process.address_space.clone_private();
         }
+        process
+            .fds
+            .retain(|_, handle| (handle.flags & HANDLE_FLAG_CLOEXEC) == 0);
         process.reset_image(entry, stack_pointer);
         process.is_thread = false;
         process.pid = process.tgid;
@@ -831,6 +964,21 @@ impl ProcessTable {
         woke
     }
 
+    pub fn is_futex_waiting(&self, addr: usize, tid: usize) -> bool {
+        self.futex_waiters
+            .get(&addr)
+            .is_some_and(|waiters| waiters.iter().any(|waiter| *waiter == tid))
+    }
+
+    pub fn remove_futex_waiter_at(&mut self, addr: usize, tid: usize) {
+        if let Some(waiters) = self.futex_waiters.get_mut(&addr) {
+            waiters.retain(|waiter| *waiter != tid);
+            if waiters.is_empty() {
+                self.futex_waiters.remove(&addr);
+            }
+        }
+    }
+
     pub fn requeue_futex(
         &mut self,
         from: usize,
@@ -872,6 +1020,7 @@ impl ProcessTable {
             let process = self.current_mut()?;
             process.state = ProcessState::Exited;
             process.exit_code = Some(code);
+            process.fds.clear();
         }
 
         let group_alive = self.processes.values().any(|process| {
@@ -919,6 +1068,7 @@ impl ProcessTable {
                 }
                 process.state = ProcessState::Exited;
                 process.exit_code = Some(code);
+                process.fds.clear();
             }
             self.remove_futex_waiter(tid);
         }
@@ -955,6 +1105,24 @@ impl ProcessTable {
             .collect()
     }
 
+    pub fn timed_wait_expired_tids(&self, now_ns: u64) -> Vec<usize> {
+        self.processes
+            .values()
+            .filter_map(|process| {
+                let sleep_expired = process
+                    .sleep_deadline_ns
+                    .is_some_and(|deadline| deadline != u64::MAX && now_ns >= deadline);
+                let futex_expired = process
+                    .futex_wait_deadline_ns
+                    .is_some_and(|deadline| deadline != u64::MAX && now_ns >= deadline);
+                let epoll_expired = process
+                    .epoll_wait_deadline_ns
+                    .is_some_and(|deadline| deadline != u64::MAX && now_ns >= deadline);
+                (sleep_expired || futex_expired || epoll_expired).then_some(process.tid)
+            })
+            .collect()
+    }
+
     pub fn force_exit_group(&mut self, tgid: usize, code: i32) -> KernelResult<Option<GroupExit>> {
         let tids = self
             .processes
@@ -977,6 +1145,7 @@ impl ProcessTable {
                 }
                 process.state = ProcessState::Exited;
                 process.exit_code = Some(code);
+                process.fds.clear();
             }
             self.remove_futex_waiter(*tid);
         }

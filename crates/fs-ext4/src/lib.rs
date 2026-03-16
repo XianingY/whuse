@@ -51,6 +51,12 @@ pub struct Ext4DirEntry {
     pub kind: Ext4NodeKind,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Ext4DirEntryLite {
+    pub name: String,
+    pub kind: Ext4NodeKind,
+}
+
 impl Ext4Mount {
     pub fn probe(device: &'static dyn HalBlockDevice) -> Result<Self, i32> {
         device.init().map_err(normalize_device_error)?;
@@ -139,6 +145,19 @@ impl Ext4Mount {
             out.push(Ext4DirEntry {
                 name: format!("{}", entry.file_name().display()),
                 stat: metadata_to_stat(&metadata),
+                kind,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn read_dir_lite(&self, path: &str) -> Result<Vec<Ext4DirEntryLite>, i32> {
+        let mut out = Vec::new();
+        for entry in self.fs.read_dir(path).map_err(map_ext4_error)? {
+            let entry = entry.map_err(map_ext4_error)?;
+            let kind = file_type_to_kind(entry.file_type().map_err(map_ext4_error)?);
+            out.push(Ext4DirEntryLite {
+                name: format!("{}", entry.file_name().display()),
                 kind,
             });
         }
@@ -446,5 +465,24 @@ mod tests {
             .any(|entry| entry.kind == Ext4NodeKind::Symlink));
         assert_eq!(mount.read_link("/etc/issue.link").unwrap(), "/etc/issue");
         assert!(mount.is_dir("/etc").unwrap());
+    }
+
+    #[test]
+    fn real_oscomp_image_stats_lmbench_script() {
+        let image = Path::new("/home/wslootie/github/whuse/target/oscomp/sdcard-rv.img");
+        if !image.exists() {
+            return;
+        }
+        let device = std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(image)));
+        let mount = Ext4Mount::probe(device).unwrap();
+
+        let stat = mount.stat("/musl/lmbench_testcode.sh").unwrap();
+        assert_eq!(stat.mode & 0o170000, 0o100000);
+        assert!(stat.size > 0);
+        assert!(mount.exists("/musl/lmbench_testcode.sh").unwrap());
+        assert!(!mount
+            .read_range("/musl/lmbench_testcode.sh", 0, 64)
+            .unwrap()
+            .is_empty());
     }
 }

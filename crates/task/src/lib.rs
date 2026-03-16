@@ -174,6 +174,17 @@ impl Scheduler {
         true
     }
 
+    pub fn wake_all_blocked(&mut self) -> usize {
+        let task_ids = self.blocked.keys().copied().collect::<Vec<_>>();
+        let mut woke = 0;
+        for task_id in task_ids {
+            if self.wake_task(task_id) {
+                woke += 1;
+            }
+        }
+        woke
+    }
+
     pub fn wake_one(&mut self, queue: &mut WaitQueue) -> Option<usize> {
         let task_id = queue.wake_one()?;
         let _ = self.wake_task(task_id);

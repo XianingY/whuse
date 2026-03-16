@@ -28,7 +28,7 @@ pub(crate) fn dispatch(
         SYS_GETPGID => ctx.dispatcher.sys_getpgid(args, ctx.procs),
         SYS_GETSID => ctx.dispatcher.sys_getsid(args, ctx.procs),
         SYS_SETSID => ctx.dispatcher.sys_setsid(ctx.procs),
-        SYS_CLONE3 => Err(crate::ENOSYS),
+        SYS_CLONE3 => ctx.dispatcher.sys_clone3(args, ctx.procs, ctx.scheduler),
         SYS_POWER_OFF => Ok(0),
         _ => return None,
     })

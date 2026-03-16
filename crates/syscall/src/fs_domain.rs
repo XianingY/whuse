@@ -39,14 +39,26 @@ pub(crate) fn dispatch(
         SYS_UTIMENSAT => ctx.dispatcher.sys_utimensat(args, ctx.procs, ctx.vfs),
         SYS_FACCESSAT | SYS_FACCESSAT2 => ctx.dispatcher.sys_faccessat(args, ctx.procs, ctx.vfs),
         SYS_OPENAT => ctx.dispatcher.sys_openat(args, ctx.procs, ctx.vfs),
-        SYS_CLOSE => ctx.dispatcher.sys_close(args, ctx.procs),
-        SYS_CLOSE_RANGE => ctx.dispatcher.sys_close_range(args, ctx.procs),
+        SYS_CLOSE => ctx
+            .dispatcher
+            .sys_close(args, ctx.procs, ctx.scheduler, ctx.vfs),
+        SYS_CLOSE_RANGE => ctx
+            .dispatcher
+            .sys_close_range(args, ctx.procs, ctx.scheduler, ctx.vfs),
         SYS_GETDENTS64 => ctx.dispatcher.sys_getdents64(args, ctx.procs, ctx.vfs),
         SYS_LSEEK => ctx.dispatcher.sys_lseek(args, ctx.procs, ctx.vfs),
-        SYS_READ => ctx.dispatcher.sys_read(args, ctx.procs, ctx.vfs),
-        SYS_WRITE => ctx.dispatcher.sys_write(args, ctx.procs, ctx.vfs),
-        SYS_READV => ctx.dispatcher.sys_readv(args, ctx.procs, ctx.vfs),
-        SYS_WRITEV => ctx.dispatcher.sys_writev(args, ctx.procs, ctx.vfs),
+        SYS_READ => ctx
+            .dispatcher
+            .sys_read(args, ctx.procs, ctx.scheduler, ctx.vfs),
+        SYS_WRITE => ctx
+            .dispatcher
+            .sys_write(args, ctx.procs, ctx.scheduler, ctx.vfs),
+        SYS_READV => ctx
+            .dispatcher
+            .sys_readv(args, ctx.procs, ctx.scheduler, ctx.vfs),
+        SYS_WRITEV => ctx
+            .dispatcher
+            .sys_writev(args, ctx.procs, ctx.scheduler, ctx.vfs),
         SYS_PREAD64 => ctx.dispatcher.sys_pread64(args, ctx.procs, ctx.vfs),
         SYS_PWRITE64 => ctx.dispatcher.sys_pwrite64(args, ctx.procs, ctx.vfs),
         SYS_PREADV => ctx.dispatcher.sys_preadv(args, ctx.procs, ctx.vfs),

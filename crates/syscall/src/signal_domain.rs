@@ -13,9 +13,11 @@ pub(crate) fn dispatch(
         SYS_FUTEX => ctx.dispatcher.sys_futex(args, ctx.procs, ctx.scheduler),
         SYS_SET_ROBUST_LIST => ctx.dispatcher.sys_set_robust_list(args, ctx.procs),
         SYS_GET_ROBUST_LIST => ctx.dispatcher.sys_get_robust_list(args, ctx.procs),
-        SYS_KILL | SYS_TGKILL => ctx.dispatcher.sys_kill(args, ctx.procs),
+        SYS_KILL | SYS_TGKILL => ctx.dispatcher.sys_kill(args, ctx.procs, ctx.scheduler),
         SYS_SIGALTSTACK => ctx.dispatcher.sys_sigaltstack(args, ctx.procs),
-        SYS_RT_SIGSUSPEND => ctx.dispatcher.sys_rt_sigsuspend(args, ctx.procs),
+        SYS_RT_SIGSUSPEND => ctx
+            .dispatcher
+            .sys_rt_sigsuspend(args, ctx.procs, ctx.scheduler),
         SYS_SIGACTION => ctx.dispatcher.sys_sigaction(args, ctx.procs),
         SYS_SIGPROCMASK => ctx.dispatcher.sys_sigprocmask(args, ctx.procs),
         SYS_RT_SIGPENDING => ctx.dispatcher.sys_rt_sigpending(args, ctx.procs),

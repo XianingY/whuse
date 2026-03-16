@@ -1,3 +1,18 @@
+# Rust build artifacts
 /target
+
+# Rust backup artifacts
 **/*.rs.bk
 
+# Editor swap/temp files
+*.swp
+*.swo
+*~
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS-generated noise
+.DS_Store
+Thumbs.db

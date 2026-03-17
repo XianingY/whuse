@@ -1085,6 +1085,7 @@ impl ProcessTable {
             {
                 process.state = ProcessState::Exited;
                 process.exit_code = Some(code);
+                process.address_space.clear();
             }
             if let Some(parent_tgid) = parent_tgid {
                 let _ = self.send_signal(parent_tgid, 17);
@@ -1118,6 +1119,7 @@ impl ProcessTable {
                 process.state = ProcessState::Exited;
                 process.exit_code = Some(code);
                 process.fds.clear();
+                process.address_space.clear();
             }
             self.remove_futex_waiter(tid);
         }
@@ -1309,6 +1311,7 @@ impl ProcessTable {
                 process.state = ProcessState::Exited;
                 process.exit_code = Some(code);
                 process.fds.clear();
+                process.address_space.clear();
             }
             self.remove_futex_waiter(*tid);
         }

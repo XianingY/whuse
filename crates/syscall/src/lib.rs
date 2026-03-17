@@ -246,11 +246,19 @@ pub const SIGNAL_TRAMPOLINE_CODE: [u8; 8] = [
 ];
 #[cfg(not(target_arch = "riscv64"))]
 pub const SIGNAL_TRAMPOLINE_CODE: [u8; 8] = [0u8; 8];
-const SYSCALL_TRACE: bool = true;
+const SYSCALL_TRACE_DEFAULT: bool = false;
+
+#[inline]
+fn syscall_trace_enabled() -> bool {
+    if SYSCALL_TRACE_DEFAULT {
+        return true;
+    }
+    matches!(option_env!("WHUSE_DEBUG_SYSCALL"), Some("1"))
+}
 const ENOSYS_TRACE: bool = true;
 
 fn trace_line(line: &str) {
-    if !SYSCALL_TRACE {
+    if !syscall_trace_enabled() {
         return;
     }
     for byte in line.bytes() {
@@ -387,7 +395,7 @@ impl SyscallDispatcher {
             scheduler,
             vfs,
         };
-        if SYSCALL_TRACE {
+        if syscall_trace_enabled() {
             if let Ok(process) = ctx.procs.current() {
                 trace_line(&format!(
                     "whuse: syscall enter tgid={} name={} sysno={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
@@ -440,7 +448,7 @@ impl SyscallDispatcher {
             Ok(value) => value as isize,
             Err(errno) => -(errno as isize),
         };
-        if SYSCALL_TRACE {
+        if syscall_trace_enabled() {
             if let Ok(process) = procs.current() {
                 trace_line(&format!(
                     "whuse: syscall exit tgid={} name={} sysno={} res={:#x}",
@@ -957,14 +965,14 @@ impl SyscallDispatcher {
 
     fn sys_brk(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let requested = args.0[0];
-        if SYSCALL_TRACE {
+        if syscall_trace_enabled() {
             trace_line(&format!("whuse: sys_brk requested={:#x}", requested));
         }
         let process = procs.current_mut()?;
         let res = process
             .address_space
             .brk((requested != 0).then_some(requested));
-        if SYSCALL_TRACE {
+        if syscall_trace_enabled() {
             match &res {
                 Ok(val) => trace_line(&format!("whuse: sys_brk success res={:#x}", val)),
                 Err(err) => trace_line(&format!("whuse: sys_brk failed err={}", err)),
@@ -2545,7 +2553,6 @@ impl SyscallDispatcher {
                         let signal_frame_pending = procs.current()?.signal_frame_pending;
                         let cancel_seen = procs.current()?.cancel_signal_seen;
                         let cancel_once = procs.current()?.cancel_interrupt_once;
-                        let current_tgid = procs.current()?.tgid;
                         if pending != 0 || signal_frame_pending || cancel_once {
                             procs.clear_futex_wait_state(tid);
                             let consumed = if cancel_once {
@@ -2557,50 +2564,6 @@ impl SyscallDispatcher {
                                 "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
                                 tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
                             ));
-                            if consumed {
-                                if let Some(clear_child_tid) = procs.current()?.clear_child_tid {
-                                    let wrote_zero = procs
-                                        .current_mut()?
-                                        .write_user_bytes(clear_child_tid, &0i32.to_le_bytes())
-                                        .is_ok();
-                                    cancel_debug(&format!(
-                                        "whuse-debug: cancel-consume tid={} clear_child_tid={:#x} wrote_zero={}",
-                                        tid, clear_child_tid, wrote_zero
-                                    ));
-                                    for wake_tid in procs.wake_futex(clear_child_tid, usize::MAX) {
-                                        procs.clear_futex_wait_state(wake_tid);
-                                        let _ = scheduler.wake_task(wake_tid);
-                                    }
-                                }
-                                for peer_tid in procs.tids_in_tgid_with_futex_wait(current_tgid) {
-                                    if peer_tid != tid {
-                                        let futex_addr = procs
-                                            .find_by_tid_mut(peer_tid)
-                                            .ok()
-                                            .and_then(|peer| peer.futex_wait_addr);
-                                        if let Some(addr) = futex_addr {
-                                            let wrote_zero = procs
-                                                .find_by_tid_mut(peer_tid)
-                                                .ok()
-                                                .map(|peer| {
-                                                    peer.write_user_bytes(addr, &0i32.to_le_bytes())
-                                                        .is_ok()
-                                                })
-                                                .unwrap_or(false);
-                                            cancel_debug(&format!(
-                                                "whuse-debug: cancel-consume peer_tid={} futex_addr={:#x} wrote_zero={}",
-                                                peer_tid, addr, wrote_zero
-                                            ));
-                                            for wake_tid in procs.wake_futex(addr, usize::MAX) {
-                                                procs.clear_futex_wait_state(wake_tid);
-                                                let _ = scheduler.wake_task(wake_tid);
-                                            }
-                                        }
-                                        procs.clear_futex_wait_state(peer_tid);
-                                        let _ = scheduler.wake_task(peer_tid);
-                                    }
-                                }
-                            }
                             return Err(EINTR);
                         }
                         if !procs.is_futex_waiting(wait_addr, tid) {
@@ -2625,7 +2588,6 @@ impl SyscallDispatcher {
                 let signal_frame_pending = procs.current()?.signal_frame_pending;
                 let cancel_seen = procs.current()?.cancel_signal_seen;
                 let cancel_once = procs.current()?.cancel_interrupt_once;
-                let current_tgid = procs.current()?.tgid;
                 if pending != 0 || signal_frame_pending || cancel_once {
                     let consumed = if cancel_once {
                         procs.current_mut()?.consume_cancel_interrupt_once()
@@ -2636,50 +2598,6 @@ impl SyscallDispatcher {
                         "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
                         tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
                     ));
-                    if consumed {
-                        if let Some(clear_child_tid) = procs.current()?.clear_child_tid {
-                            let wrote_zero = procs
-                                .current_mut()?
-                                .write_user_bytes(clear_child_tid, &0i32.to_le_bytes())
-                                .is_ok();
-                            cancel_debug(&format!(
-                                "whuse-debug: cancel-consume(fresh) tid={} clear_child_tid={:#x} wrote_zero={}",
-                                tid, clear_child_tid, wrote_zero
-                            ));
-                            for wake_tid in procs.wake_futex(clear_child_tid, usize::MAX) {
-                                procs.clear_futex_wait_state(wake_tid);
-                                let _ = scheduler.wake_task(wake_tid);
-                            }
-                        }
-                        for peer_tid in procs.tids_in_tgid_with_futex_wait(current_tgid) {
-                            if peer_tid != tid {
-                                let futex_addr = procs
-                                    .find_by_tid_mut(peer_tid)
-                                    .ok()
-                                    .and_then(|peer| peer.futex_wait_addr);
-                                if let Some(addr) = futex_addr {
-                                    let wrote_zero = procs
-                                        .find_by_tid_mut(peer_tid)
-                                        .ok()
-                                        .map(|peer| {
-                                            peer.write_user_bytes(addr, &0i32.to_le_bytes())
-                                                .is_ok()
-                                        })
-                                        .unwrap_or(false);
-                                    cancel_debug(&format!(
-                                        "whuse-debug: cancel-consume(fresh) peer_tid={} futex_addr={:#x} wrote_zero={}",
-                                        peer_tid, addr, wrote_zero
-                                    ));
-                                    for wake_tid in procs.wake_futex(addr, usize::MAX) {
-                                        procs.clear_futex_wait_state(wake_tid);
-                                        let _ = scheduler.wake_task(wake_tid);
-                                    }
-                                }
-                                procs.clear_futex_wait_state(peer_tid);
-                                let _ = scheduler.wake_task(peer_tid);
-                            }
-                        }
-                    }
                     return Err(EINTR);
                 }
                 let current = read_i32(procs.current()?, uaddr)?;

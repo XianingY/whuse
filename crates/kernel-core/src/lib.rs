@@ -54,7 +54,7 @@ const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
 const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 30 * 1_000_000_000;
-const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 30 * 1_000_000_000;
+const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 10 * 1_000_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
 const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
@@ -995,7 +995,7 @@ impl Kernel {
             "whuse: pid {} ({}) trapped with scause={} stval={:#x} sepc={:#x} ra={:#x}",
             pid, name, scause, stval, fault_sepc, ra,
         ));
-        if let Ok(exit) = self.processes.exit_current_thread(-1) {
+        if let Ok(exit) = self.processes.exit_current_process_group(-1) {
             self.scheduler.remove_task(exit.tid);
             if exit.group_exited {
                 self.scheduler.exit_group(exit.tgid);

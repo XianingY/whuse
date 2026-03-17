@@ -541,26 +541,69 @@ fn prepare_oscomp_images() -> ExitCode {
 }
 
 fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
+    let docker_image = env::var("WHUSE_OSCOMP_DOCKER_IMAGE")
+        .unwrap_or_else(|_| "docker.educg.net/cg/os-contest:20260104".to_string());
+    let host_first = env::var("WHUSE_OSCOMP_HOST_FIRST")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+
+    if !host_first {
+        if run_make_sdcard_docker(testsuits, &docker_image) {
+            return true;
+        }
+        eprintln!(
+            "docker make sdcard failed in {}, trying host fallback",
+            testsuits.display()
+        );
+    }
+
+    if run_make_sdcard_host(testsuits) {
+        return true;
+    }
+
+    if host_first {
+        eprintln!(
+            "host make sdcard failed in {}, trying docker fallback",
+            testsuits.display()
+        );
+        return run_make_sdcard_docker(testsuits, &docker_image);
+    }
+    false
+}
+
+fn run_make_sdcard_host(testsuits: &PathBuf) -> bool {
     let status = Command::new("make")
         .arg("sdcard")
         .current_dir(testsuits)
         .status();
     match status {
-        Ok(status) if status.success() => return true,
-        Ok(status) => eprintln!(
-            "host make sdcard failed in {} (exit code {:?}), trying docker fallback",
-            testsuits.display(),
-            status.code()
-        ),
-        Err(err) => eprintln!(
-            "failed to execute host make sdcard in {} ({err}), trying docker fallback",
-            testsuits.display()
-        ),
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!(
+                "host make sdcard failed in {} (exit code {:?})",
+                testsuits.display(),
+                status.code()
+            );
+            false
+        }
+        Err(err) => {
+            eprintln!(
+                "failed to execute host make sdcard in {} ({err})",
+                testsuits.display()
+            );
+            false
+        }
     }
+}
 
-    let docker_image = env::var("WHUSE_OSCOMP_DOCKER_IMAGE")
-        .unwrap_or_else(|_| "docker.educg.net/cg/os-contest:20250614".to_string());
-    let mount_arg = format!("{}:/code", testsuits.display());
+fn run_make_sdcard_docker(testsuits: &PathBuf, docker_image: &str) -> bool {
+    let mount_root = fs::canonicalize(testsuits).unwrap_or_else(|_| testsuits.clone());
+    let mount_arg = format!("{}:/code", mount_root.display());
+    eprintln!(
+        "building oscomp image in docker {} with workspace {}",
+        docker_image,
+        mount_root.display()
+    );
     let status = Command::new("docker")
         .args([
             "run",
@@ -572,7 +615,7 @@ fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
             "-w",
             "/code",
             "--privileged",
-            docker_image.as_str(),
+            docker_image,
             "-lc",
             "make sdcard",
         ])
@@ -582,7 +625,7 @@ fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
         Ok(status) => {
             eprintln!(
                 "docker make sdcard failed in {} (exit code {:?})",
-                testsuits.display(),
+                mount_root.display(),
                 status.code()
             );
             false
@@ -590,7 +633,7 @@ fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
         Err(err) => {
             eprintln!(
                 "failed to execute docker make sdcard in {} ({err})",
-                testsuits.display()
+                mount_root.display()
             );
             false
         }

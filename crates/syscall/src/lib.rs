@@ -197,6 +197,7 @@ pub const SYS_PRLIMIT64: usize = 261;
 pub const SYS_RENAMEAT2: usize = 276;
 pub const SYS_GETRANDOM: usize = 278;
 pub const SYS_MEMFD_CREATE: usize = 279;
+pub const SYS_MEMBARRIER: usize = 283;
 pub const SYS_MLOCK2: usize = 284;
 pub const SYS_COPY_FILE_RANGE: usize = 285;
 pub const SYS_PREADV2: usize = 286;
@@ -273,6 +274,19 @@ fn log_always(line: &str) {
         hal().console.put_byte(byte);
     }
     hal().console.put_byte(b'\n');
+}
+
+fn cancel_debug_enabled() -> bool {
+    match option_env!("WHUSE_DEBUG_CANCEL") {
+        Some("1") => true,
+        _ => false,
+    }
+}
+
+fn cancel_debug(line: &str) {
+    if cancel_debug_enabled() {
+        log_always(line);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2517,56 +2531,150 @@ impl SyscallDispatcher {
                     procs.current()?.futex_wait_deadline_ns,
                 ) {
                     if wait_addr == uaddr {
-                        let pending =
-                            procs.current()?.pending_signals & !procs.current()?.signal_mask;
-                        if pending != 0 || procs.current()?.signal_frame_pending {
-                            procs.remove_futex_waiter_at(wait_addr, tid);
-                            let process = procs.current_mut()?;
-                            process.futex_wait_addr = None;
-                            process.futex_wait_deadline_ns = None;
-                            log_always(&format!(
-                                "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x}",
-                                tid, wait_addr, pending
+                        let pending = procs.current()?.pending_signals & !procs.current()?.signal_mask;
+                        let signal_frame_pending = procs.current()?.signal_frame_pending;
+                        let cancel_seen = procs.current()?.cancel_signal_seen;
+                        let cancel_once = procs.current()?.cancel_interrupt_once;
+                        let current_tgid = procs.current()?.tgid;
+                        if pending != 0 || signal_frame_pending || cancel_once {
+                            procs.clear_futex_wait_state(tid);
+                            let consumed = if cancel_once {
+                                procs.current_mut()?.consume_cancel_interrupt_once()
+                            } else {
+                                false
+                            };
+                            cancel_debug(&format!(
+                                "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
+                                tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
                             ));
+                            if consumed {
+                                if let Some(clear_child_tid) = procs.current()?.clear_child_tid {
+                                    let wrote_zero = procs
+                                        .current_mut()?
+                                        .write_user_bytes(clear_child_tid, &0i32.to_le_bytes())
+                                        .is_ok();
+                                    cancel_debug(&format!(
+                                        "whuse-debug: cancel-consume tid={} clear_child_tid={:#x} wrote_zero={}",
+                                        tid, clear_child_tid, wrote_zero
+                                    ));
+                                    for wake_tid in procs.wake_futex(clear_child_tid, usize::MAX) {
+                                        procs.clear_futex_wait_state(wake_tid);
+                                        let _ = scheduler.wake_task(wake_tid);
+                                    }
+                                }
+                                for peer_tid in procs.tids_in_tgid_with_futex_wait(current_tgid) {
+                                    if peer_tid != tid {
+                                        let futex_addr = procs
+                                            .find_by_tid_mut(peer_tid)
+                                            .ok()
+                                            .and_then(|peer| peer.futex_wait_addr);
+                                        if let Some(addr) = futex_addr {
+                                            let wrote_zero = procs
+                                                .find_by_tid_mut(peer_tid)
+                                                .ok()
+                                                .map(|peer| {
+                                                    peer.write_user_bytes(addr, &0i32.to_le_bytes())
+                                                        .is_ok()
+                                                })
+                                                .unwrap_or(false);
+                                            cancel_debug(&format!(
+                                                "whuse-debug: cancel-consume peer_tid={} futex_addr={:#x} wrote_zero={}",
+                                                peer_tid, addr, wrote_zero
+                                            ));
+                                            for wake_tid in procs.wake_futex(addr, usize::MAX) {
+                                                procs.clear_futex_wait_state(wake_tid);
+                                                let _ = scheduler.wake_task(wake_tid);
+                                            }
+                                        }
+                                        procs.clear_futex_wait_state(peer_tid);
+                                        let _ = scheduler.wake_task(peer_tid);
+                                    }
+                                }
+                            }
                             return Err(EINTR);
                         }
                         if !procs.is_futex_waiting(wait_addr, tid) {
-                            let process = procs.current_mut()?;
-                            process.futex_wait_addr = None;
-                            process.futex_wait_deadline_ns = None;
-                            log_always(&format!(
+                            procs.clear_futex_wait_state(tid);
+                            cancel_debug(&format!(
                                 "whuse-debug: FUTEX_WAIT woke(remove) tid={} addr={:#x}",
                                 tid, wait_addr
                             ));
                             return Ok(0);
                         }
                         if deadline != u64::MAX && now >= deadline {
-                            procs.remove_futex_waiter_at(wait_addr, tid);
-                            let process = procs.current_mut()?;
-                            process.futex_wait_addr = None;
-                            process.futex_wait_deadline_ns = None;
+                            procs.clear_futex_wait_state(tid);
                             return Err(ETIMEDOUT);
                         }
                         let _ = scheduler.block_current();
                         return Err(EAGAIN);
                     } else {
-                        procs.remove_futex_waiter_at(wait_addr, tid);
-                        let process = procs.current_mut()?;
-                        process.futex_wait_addr = None;
-                        process.futex_wait_deadline_ns = None;
+                        procs.clear_futex_wait_state(tid);
                     }
                 }
                 let pending = procs.current()?.pending_signals & !procs.current()?.signal_mask;
-                if pending != 0 || procs.current()?.signal_frame_pending {
-                    log_always(&format!(
-                        "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={}",
-                        tid, uaddr, pending, procs.current()?.signal_frame_pending
+                let signal_frame_pending = procs.current()?.signal_frame_pending;
+                let cancel_seen = procs.current()?.cancel_signal_seen;
+                let cancel_once = procs.current()?.cancel_interrupt_once;
+                let current_tgid = procs.current()?.tgid;
+                if pending != 0 || signal_frame_pending || cancel_once {
+                    let consumed = if cancel_once {
+                        procs.current_mut()?.consume_cancel_interrupt_once()
+                    } else {
+                        false
+                    };
+                    cancel_debug(&format!(
+                        "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
+                        tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
                     ));
+                    if consumed {
+                        if let Some(clear_child_tid) = procs.current()?.clear_child_tid {
+                            let wrote_zero = procs
+                                .current_mut()?
+                                .write_user_bytes(clear_child_tid, &0i32.to_le_bytes())
+                                .is_ok();
+                            cancel_debug(&format!(
+                                "whuse-debug: cancel-consume(fresh) tid={} clear_child_tid={:#x} wrote_zero={}",
+                                tid, clear_child_tid, wrote_zero
+                            ));
+                            for wake_tid in procs.wake_futex(clear_child_tid, usize::MAX) {
+                                procs.clear_futex_wait_state(wake_tid);
+                                let _ = scheduler.wake_task(wake_tid);
+                            }
+                        }
+                        for peer_tid in procs.tids_in_tgid_with_futex_wait(current_tgid) {
+                            if peer_tid != tid {
+                                let futex_addr = procs
+                                    .find_by_tid_mut(peer_tid)
+                                    .ok()
+                                    .and_then(|peer| peer.futex_wait_addr);
+                                if let Some(addr) = futex_addr {
+                                    let wrote_zero = procs
+                                        .find_by_tid_mut(peer_tid)
+                                        .ok()
+                                        .map(|peer| {
+                                            peer.write_user_bytes(addr, &0i32.to_le_bytes())
+                                                .is_ok()
+                                        })
+                                        .unwrap_or(false);
+                                    cancel_debug(&format!(
+                                        "whuse-debug: cancel-consume(fresh) peer_tid={} futex_addr={:#x} wrote_zero={}",
+                                        peer_tid, addr, wrote_zero
+                                    ));
+                                    for wake_tid in procs.wake_futex(addr, usize::MAX) {
+                                        procs.clear_futex_wait_state(wake_tid);
+                                        let _ = scheduler.wake_task(wake_tid);
+                                    }
+                                }
+                                procs.clear_futex_wait_state(peer_tid);
+                                let _ = scheduler.wake_task(peer_tid);
+                            }
+                        }
+                    }
                     return Err(EINTR);
                 }
                 let current = read_i32(procs.current()?, uaddr)?;
                 if current != val {
-                    log_always(&format!(
+                    cancel_debug(&format!(
                         "whuse-debug: FUTEX_WAIT EAGAIN tid={} uaddr={:#x} cur={} val={}",
                         tid, uaddr, current, val
                     ));
@@ -2578,12 +2686,14 @@ impl SyscallDispatcher {
                     } else {
                         now.saturating_add(read_timespec_ns(procs.current()?, timeout_ptr)?)
                     };
-                    log_always(&format!(
-                        "whuse-debug: FUTEX_WAIT tid={} uaddr={:#x} val={} sfp={}",
+                    cancel_debug(&format!(
+                        "whuse-debug: FUTEX_WAIT tid={} uaddr={:#x} val={} sfp={} cancel_seen={} cancel_once={}",
                         tid,
                         uaddr,
                         val,
-                        procs.current()?.signal_frame_pending
+                        procs.current()?.signal_frame_pending,
+                        procs.current()?.cancel_signal_seen,
+                        procs.current()?.cancel_interrupt_once
                     ));
                     procs.enqueue_futex_waiter(uaddr, tid);
                     {
@@ -2599,10 +2709,7 @@ impl SyscallDispatcher {
                 let wake_count = val.max(0) as usize;
                 let woke = procs.wake_futex(uaddr, wake_count);
                 for tid in &woke {
-                    if let Ok(process) = procs.find_by_tid_mut(*tid) {
-                        process.futex_wait_addr = None;
-                        process.futex_wait_deadline_ns = None;
-                    }
+                    procs.clear_futex_wait_state(*tid);
                     let _ = scheduler.wake_task(*tid);
                 }
                 Ok(woke.len())
@@ -2650,10 +2757,7 @@ impl SyscallDispatcher {
                 let wake_count = val.max(0) as usize;
                 let woke = procs.wake_futex(uaddr, wake_count);
                 for tid in &woke {
-                    if let Ok(process) = procs.find_by_tid_mut(*tid) {
-                        process.futex_wait_addr = None;
-                        process.futex_wait_deadline_ns = None;
-                    }
+                    procs.clear_futex_wait_state(*tid);
                     let _ = scheduler.wake_task(*tid);
                 }
 
@@ -2669,10 +2773,7 @@ impl SyscallDispatcher {
                 if condition {
                     let woke2 = procs.wake_futex(uaddr2, val2);
                     for tid in &woke2 {
-                        if let Ok(process) = procs.find_by_tid_mut(*tid) {
-                            process.futex_wait_addr = None;
-                            process.futex_wait_deadline_ns = None;
-                        }
+                        procs.clear_futex_wait_state(*tid);
                         let _ = scheduler.wake_task(*tid);
                     }
                     Ok(woke.len() + woke2.len())
@@ -3324,12 +3425,17 @@ impl SyscallDispatcher {
         let saved_pc = read_u64(MCTX_OFF) as usize;
         let saved_fcsr = read_u64(FCSR_OFF) as usize;
 
-        log_always(&format!(
-            "whuse-debug: rt_sigreturn tid={} sfp={} saved_pc={:#x}",
-            process.tid, process.signal_frame_pending, saved_pc
+        cancel_debug(&format!(
+            "whuse-debug: rt_sigreturn tid={} sfp={} cancel_seen={} cancel_once={} saved_pc={:#x}",
+            process.tid,
+            process.signal_frame_pending,
+            process.cancel_signal_seen,
+            process.cancel_interrupt_once,
+            saved_pc
         ));
         process.signal_mask = saved_mask;
         process.signal_frame_pending = false;
+        process.arm_cancel_interrupt_once();
         process.trap_frame.sepc = saved_pc;
         #[cfg(target_arch = "riscv64")]
         {
@@ -3365,6 +3471,42 @@ impl SyscallDispatcher {
 
     fn sys_prctl(&self) -> Result<usize, i32> {
         Ok(0)
+    }
+
+    fn sys_membarrier(&self, args: SyscallArgs) -> Result<usize, i32> {
+        // Single-core kernel: membarrier is effectively a validated no-op for
+        // the private expedited command family used by libc/pthread runtimes.
+        const MEMBARRIER_CMD_QUERY: usize = 0;
+        const MEMBARRIER_CMD_PRIVATE_EXPEDITED: usize = 1 << 3;
+        const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: usize = 1 << 4;
+        const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: usize = 1 << 5;
+        const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: usize = 1 << 6;
+        const MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ: usize = 1 << 7;
+        const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ: usize = 1 << 8;
+
+        let cmd = args.0[0];
+        let flags = args.0[1];
+        if flags != 0 {
+            return Err(EINVAL);
+        }
+
+        let supported = MEMBARRIER_CMD_PRIVATE_EXPEDITED
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+            | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+            | MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ;
+
+        match cmd {
+            MEMBARRIER_CMD_QUERY => Ok(supported),
+            MEMBARRIER_CMD_PRIVATE_EXPEDITED
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+            | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+            | MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ => Ok(0),
+            _ => Err(EINVAL),
+        }
     }
 
     fn sys_getgroups(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
@@ -4453,16 +4595,16 @@ mod tests {
         SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER, SYS_GETPRIORITY, SYS_GETSID,
         SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTIMEOFDAY, SYS_GET_ROBUST_LIST, SYS_LINKAT,
         SYS_LISTEN, SYS_LSEEK, SYS_MEMFD_CREATE, SYS_MKDIR, SYS_MLOCK, SYS_MLOCK2, SYS_MSYNC,
-        SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL, SYS_PIPE, SYS_PPOLL,
-        SYS_PRCTL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PRLIMIT64, SYS_PSELECT6, SYS_PWRITE64,
-        SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RENAMEAT,
-        SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE, SYS_RT_SIGPENDING, SYS_RT_SIGRETURN,
-        SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SECCOMP, SYS_SENDMSG, SYS_SENDTO, SYS_SETGID,
-        SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_ROBUST_LIST,
-        SYS_SET_TID_ADDRESS, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET, SYS_SHUTDOWN,
-        SYS_SIGACTION, SYS_SIGALTSTACK, SYS_SIGPROCMASK, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SPLICE,
-        SYS_STATX, SYS_SYMLINKAT, SYS_TIMES, SYS_TRUNCATE, SYS_UMASK, SYS_UNAME, SYS_UTIMENSAT,
-        SYS_WAIT, SYS_WRITE, SYS_WRITEV,
+        SYS_MEMBARRIER, SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL,
+        SYS_PIPE, SYS_PPOLL, SYS_PRCTL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PRLIMIT64,
+        SYS_PSELECT6, SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_RECVFROM,
+        SYS_RECVMSG, SYS_RENAMEAT, SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE, SYS_RT_SIGPENDING,
+        SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SECCOMP, SYS_SENDMSG,
+        SYS_SENDTO, SYS_SETGID, SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID, SYS_SETSOCKOPT,
+        SYS_SETUID, SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT,
+        SYS_SHMGET, SYS_SHUTDOWN, SYS_SIGACTION, SYS_SIGALTSTACK, SYS_SIGPROCMASK, SYS_SOCKET,
+        SYS_SOCKETPAIR, SYS_SPLICE, SYS_STATX, SYS_SYMLINKAT, SYS_TIMES, SYS_TRUNCATE, SYS_UMASK,
+        SYS_UNAME, SYS_UTIMENSAT, SYS_WAIT, SYS_WRITE, SYS_WRITEV,
     };
     use hal_api::{
         register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
@@ -5144,6 +5286,177 @@ mod tests {
                 &mut vfs,
             ),
             0
+        );
+    }
+
+    #[test]
+    fn futex_cancel_interrupt_is_one_shot() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xa400, &0i32.to_le_bytes());
+        {
+            let process = procs.current_mut().unwrap();
+            process.cancel_interrupt_once = true;
+        }
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FUTEX,
+                SyscallArgs([0xa400, super::FUTEX_WAIT, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EINTR as isize
+        );
+        assert!(!procs.current().unwrap().cancel_interrupt_once);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FUTEX,
+                SyscallArgs([0xa400, super::FUTEX_WAIT, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EAGAIN as isize
+        );
+        assert_eq!(procs.current().unwrap().futex_wait_addr, Some(0xa400));
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FUTEX,
+                SyscallArgs([0xa400, super::FUTEX_WAKE, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            1
+        );
+        assert_eq!(procs.current().unwrap().futex_wait_addr, None);
+    }
+
+    #[test]
+    fn rt_sigreturn_arms_cancel_interrupt_once() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        const FRAME_SIZE: usize = 832;
+        const UCONTEXT_OFF: usize = 128;
+        const UC_SIGMASK_OFF: usize = UCONTEXT_OFF + 40;
+        const MCTX_OFF: usize = UCONTEXT_OFF + 168;
+        let frame_sp = 0x7d00usize;
+        let saved_mask = 0x1234_5678_u64;
+        let saved_pc = 0x4001_2000_u64;
+        let retval = 77u64;
+
+        let mut frame = [0u8; FRAME_SIZE];
+        frame[UC_SIGMASK_OFF..UC_SIGMASK_OFF + 8].copy_from_slice(&saved_mask.to_le_bytes());
+        frame[MCTX_OFF..MCTX_OFF + 8].copy_from_slice(&saved_pc.to_le_bytes());
+        let a0_off = MCTX_OFF + 10 * 8;
+        frame[a0_off..a0_off + 8].copy_from_slice(&retval.to_le_bytes());
+
+        {
+            let process = procs.current_mut().unwrap();
+            process.signal_frame_pending = true;
+            process.cancel_signal_seen = true;
+            process.cancel_interrupt_once = false;
+            process.signal_mask = 0xffff;
+            process.trap_frame.regs[2] = frame_sp;
+            process.address_space.install_bytes(frame_sp, &frame);
+        }
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_RT_SIGRETURN,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            retval as isize
+        );
+        let process = procs.current().unwrap();
+        assert_eq!(process.signal_mask, saved_mask);
+        assert!(!process.signal_frame_pending);
+        assert!(!process.cancel_signal_seen);
+        assert!(process.cancel_interrupt_once);
+    }
+
+    #[test]
+    fn membarrier_private_commands_supported() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        const QUERY: usize = 0;
+        const PRIVATE_EXPEDITED: usize = 1 << 3;
+        const REGISTER_PRIVATE_EXPEDITED: usize = 1 << 4;
+
+        let query = dispatcher.dispatch(
+            SYS_MEMBARRIER,
+            SyscallArgs([QUERY, 0, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(query >= 0);
+        let mask = query as usize;
+        assert_ne!(mask & PRIVATE_EXPEDITED, 0);
+        assert_ne!(mask & REGISTER_PRIVATE_EXPEDITED, 0);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MEMBARRIER,
+                SyscallArgs([REGISTER_PRIVATE_EXPEDITED, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MEMBARRIER,
+                SyscallArgs([PRIVATE_EXPEDITED, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MEMBARRIER,
+                SyscallArgs([REGISTER_PRIVATE_EXPEDITED, 1, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINVAL as isize)
         );
     }
 

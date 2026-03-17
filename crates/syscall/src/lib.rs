@@ -197,6 +197,7 @@ pub const SYS_PRLIMIT64: usize = 261;
 pub const SYS_RENAMEAT2: usize = 276;
 pub const SYS_GETRANDOM: usize = 278;
 pub const SYS_MEMFD_CREATE: usize = 279;
+pub const SYS_MEMBARRIER: usize = 283;
 pub const SYS_MLOCK2: usize = 284;
 pub const SYS_COPY_FILE_RANGE: usize = 285;
 pub const SYS_PREADV2: usize = 286;
@@ -3472,6 +3473,42 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
+    fn sys_membarrier(&self, args: SyscallArgs) -> Result<usize, i32> {
+        // Single-core kernel: membarrier is effectively a validated no-op for
+        // the private expedited command family used by libc/pthread runtimes.
+        const MEMBARRIER_CMD_QUERY: usize = 0;
+        const MEMBARRIER_CMD_PRIVATE_EXPEDITED: usize = 1 << 3;
+        const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: usize = 1 << 4;
+        const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: usize = 1 << 5;
+        const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: usize = 1 << 6;
+        const MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ: usize = 1 << 7;
+        const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ: usize = 1 << 8;
+
+        let cmd = args.0[0];
+        let flags = args.0[1];
+        if flags != 0 {
+            return Err(EINVAL);
+        }
+
+        let supported = MEMBARRIER_CMD_PRIVATE_EXPEDITED
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+            | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+            | MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ;
+
+        match cmd {
+            MEMBARRIER_CMD_QUERY => Ok(supported),
+            MEMBARRIER_CMD_PRIVATE_EXPEDITED
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+            | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+            | MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ => Ok(0),
+            _ => Err(EINVAL),
+        }
+    }
+
     fn sys_getgroups(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let groups = procs.getgroups_current()?;
         let size = args.0[0];
@@ -4558,16 +4595,16 @@ mod tests {
         SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER, SYS_GETPRIORITY, SYS_GETSID,
         SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTIMEOFDAY, SYS_GET_ROBUST_LIST, SYS_LINKAT,
         SYS_LISTEN, SYS_LSEEK, SYS_MEMFD_CREATE, SYS_MKDIR, SYS_MLOCK, SYS_MLOCK2, SYS_MSYNC,
-        SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL, SYS_PIPE, SYS_PPOLL,
-        SYS_PRCTL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PRLIMIT64, SYS_PSELECT6, SYS_PWRITE64,
-        SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RENAMEAT,
-        SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE, SYS_RT_SIGPENDING, SYS_RT_SIGRETURN,
-        SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SECCOMP, SYS_SENDMSG, SYS_SENDTO, SYS_SETGID,
-        SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_ROBUST_LIST,
-        SYS_SET_TID_ADDRESS, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET, SYS_SHUTDOWN,
-        SYS_SIGACTION, SYS_SIGALTSTACK, SYS_SIGPROCMASK, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SPLICE,
-        SYS_STATX, SYS_SYMLINKAT, SYS_TIMES, SYS_TRUNCATE, SYS_UMASK, SYS_UNAME, SYS_UTIMENSAT,
-        SYS_WAIT, SYS_WRITE, SYS_WRITEV,
+        SYS_MEMBARRIER, SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL,
+        SYS_PIPE, SYS_PPOLL, SYS_PRCTL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PRLIMIT64,
+        SYS_PSELECT6, SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_RECVFROM,
+        SYS_RECVMSG, SYS_RENAMEAT, SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE, SYS_RT_SIGPENDING,
+        SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SECCOMP, SYS_SENDMSG,
+        SYS_SENDTO, SYS_SETGID, SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID, SYS_SETSOCKOPT,
+        SYS_SETUID, SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT,
+        SYS_SHMGET, SYS_SHUTDOWN, SYS_SIGACTION, SYS_SIGALTSTACK, SYS_SIGPROCMASK, SYS_SOCKET,
+        SYS_SOCKETPAIR, SYS_SPLICE, SYS_STATX, SYS_SYMLINKAT, SYS_TIMES, SYS_TRUNCATE, SYS_UMASK,
+        SYS_UNAME, SYS_UTIMENSAT, SYS_WAIT, SYS_WRITE, SYS_WRITEV,
     };
     use hal_api::{
         register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
@@ -5361,6 +5398,66 @@ mod tests {
         assert!(!process.signal_frame_pending);
         assert!(!process.cancel_signal_seen);
         assert!(process.cancel_interrupt_once);
+    }
+
+    #[test]
+    fn membarrier_private_commands_supported() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        const QUERY: usize = 0;
+        const PRIVATE_EXPEDITED: usize = 1 << 3;
+        const REGISTER_PRIVATE_EXPEDITED: usize = 1 << 4;
+
+        let query = dispatcher.dispatch(
+            SYS_MEMBARRIER,
+            SyscallArgs([QUERY, 0, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(query >= 0);
+        let mask = query as usize;
+        assert_ne!(mask & PRIVATE_EXPEDITED, 0);
+        assert_ne!(mask & REGISTER_PRIVATE_EXPEDITED, 0);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MEMBARRIER,
+                SyscallArgs([REGISTER_PRIVATE_EXPEDITED, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MEMBARRIER,
+                SyscallArgs([PRIVATE_EXPEDITED, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MEMBARRIER,
+                SyscallArgs([REGISTER_PRIVATE_EXPEDITED, 1, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINVAL as isize)
+        );
     }
 
     #[test]

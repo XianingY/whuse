@@ -32,7 +32,7 @@ pub const UART0_BASE: usize = 0x1000_0000;
 pub const VIRTIO0_BASE: usize = 0x1000_1000;
 pub const MMIO_BASE: usize = 0x1000_0000;
 pub const PHYS_MEM_BASE: usize = 0x8000_0000;
-pub const PHYS_MEM_SIZE: usize = 128 * 1024 * 1024;
+pub const PHYS_MEM_SIZE: usize = 256 * 1024 * 1024;
 const DMA_ARENA_BYTES: usize = 2 * 1024 * 1024;
 const DMA_ARENA_WORDS: usize = DMA_ARENA_BYTES / SECTOR_SIZE / 64;
 const EIO: i32 = 5;
@@ -111,10 +111,6 @@ __whuse_run_user:
     ld t0, 256(t6)
     csrw sepc, t0
     ld t0, 264(t6)
-    li t2, -257
-    and t0, t0, t2
-    li t2, -3
-    and t0, t0, t2
     ori t0, t0, 32
     li t2, 0x6000
     or t0, t0, t2
@@ -260,11 +256,101 @@ __whuse_user_trap_entry:
 );
 
 #[cfg(target_arch = "riscv64")]
-unsafe extern "C" {
+global_asm!(
+    r#"
+    .section .text
+    .globl __whuse_kernel_trap_entry
+    .align 4
+__whuse_kernel_trap_entry:
+    addi sp, sp, -256
+    sd ra,    0(sp)
+    sd t0,    8(sp)
+    sd t1,   16(sp)
+    sd t2,   24(sp)
+    sd t3,   32(sp)
+    sd t4,   40(sp)
+    sd t5,   48(sp)
+    sd t6,   56(sp)
+    sd a0,   64(sp)
+    sd a1,   72(sp)
+    sd a2,   80(sp)
+    sd a3,   88(sp)
+    sd a4,   96(sp)
+    sd a5,  104(sp)
+    sd a6,  112(sp)
+    sd a7,  120(sp)
+    sd s0,  128(sp)
+    sd s1,  136(sp)
+    sd s2,  144(sp)
+    sd s3,  152(sp)
+    sd s4,  160(sp)
+    sd s5,  168(sp)
+    sd s6,  176(sp)
+    sd s7,  184(sp)
+    sd s8,  192(sp)
+    sd s9,  200(sp)
+    sd s10, 208(sp)
+    sd s11, 216(sp)
+    csrr a0, scause
+    csrr a1, sepc
+    call __whuse_kernel_trap_handler
+    ld ra,    0(sp)
+    ld t0,    8(sp)
+    ld t1,   16(sp)
+    ld t2,   24(sp)
+    ld t3,   32(sp)
+    ld t4,   40(sp)
+    ld t5,   48(sp)
+    ld t6,   56(sp)
+    ld a0,   64(sp)
+    ld a1,   72(sp)
+    ld a2,   80(sp)
+    ld a3,   88(sp)
+    ld a4,   96(sp)
+    ld a5,  104(sp)
+    ld a6,  112(sp)
+    ld a7,  120(sp)
+    ld s0,  128(sp)
+    ld s1,  136(sp)
+    ld s2,  144(sp)
+    ld s3,  152(sp)
+    ld s4,  160(sp)
+    ld s5,  168(sp)
+    ld s6,  176(sp)
+    ld s7,  184(sp)
+    ld s8,  192(sp)
+    ld s9,  200(sp)
+    ld s10, 208(sp)
+    ld s11, 216(sp)
+    addi sp, sp, 256
+    sret
+"#
+);
+
+extern "C" {
+    fn end();
+    fn __whuse_kernel_trap_entry();
     fn __whuse_run_user(frame: *mut TrapFrame);
 }
 
-static MEMORY_MAP: [MemoryRegion; 2] = [
+pub static KERNEL_TRAP_HANDLER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[no_mangle]
+unsafe extern "C" fn __whuse_kernel_trap_handler(scause: usize, _sepc: usize) {
+    let interrupt_bit = 1usize << (usize::BITS as usize - 1);
+    let is_timer = (scause & interrupt_bit) != 0 && (scause & !interrupt_bit) == 5;
+    if !is_timer {
+        return;
+    }
+    let cb_ptr = KERNEL_TRAP_HANDLER.load(core::sync::atomic::Ordering::Relaxed);
+    if cb_ptr != 0 {
+        let cb: fn() = core::mem::transmute(cb_ptr);
+        cb();
+    }
+}
+
+static mut MEMORY_MAP: [MemoryRegion; 2] = [
     MemoryRegion {
         start: 0x0,
         size: MMIO_BASE,
@@ -282,6 +368,15 @@ pub fn bootstrap(dtb_pa: usize) {
         if let Some(discovery) = parse_riscv_virtio_discovery(dtb_pa) {
             INTERRUPT.configure(discovery.plic);
             VIRTIO_BLK.bootstrap(&discovery);
+        }
+    }
+    unsafe {
+        let kernel_end = (end as *const () as usize + 4095) & !4095;
+        MEMORY_MAP[1].start = kernel_end;
+        MEMORY_MAP[1].size = (PHYS_MEM_BASE + PHYS_MEM_SIZE).saturating_sub(kernel_end);
+        // Use UART directly before HAL is registered to avoid panic.
+        for byte in "whuse: memory map adjusted\n".bytes() {
+            UART.put_byte(byte);
         }
     }
     register_hal(HalBundle {
@@ -513,14 +608,33 @@ impl HalCpu for VirtCpu {
     }
 
     fn enable_interrupts(&self) {
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            let mut sstatus: usize;
+            core::arch::asm!("csrr {}, sstatus", out(reg) sstatus);
+            core::arch::asm!("csrw sstatus, {}", in(reg) sstatus | (1 << 1));
+        }
         self.interrupts_enabled.store(true, Ordering::Relaxed);
     }
 
     fn disable_interrupts(&self) {
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            let mut sstatus: usize;
+            core::arch::asm!("csrr {}, sstatus", out(reg) sstatus);
+            core::arch::asm!("csrw sstatus, {}", in(reg) sstatus & !(1 << 1));
+        }
         self.interrupts_enabled.store(false, Ordering::Relaxed);
     }
 
     fn interrupts_enabled(&self) -> bool {
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            let sstatus: usize;
+            core::arch::asm!("csrr {}, sstatus", out(reg) sstatus);
+            (sstatus & (1 << 1)) != 0
+        }
+        #[cfg(not(target_arch = "riscv64"))]
         self.interrupts_enabled.load(Ordering::Relaxed)
     }
 
@@ -545,7 +659,7 @@ impl HalCpu for VirtCpu {
     fn wait_for_interrupt(&self) {
         #[cfg(target_arch = "riscv64")]
         unsafe {
-            core::arch::asm!("wfi");
+            core::arch::asm!("csrsi sstatus, 2", "wfi",);
         }
         #[cfg(not(target_arch = "riscv64"))]
         core::hint::spin_loop();
@@ -555,17 +669,40 @@ impl HalCpu for VirtCpu {
         #[cfg(target_arch = "riscv64")]
         unsafe {
             __whuse_run_user(frame as *mut TrapFrame);
+            if KERNEL_TRAP_HANDLER.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+                core::arch::asm!(
+                    "la t0, __whuse_kernel_trap_entry",
+                    "csrw stvec, t0",
+                    out("t0") _,
+                );
+            }
         }
         #[cfg(not(target_arch = "riscv64"))]
         {
             let _ = frame;
         }
     }
+
+    fn set_kernel_timer_callback(&self, cb: fn()) {
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            KERNEL_TRAP_HANDLER.store(cb as usize, core::sync::atomic::Ordering::Relaxed);
+            core::arch::asm!(
+                "la t0, __whuse_kernel_trap_entry",
+                "csrw stvec, t0",
+                out("t0") _,
+            );
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = cb;
+        }
+    }
 }
 
 impl HalMemory for VirtMemory {
     fn memory_regions(&self) -> &'static [MemoryRegion] {
-        &MEMORY_MAP
+        unsafe { &MEMORY_MAP }
     }
 
     fn phys_to_virt(&self, phys: usize) -> usize {

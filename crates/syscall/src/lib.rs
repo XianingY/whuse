@@ -38,11 +38,20 @@ const EINTR: i32 = 4;
 const EINVAL: i32 = 22;
 const ENOENT: i32 = 2;
 const ENOTDIR: i32 = 20;
+const ENOEXEC: i32 = 8;
+const ESRCH: i32 = 3;
+
+const FUTEX_WAIT: usize = 0;
+const FUTEX_WAKE: usize = 1;
+const FUTEX_REQUEUE: usize = 3;
+const FUTEX_CMP_REQUEUE: usize = 4;
+const FUTEX_WAKE_OP: usize = 5;
+const FUTEX_WAIT_BITSET: usize = 9;
+const FUTEX_WAKE_BITSET: usize = 10;
 const ENOTTY: i32 = 25;
 const ENOSYS: i32 = 38;
 const ETIMEDOUT: i32 = 110;
 const EPROTOTYPE: i32 = 91;
-const ENOEXEC: i32 = 8;
 const AT_FDCWD: i32 = -100;
 const SIGCHLD: usize = 17;
 
@@ -114,6 +123,7 @@ pub const SYS_SETITIMER: usize = 103;
 pub const SYS_CLOCK_GETRES: usize = 114;
 pub const SYS_SCHED_YIELD: usize = 124;
 pub const SYS_KILL: usize = 129;
+pub const SYS_TKILL: usize = 130;
 pub const SYS_TGKILL: usize = 131;
 pub const SYS_SIGALTSTACK: usize = 132;
 pub const SYS_RT_SIGSUSPEND: usize = 133;
@@ -214,14 +224,10 @@ const CLONE_PARENT_SETTID: usize = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
 const CLONE_CHILD_SETTID: usize = 0x0100_0000;
 const TIMER_ABSTIME: usize = 1;
-const CLONE_NAMESPACE_MASK: usize = 0x0002_0000
-    | 0x0004_0000
-    | 0x0200_0000
-    | 0x0400_0000
-    | 0x0800_0000
-    | 0x1000_0000
-    | 0x2000_0000
-    | 0x4000_0000;
+// CLONE_SYSVSEM (0x0004_0000) is NOT a namespace flag; excluding it here
+// ensures pthread_create (which sets CLONE_SYSVSEM) is not rejected with EINVAL.
+const CLONE_NAMESPACE_MASK: usize =
+    0x0002_0000 | 0x0200_0000 | 0x0400_0000 | 0x0800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000;
 const PAGE_SIZE: usize = 4096;
 const O_CLOEXEC: usize = 0x0008_0000;
 const MAP_SHARED: usize = 0x01;
@@ -229,7 +235,16 @@ const MAP_PRIVATE: usize = 0x02;
 const MAP_TYPE_MASK: usize = 0x0f;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
+const MAP_FIXED_NOREPLACE: usize = 0x10_0000;
 const BUILTIN_EXEC_BASE: usize = 0x0080_0000;
+pub const SIGNAL_TRAMPOLINE_BASE: usize = 0x7fff_0000;
+#[cfg(target_arch = "riscv64")]
+pub const SIGNAL_TRAMPOLINE_CODE: [u8; 8] = [
+    0x93, 0x08, 0xb0, 0x08, // addi a7, zero, 0x8b (= 139 = SYS_RT_SIGRETURN)
+    0x73, 0x00, 0x00, 0x00, // ecall
+];
+#[cfg(not(target_arch = "riscv64"))]
+pub const SIGNAL_TRAMPOLINE_CODE: [u8; 8] = [0u8; 8];
 const SYSCALL_TRACE: bool = false;
 const ENOSYS_TRACE: bool = true;
 
@@ -247,6 +262,13 @@ fn trace_enosys(line: &str) {
     if !ENOSYS_TRACE {
         return;
     }
+    for byte in line.bytes() {
+        hal().console.put_byte(byte);
+    }
+    hal().console.put_byte(b'\n');
+}
+
+fn log_always(line: &str) {
     for byte in line.bytes() {
         hal().console.put_byte(byte);
     }
@@ -351,6 +373,22 @@ impl SyscallDispatcher {
             scheduler,
             vfs,
         };
+        if SYSCALL_TRACE {
+            if let Ok(process) = ctx.procs.current() {
+                trace_line(&format!(
+                    "whuse: syscall enter tgid={} name={} sysno={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    process.tgid,
+                    process.name,
+                    sysno,
+                    args.0[0],
+                    args.0[1],
+                    args.0[2],
+                    args.0[3],
+                    args.0[4],
+                    args.0[5]
+                ));
+            }
+        }
         let result = fs_domain::dispatch(&mut ctx, sysno, args)
             .or_else(|| io_mpx_domain::dispatch(&mut ctx, sysno, args))
             .or_else(|| ipc_domain::dispatch(&mut ctx, sysno, args))
@@ -384,10 +422,19 @@ impl SyscallDispatcher {
             }
         }
 
-        match result {
+        let res = match result {
             Ok(value) => value as isize,
             Err(errno) => -(errno as isize),
+        };
+        if SYSCALL_TRACE {
+            if let Ok(process) = procs.current() {
+                trace_line(&format!(
+                    "whuse: syscall exit tgid={} name={} sysno={} res={:#x}",
+                    process.tgid, process.name, sysno, res
+                ));
+            }
         }
+        res
     }
 
     fn sys_getcwd(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
@@ -536,22 +583,34 @@ impl SyscallDispatcher {
         let fd = args.0[0] as i32;
         let buf = args.0[1];
         let count = args.0[2];
-        let (bytes, path) = {
+        let bytes = {
             let process = procs.current_mut()?;
+            process.sync_fd_offset_from_alias(fd)?;
             let handle = process.fd_mut(fd)?;
             let path = handle.path.clone();
             (vfs.getdents(handle, count)?, path)
         };
-        if let Some(applet) = BUSYBOX_APPLETS.lock().get(&procs.current_tgid()?).cloned() {
-            if applet == "du" && bytes.is_empty() {
-                trace_enosys(&format!("whuse: du getdents eof fd={} path={}", fd, path));
-            }
+        procs.current_mut()?.sync_fd_offset_to_aliases(fd)?;
+        if matches!(
+            BUSYBOX_APPLETS
+                .lock()
+                .get(&procs.current_tgid()?)
+                .map(|s| s.as_str()),
+            Some("du")
+        ) {
+            trace_line(&format!(
+                "whuse: du getdents path={} bytes={}",
+                bytes.1,
+                bytes.0.len()
+            ));
         }
+        let bytes_data = bytes.0;
+
         procs
             .current_mut()?
-            .write_user_bytes(buf, &bytes)
+            .write_user_bytes(buf, &bytes_data)
             .map_err(|_| EFAULT)?;
-        Ok(bytes.len())
+        Ok(bytes_data.len())
     }
 
     fn sys_lseek(
@@ -691,7 +750,13 @@ impl SyscallDispatcher {
                 if rem_ptr != 0 {
                     procs
                         .current_mut()?
-                        .write_user_bytes(rem_ptr, &timespec_to_bytes(Timespec { tv_sec: 0, tv_nsec: 0 }))
+                        .write_user_bytes(
+                            rem_ptr,
+                            &timespec_to_bytes(Timespec {
+                                tv_sec: 0,
+                                tv_nsec: 0,
+                            }),
+                        )
                         .map_err(|_| EFAULT)?;
                 }
                 return Ok(0);
@@ -730,7 +795,13 @@ impl SyscallDispatcher {
         if let Some(ptr) = remain_ptr {
             procs
                 .current_mut()?
-                .write_user_bytes(ptr, &timespec_to_bytes(Timespec { tv_sec: 0, tv_nsec: 0 }))
+                .write_user_bytes(
+                    ptr,
+                    &timespec_to_bytes(Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    }),
+                )
                 .map_err(|_| EFAULT)?;
         }
         let process = procs.current_mut()?;
@@ -777,9 +848,23 @@ impl SyscallDispatcher {
                 ));
             }
             if let Some(addr) = exit.clear_child_tid {
-                for tid in procs.wake_futex(addr, usize::MAX) {
+                log_always(&format!(
+                    "whuse-debug: exit tid={} clear_child_tid={:#x}",
+                    exit.tid, addr
+                ));
+                let woken = procs.wake_futex(addr, usize::MAX);
+                log_always(&format!(
+                    "whuse-debug: wake_futex addr={:#x} woken={:?}",
+                    addr, woken
+                ));
+                for tid in woken {
                     let _ = scheduler.wake_task(tid);
                 }
+            } else {
+                log_always(&format!(
+                    "whuse-debug: exit tid={} no clear_child_tid",
+                    exit.tid
+                ));
             }
         }
         if let Some(applet) = BUSYBOX_APPLETS.lock().remove(&exit.tgid) {
@@ -919,6 +1004,8 @@ impl SyscallDispatcher {
 
         let child_stack = args.0[1];
         let shared_vm = (compat_flags & CLONE_VM) != 0;
+        let parent_tid = args.0[2];
+        let child_tid_ptr = args.0[3];
         let pid = if shared_vm {
             procs.fork_process_from_current_shared()?
         } else {
@@ -928,6 +1015,24 @@ impl SyscallDispatcher {
             "whuse: clone parent_tgid={} flags={:#x} child_tgid={} shared_vm={}",
             parent_pid, flags, pid, shared_vm
         ));
+
+        if compat_flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
+            procs
+                .current_mut()?
+                .write_user_bytes(parent_tid, &(pid as u32).to_le_bytes())
+                .map_err(|_| EFAULT)?;
+        }
+
+        {
+            let child = procs.find_by_tid_mut(pid)?;
+            if compat_flags & CLONE_CHILD_SETTID != 0 && child_tid_ptr != 0 {
+                let _ = child.write_user_bytes(child_tid_ptr, &(pid as u32).to_le_bytes());
+            }
+            if compat_flags & CLONE_CHILD_CLEARTID != 0 && child_tid_ptr != 0 {
+                child.clear_child_tid = Some(child_tid_ptr);
+            }
+        }
+
         if child_stack != 0 {
             procs.set_thread_stack_pointer(pid, child_stack)?;
         }
@@ -1140,6 +1245,12 @@ impl SyscallDispatcher {
                     .address_space
                     .map_fixed_bytes(BUILTIN_EXEC_BASE, program.image, program.image.len(), 0b101)
                     .map_err(|_| EFAULT)?;
+                let _ = process.address_space.map_fixed_bytes(
+                    SIGNAL_TRAMPOLINE_BASE,
+                    &SIGNAL_TRAMPOLINE_CODE,
+                    4096,
+                    0b101,
+                );
                 process.trap_frame.sepc = entry;
                 let tgid = process.tgid;
                 #[cfg(target_arch = "riscv64")]
@@ -1165,6 +1276,12 @@ impl SyscallDispatcher {
             process.trap_frame.sepc = loaded.entry;
             process.trap_frame.regs[2] = loaded.stack_pointer;
             process.name = display_path;
+            let _ = process.address_space.map_fixed_bytes(
+                SIGNAL_TRAMPOLINE_BASE,
+                &SIGNAL_TRAMPOLINE_CODE,
+                4096,
+                0b101,
+            );
             let tgid = process.tgid;
             let proc_name = process.name.clone();
             let entry = process.trap_frame.sepc;
@@ -1205,18 +1322,32 @@ impl SyscallDispatcher {
         let aligned_len = len.checked_add(PAGE_SIZE - 1).ok_or(EINVAL)? & !(PAGE_SIZE - 1);
         let anonymous = (flags & MAP_ANONYMOUS) != 0;
         let fixed = (flags & MAP_FIXED) != 0;
+        let fixed_noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
 
-        let hinted = if fixed || addr != 0 {
+        let hinted = if fixed || fixed_noreplace || addr != 0 {
             let aligned = addr & !(PAGE_SIZE - 1);
-            if fixed && aligned != addr {
+            if (fixed || fixed_noreplace) && aligned != addr {
                 return Err(EINVAL);
             }
             Some(aligned)
         } else {
             None
         };
+        // MAP_FIXED_NOREPLACE: fail with EEXIST if range is already in use.
+        if fixed_noreplace {
+            if let Some(hint) = hinted {
+                if !procs
+                    .current()?
+                    .address_space
+                    .is_range_available(hint, aligned_len)?
+                {
+                    return Err(17); // EEXIST
+                }
+            }
+        }
         let target = match hinted {
             Some(hint) if fixed => Some(hint),
+            Some(hint) if fixed_noreplace => Some(hint),
             Some(hint) => {
                 if procs
                     .current()?
@@ -1616,11 +1747,12 @@ impl SyscallDispatcher {
         Ok(written)
     }
 
-    fn sys_ppoll(
+    pub(crate) fn sys_ppoll(
         &self,
         args: SyscallArgs,
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
+        scheduler: &mut Scheduler,
     ) -> Result<usize, i32> {
         const POLLIN: i16 = 0x0001;
         const POLLOUT: i16 = 0x0004;
@@ -1658,18 +1790,51 @@ impl SyscallDispatcher {
                 ready += 1;
             }
         }
-        procs
-            .current_mut()?
-            .write_user_bytes(addr, &pollfds_to_bytes(&pollfds))
-            .map_err(|_| EFAULT)?;
-        Ok(ready)
+        if ready != 0 {
+            procs.current_mut()?.epoll_wait_deadline_ns = None;
+            procs
+                .current_mut()?
+                .write_user_bytes(addr, &pollfds_to_bytes(&pollfds))
+                .map_err(|_| EFAULT)?;
+            return Ok(ready);
+        }
+
+        let process = procs.current_mut()?;
+        if process.pending_signals & !process.signal_mask != 0 {
+            process.epoll_wait_deadline_ns = None;
+            return Err(EINTR);
+        }
+
+        let now = hal().timer.monotonic_nanos();
+        let timeout_ptr = args.0[2];
+        if process.epoll_wait_deadline_ns.is_none() {
+            if timeout_ptr != 0 {
+                let requested = read_timespec_ns(process, timeout_ptr)?;
+                if requested == 0 {
+                    return Ok(0);
+                }
+                process.epoll_wait_deadline_ns = Some(now.saturating_add(requested));
+            } else {
+                process.epoll_wait_deadline_ns = Some(u64::MAX);
+            }
+        }
+
+        let deadline = process.epoll_wait_deadline_ns.unwrap();
+        if deadline != u64::MAX && now >= deadline {
+            process.epoll_wait_deadline_ns = None;
+            return Ok(0);
+        }
+
+        let _ = scheduler.block_current();
+        Err(EAGAIN)
     }
 
-    fn sys_pselect6(
+    pub(crate) fn sys_pselect6(
         &self,
         args: SyscallArgs,
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
+        scheduler: &mut Scheduler,
     ) -> Result<usize, i32> {
         let nfds = args.0[0];
         let readfds = args.0[1];
@@ -1717,7 +1882,39 @@ impl SyscallDispatcher {
                 .write_user_bytes(exceptfds, &vec![0u8; fd_set_len(nfds)])
                 .map_err(|_| EFAULT)?;
         }
-        Ok(ready.len())
+        if !ready.is_empty() {
+            procs.current_mut()?.epoll_wait_deadline_ns = None;
+            return Ok(ready.len());
+        }
+
+        let process = procs.current_mut()?;
+        if process.pending_signals & !process.signal_mask != 0 {
+            process.epoll_wait_deadline_ns = None;
+            return Err(EINTR);
+        }
+
+        let now = hal().timer.monotonic_nanos();
+        let timeout_ptr = args.0[4];
+        if process.epoll_wait_deadline_ns.is_none() {
+            if timeout_ptr != 0 {
+                let requested = read_timespec_ns(process, timeout_ptr)?;
+                if requested == 0 {
+                    return Ok(0);
+                }
+                process.epoll_wait_deadline_ns = Some(now.saturating_add(requested));
+            } else {
+                process.epoll_wait_deadline_ns = Some(u64::MAX);
+            }
+        }
+
+        let deadline = process.epoll_wait_deadline_ns.unwrap();
+        if deadline != u64::MAX && now >= deadline {
+            process.epoll_wait_deadline_ns = None;
+            return Ok(0);
+        }
+
+        let _ = scheduler.block_current();
+        Err(EAGAIN)
     }
 
     fn sys_splice(
@@ -1750,7 +1947,7 @@ impl SyscallDispatcher {
             .map_err(|_| EFAULT)?;
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
         let target = match path.as_str() {
-            "/proc/self/exe" => String::from("/bin/init"),
+            "/proc/self/exe" => procs.current()?.name.clone(),
             "/proc/self/cwd" => cwd.clone(),
             _ => vfs.read_link(&cwd, &path)?,
         };
@@ -1775,22 +1972,17 @@ impl SyscallDispatcher {
             .read_user_cstr(args.0[1])
             .map_err(|_| EFAULT)?;
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
-        let trace_du = BUSYBOX_APPLETS
-            .lock()
-            .get(&procs.current_tgid()?)
-            .is_some_and(|applet| applet == "du");
-        let stat = match vfs.stat_path(&cwd, &path) {
-            Ok(stat) => stat,
-            Err(err) => {
-                if trace_du {
-                    trace_enosys(&format!(
-                        "whuse: du fstatat fail path={} errno={}",
-                        path, err
-                    ));
-                }
-                return Err(err);
-            }
-        };
+        let stat = vfs.stat_path(&cwd, &path)?;
+        if matches!(
+            BUSYBOX_APPLETS
+                .lock()
+                .get(&procs.current_tgid()?)
+                .map(|s| s.as_str()),
+            Some("du")
+        ) {
+            trace_line(&format!("whuse: du fstatat path={} ok", path));
+        }
+
         procs
             .current_mut()?
             .write_user_bytes(args.0[2], &stat_to_bytes(stat))
@@ -1846,12 +2038,41 @@ impl SyscallDispatcher {
             args.0[0]
         };
         let sig = args.0[1];
+        log_always(&format!(
+            "whuse-debug: kill/tkill target={} sig={} caller_tid={}",
+            pid,
+            sig,
+            procs.current_tid().unwrap_or(0)
+        ));
         if sig > 64 {
             return Err(EINVAL);
         }
         if sig != 0 {
             procs.deliver_signal(pid, sig)?;
             let _ = scheduler.wake_task(pid);
+        }
+        Ok(0)
+    }
+
+    fn sys_tgkill(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        scheduler: &mut Scheduler,
+    ) -> Result<usize, i32> {
+        let tgid = args.0[0];
+        let tid = args.0[1];
+        let sig = args.0[2];
+        log_always(&format!(
+            "whuse-debug: tgkill tgid={} tid={} sig={}",
+            tgid, tid, sig
+        ));
+        if sig > 64 {
+            return Err(EINVAL);
+        }
+        if sig != 0 {
+            procs.deliver_signal(tid, sig)?;
+            let _ = scheduler.wake_task(tid);
         }
         Ok(0)
     }
@@ -1898,21 +2119,82 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
-    fn sys_rt_sigtimedwait(
+    pub(crate) fn sys_rt_sigtimedwait(
         &self,
         args: SyscallArgs,
         procs: &mut ProcessTable,
+        scheduler: &mut Scheduler,
     ) -> Result<usize, i32> {
-        if args.0[2] != 0 {
-            return Err(ENOSYS);
+        let set_ptr = args.0[0];
+        let info_ptr = args.0[1];
+        let timeout_ptr = args.0[2];
+        let sigsetsize = args.0[3];
+
+        if sigsetsize != 8 {
+            return Err(EINVAL);
         }
-        let Some(signal) = procs.dequeue_unmasked_signal()? else {
+
+        let mut set = [0u8; 8];
+        procs
+            .current()?
+            .read_user_bytes(set_ptr, 8)
+            .map(|bytes| set.copy_from_slice(&bytes))
+            .map_err(|_| EFAULT)?;
+        let wait_mask = u64::from_le_bytes(set);
+
+        let mut found_signal = None;
+        {
+            let process = procs.current_mut()?;
+            let matching = process.pending_signals & wait_mask;
+            if matching != 0 {
+                let signal = matching.trailing_zeros() as usize + 1;
+                process.pending_signals &= !(1u64 << (signal - 1));
+                found_signal = Some(signal);
+            }
+        }
+
+        let now = hal().timer.monotonic_nanos();
+        if found_signal.is_none() {
+            let process = procs.current_mut()?;
+            let pending_unmasked = process.pending_signals & !process.signal_mask;
+            if pending_unmasked != 0 {
+                process.sleep_deadline_ns = None;
+                return Err(EINTR);
+            }
+
+            if process.sleep_deadline_ns.is_none() {
+                if timeout_ptr != 0 {
+                    let requested = read_timespec_ns(process, timeout_ptr)?;
+                    if requested == 0 {
+                        return Err(EAGAIN);
+                    }
+                    process.sleep_deadline_ns = Some(now.saturating_add(requested));
+                } else {
+                    process.sleep_deadline_ns = Some(u64::MAX);
+                }
+                process.sleep_absolute = false;
+            }
+
+            let deadline = process.sleep_deadline_ns.unwrap();
+
+            if now < deadline {
+                let _ = scheduler.block_current();
+                return Err(EAGAIN);
+            }
+
+            process.sleep_deadline_ns = None;
             return Err(EAGAIN);
-        };
-        if args.0[1] != 0 {
+        }
+
+        procs.current_mut()?.sleep_deadline_ns = None;
+        let signal = found_signal.unwrap();
+
+        if info_ptr != 0 {
+            let mut info = [0u8; 128];
+            info[0] = signal as u8;
             procs
                 .current_mut()?
-                .write_user_bytes(args.0[1], &[0; 128])
+                .write_user_bytes(info_ptr, &info)
                 .map_err(|_| EFAULT)?;
         }
         Ok(signal)
@@ -2217,14 +2499,14 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         scheduler: &mut Scheduler,
     ) -> Result<usize, i32> {
-        const FUTEX_WAIT: usize = 0;
-        const FUTEX_WAKE: usize = 1;
-        const FUTEX_WAIT_BITSET: usize = 9;
-        const FUTEX_WAKE_BITSET: usize = 10;
-        const FUTEX_REQUEUE: usize = 3;
-        const FUTEX_CMP_REQUEUE: usize = 4;
         let uaddr = args.0[0];
         let op = args.0[1] & 0x7f;
+        trace_line(&format!(
+            "whuse: futex tgid={} op={} uaddr=0x{:x}",
+            procs.current_tgid().unwrap_or(0),
+            op,
+            uaddr
+        ));
         let val = args.0[2] as i32;
         match op {
             FUTEX_WAIT | FUTEX_WAIT_BITSET => {
@@ -2235,10 +2517,27 @@ impl SyscallDispatcher {
                     procs.current()?.futex_wait_deadline_ns,
                 ) {
                     if wait_addr == uaddr {
+                        let pending =
+                            procs.current()?.pending_signals & !procs.current()?.signal_mask;
+                        if pending != 0 || procs.current()?.signal_frame_pending {
+                            procs.remove_futex_waiter_at(wait_addr, tid);
+                            let process = procs.current_mut()?;
+                            process.futex_wait_addr = None;
+                            process.futex_wait_deadline_ns = None;
+                            log_always(&format!(
+                                "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x}",
+                                tid, wait_addr, pending
+                            ));
+                            return Err(EINTR);
+                        }
                         if !procs.is_futex_waiting(wait_addr, tid) {
                             let process = procs.current_mut()?;
                             process.futex_wait_addr = None;
                             process.futex_wait_deadline_ns = None;
+                            log_always(&format!(
+                                "whuse-debug: FUTEX_WAIT woke(remove) tid={} addr={:#x}",
+                                tid, wait_addr
+                            ));
                             return Ok(0);
                         }
                         if deadline != u64::MAX && now >= deadline {
@@ -2257,8 +2556,20 @@ impl SyscallDispatcher {
                         process.futex_wait_deadline_ns = None;
                     }
                 }
+                let pending = procs.current()?.pending_signals & !procs.current()?.signal_mask;
+                if pending != 0 || procs.current()?.signal_frame_pending {
+                    log_always(&format!(
+                        "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={}",
+                        tid, uaddr, pending, procs.current()?.signal_frame_pending
+                    ));
+                    return Err(EINTR);
+                }
                 let current = read_i32(procs.current()?, uaddr)?;
                 if current != val {
+                    log_always(&format!(
+                        "whuse-debug: FUTEX_WAIT EAGAIN tid={} uaddr={:#x} cur={} val={}",
+                        tid, uaddr, current, val
+                    ));
                     Err(EAGAIN)
                 } else {
                     let timeout_ptr = args.0[3];
@@ -2267,6 +2578,13 @@ impl SyscallDispatcher {
                     } else {
                         now.saturating_add(read_timespec_ns(procs.current()?, timeout_ptr)?)
                     };
+                    log_always(&format!(
+                        "whuse-debug: FUTEX_WAIT tid={} uaddr={:#x} val={} sfp={}",
+                        tid,
+                        uaddr,
+                        val,
+                        procs.current()?.signal_frame_pending
+                    ));
                     procs.enqueue_futex_waiter(uaddr, tid);
                     {
                         let process = procs.current_mut()?;
@@ -2305,6 +2623,62 @@ impl SyscallDispatcher {
                     let _ = scheduler.wake_task(*tid);
                 }
                 Ok(moved.len())
+            }
+            FUTEX_WAKE_OP => {
+                let uaddr2 = args.0[4];
+                let val2 = args.0[5] as usize;
+                let val3 = args.0[3] as u32;
+                let op = (val3 >> 28) & 0xf;
+                let cmp = (val3 >> 24) & 0xf;
+                let oparg = (val3 >> 12) & 0xfff;
+                let cmparg = val3 & 0xfff;
+
+                let oldval = read_i32(procs.current()?, uaddr2)?;
+                let newval = match op {
+                    0 => oparg as i32,
+                    1 => oldval.wrapping_add(oparg as i32),
+                    2 => oldval | (oparg as i32),
+                    3 => oldval & !(oparg as i32),
+                    4 => oldval ^ (oparg as i32),
+                    _ => return Err(EINVAL),
+                };
+                procs
+                    .current_mut()?
+                    .write_user_bytes(uaddr2, &newval.to_le_bytes())
+                    .map_err(|_| EFAULT)?;
+
+                let wake_count = val.max(0) as usize;
+                let woke = procs.wake_futex(uaddr, wake_count);
+                for tid in &woke {
+                    if let Ok(process) = procs.find_by_tid_mut(*tid) {
+                        process.futex_wait_addr = None;
+                        process.futex_wait_deadline_ns = None;
+                    }
+                    let _ = scheduler.wake_task(*tid);
+                }
+
+                let condition = match cmp {
+                    0 => oldval == cmparg as i32,
+                    1 => oldval != cmparg as i32,
+                    2 => oldval < cmparg as i32,
+                    3 => oldval <= cmparg as i32,
+                    4 => oldval > cmparg as i32,
+                    5 => oldval >= cmparg as i32,
+                    _ => return Err(EINVAL),
+                };
+                if condition {
+                    let woke2 = procs.wake_futex(uaddr2, val2);
+                    for tid in &woke2 {
+                        if let Ok(process) = procs.find_by_tid_mut(*tid) {
+                            process.futex_wait_addr = None;
+                            process.futex_wait_deadline_ns = None;
+                        }
+                        let _ = scheduler.wake_task(*tid);
+                    }
+                    Ok(woke.len() + woke2.len())
+                } else {
+                    Ok(woke.len())
+                }
             }
             _ => Err(ENOSYS),
         }
@@ -2632,13 +3006,29 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs
-            .current()?
-            .read_user_cstr(args.0[1])
-            .map_err(|_| EFAULT)?;
-        let cwd = procs.current()?.cwd.clone();
+        const AT_EMPTY_PATH: usize = 0x1000;
+        let dirfd = args.0[0] as i32;
+        let path_ptr = args.0[1];
         let _times = args.0[2];
-        let _flags = args.0[3];
+        let flags = args.0[3];
+        // If path pointer is null, treat as empty path.
+        let path = if path_ptr == 0 {
+            String::new()
+        } else {
+            procs
+                .current()?
+                .read_user_cstr(path_ptr)
+                .map_err(|_| EFAULT)?
+        };
+        if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+            // Operate on the fd directly. We don't track timestamps, so just
+            // validate that the fd exists and return success.
+            if dirfd != AT_FDCWD {
+                let _ = procs.current()?.fd(dirfd)?;
+            }
+            return Ok(0);
+        }
+        let cwd = procs.current()?.cwd.clone();
         vfs.access(&cwd, &path)?;
         Ok(0)
     }
@@ -2830,7 +3220,13 @@ impl SyscallDispatcher {
             if let Some(ptr) = remain_ptr {
                 procs
                     .current_mut()?
-                    .write_user_bytes(ptr, &timespec_to_bytes(Timespec { tv_sec: 0, tv_nsec: 0 }))
+                    .write_user_bytes(
+                        ptr,
+                        &timespec_to_bytes(Timespec {
+                            tv_sec: 0,
+                            tv_nsec: 0,
+                        }),
+                    )
                     .map_err(|_| EFAULT)?;
             }
         }
@@ -2904,8 +3300,51 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
-    fn sys_rt_sigreturn(&self) -> Result<usize, i32> {
-        Ok(0)
+    fn sys_rt_sigreturn(&self, procs: &mut ProcessTable) -> Result<usize, i32> {
+        const FRAME_SIZE: usize = 832;
+        const UCONTEXT_OFF: usize = 128;
+        const UC_SIGMASK_OFF: usize = UCONTEXT_OFF + 40;
+        const MCTX_OFF: usize = UCONTEXT_OFF + 168;
+        const FCSR_OFF: usize = MCTX_OFF + 32 * 8;
+
+        let process = procs.current_mut().map_err(|_| ESRCH)?;
+        let frame_sp = process.trap_frame.regs[2];
+
+        let frame = process
+            .read_user_bytes(frame_sp, FRAME_SIZE)
+            .map_err(|_| EFAULT)?;
+
+        let read_u64 = |off: usize| -> u64 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&frame[off..off + 8]);
+            u64::from_le_bytes(b)
+        };
+
+        let saved_mask = read_u64(UC_SIGMASK_OFF);
+        let saved_pc = read_u64(MCTX_OFF) as usize;
+        let saved_fcsr = read_u64(FCSR_OFF) as usize;
+
+        log_always(&format!(
+            "whuse-debug: rt_sigreturn tid={} sfp={} saved_pc={:#x}",
+            process.tid, process.signal_frame_pending, saved_pc
+        ));
+        process.signal_mask = saved_mask;
+        process.signal_frame_pending = false;
+        process.trap_frame.sepc = saved_pc;
+        #[cfg(target_arch = "riscv64")]
+        {
+            process.trap_frame.fcsr = saved_fcsr;
+        }
+        let _ = saved_fcsr;
+
+        for i in 1usize..32 {
+            let off = MCTX_OFF + i * 8;
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&frame[off..off + 8]);
+            process.trap_frame.regs[i] = usize::from_le_bytes(b);
+        }
+
+        Ok(process.trap_frame.regs[10])
     }
 
     fn sys_getpriority(&self) -> Result<usize, i32> {
@@ -3032,7 +3471,8 @@ impl SyscallDispatcher {
         if !matches!(family, 1 | 2 | 10) {
             return Err(EAFNOSUPPORT);
         }
-        if sock_type != 1 {
+        // Accept SOCK_STREAM (1) and SOCK_DGRAM (2); reject everything else.
+        if !matches!(sock_type, 1 | 2) {
             return Err(EPROTOTYPE);
         }
         let handle = vfs.create_socket()?;
@@ -4072,6 +4512,7 @@ mod tests {
         fn switch_address_space(&self, _token: VmSpaceToken) {}
         fn wait_for_interrupt(&self) {}
         fn run_user(&self, _frame: &mut TrapFrame) {}
+        fn set_kernel_timer_callback(&self, _cb: fn()) {}
     }
 
     impl HalMemory for TestMemory {
@@ -4634,7 +5075,7 @@ mod tests {
                 &mut scheduler,
                 &mut vfs,
             ),
-            0
+            -11
         );
         assert_eq!(scheduler.current_thread_id(), Some(thread_tid));
         assert_eq!(

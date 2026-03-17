@@ -92,6 +92,7 @@ pub trait HalCpu: Send + Sync {
     fn switch_address_space(&self, token: VmSpaceToken);
     fn wait_for_interrupt(&self);
     fn run_user(&self, frame: &mut TrapFrame);
+    fn set_kernel_timer_callback(&self, cb: fn());
 }
 
 pub trait HalMemory: Send + Sync {

@@ -41,7 +41,7 @@ const PROC_UPTIME: &[u8] = b"1.00 1.00\n";
 const PROC_STAT: &[u8] = b"cpu  1 0 1 1 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 1735689600\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n";
 const PROC_VERSION: &[u8] = b"Linux version 6.8.0-whuse (whuse@localdomain) #1 SMP PREEMPT\n";
 const PROC_SELF_STAT: &[u8] = b"1 (self) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 1 4096 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
-const EXT4_DIR_STAT_CACHE_MAX_SIZE: u64 = 16 * 1024;
+const EXT4_DIR_STAT_CACHE_MAX_SIZE: u64 = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeKind {
@@ -380,7 +380,7 @@ impl KernelVfs {
             }
             NodeData::Ext4Dir(state) => {
                 let entries = if let Some(entries) = &state.entries {
-                    entries.clone()
+                    Arc::clone(entries)
                 } else {
                     let entries = if state.size <= EXT4_DIR_STAT_CACHE_MAX_SIZE {
                         state
@@ -409,7 +409,7 @@ impl KernelVfs {
                             .collect::<Vec<_>>()
                     };
                     let entries = Arc::new(entries);
-                    state.entries = Some(entries.clone());
+                    state.entries = Some(Arc::clone(&entries));
                     entries
                 };
                 let Some(remaining) = entries.get(start..) else {
@@ -940,6 +940,8 @@ impl KernelVfs {
         if let Some(stat) = self.external_stat_cache.get(absolute) {
             return Ok(Some(*stat));
         }
+        // hal_api::hal().console.put_byte(b'M'); // Mark a miss if needed, or use full trace
+
         let Some((mount, fs_path)) = self.resolve_external_path(absolute) else {
             return Ok(None);
         };
@@ -1076,7 +1078,7 @@ impl KernelVfs {
         name: &str,
         stat: fs_ext4::Ext4FileStat,
     ) {
-        let absolute = join_absolute_path(dir_absolute, name);
+        let absolute = normalize_path(dir_absolute, name);
         self.external_stat_cache.insert(
             absolute,
             FileStat {
@@ -1645,13 +1647,7 @@ fn external_mount_path(target: &str, absolute: &str) -> Option<String> {
         .map(|suffix| format!("/{}", suffix))
 }
 
-fn join_absolute_path(dir: &str, name: &str) -> String {
-    if dir == "/" {
-        format!("/{}", name)
-    } else {
-        format!("{}/{}", dir.trim_end_matches('/'), name)
-    }
-}
+
 
 fn append_dirent(out: &mut Vec<u8>, index: usize, name: &str, file_type: u8) {
     let reclen = align_up(19 + name.len() + 1, 8) as u16;

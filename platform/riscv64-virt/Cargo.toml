@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 hal-riscv64-virt = { path = "../../crates/hal-riscv64-virt" }
+hal-api = { path = "../../crates/hal-api" }
 kernel-core = { path = "../../crates/kernel-core" }
+spin = "0.9"
 
 [[bin]]
 name = "whuse-riscv64-virt"

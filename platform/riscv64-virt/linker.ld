@@ -29,6 +29,8 @@ SECTIONS
     *(COMMON)
   } > RAM
 
+  PROVIDE(end = .);
+
   /DISCARD/ : {
     *(.eh_frame)
     *(.eh_frame_hdr)

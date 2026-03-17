@@ -135,6 +135,7 @@ struct AddressSpaceInner {
     program_break: usize,
     next_mapping_base: usize,
     page_table: Option<PageTableSpace>,
+    dirty: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -181,21 +182,26 @@ impl BinaryLoader for ElfBinaryLoader {
 
 impl AddressSpace {
     pub fn new_user() -> Self {
-        let mut inner = AddressSpaceInner {
+        let inner = AddressSpaceInner {
             token: VmSpaceToken(0),
             mappings: BTreeMap::new(),
             program_break: USER_HEAP_BASE,
             next_mapping_base: USER_MMAP_BASE,
             page_table: None,
+            dirty: true,
         };
-        inner.rebuild_page_table();
         Self {
             inner: alloc::sync::Arc::new(Mutex::new(inner)),
         }
     }
 
     pub fn token(&self) -> VmSpaceToken {
-        self.inner.lock().token
+        let mut inner = self.inner.lock();
+        if inner.dirty {
+            inner.rebuild_page_table();
+            inner.dirty = false;
+        }
+        inner.token
     }
 
     pub fn map_anonymous(&self, len: usize, prot: usize) -> KernelResult<usize> {
@@ -287,11 +293,8 @@ impl AddressSpace {
             return Err(EINVAL);
         }
         let aligned = align_up(len, PAGE_SIZE);
-        let mut inner = self.inner.lock();
-        if !range_fully_mapped(&inner.mappings, addr, aligned) {
-            return Err(EINVAL);
-        }
         let end = addr.checked_add(aligned).ok_or(EINVAL)?;
+        let mut inner = self.inner.lock();
         let keys = inner.mappings.keys().copied().collect::<Vec<_>>();
         for key in keys {
             let Some(segment) = inner.mappings.remove(&key) else {
@@ -322,7 +325,7 @@ impl AddressSpace {
                 inner.mappings.insert(right.area.start, right);
             }
         }
-        inner.rebuild_page_table();
+        inner.dirty = true;
         Ok(())
     }
 
@@ -360,7 +363,7 @@ impl AddressSpace {
         inner.mappings.clear();
         inner.program_break = USER_HEAP_BASE;
         inner.next_mapping_base = USER_MMAP_BASE;
-        inner.rebuild_page_table();
+        inner.dirty = true;
     }
 
     pub fn read_bytes(&self, addr: usize, len: usize) -> KernelResult<Vec<u8>> {
@@ -407,13 +410,33 @@ impl AddressSpace {
     }
 
     pub fn read_cstr(&self, addr: usize) -> KernelResult<String> {
+        const MAX_STR_LEN: usize = 16 * PAGE_SIZE;
         let mut out = Vec::new();
-        for offset in 0..PAGE_SIZE {
-            let byte = self.read_bytes(addr + offset, 1)?[0];
-            if byte == 0 {
+        let mut offset = 0usize;
+        while offset < MAX_STR_LEN {
+            let page_offset = (addr + offset) & (PAGE_SIZE - 1);
+            let chunk_len = (PAGE_SIZE - page_offset).min(MAX_STR_LEN - offset);
+            let chunk = {
+                let mut result = self.read_bytes(addr + offset, chunk_len);
+                if result.is_err() && chunk_len > 1 {
+                    result = self.read_bytes(addr + offset, 1);
+                }
+                match result {
+                    Ok(c) => c,
+                    Err(_) => {
+                        if out.is_empty() {
+                            return Err(EFAULT);
+                        }
+                        break;
+                    }
+                }
+            };
+            if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+                out.extend_from_slice(&chunk[..nul]);
                 return String::from_utf8(out).map_err(|_| EFAULT);
             }
-            out.push(byte);
+            out.extend_from_slice(&chunk);
+            offset += chunk.len();
         }
         Err(EFAULT)
     }
@@ -445,16 +468,13 @@ impl AddressSpace {
             );
         }
         Self {
-            inner: alloc::sync::Arc::new(Mutex::new({
-                let mut cloned = AddressSpaceInner {
-                    token: VmSpaceToken(0),
-                    mappings,
-                    program_break: inner.program_break,
-                    next_mapping_base: inner.next_mapping_base,
-                    page_table: None,
-                };
-                cloned.rebuild_page_table();
-                cloned
+            inner: alloc::sync::Arc::new(Mutex::new(AddressSpaceInner {
+                token: VmSpaceToken(0),
+                mappings,
+                program_break: inner.program_break,
+                next_mapping_base: inner.next_mapping_base,
+                page_table: None,
+                dirty: true,
             })),
         }
     }
@@ -561,7 +581,7 @@ impl AddressSpace {
             unmap_range_inner(&mut inner, segment.area.start, segment.area.len)?;
         }
         inner.mappings.insert(segment.area.start, segment);
-        inner.rebuild_page_table();
+        inner.dirty = true;
         Ok(())
     }
 }
@@ -1047,7 +1067,7 @@ fn find_phdr_vaddr(header: &ElfHeader, image: &[u8]) -> KernelResult<usize> {
         let delta = phoff - ph.offset;
         return ph.vaddr.checked_add(delta).ok_or(ENOEXEC);
     }
-    Err(ENOEXEC)
+    Ok(0)
 }
 
 fn overlaps(mappings: &BTreeMap<usize, Segment>, start: usize, len: usize) -> bool {
@@ -1117,7 +1137,7 @@ fn unmap_range_inner(inner: &mut AddressSpaceInner, start: usize, len: usize) ->
         }
     }
     if changed {
-        inner.rebuild_page_table();
+        inner.dirty = true;
     }
     Ok(())
 }

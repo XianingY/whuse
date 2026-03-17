@@ -136,6 +136,16 @@ pub struct Process {
     pub epoll_wait_deadline_ns: Option<u64>,
     pub sigsuspend_saved_mask: Option<u64>,
     pub is_thread: bool,
+    /// Set to true when a signal frame has been dispatched into the thread's
+    /// trap frame (sepc redirected to signal handler) but the handler has not
+    /// yet returned via rt_sigreturn.  Any FUTEX_WAIT entered while this flag
+    /// is true must return -EINTR so the pending handler can actually run.
+    pub signal_frame_pending: bool,
+    /// Set to true when SIGCANCEL (sig 33) is dispatched to this thread.
+    /// Never cleared — once a thread is being cancelled it must never block
+    /// indefinitely in FUTEX_WAIT, because it needs to run its pthread_exit
+    /// path to completion.  FUTEX_WAIT returns -EINTR when this flag is set.
+    pub cancellation_pending: bool,
 }
 
 pub struct ProcessTable {
@@ -190,6 +200,8 @@ impl Process {
             epoll_wait_deadline_ns: None,
             sigsuspend_saved_mask: None,
             is_thread: false,
+            signal_frame_pending: false,
+            cancellation_pending: false,
         }
     }
 
@@ -270,7 +282,9 @@ impl Process {
         let peers = self
             .fd_alias
             .iter()
-            .filter_map(|(candidate, mapped_leader)| (*mapped_leader == leader).then_some(*candidate))
+            .filter_map(|(candidate, mapped_leader)| {
+                (*mapped_leader == leader).then_some(*candidate)
+            })
             .collect::<Vec<_>>();
         for peer in peers {
             if let Some(handle) = self.fds.get_mut(&peer) {
@@ -374,6 +388,8 @@ impl Process {
             epoll_wait_deadline_ns: None,
             sigsuspend_saved_mask: None,
             is_thread: false,
+            signal_frame_pending: false,
+            cancellation_pending: false,
         }
     }
 
@@ -426,6 +442,8 @@ impl Process {
             epoll_wait_deadline_ns: None,
             sigsuspend_saved_mask: None,
             is_thread: false,
+            signal_frame_pending: false,
+            cancellation_pending: false,
         }
     }
 
@@ -489,6 +507,8 @@ impl Process {
             epoll_wait_deadline_ns: None,
             sigsuspend_saved_mask: None,
             is_thread: true,
+            signal_frame_pending: false,
+            cancellation_pending: false,
         }
     }
 
@@ -1103,6 +1123,104 @@ impl ProcessTable {
                 is_thread: process.is_thread,
             })
             .collect()
+    }
+
+    pub fn all_blocked_are_futex_waiters(&self, blocked_tids: &[usize]) -> bool {
+        if blocked_tids.is_empty() {
+            return false;
+        }
+        blocked_tids.iter().all(|tid| {
+            self.processes
+                .get(tid)
+                .is_some_and(|p| p.futex_wait_addr.is_some())
+        })
+    }
+
+    pub fn futex_blocked_with_pending_signal_tids(&self) -> Vec<usize> {
+        self.processes
+            .values()
+            .filter(|p| {
+                p.futex_wait_addr.is_some()
+                    && (p.pending_signals & !p.signal_mask) != 0
+                    && p.state != ProcessState::Exited
+            })
+            .map(|p| p.tid)
+            .collect()
+    }
+
+    pub fn tgids_with_all_threads_futex_blocked(&self) -> Vec<usize> {
+        static mut CHECK_COUNT: usize = 0;
+        unsafe {
+            CHECK_COUNT += 1;
+            if CHECK_COUNT % 50 == 0 {
+                for b in b"[CHK50]" {
+                    hal_api::hal().console.put_byte(*b);
+                }
+                for p in self.processes.values() {
+                    if p.tgid == 124 {
+                        for b in alloc::format!(
+                            " T{}F{}",
+                            p.tid,
+                            if p.futex_wait_addr.is_some() { 1 } else { 0 }
+                        )
+                        .bytes()
+                        {
+                            hal_api::hal().console.put_byte(b);
+                        }
+                    }
+                }
+                for b in b"\n" {
+                    hal_api::hal().console.put_byte(*b);
+                }
+            }
+        }
+
+        let mut tgid_thread_counts: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+        for p in self.processes.values() {
+            if p.state == ProcessState::Exited {
+                continue;
+            }
+            let entry = tgid_thread_counts.entry(p.tgid).or_insert((0, 0));
+            entry.0 += 1;
+            if p.futex_wait_addr.is_some() {
+                entry.1 += 1;
+            }
+        }
+
+        tgid_thread_counts
+            .into_iter()
+            .filter_map(|(tgid, (total, futex))| {
+                if total > 1 && futex == total {
+                    if tgid == 124 {
+                        for b in b"DEADLOCK-124!\n" {
+                            hal_api::hal().console.put_byte(*b);
+                        }
+                    }
+                    Some(tgid)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn tids_in_tgid_with_futex_wait(&self, tgid: usize) -> Vec<usize> {
+        self.processes
+            .values()
+            .filter(|p| p.tgid == tgid && p.futex_wait_addr.is_some())
+            .map(|p| p.tid)
+            .collect()
+    }
+
+    pub fn clear_futex_wait_state(&mut self, tid: usize) {
+        let addr = self.processes.get_mut(&tid).and_then(|p| {
+            let a = p.futex_wait_addr.take();
+            p.futex_wait_deadline_ns = None;
+            a
+        });
+        if let Some(addr) = addr {
+            self.remove_futex_waiter_at(addr, tid);
+        }
     }
 
     pub fn timed_wait_expired_tids(&self, now_ns: u64) -> Vec<usize> {

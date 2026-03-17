@@ -291,8 +291,10 @@ dependencies = [
 name = "whuse-riscv64-virt"
 version = "0.1.0"
 dependencies = [
+ "hal-api",
  "hal-riscv64-virt",
  "kernel-core",
+ "spin",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicU64, Ordering};
 use fs_ext4::Ext4Mount;
 use hal_api::{hal, ConsoleWriter, PlatformArch};
 use mm::MemoryManager;
@@ -15,8 +16,10 @@ use mm::{BinaryLoader, ElfBinaryLoader};
 use proc::ProcessTable;
 use syscall::cache_busybox_image;
 use syscall::{
-    SyscallArgs, SyscallDispatcher, SYS_CLOCK_NANOSLEEP, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2,
-    SYS_EXECVE, SYS_FUTEX, SYS_NANOSLEEP, SYS_READ, SYS_READV, SYS_RT_SIGSUSPEND, SYS_WAIT,
+    SyscallArgs, SyscallDispatcher, SIGNAL_TRAMPOLINE_BASE, SIGNAL_TRAMPOLINE_CODE,
+    SYS_CLOCK_NANOSLEEP, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2, SYS_EXECVE, SYS_FUTEX, SYS_NANOSLEEP,
+    SYS_PPOLL, SYS_PSELECT6, SYS_READ, SYS_READV, SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND,
+    SYS_RT_SIGTIMEDWAIT, SYS_WAIT,
 };
 use task::Scheduler;
 use vfs::{KernelVfs, O_RDWR};
@@ -201,17 +204,6 @@ const OSCOMP_BUSYBOX_COMPAT_SCRIPT: &str = concat!(
     "    if [ -z \"$line\" ]; then\n",
     "        continue\n",
     "    fi\n",
-    "    case \"$line\" in\n",
-    "        date|\"date \"|dmesg|\"dmesg \"|du|\"du \"|hwclock*)\n",
-    "            echo \"testcase busybox $line fail\"\n",
-    "            continue\n",
-    "            ;;\n",
-    "        expr*)\n",
-    "            echo \"testcase busybox $line fail\"\n",
-    "            echo \"#### OS COMP TEST GROUP END busybox-musl ####\"\n",
-    "            exit 0\n",
-    "            ;;\n",
-    "    esac\n",
     "    eval \"./busybox $line\" <&-\n",
     "    RTN=$?\n",
     "    if [ \"$RTN\" -ne 0 ] && [ \"$line\" != \"false\" ]; then\n",
@@ -224,7 +216,7 @@ const OSCOMP_BUSYBOX_COMPAT_SCRIPT: &str = concat!(
 );
 const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "set +e\n",
-    "WHUSE_OSCOMP_COMPAT=${WHUSE_OSCOMP_COMPAT:-1}\n",
+    "WHUSE_OSCOMP_COMPAT=${WHUSE_OSCOMP_COMPAT:-0}\n",
     "WHUSE_HAVE_TIMEOUT=0\n",
     "if /musl/busybox timeout 1 /musl/busybox true >/tmp/whuse-timeout-probe.log 2>&1; then\n",
     "    WHUSE_HAVE_TIMEOUT=1\n",
@@ -361,6 +353,19 @@ const OSCOMP_SUITE_CMD: &str = concat!(
     "if [ -x /musl/basic/exit ]; then exec /musl/basic/exit; fi; ",
     "echo whuse-oscomp-exit-missing; exit 0;",
 );
+
+static KERNEL_IDLE_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+
+fn kernel_idle_timer_cb() {
+    let count = KERNEL_IDLE_TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = hal().timer.monotonic_nanos();
+    hal()
+        .timer
+        .program_oneshot(now.saturating_add(SCHED_TIME_SLICE_NS));
+    if count <= 5 || count % 100 == 0 {
+        logln(format_args!("[IDLE-TMR:{}]", count));
+    }
+}
 
 impl Kernel {
     pub fn bootstrap(info: BootInfo) -> Self {
@@ -513,12 +518,24 @@ impl Kernel {
             timer_irq_count: 0,
         };
         logln(format_args!("whuse: init process bootstrapped"));
+        hal().cpu.set_kernel_timer_callback(kernel_idle_timer_cb);
         kernel
     }
 
     pub fn run_forever(&mut self) -> ! {
         logln(format_args!("whuse: entering scheduler loop"));
+        static mut LOOP_COUNT: usize = 0;
         loop {
+            unsafe {
+                LOOP_COUNT += 1;
+                if LOOP_COUNT == 1000
+                    || LOOP_COUNT == 5000
+                    || (LOOP_COUNT >= 10000 && LOOP_COUNT % 10000 == 0 && LOOP_COUNT <= 100000)
+                {
+                    logln(format_args!("[LOOP:{}]", LOOP_COUNT));
+                }
+            }
+
             if self.enforce_oscomp_watchdog() {
                 continue;
             }
@@ -529,7 +546,60 @@ impl Kernel {
                     .iter()
                     .any(|process| process.tgid > 1 && !process.is_thread);
                 if has_non_init {
-                    // Keep watchdog progress alive even when runnable queue is empty.
+                    static mut SPIN_LOG_COUNT: usize = 0;
+                    unsafe {
+                        SPIN_LOG_COUNT += 1;
+                        if SPIN_LOG_COUNT == 1000
+                            || SPIN_LOG_COUNT == 5000
+                            || (SPIN_LOG_COUNT >= 10000
+                                && SPIN_LOG_COUNT % 10000 == 0
+                                && SPIN_LOG_COUNT <= 100000)
+                        {
+                            logln(format_args!("[SPIN:{}]", SPIN_LOG_COUNT));
+                        }
+                    }
+                    let idle_ticks = KERNEL_IDLE_TIMER_TICKS.swap(0, Ordering::Relaxed);
+                    if idle_ticks > 0 {
+                        self.timer_irq_count = self.timer_irq_count.saturating_add(idle_ticks);
+                        let now = hal().timer.monotonic_nanos();
+                        for tid in self.processes.timed_wait_expired_tids(now) {
+                            let _ = self.scheduler.wake_task(tid);
+                        }
+                        if self.scheduler.ready_count() == 0 && self.scheduler.blocked_count() > 0 {
+                            let blocked_tids = self.scheduler.blocked_task_ids();
+                            let all_futex =
+                                self.processes.all_blocked_are_futex_waiters(&blocked_tids);
+                            logln(format_args!(
+                                "whuse: idle-tick ready=0 blocked={} all_futex={}",
+                                blocked_tids.len(),
+                                all_futex
+                            ));
+                            if all_futex {
+                                logln(format_args!(
+                                    "whuse: idle-timer futex deadlock, force-waking {} tasks",
+                                    blocked_tids.len()
+                                ));
+                                for tid in &blocked_tids {
+                                    self.processes.clear_futex_wait_state(*tid);
+                                }
+                                let _ = self.scheduler.wake_all_blocked();
+                            }
+                        }
+                        let signal_blocked =
+                            self.processes.futex_blocked_with_pending_signal_tids();
+                        if !signal_blocked.is_empty() {
+                            logln(format_args!(
+                                "whuse: idle-tick signal-wake {:?}",
+                                signal_blocked
+                            ));
+                        }
+                        for tid in signal_blocked {
+                            self.processes.clear_futex_wait_state(tid);
+                            let _ = self.scheduler.wake_task(tid);
+                        }
+                        continue;
+                    }
+                    hal().cpu.enable_interrupts();
                     core::hint::spin_loop();
                     continue;
                 }
@@ -754,12 +824,33 @@ impl Kernel {
         }
         if is_timer_interrupt {
             self.timer_irq_count = self.timer_irq_count.saturating_add(1);
+
+            if self.timer_irq_count >= 6 && self.timer_irq_count <= 20 {
+                logln(format_args!("[TMR-EVERY:{}]", self.timer_irq_count));
+            }
+
+            if self.timer_irq_count >= 10 && self.timer_irq_count <= 50 {
+                logln(format_args!("[TMR:{}]", self.timer_irq_count));
+            }
+
+            if self.timer_irq_count >= 190 && self.timer_irq_count <= 250 {
+                logln(format_args!("[TMR-LATE:{}]", self.timer_irq_count));
+            }
+
             if self.timer_irq_count <= 5 || self.timer_irq_count % 1024 == 0 {
                 logln(format_args!(
                     "whuse: timer interrupt preemption active count={}",
                     self.timer_irq_count
                 ));
             }
+
+            if self.timer_irq_count >= 250 && self.timer_irq_count <= 400 {
+                logln(format_args!(
+                    "whuse-timer-probe: count={}",
+                    self.timer_irq_count
+                ));
+            }
+
             let next_deadline = hal()
                 .timer
                 .monotonic_nanos()
@@ -769,6 +860,84 @@ impl Kernel {
             for tid in self.processes.timed_wait_expired_tids(now) {
                 let _ = self.scheduler.wake_task(tid);
             }
+
+            if self.scheduler.ready_count() == 0 && self.scheduler.blocked_count() > 0 {
+                let blocked_tids = self.scheduler.blocked_task_ids();
+                if self.processes.all_blocked_are_futex_waiters(&blocked_tids) {
+                    logln(format_args!(
+                        "whuse: futex deadlock detected, force-waking {} blocked tasks",
+                        blocked_tids.len()
+                    ));
+                    for tid in &blocked_tids {
+                        self.processes.clear_futex_wait_state(*tid);
+                    }
+                    let _ = self.scheduler.wake_all_blocked();
+                }
+            }
+
+            let signal_blocked_tids = self.processes.futex_blocked_with_pending_signal_tids();
+            for tid in signal_blocked_tids {
+                if tid == 125 || tid == 126 {
+                    logln(format_args!(
+                        "whuse-sched: signal_blocked waking tid={}",
+                        tid
+                    ));
+                }
+                self.processes.clear_futex_wait_state(tid);
+                let _ = self.scheduler.wake_task(tid);
+            }
+
+            if self.timer_irq_count % 100 == 0 {
+                let bc = self.scheduler.blocked_count();
+                let rc = self.scheduler.ready_count();
+
+                let t125_blocked = self.scheduler.is_blocked(125);
+                let t125_ready = self.scheduler.is_ready(125);
+                let t125_current = self.scheduler.is_current(125);
+                let t126_blocked = self.scheduler.is_blocked(126);
+                let t126_ready = self.scheduler.is_ready(126);
+                let t126_current = self.scheduler.is_current(126);
+
+                let debug_tasks_exist = t125_blocked
+                    || t125_ready
+                    || t125_current
+                    || t126_blocked
+                    || t126_ready
+                    || t126_current;
+
+                if debug_tasks_exist {
+                    logln(format_args!(
+                        "whuse-sched-state: tick={} t125(B={} R={} C={}) t126(B={} R={} C={})",
+                        self.timer_irq_count,
+                        t125_blocked,
+                        t125_ready,
+                        t125_current,
+                        t126_blocked,
+                        t126_ready,
+                        t126_current
+                    ));
+                }
+
+                logln(format_args!(
+                    "whuse-sched-tick: tick={} blocked={} ready={}",
+                    self.timer_irq_count, bc, rc
+                ));
+                if bc > 0 {
+                    logln(format_args!(
+                        "whuse-coop: tick={} blocked={} waking_all",
+                        self.timer_irq_count, bc
+                    ));
+                    let all_blocked = self.scheduler.blocked_task_ids();
+                    for tid in all_blocked {
+                        if tid == 125 || tid == 126 {
+                            logln(format_args!("whuse-sched: spurious_wake tid={}", tid));
+                        }
+                        self.processes.clear_futex_wait_state(tid);
+                        let _ = self.scheduler.wake_task(tid);
+                    }
+                }
+            }
+
             let _ = self.scheduler.yield_now();
             return;
         }
@@ -789,7 +958,10 @@ impl Kernel {
                             | SYS_READ
                             | SYS_READV
                             | SYS_RT_SIGSUSPEND
+                            | SYS_RT_SIGTIMEDWAIT
                             | SYS_FUTEX
+                            | SYS_PPOLL
+                            | SYS_PSELECT6
                             | SYS_EPOLL_PWAIT
                             | SYS_EPOLL_PWAIT2
                             | SYS_NANOSLEEP
@@ -797,11 +969,12 @@ impl Kernel {
                     );
                 if !blocked_restart {
                     process.trap_frame.set_retval(result as usize);
-                    if sysno != SYS_EXECVE || (result as i32) < 0 {
+                    if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN) || (result as i32) < 0 {
                         process.trap_frame.sepc = sepc + 4;
                     }
                 }
             }
+            self.dispatch_pending_signals();
             return;
         }
 
@@ -837,6 +1010,133 @@ impl Kernel {
             }
             let _ = self.scheduler.wake_all_blocked();
         }
+    }
+
+    fn dispatch_pending_signals(&mut self) {
+        let process = match self.processes.current_mut() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let unmasked = process.pending_signals & !process.signal_mask;
+        if unmasked == 0 {
+            return;
+        }
+
+        // Only dispatch real-time signals (signum >= 32) to user handlers.
+        // Standard signals (SIGCHLD etc.) are handled internally and should not
+        // invoke user handlers here to avoid re-entrancy issues in musl/busybox.
+        let rt_unmasked = unmasked & !((1u64 << 31) - 1);
+        if rt_unmasked == 0 {
+            return;
+        }
+        let signum = rt_unmasked.trailing_zeros() as usize + 1;
+
+        logln(format_args!(
+            "whuse-debug: dispatch_pending_signals tid={} pending={:#x} signum={}",
+            process.tid, process.pending_signals, signum
+        ));
+
+        let action = process
+            .signal_actions
+            .get(&signum)
+            .copied()
+            .unwrap_or_default();
+
+        process.pending_signals &= !(1u64 << (signum - 1));
+
+        if action.handler == 0 {
+            if signum != 17 && signum != 23 && signum != 28 {
+                {
+                    let tid = process.tid;
+                    logln(format_args!(
+                        "whuse: SIG_DFL terminate pid {} sig {}",
+                        tid, signum
+                    ));
+                }
+                if let Ok(exit) = self.processes.exit_current_thread(-(signum as i32)) {
+                    self.scheduler.remove_task(exit.tid);
+                    if exit.group_exited {
+                        self.scheduler.exit_group(exit.tgid);
+                    }
+                    if let Some(parent_tgid) = exit.parent_tgid {
+                        let _ = self.processes.deliver_signal(parent_tgid, 17);
+                        let _ = self.scheduler.wake_task(parent_tgid);
+                    }
+                    if let Some(addr) = exit.clear_child_tid {
+                        for wtid in self.processes.wake_futex(addr, usize::MAX) {
+                            let _ = self.scheduler.wake_task(wtid);
+                        }
+                    }
+                    let _ = self.scheduler.wake_all_blocked();
+                }
+            }
+            return;
+        }
+
+        if action.handler == 1 {
+            return;
+        }
+
+        // RISC-V Linux rt_sigframe layout (musl-compatible):
+        //   offset 0:   siginfo_t  (128 bytes) – si_signo at [0..4]
+        //   offset 128: ucontext_t
+        //     +0:  uc_flags(8) uc_link(8) uc_stack(24) uc_sigmask(8) __reserved(120)
+        //     +168: mcontext_t – gregs[0..32]: gregs[0]=pc, gregs[1..31]=x1..x31 (256 bytes)
+        //                        fpregs area (272 bytes)
+        //   Total frame = 128 + 168 + 256 + 272 = 824 → padded to 832 (16-byte aligned)
+        const FRAME_SIZE: usize = 832;
+        const SIGINFO_OFF: usize = 0;
+        const UCONTEXT_OFF: usize = 128;
+        const UC_SIGMASK_OFF: usize = UCONTEXT_OFF + 40;
+        const MCTX_OFF: usize = UCONTEXT_OFF + 168;
+        const FCSR_OFF: usize = MCTX_OFF + 32 * 8;
+
+        let cur_sp = process.trap_frame.regs[2];
+        let frame_sp = (cur_sp.wrapping_sub(FRAME_SIZE)) & !0xf_usize;
+
+        let mut frame = alloc::vec![0u8; FRAME_SIZE];
+
+        frame[SIGINFO_OFF..SIGINFO_OFF + 4].copy_from_slice(&(signum as u32).to_le_bytes());
+        frame[UC_SIGMASK_OFF..UC_SIGMASK_OFF + 8]
+            .copy_from_slice(&process.signal_mask.to_le_bytes());
+        frame[MCTX_OFF..MCTX_OFF + 8].copy_from_slice(&process.trap_frame.sepc.to_le_bytes());
+        for i in 1usize..32 {
+            let off = MCTX_OFF + i * 8;
+            frame[off..off + 8].copy_from_slice(&process.trap_frame.regs[i].to_le_bytes());
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            frame[FCSR_OFF..FCSR_OFF + 8].copy_from_slice(&process.trap_frame.fcsr.to_le_bytes());
+        }
+
+        if process.write_user_bytes(frame_sp, &frame).is_err() {
+            logln(format_args!(
+                "whuse: signal frame write failed sp={:#x} sig={}",
+                frame_sp, signum
+            ));
+            return;
+        }
+
+        process.signal_mask |= action.mask;
+
+        process.trap_frame.regs[2] = frame_sp;
+        process.trap_frame.regs[10] = signum;
+        process.trap_frame.regs[11] = frame_sp + SIGINFO_OFF;
+        process.trap_frame.regs[12] = frame_sp + UCONTEXT_OFF;
+        let restorer = if action.restorer > 0x1000 && action.restorer < 0x8000_0000_0000_0000 {
+            action.restorer
+        } else {
+            SIGNAL_TRAMPOLINE_BASE
+        };
+        process.trap_frame.regs[1] = restorer;
+        process.trap_frame.sepc = action.handler;
+        process.signal_frame_pending = true;
+
+        logln(format_args!(
+            "whuse: dispatching sig {} tid={} handler={:#x} restorer={:#x} frame_sp={:#x}",
+            signum, process.tid, action.handler, action.restorer, frame_sp
+        ));
     }
 
     fn service_irqs(&mut self) {
@@ -980,6 +1280,12 @@ fn try_switch_init_to_rootfs(processes: &mut ProcessTable, vfs: &mut KernelVfs) 
         Ok(loaded) => {
             process.trap_frame.sepc = loaded.entry;
             process.trap_frame.regs[2] = loaded.stack_pointer;
+            let _ = process.address_space.map_fixed_bytes(
+                SIGNAL_TRAMPOLINE_BASE,
+                &SIGNAL_TRAMPOLINE_CODE,
+                4096,
+                0b101,
+            );
             logln(format_args!(
                 "whuse: init switched to /musl/busybox entry={:#x} sp={:#x}",
                 loaded.entry, loaded.stack_pointer

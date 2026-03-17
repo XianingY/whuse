@@ -206,6 +206,26 @@ impl Scheduler {
         self.blocked.len()
     }
 
+    pub fn ready_count(&self) -> usize {
+        self.ready.len()
+    }
+
+    pub fn blocked_task_ids(&self) -> Vec<usize> {
+        self.blocked.keys().copied().collect()
+    }
+
+    pub fn is_blocked(&self, task_id: usize) -> bool {
+        self.blocked.contains_key(&task_id)
+    }
+
+    pub fn is_ready(&self, task_id: usize) -> bool {
+        self.ready.iter().any(|t| t.id == task_id)
+    }
+
+    pub fn is_current(&self, task_id: usize) -> bool {
+        self.current.as_ref().is_some_and(|t| t.id == task_id)
+    }
+
     pub fn remove_task(&mut self, task_id: usize) -> bool {
         if self.current.as_ref().is_some_and(|task| task.id == task_id) {
             self.current = None;

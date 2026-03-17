@@ -462,6 +462,8 @@ impl HalCpu for VirtCpu {
             frame.scause = usize::MAX;
         }
     }
+
+    fn set_kernel_timer_callback(&self, _cb: fn()) {}
 }
 
 impl HalMemory for VirtMemory {

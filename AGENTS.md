@@ -149,11 +149,14 @@ Steps confirmed completing with `step-end` marker:
 - `time-test` — skip (missing binary, expected)
 - `busybox_testcode.sh` — completes
 - `iozone_testcode.sh` — completes
-- `libctest_testcode.sh` — **HANGS** at `pthread_cancel_points` test (see Section 10)
+- `libctest_testcode.sh` — enters `pthread_cancel_points` and no longer hard-deadlocks, but still livelocks in post-cancel futex handling (see Section 10)
 
 Steps not yet reached due to libctest hang:
 
 - `libc-bench`, `lmbench_testcode.sh`, `lua_testcode.sh`, `unixbench_testcode.sh`, `netperf_testcode.sh`, `iperf_testcode.sh`, `cyclic_testcode.sh`
+
+- 180s run reaches `whuse-oscomp-shell-entered`
+- 180s run is progressing but currently blocked by `mmap` behaviors in dynamic loader (see Section 10.4)
 
 ## 5) Target Flow (理想真实执行 / Real Execution)
 
@@ -267,7 +270,7 @@ Preconditions:
 Commands:
 
 ```bash
-export WHUSE_OSCOMP_DOCKER_IMAGE="${WHUSE_OSCOMP_DOCKER_IMAGE:-docker.educg.net/cg/os-contest:20250614}"
+export WHUSE_OSCOMP_DOCKER_IMAGE="${WHUSE_OSCOMP_DOCKER_IMAGE:-docker.educg.net/cg/os-contest:20260104}"
 cargo xtask oscomp-images
 ```
 
@@ -288,61 +291,75 @@ Failure handling:
 
 ## 10) Known Blocking Issues and Active Fixes
 
-### 10.1 pthread_cancel_points deadlock (libctest, RISC-V)
+### 10.1 pthread_cancel_points cancellation livelock (libctest, RISC-V)
 
-**Status**: Fix implemented, verification in progress.
+**Status**: Cancellation delivery improved; join/exit semantics still unresolved.
 
-**Symptom**: The `libctest_testcode.sh` step starts `pthread_cancel_points` and then hangs permanently. All subsequent suite steps are never reached. The QEMU log shows `[IDLE-TMR:1]` firing repeatedly but no progress.
+**Symptom**: The `libctest_testcode.sh` step starts `pthread_cancel_points` and still fails to finish. The original hard deadlock is gone, but the cancelled thread now livelocks in repeated `FUTEX_WAIT -> -EINTR` handling on `__tl_lock`, while the joiner remains blocked on the thread join word.
 
 **Root cause chain**:
 
-1. Thread 125 (joiner) sends SIGCANCEL (sig 33) to thread 126, then calls `FUTEX_WAIT` on `0x50022b30` (detach_state, waiting for thread 126 to finish).
-2. Thread 126 receives SIGCANCEL. The kernel dispatches the signal frame: `sepc` is redirected to `__cancel` (musl's cancellation handler at `0x47840`). `pending_signals` bit for sig 33 is **cleared** at this point (consumed during dispatch).
-3. Thread 126 runs `sret` and begins executing `__cancel`. The handler internally calls `pthread_exit` → acquires `__tl_lock` → calls `FUTEX_WAIT` on `0xaec68` (`__tl_lock` futex).
-4. `__tl_lock` is held by thread 125 (which called `pthread_join` → holds the lock while waiting for thread 126).
-5. **Deadlock**: thread 125 holds `__tl_lock`, waits for thread 126. Thread 126 needs `__tl_lock`, waits for thread 125 to release it.
+1. Thread 125 (main joiner) sends SIGCANCEL (sig 33) to thread 126, then waits in `FUTEX_WAIT` on `0x50022b30` with expected value `2`.
+2. Thread 126 receives SIGCANCEL. The kernel dispatches the signal frame to musl's `__cancel` handler (`0x47840`).
+3. `rt_sigreturn` runs and returns execution into musl cancellation cleanup at `saved_pc=0x48d48`.
+4. The cancelled thread then tries to acquire `__tl_lock` and calls `FUTEX_WAIT` on `0xaec68`.
+5. With sticky `cancellation_pending`, the kernel now returns `-EINTR` for that futex repeatedly, so thread 126 does not hard-block anymore.
+6. Despite that improvement, thread 126 also does not reach a userspace exit/join state transition that lets thread 125 finish; thread 125 remains waiting on `0x50022b30`.
 
-The prior fix attempt (idle-timer + `futex_blocked_with_pending_signal_tids`) did not resolve this because `pending_signals` is already 0 by the time thread 126 is blocked — the signal was consumed during dispatch.
+**Important verified fact**:
 
-**Fix implemented** (`signal_frame_pending` flag):
+- `clear_child_tid` for thread 126 is `0x50022bd0`
+- the main joiner waits on `0x50022b30`
+- these addresses are different, so kernel thread exit / `clear_child_tid` wakeups do **not** satisfy the musl join condition directly
 
-Added `signal_frame_pending: bool` to `Process` in `crates/proc/src/lib.rs`.
+**What changed so far**:
 
-- Set to `true` in `dispatch_pending_signals` in `crates/kernel-core/src/lib.rs` immediately after the signal frame is written and `sepc` is redirected.
-- Cleared to `false` in `sys_rt_sigreturn` in `crates/syscall/src/lib.rs`.
-- In `FUTEX_WAIT` handler (`crates/syscall/src/lib.rs`): both the re-entry path and the fresh-entry path now check `signal_frame_pending || pending_signals != 0` and return `-EINTR` immediately if true.
+- Added `signal_frame_pending: bool` and `cancellation_pending: bool` to `Process` in `crates/proc/src/lib.rs`.
+- `dispatch_pending_signals` in `crates/kernel-core/src/lib.rs` now logs `clear_child_tid` and `tid_address` for SIGCANCEL debugging.
+- `sys_futex` in `crates/syscall/src/lib.rs` checks `pending_signals || signal_frame_pending || cancellation_pending` and returns `-EINTR` instead of blocking.
+- The earlier kernel forced-exit shortcut for `SIGCANCEL` was removed again because it bypassed musl's own join-state transition and only woke the wrong futex.
 
-The intended effect: when thread 126's `__cancel` handler calls `FUTEX_WAIT` on `__tl_lock`, the kernel returns `EINTR` immediately instead of blocking. The `__cancel` / `pthread_exit` path in musl is designed to handle `EINTR` from cancellation-point futexes and retry, or it will call `__do_cancel` directly. This breaks the deadlock.
+**Current verified runtime sequence**:
 
-**Current gap (still debugging)**:
+```text
+pthread_cancel_points starts
+tid=125 -> FUTEX_WAIT on 0x50022b30 val=2
+tid=126 -> dispatch_pending_signals ... clear_child_tid=0x50022bd0 tid_address=None
+tid=126 -> rt_sigreturn saved_pc=0x48d48
+tid=126 -> repeated FUTEX_WAIT EINTR on 0xaec68 with cancel=true
+tid=125 -> still waiting on 0x50022b30
+```
 
-Despite the fix being compiled in, the `FUTEX_WAIT tid=126 uaddr=0xaec68` is still entered (seen in log). This means `signal_frame_pending` is `false` when thread 126 makes this FUTEX_WAIT call. Investigation ongoing.
+**Current conclusion**:
 
-Possible explanations to check:
+- The correct kernel boundary is still: deliver cancellation, interrupt the cancelled thread's blocking syscalls, and let musl perform its own `pthread_exit` / join-state transition.
+- The kernel must **not** try to synthesize musl join completion from `clear_child_tid` alone.
+- The remaining gap is that repeated futex interruption on `__tl_lock` is not yet sufficient for musl to complete the cancellation path.
 
-1. `dispatch_pending_signals` is called for thread 126 when a **different thread** is "current" — i.e., the process pointer is correct but the `signal_frame_pending` write goes to a cloned/stale copy.
-2. There is a second `dispatch_pending_signals` call later that re-dispatches and overwrites the state without re-setting `signal_frame_pending` (e.g., a double-dispatch path).
-3. The signal frame for thread 126 is set up while thread 126 is not yet "current" (it was woken remotely and its frame modified directly), and by the time it becomes current and runs, some path has reset `signal_frame_pending`.
-4. `__cancel` itself calls `rt_sigreturn` before reaching the `FUTEX_WAIT` — clearing `signal_frame_pending` prematurely.
+**Next checks**:
+
+1. Check whether other blocking syscalls in the cancelled thread need the same cancellation interruption semantics.
+2. Inspect musl's post-`rt_sigreturn` cancellation cleanup path around the `saved_pc=0x48d48` site.
+3. Avoid any new kernel-side shortcut that assumes musl join state lives at `clear_child_tid`.
 
 **Debug commands**:
 
 ```bash
-# Check sequence around dispatch and FUTEX_WAIT
-strings /tmp/rv-test.log | grep -A 20 "dispatching sig 33"
+# Compact pthread_cancel trace
+strings /tmp/rv-*.log | grep -A2 -B2 "pthread_cancel_points\|dispatch_pending_signals tid=126\|rt_sigreturn tid=126\|FUTEX_WAIT EINTR\|FUTEX_WAIT tid=125\|FUTEX_WAIT tid=126"
 
-# Check if FUTEX_WAIT EINTR ever fires for tid=126
-strings /tmp/rv-test.log | grep "FUTEX_WAIT EINTR.*tid=126"
+# Check whether join word and clear_child_tid differ
+strings /tmp/rv-*.log | grep -A2 "dispatch_pending_signals tid=126"
 
-# Check if rt_sigreturn fires before the FUTEX_WAIT
-strings /tmp/rv-test.log | grep "rt_sigreturn\|sigreturn"
+# Check LoongArch boot-to-shell progress
+strings /tmp/la-*.log | grep "whuse-oscomp-shell-entered\|whuse-oscomp-script-start\|whuse-oscomp-step-begin\|panic\|trapped with scause"
 ```
 
 **Files involved**:
 
-- `crates/proc/src/lib.rs` — `Process::signal_frame_pending` field
-- `crates/kernel-core/src/lib.rs` — `dispatch_pending_signals` sets the flag
-- `crates/syscall/src/lib.rs` — `FUTEX_WAIT` checks flag; `sys_rt_sigreturn` clears it
+- `crates/proc/src/lib.rs` — `Process::{signal_frame_pending,cancellation_pending}`
+- `crates/kernel-core/src/lib.rs` — `dispatch_pending_signals` SIGCANCEL path and debug logging
+- `crates/syscall/src/lib.rs` — `FUTEX_WAIT` interruption path and `sys_rt_sigreturn`
 
 ### 10.2 Kernel idle timer infrastructure (COMPLETED)
 
@@ -381,7 +398,7 @@ These log lines are intentionally present in the current build for diagnostics. 
 | Marker | Source | Meaning |
 |---|---|---|
 | `[IDLE-TMR:N]` | kernel-core spin loop | Kernel idle timer fired N times since last drain |
-| `whuse-debug: dispatch_pending_signals tid=X pending=Y signum=Z` | kernel-core | Signal dispatch attempt for thread X |
+| `whuse-debug: dispatch_pending_signals tid=X pending=Y signum=Z clear_child_tid=A tid_address=B` | kernel-core | Signal dispatch attempt for thread X with thread-exit pointers |
 | `whuse: dispatching sig N tid=X handler=H ...` | kernel-core | Signal frame written; sepc redirected to handler H |
 | `whuse-debug: FUTEX_WAIT tid=X uaddr=A val=V` | syscall | Thread X entering FUTEX_WAIT (registered in queue) |
 | `whuse-debug: FUTEX_WAIT EINTR tid=X addr=A pending=P` | syscall | FUTEX_WAIT interrupted by pending signal |
@@ -389,3 +406,29 @@ These log lines are intentionally present in the current build for diagnostics. 
 | `whuse-debug: kill/tkill target=X sig=S caller_tid=Y` | syscall | Signal delivery from Y to X |
 | `whuse: idle-tick ready=R blocked=B all_futex=F` | kernel-core | Idle tick: R runnable, B blocked, all-futex deadlock flag |
 | `[SPIN:N]` / `[LOOP:N]` | kernel-core | Spin loop / run-forever iteration counters |
+| `whuse: syscall enter ...` | syscall | Broad syscall tracing (entry point) |
+| `whuse: syscall exit ...` | syscall | Broad syscall tracing (exit point) |
+| `whuse: run_user sepc=... sp=...` | hal-riscv | HAL context switch entry diagnostic |
+| `whuse: trap return scause=...` | hal-riscv | HAL context switch exit diagnostic |
+
+### 10.4 Buddy Allocator & Memory Overlap Fix (COMPLETED)
+
+**Status**: Verified stable.
+
+**Issue**: System stalled after `init` bootstrap due to memory collision between the kernel static `HEAP` (managed by `BuddyAllocator`) and the `mm` crate's page allocator. The page allocator was consuming DRAM starting from `0x80200000`, which the kernel binary also occupied.
+
+**Fix**:
+1.  Implemented a robust `BuddyAllocator` in `platform/riscv64-virt/src/main.rs`.
+2.  Added `PROVIDE(end = .);` to `linker.ld` to identify the kernel end.
+3.  Updated `hal-riscv64-virt` to dynamically adjust `MEMORY_MAP` during bootstrap, starting usable DRAM at the kernel `end`.
+4.  Implemented actual CSR manipulation (`csrs/csrc sie`) for interrupt control in `VirtCpu` to protect allocator locks.
+
+**Result**: Init process now successfully enters user mode and performs syscalls (`brk`, `mmap`, `execve`).
+
+### 10.5 Universal Syscall Tracing (COMPLETED)
+
+**Status**: Enabled.
+
+**Improvement**: Moved syscall tracing from individual syscall implementations to the central `SyscallDispatcher::dispatch` in `crates/syscall/src/lib.rs`. 
+- Ensures all syscalls (including unknown/unsupported) are logged with arguments and return values.
+- Significantly improved observability into `init` and `busybox` behavior.

@@ -30,3 +30,15 @@ oscomp-loongarch:
 
 oscomp-images:
 	cargo xtask oscomp-images
+
+parallel-setup:
+	tools/dev/setup_parallel_worktrees.sh
+
+stage1-riscv:
+	tools/dev/run_oscomp_stage1.sh riscv
+
+stage1-loongarch:
+	tools/dev/run_oscomp_stage1.sh loongarch
+
+stage1-both:
+	tools/dev/run_oscomp_stage1.sh both

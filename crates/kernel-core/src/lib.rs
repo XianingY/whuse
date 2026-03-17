@@ -1035,8 +1035,12 @@ impl Kernel {
 
         if cancel_debug_enabled() {
             logln(format_args!(
-                "whuse-debug: dispatch_pending_signals tid={} pending={:#x} signum={}",
-                process.tid, process.pending_signals, signum
+                "whuse-debug: dispatch_pending_signals tid={} pending={:#x} signum={} clear_child_tid={:#x?} tid_address={:#x?}",
+                process.tid,
+                process.pending_signals,
+                signum,
+                process.clear_child_tid,
+                process.tid_address
             ));
         }
 

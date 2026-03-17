@@ -674,11 +674,14 @@ impl Kernel {
                 self.watchdog_started_at.entry(*tgid).or_insert(now);
             }
         }
-        if watched.values().any(|name| is_oscomp_heavy_process(name)) {
+        if OSCOMP_IOZONE_BUSYBOX_WINDOW_NS > 0
+            && watched.values().any(|name| name.contains("iozone"))
+        {
             self.watchdog_iozone_window_until_ns =
                 now.saturating_add(OSCOMP_IOZONE_BUSYBOX_WINDOW_NS);
         }
-        let in_iozone_busybox_window = now <= self.watchdog_iozone_window_until_ns;
+        let in_iozone_busybox_window = OSCOMP_IOZONE_BUSYBOX_WINDOW_NS > 0
+            && now <= self.watchdog_iozone_window_until_ns;
         if !all_groups.is_empty()
             && (self.watchdog_last_heartbeat_ns == 0
                 || now.saturating_sub(self.watchdog_last_heartbeat_ns) >= 2_000_000_000)

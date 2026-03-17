@@ -2519,15 +2519,34 @@ impl SyscallDispatcher {
                     if wait_addr == uaddr {
                         let pending =
                             procs.current()?.pending_signals & !procs.current()?.signal_mask;
-                        if pending != 0 || procs.current()?.signal_frame_pending {
+                        if pending != 0
+                            || procs.current()?.signal_frame_pending
+                            || procs.current()?.cancellation_pending
+                        {
+                            let current_tgid = procs.current()?.tgid;
+                            let cancellation_pending = procs.current()?.cancellation_pending;
                             procs.remove_futex_waiter_at(wait_addr, tid);
                             let process = procs.current_mut()?;
                             process.futex_wait_addr = None;
                             process.futex_wait_deadline_ns = None;
+                            if cancellation_pending {
+                                process.cancellation_pending = false;
+                            }
                             log_always(&format!(
-                                "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x}",
-                                tid, wait_addr, pending
+                                "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x} sfp={} cancel={}",
+                                tid,
+                                wait_addr,
+                                pending,
+                                process.signal_frame_pending,
+                                process.cancellation_pending
                             ));
+                            if cancellation_pending {
+                                for peer_tid in procs.wake_all_futex_waiters_in_tgid(current_tgid) {
+                                    if peer_tid != tid {
+                                        let _ = scheduler.wake_task(peer_tid);
+                                    }
+                                }
+                            }
                             return Err(EINTR);
                         }
                         if !procs.is_futex_waiting(wait_addr, tid) {
@@ -2557,11 +2576,30 @@ impl SyscallDispatcher {
                     }
                 }
                 let pending = procs.current()?.pending_signals & !procs.current()?.signal_mask;
-                if pending != 0 || procs.current()?.signal_frame_pending {
+                if pending != 0
+                    || procs.current()?.signal_frame_pending
+                    || procs.current()?.cancellation_pending
+                {
+                    let current_tgid = procs.current()?.tgid;
+                    let cancellation_pending = procs.current()?.cancellation_pending;
+                    if cancellation_pending {
+                        procs.current_mut()?.cancellation_pending = false;
+                    }
                     log_always(&format!(
-                        "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={}",
-                        tid, uaddr, pending, procs.current()?.signal_frame_pending
+                        "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={} cancel={}",
+                        tid,
+                        uaddr,
+                        pending,
+                        procs.current()?.signal_frame_pending,
+                        procs.current()?.cancellation_pending
                     ));
+                    if cancellation_pending {
+                        for peer_tid in procs.wake_all_futex_waiters_in_tgid(current_tgid) {
+                            if peer_tid != tid {
+                                let _ = scheduler.wake_task(peer_tid);
+                            }
+                        }
+                    }
                     return Err(EINTR);
                 }
                 let current = read_i32(procs.current()?, uaddr)?;
@@ -2579,11 +2617,12 @@ impl SyscallDispatcher {
                         now.saturating_add(read_timespec_ns(procs.current()?, timeout_ptr)?)
                     };
                     log_always(&format!(
-                        "whuse-debug: FUTEX_WAIT tid={} uaddr={:#x} val={} sfp={}",
+                        "whuse-debug: FUTEX_WAIT tid={} uaddr={:#x} val={} sfp={} cancel={}",
                         tid,
                         uaddr,
                         val,
-                        procs.current()?.signal_frame_pending
+                        procs.current()?.signal_frame_pending,
+                        procs.current()?.cancellation_pending
                     ));
                     procs.enqueue_futex_waiter(uaddr, tid);
                     {

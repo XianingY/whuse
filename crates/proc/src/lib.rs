@@ -337,6 +337,8 @@ impl Process {
         self.futex_wait_deadline_ns = None;
         self.epoll_wait_deadline_ns = None;
         self.sigsuspend_saved_mask = None;
+        self.signal_frame_pending = false;
+        self.cancellation_pending = false;
     }
 
     fn fork_from(&self, pid: usize) -> Self {
@@ -1141,7 +1143,9 @@ impl ProcessTable {
             .values()
             .filter(|p| {
                 p.futex_wait_addr.is_some()
-                    && (p.pending_signals & !p.signal_mask) != 0
+                    && ((p.pending_signals & !p.signal_mask) != 0
+                        || p.signal_frame_pending
+                        || p.cancellation_pending)
                     && p.state != ProcessState::Exited
             })
             .map(|p| p.tid)
@@ -1221,6 +1225,19 @@ impl ProcessTable {
         if let Some(addr) = addr {
             self.remove_futex_waiter_at(addr, tid);
         }
+    }
+
+    pub fn wake_all_futex_waiters_in_tgid(&mut self, tgid: usize) -> Vec<usize> {
+        let tids = self
+            .processes
+            .values()
+            .filter(|p| p.tgid == tgid && p.futex_wait_addr.is_some() && p.state != ProcessState::Exited)
+            .map(|p| p.tid)
+            .collect::<Vec<_>>();
+        for tid in &tids {
+            self.clear_futex_wait_state(*tid);
+        }
+        tids
     }
 
     pub fn timed_wait_expired_tids(&self, now_ns: u64) -> Vec<usize> {

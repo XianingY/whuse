@@ -1132,6 +1132,9 @@ impl Kernel {
         process.trap_frame.regs[1] = restorer;
         process.trap_frame.sepc = action.handler;
         process.signal_frame_pending = true;
+        if signum == 33 {
+            process.cancellation_pending = true;
+        }
 
         logln(format_args!(
             "whuse: dispatching sig {} tid={} handler={:#x} restorer={:#x} frame_sp={:#x}",

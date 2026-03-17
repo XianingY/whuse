@@ -54,6 +54,7 @@ const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
 const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 30 * 1_000_000_000;
+const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 120 * 1_000_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
 const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
@@ -1032,10 +1033,12 @@ impl Kernel {
         }
         let signum = rt_unmasked.trailing_zeros() as usize + 1;
 
-        logln(format_args!(
-            "whuse-debug: dispatch_pending_signals tid={} pending={:#x} signum={}",
-            process.tid, process.pending_signals, signum
-        ));
+        if cancel_debug_enabled() {
+            logln(format_args!(
+                "whuse-debug: dispatch_pending_signals tid={} pending={:#x} signum={}",
+                process.tid, process.pending_signals, signum
+            ));
+        }
 
         let action = process
             .signal_actions
@@ -1133,13 +1136,15 @@ impl Kernel {
         process.trap_frame.sepc = action.handler;
         process.signal_frame_pending = true;
         if signum == 33 {
-            process.cancellation_pending = true;
+            process.mark_cancel_signal_dispatched();
         }
 
-        logln(format_args!(
-            "whuse: dispatching sig {} tid={} handler={:#x} restorer={:#x} frame_sp={:#x}",
-            signum, process.tid, action.handler, action.restorer, frame_sp
-        ));
+        if cancel_debug_enabled() {
+            logln(format_args!(
+                "whuse: dispatching sig {} tid={} handler={:#x} restorer={:#x} frame_sp={:#x}",
+                signum, process.tid, action.handler, action.restorer, frame_sp
+            ));
+        }
     }
 
     fn service_irqs(&mut self) {
@@ -1154,6 +1159,13 @@ impl Kernel {
         for device in hal().block_devices {
             let _ = device.ack_interrupt();
         }
+    }
+}
+
+fn cancel_debug_enabled() -> bool {
+    match option_env!("WHUSE_DEBUG_CANCEL") {
+        Some("1") => true,
+        _ => false,
     }
 }
 
@@ -1395,6 +1407,9 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
 fn oscomp_process_timeout_ns(name: &str, in_iozone_busybox_window: bool) -> u64 {
     if name == "./busybox" {
         return OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS;
+    }
+    if name == "entry-static.exe" || name == "./runtest.exe" {
+        return OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS;
     }
     if is_oscomp_heavy_process(name) {
         return OSCOMP_HEAVY_TIMEOUT_NS;

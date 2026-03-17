@@ -141,11 +141,13 @@ pub struct Process {
     /// yet returned via rt_sigreturn.  Any FUTEX_WAIT entered while this flag
     /// is true must return -EINTR so the pending handler can actually run.
     pub signal_frame_pending: bool,
-    /// Set to true when SIGCANCEL (sig 33) is dispatched to this thread.
-    /// Never cleared — once a thread is being cancelled it must never block
-    /// indefinitely in FUTEX_WAIT, because it needs to run its pthread_exit
-    /// path to completion.  FUTEX_WAIT returns -EINTR when this flag is set.
-    pub cancellation_pending: bool,
+    /// Set to true when SIGCANCEL (sig 33) is dispatched and not yet consumed
+    /// by rt_sigreturn. This tracks cancellation arrival without forcing all
+    /// subsequent blocking syscalls to return EINTR forever.
+    pub cancel_signal_seen: bool,
+    /// One-shot futex interrupt token armed by rt_sigreturn after SIGCANCEL.
+    /// FUTEX_WAIT consumes this token and returns -EINTR once.
+    pub cancel_interrupt_once: bool,
 }
 
 pub struct ProcessTable {
@@ -201,7 +203,8 @@ impl Process {
             sigsuspend_saved_mask: None,
             is_thread: false,
             signal_frame_pending: false,
-            cancellation_pending: false,
+            cancel_signal_seen: false,
+            cancel_interrupt_once: false,
         }
     }
 
@@ -313,6 +316,26 @@ impl Process {
         self.address_space.read_cstr(addr)
     }
 
+    pub fn mark_cancel_signal_dispatched(&mut self) {
+        self.cancel_signal_seen = true;
+        self.cancel_interrupt_once = false;
+    }
+
+    pub fn arm_cancel_interrupt_once(&mut self) {
+        if self.cancel_signal_seen {
+            self.cancel_signal_seen = false;
+            self.cancel_interrupt_once = true;
+        }
+    }
+
+    pub fn consume_cancel_interrupt_once(&mut self) -> bool {
+        if self.cancel_interrupt_once {
+            self.cancel_interrupt_once = false;
+            return true;
+        }
+        false
+    }
+
     pub fn reset_image(&mut self, entry: usize, stack_pointer: Option<usize>) {
         self.address_space.clear();
         self.user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
@@ -338,7 +361,8 @@ impl Process {
         self.epoll_wait_deadline_ns = None;
         self.sigsuspend_saved_mask = None;
         self.signal_frame_pending = false;
-        self.cancellation_pending = false;
+        self.cancel_signal_seen = false;
+        self.cancel_interrupt_once = false;
     }
 
     fn fork_from(&self, pid: usize) -> Self {
@@ -391,7 +415,8 @@ impl Process {
             sigsuspend_saved_mask: None,
             is_thread: false,
             signal_frame_pending: false,
-            cancellation_pending: false,
+            cancel_signal_seen: false,
+            cancel_interrupt_once: false,
         }
     }
 
@@ -445,7 +470,8 @@ impl Process {
             sigsuspend_saved_mask: None,
             is_thread: false,
             signal_frame_pending: false,
-            cancellation_pending: false,
+            cancel_signal_seen: false,
+            cancel_interrupt_once: false,
         }
     }
 
@@ -510,7 +536,8 @@ impl Process {
             sigsuspend_saved_mask: None,
             is_thread: true,
             signal_frame_pending: false,
-            cancellation_pending: false,
+            cancel_signal_seen: false,
+            cancel_interrupt_once: false,
         }
     }
 
@@ -1145,7 +1172,8 @@ impl ProcessTable {
                 p.futex_wait_addr.is_some()
                     && ((p.pending_signals & !p.signal_mask) != 0
                         || p.signal_frame_pending
-                        || p.cancellation_pending)
+                        || p.cancel_signal_seen
+                        || p.cancel_interrupt_once)
                     && p.state != ProcessState::Exited
             })
             .map(|p| p.tid)
@@ -1474,5 +1502,29 @@ mod tests {
         let woke = table.requeue_futex(0x1000, 0x2000, 1, 1);
         assert_eq!(woke, vec![leader]);
         assert_eq!(table.wake_futex(0x2000, 1), vec![thread]);
+    }
+
+    #[test]
+    fn cancel_interrupt_token_is_one_shot() {
+        let mut table = ProcessTable::new();
+        let pid = table.spawn_init("init", 0x1000);
+        table.set_current(pid).unwrap();
+        let process = table.current_mut().unwrap();
+
+        process.mark_cancel_signal_dispatched();
+        assert!(process.cancel_signal_seen);
+        assert!(!process.cancel_interrupt_once);
+
+        process.arm_cancel_interrupt_once();
+        assert!(!process.cancel_signal_seen);
+        assert!(process.cancel_interrupt_once);
+        assert!(process.consume_cancel_interrupt_once());
+        assert!(!process.consume_cancel_interrupt_once());
+
+        process.mark_cancel_signal_dispatched();
+        process.arm_cancel_interrupt_once();
+        process.reset_image(0x2000, None);
+        assert!(!process.cancel_signal_seen);
+        assert!(!process.cancel_interrupt_once);
     }
 }

@@ -54,7 +54,7 @@ const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
 const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 30 * 1_000_000_000;
-const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 120 * 1_000_000_000;
+const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 30 * 1_000_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
 const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
@@ -1408,7 +1408,7 @@ fn oscomp_process_timeout_ns(name: &str, in_iozone_busybox_window: bool) -> u64 
     if name == "./busybox" {
         return OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS;
     }
-    if name == "entry-static.exe" || name == "./runtest.exe" {
+    if is_libctest_entry_or_runner(name) {
         return OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS;
     }
     if is_oscomp_heavy_process(name) {
@@ -1418,6 +1418,12 @@ fn oscomp_process_timeout_ns(name: &str, in_iozone_busybox_window: bool) -> u64 
         return OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS;
     }
     OSCOMP_GROUP_TIMEOUT_NS
+}
+
+fn is_libctest_entry_or_runner(name: &str) -> bool {
+    name == "./runtest.exe"
+        || (name.starts_with("entry-") && name.ends_with(".exe"))
+        || name == "entry.exe"
 }
 
 fn process_needs_forced_preempt(name: &str, now: u64, iozone_busybox_window_until_ns: u64) -> bool {

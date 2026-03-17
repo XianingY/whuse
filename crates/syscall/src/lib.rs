@@ -255,7 +255,7 @@ fn syscall_trace_enabled() -> bool {
     }
     matches!(option_env!("WHUSE_DEBUG_SYSCALL"), Some("1"))
 }
-const ENOSYS_TRACE: bool = true;
+const ENOSYS_TRACE_DEFAULT: bool = false;
 
 fn trace_line(line: &str) {
     if !syscall_trace_enabled() {
@@ -268,7 +268,7 @@ fn trace_line(line: &str) {
 }
 
 fn trace_enosys(line: &str) {
-    if !ENOSYS_TRACE {
+    if !(ENOSYS_TRACE_DEFAULT || matches!(option_env!("WHUSE_DEBUG_ENOSYS"), Some("1"))) {
         return;
     }
     for byte in line.bytes() {
@@ -2549,7 +2549,8 @@ impl SyscallDispatcher {
                     procs.current()?.futex_wait_deadline_ns,
                 ) {
                     if wait_addr == uaddr {
-                        let pending = procs.current()?.pending_signals & !procs.current()?.signal_mask;
+                        let pending =
+                            procs.current()?.pending_signals & !procs.current()?.signal_mask;
                         let signal_frame_pending = procs.current()?.signal_frame_pending;
                         let cancel_seen = procs.current()?.cancel_signal_seen;
                         let cancel_once = procs.current()?.cancel_interrupt_once;
@@ -4517,22 +4518,22 @@ fn statx_bytes(stat: FileStat) -> [u8; 256] {
 mod tests {
     use super::{
         SyscallArgs, SyscallDispatcher, SYS_ACCEPT, SYS_BIND, SYS_CLOCK_GETRES, SYS_CLONE,
-        SYS_CONNECT, SYS_COPY_FILE_RANGE, SYS_DUP3, SYS_EPOLL_CREATE1, SYS_EPOLL_CTL,
+        SYS_CLOSE, SYS_CONNECT, SYS_COPY_FILE_RANGE, SYS_DUP3, SYS_EPOLL_CREATE1, SYS_EPOLL_CTL,
         SYS_EPOLL_PWAIT, SYS_EVENTFD2, SYS_FACCESSAT2, SYS_FALLOCATE, SYS_FCHDIR, SYS_FCHMOD,
         SYS_FCHMODAT, SYS_FCHOWN, SYS_FCHOWNAT, SYS_FDATASYNC, SYS_FLOCK, SYS_FSTATFS, SYS_FSYNC,
         SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER, SYS_GETPRIORITY, SYS_GETSID,
         SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTIMEOFDAY, SYS_GET_ROBUST_LIST, SYS_LINKAT,
-        SYS_LISTEN, SYS_LSEEK, SYS_MEMFD_CREATE, SYS_MKDIR, SYS_MLOCK, SYS_MLOCK2, SYS_MSYNC,
-        SYS_MEMBARRIER, SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL,
-        SYS_PIPE, SYS_PPOLL, SYS_PRCTL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PRLIMIT64,
-        SYS_PSELECT6, SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_RECVFROM,
-        SYS_RECVMSG, SYS_RENAMEAT, SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE, SYS_RT_SIGPENDING,
-        SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SECCOMP, SYS_SENDMSG,
-        SYS_SENDTO, SYS_SETGID, SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID, SYS_SETSOCKOPT,
-        SYS_SETUID, SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT,
-        SYS_SHMGET, SYS_SHUTDOWN, SYS_SIGACTION, SYS_SIGALTSTACK, SYS_SIGPROCMASK, SYS_SOCKET,
-        SYS_SOCKETPAIR, SYS_SPLICE, SYS_STATX, SYS_SYMLINKAT, SYS_TIMES, SYS_TRUNCATE, SYS_UMASK,
-        SYS_UNAME, SYS_UTIMENSAT, SYS_WAIT, SYS_WRITE, SYS_WRITEV,
+        SYS_LISTEN, SYS_LSEEK, SYS_MEMBARRIER, SYS_MEMFD_CREATE, SYS_MKDIR, SYS_MLOCK, SYS_MLOCK2,
+        SYS_MSYNC, SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL, SYS_PIPE,
+        SYS_PPOLL, SYS_PRCTL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PRLIMIT64, SYS_PSELECT6,
+        SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RENAMEAT,
+        SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE, SYS_RT_SIGPENDING, SYS_RT_SIGRETURN,
+        SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SECCOMP, SYS_SENDMSG, SYS_SENDTO, SYS_SETGID,
+        SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_ROBUST_LIST,
+        SYS_SET_TID_ADDRESS, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET, SYS_SHUTDOWN,
+        SYS_SIGACTION, SYS_SIGALTSTACK, SYS_SIGPROCMASK, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SPLICE,
+        SYS_STATX, SYS_SYMLINKAT, SYS_TIMES, SYS_TRUNCATE, SYS_UMASK, SYS_UNAME, SYS_UTIMENSAT,
+        SYS_WAIT, SYS_WRITE, SYS_WRITEV,
     };
     use hal_api::{
         register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
@@ -4920,6 +4921,32 @@ mod tests {
         assert_eq!(
             procs.current().unwrap().read_user_bytes(0x7100, 4).unwrap(),
             b"ping"
+        );
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_CLOSE,
+                SyscallArgs([write_fd, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x7200, &[0; 1]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_READ,
+                SyscallArgs([read_fd, 0x7200, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
         );
     }
 

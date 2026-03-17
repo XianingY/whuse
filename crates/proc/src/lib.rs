@@ -1156,6 +1156,80 @@ impl ProcessTable {
             .collect()
     }
 
+    pub fn has_child_process_group(&self, tgid: usize) -> bool {
+        self.processes.values().any(|process| {
+            !process.is_thread
+                && process.state != ProcessState::Exited
+                && process.parent == Some(tgid)
+                && process.tgid != tgid
+        })
+    }
+
+    pub fn descendant_process_groups(&self, root_tgid: usize) -> Vec<usize> {
+        let mut children = BTreeMap::<usize, Vec<usize>>::new();
+        let mut has_root = false;
+        for process in self.processes.values() {
+            if process.is_thread || process.state == ProcessState::Exited {
+                continue;
+            }
+            if process.tgid == root_tgid {
+                has_root = true;
+            }
+            if let Some(parent) = process.parent {
+                if process.tgid != parent {
+                    children.entry(parent).or_default().push(process.tgid);
+                }
+            }
+        }
+        if !has_root {
+            return Vec::new();
+        }
+        let mut queue = VecDeque::new();
+        let mut out = Vec::new();
+        queue.push_back(root_tgid);
+        while let Some(current) = queue.pop_front() {
+            if out.iter().any(|tgid| *tgid == current) {
+                continue;
+            }
+            out.push(current);
+            if let Some(kids) = children.get(&current) {
+                for kid in kids {
+                    queue.push_back(*kid);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn active_process_group_count_in(&self, groups: &[usize]) -> usize {
+        self.processes
+            .values()
+            .filter(|process| {
+                !process.is_thread
+                    && process.state != ProcessState::Exited
+                    && groups.iter().any(|tgid| *tgid == process.tgid)
+            })
+            .count()
+    }
+
+    pub fn force_exit_subtree(
+        &mut self,
+        root_tgid: usize,
+        code: i32,
+    ) -> KernelResult<Vec<GroupExit>> {
+        let groups = self.descendant_process_groups(root_tgid);
+        if groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut exits = Vec::new();
+        for tgid in groups.into_iter().rev() {
+            if let Some(exit) = self.force_exit_group(tgid, code)? {
+                exits.push(exit);
+            }
+        }
+        Ok(exits)
+    }
+
     pub fn all_blocked_are_futex_waiters(&self, blocked_tids: &[usize]) -> bool {
         if blocked_tids.is_empty() {
             return false;
@@ -1261,7 +1335,9 @@ impl ProcessTable {
         let tids = self
             .processes
             .values()
-            .filter(|p| p.tgid == tgid && p.futex_wait_addr.is_some() && p.state != ProcessState::Exited)
+            .filter(|p| {
+                p.tgid == tgid && p.futex_wait_addr.is_some() && p.state != ProcessState::Exited
+            })
             .map(|p| p.tid)
             .collect::<Vec<_>>();
         for tid in &tids {
@@ -1505,6 +1581,29 @@ mod tests {
         let woke = table.requeue_futex(0x1000, 0x2000, 1, 1);
         assert_eq!(woke, vec![leader]);
         assert_eq!(table.wake_futex(0x2000, 1), vec![thread]);
+    }
+
+    #[test]
+    fn descendant_cleanup_reaps_process_subtree() {
+        let mut table = ProcessTable::new();
+        let init = table.spawn_init("init", 0x1000);
+        let shell = table.spawn("shell", Some(init), 0x1000);
+        let worker = table.spawn("worker", Some(shell), 0x1000);
+        let helper = table.spawn("helper", Some(worker), 0x1000);
+
+        assert!(table.has_child_process_group(shell));
+        let descendants = table.descendant_process_groups(shell);
+        assert!(descendants.contains(&shell));
+        assert!(descendants.contains(&worker));
+        assert!(descendants.contains(&helper));
+
+        let exits = table.force_exit_subtree(shell, 124).unwrap();
+        assert_eq!(exits.len(), 3);
+        assert_eq!(
+            table.active_process_group_count_in(&[shell, worker, helper]),
+            0
+        );
+        assert!(table.descendant_process_groups(shell).is_empty());
     }
 
     #[test]

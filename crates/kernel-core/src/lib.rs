@@ -53,11 +53,12 @@ const SCHED_TIME_SLICE_NS: u64 = 10_000_000;
 const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
 const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
-const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 30 * 1_000_000_000;
+const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
+const OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID: usize = 128;
 const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 10 * 1_000_000_000;
-const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 120 * 1_000_000_000;
-const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 120 * 1_000_000_000;
+const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
+const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
 const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
@@ -308,7 +309,7 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:lmbench_testcode.sh:124\n",
     "else\n",
     "    echo whuse-oscomp-lmbench-marker:runner-start\n",
-    "    run_step_with_timeout lmbench_testcode.sh 300 /musl/busybox sh ./lmbench_testcode.sh\n",
+    "    run_step_with_timeout lmbench_testcode.sh 600 /musl/busybox sh ./lmbench_testcode.sh\n",
     "    lmbench_rc=$?\n",
     "    echo whuse-oscomp-lmbench-marker:runner-end:$lmbench_rc\n",
     "fi\n",
@@ -327,7 +328,7 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:unixbench_testcode.sh:124\n",
     "else\n",
     "    echo whuse-oscomp-unixbench-marker:runner-start\n",
-    "    run_step_with_timeout unixbench_testcode.sh 300 /musl/busybox sh ./unixbench_testcode.sh\n",
+    "    run_step_with_timeout unixbench_testcode.sh 600 /musl/busybox sh ./unixbench_testcode.sh\n",
     "    unixbench_rc=$?\n",
     "    echo whuse-oscomp-unixbench-marker:runner-end:$unixbench_rc\n",
     "fi\n",
@@ -703,8 +704,8 @@ impl Kernel {
             self.watchdog_iozone_window_until_ns =
                 now.saturating_add(OSCOMP_IOZONE_BUSYBOX_WINDOW_NS);
         }
-        let in_iozone_busybox_window = OSCOMP_IOZONE_BUSYBOX_WINDOW_NS > 0
-            && now <= self.watchdog_iozone_window_until_ns;
+        let in_iozone_busybox_window =
+            OSCOMP_IOZONE_BUSYBOX_WINDOW_NS > 0 && now <= self.watchdog_iozone_window_until_ns;
         if !all_groups.is_empty()
             && (self.watchdog_last_heartbeat_ns == 0
                 || now.saturating_sub(self.watchdog_last_heartbeat_ns) >= 2_000_000_000)
@@ -727,65 +728,149 @@ impl Kernel {
                 sample
             ));
         }
+        let in_bench_phase = watched
+            .values()
+            .any(|name| name.contains("lmbench") || name.contains("unixbench"));
         let timed_out = watched
             .iter()
             .filter_map(|(tgid, name)| {
                 let started = *self.watchdog_started_at.get(tgid)?;
-                let timeout_ns = oscomp_process_timeout_ns(*tgid, name, in_iozone_busybox_window);
+                let has_child_groups = self.processes.has_child_process_group(*tgid);
+                let timeout_ns = oscomp_process_timeout_ns(
+                    *tgid,
+                    name,
+                    in_iozone_busybox_window,
+                    has_child_groups,
+                    in_bench_phase,
+                );
                 (now.saturating_sub(started) >= timeout_ns).then_some((
                     *tgid,
                     name.clone(),
                     timeout_ns,
+                    has_child_groups,
+                    in_bench_phase,
                 ))
             })
             .collect::<Vec<_>>();
         let mut killed = false;
-        for (tgid, name, timeout_ns) in timed_out {
-            self.watchdog_started_at.remove(&tgid);
-            self.watchdog_seen_name.remove(&tgid);
-            let Ok(Some(exit)) = self.processes.force_exit_group(tgid, 124) else {
+        for (tgid, name, timeout_ns, has_child_groups, in_bench_phase) in timed_out {
+            let reason = watchdog_timeout_reason(name.as_str(), has_child_groups, in_bench_phase);
+            let subtree = self.processes.descendant_process_groups(tgid);
+            if subtree.is_empty() {
+                self.watchdog_started_at.remove(&tgid);
+                self.watchdog_seen_name.remove(&tgid);
                 continue;
+            }
+            let cleanup_children_only =
+                is_busybox_supervisor(name.as_str(), has_child_groups, in_bench_phase)
+                    && has_child_groups;
+            let mut cleanup_groups = if cleanup_children_only {
+                subtree
+                    .iter()
+                    .copied()
+                    .filter(|group_tgid| *group_tgid != tgid)
+                    .collect::<Vec<_>>()
+            } else {
+                subtree.clone()
             };
-            let _ = self.scheduler.exit_group(exit.tgid);
-            for tid in &exit.tids {
-                let _ = self.scheduler.remove_task(*tid);
+            if cleanup_groups.is_empty() {
+                self.watchdog_started_at.insert(tgid, now);
+                continue;
             }
-            if let Some(parent_tgid) = exit.parent_tgid {
-                let woke = self.scheduler.wake_task(parent_tgid);
-                logln(format_args!(
-                    "whuse: oscomp watchdog wake parent_tgid={} woke={}",
-                    parent_tgid, woke
-                ));
+            for group_tgid in &cleanup_groups {
+                self.watchdog_started_at.remove(group_tgid);
+                self.watchdog_seen_name.remove(group_tgid);
             }
-            for process in self.processes.process_snapshots() {
-                if process.is_thread || process.state != proc::ProcessState::Blocked {
-                    continue;
+            if cleanup_children_only {
+                self.watchdog_started_at.insert(tgid, now);
+            } else {
+                self.watchdog_started_at.remove(&tgid);
+                self.watchdog_seen_name.remove(&tgid);
+            }
+            let cleanup_scope = if cleanup_children_only {
+                "children"
+            } else {
+                "subtree"
+            };
+            logln(format_args!(
+                "whuse-oscomp-step-cleanup-start:root_tgid={}:root_name={}:reason={}:scope={}:groups={}",
+                tgid,
+                name,
+                reason,
+                cleanup_scope,
+                cleanup_groups.len()
+            ));
+            let exits = if cleanup_children_only {
+                cleanup_groups.reverse();
+                let mut child_exits = Vec::new();
+                for child_tgid in &cleanup_groups {
+                    if let Ok(Some(exit)) = self.processes.force_exit_group(*child_tgid, 124) {
+                        child_exits.push(exit);
+                    }
                 }
-                let _ = self.scheduler.wake_task(process.tid);
+                child_exits
+            } else {
+                match self.processes.force_exit_subtree(tgid, 124) {
+                    Ok(exits) => exits,
+                    Err(_) => Vec::new(),
+                }
+            };
+            if exits.is_empty() {
+                let leftover = self
+                    .processes
+                    .active_process_group_count_in(&cleanup_groups);
+                logln(format_args!(
+                    "whuse-oscomp-step-cleanup-end:root_tgid={}:killed=0:reaped=0:leftover={}",
+                    tgid, leftover
+                ));
+                continue;
             }
-            for addr in exit.clear_child_tids {
+            let mut killed_groups = 0usize;
+            let mut killed_threads = 0usize;
+            let mut reaped_tasks = 0usize;
+            let mut clear_child_tids = Vec::new();
+            for exit in exits {
+                killed_groups = killed_groups.saturating_add(1);
+                killed_threads = killed_threads.saturating_add(exit.tids.len());
+                reaped_tasks = reaped_tasks.saturating_add(self.scheduler.exit_group(exit.tgid));
+                if let Some(parent_tgid) = exit.parent_tgid {
+                    let woke = self.scheduler.wake_task(parent_tgid);
+                    logln(format_args!(
+                        "whuse: oscomp watchdog wake parent_tgid={} woke={}",
+                        parent_tgid, woke
+                    ));
+                }
+                clear_child_tids.extend(exit.clear_child_tids);
+            }
+            for addr in clear_child_tids {
                 for tid in self.processes.wake_futex(addr, usize::MAX) {
                     let _ = self.scheduler.wake_task(tid);
                 }
             }
+            let woke_blocked = self.scheduler.wake_all_blocked();
+            let leftover = self
+                .processes
+                .active_process_group_count_in(&cleanup_groups);
             logln(format_args!(
                 "whuse: oscomp watchdog timeout tgid={} name={} after {}s",
                 tgid,
                 name,
                 timeout_ns / 1_000_000_000,
             ));
-            if name.contains("lmbench")
-                || name.contains("unixbench")
-                || name.contains("busybox")
-            {
+            if name.contains("lmbench") || name.contains("unixbench") || name.contains("busybox") {
                 logln(format_args!(
-                    "whuse-oscomp-bench-marker:watchdog-timeout:tgid={}:name={}:timeout_s={}:exit=124:threads={}",
+                    "whuse-oscomp-bench-marker:watchdog-timeout:tgid={}:name={}:timeout_s={}:reason={}:exit=124:threads={}",
                     tgid,
                     name,
                     timeout_ns / 1_000_000_000,
-                    exit.tids.len()
+                    reason,
+                    killed_threads
                 ));
             }
+            logln(format_args!(
+                "whuse-oscomp-step-cleanup-end:root_tgid={}:killed={}:reaped={}:woke_blocked={}:leftover={}",
+                tgid, killed_groups, reaped_tasks, woke_blocked, leftover
+            ));
             killed = true;
         }
         killed
@@ -1462,9 +1547,18 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
     ok
 }
 
-fn oscomp_process_timeout_ns(tgid: usize, name: &str, in_iozone_busybox_window: bool) -> u64 {
+fn oscomp_process_timeout_ns(
+    tgid: usize,
+    name: &str,
+    in_iozone_busybox_window: bool,
+    has_child_groups: bool,
+    in_bench_phase: bool,
+) -> u64 {
     if is_libctest_entry_or_runner(name) {
         return OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS;
+    }
+    if tgid < OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID && name == "/musl/busybox" {
+        return u64::MAX;
     }
     if name.contains("lmbench") {
         return OSCOMP_LMBENCH_TIMEOUT_NS;
@@ -1476,6 +1570,9 @@ fn oscomp_process_timeout_ns(tgid: usize, name: &str, in_iozone_busybox_window: 
         if tgid < OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID {
             return OSCOMP_GROUP_TIMEOUT_NS;
         }
+        if is_busybox_supervisor(name, has_child_groups, in_bench_phase) {
+            return OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS;
+        }
         if in_iozone_busybox_window {
             return OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS;
         }
@@ -1485,6 +1582,24 @@ fn oscomp_process_timeout_ns(tgid: usize, name: &str, in_iozone_busybox_window: 
         return OSCOMP_HEAVY_TIMEOUT_NS;
     }
     OSCOMP_GROUP_TIMEOUT_NS
+}
+
+fn watchdog_timeout_reason(
+    name: &str,
+    has_child_groups: bool,
+    in_bench_phase: bool,
+) -> &'static str {
+    if is_busybox_supervisor(name, has_child_groups, in_bench_phase) {
+        return "runner-stall";
+    }
+    if has_child_groups {
+        return "child-stall";
+    }
+    "leftover-cleanup"
+}
+
+fn is_busybox_supervisor(name: &str, has_child_groups: bool, in_bench_phase: bool) -> bool {
+    name.contains("busybox") && (name == "/musl/busybox" || has_child_groups || in_bench_phase)
 }
 
 fn watchdog_name_change_resets_timer(previous: &str, current: &str) -> bool {

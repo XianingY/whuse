@@ -219,6 +219,10 @@ impl KernelVfs {
             let _ = vfs.mkdir("/", dir, 0o755);
         }
         let _ = vfs.create_char_device("/dev/console", "console");
+        let _ = vfs.create_char_device("/dev/null", "null");
+        let _ = vfs.create_char_device("/dev/zero", "zero");
+        let _ = vfs.create_char_device("/dev/random", "random");
+        let _ = vfs.create_char_device("/dev/urandom", "urandom");
         let _ = vfs.create_char_device("/dev/rtc0", "rtc0");
         let _ = vfs.create_proc_file("/proc/mounts", b"");
         let _ = vfs.create_proc_file("/proc/meminfo", PROC_MEMINFO);
@@ -1378,7 +1382,15 @@ impl KernelObject for FileHandle {
                 let end = len.min(inbox.len());
                 Ok(inbox.drain(..end).collect())
             }
-            NodeData::CharDevice => Ok(Vec::new()),
+            NodeData::CharDevice => {
+                if self.path == "/dev/zero" {
+                    return Ok(alloc::vec![0; len]);
+                }
+                if self.path == "/dev/random" || self.path == "/dev/urandom" {
+                    return Ok(alloc::vec![0u8; len]);
+                }
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -1424,6 +1436,13 @@ impl KernelObject for FileHandle {
                 Ok(data.len())
             }
             NodeData::CharDevice => {
+                if self.path == "/dev/null"
+                    || self.path == "/dev/zero"
+                    || self.path == "/dev/random"
+                    || self.path == "/dev/urandom"
+                {
+                    return Ok(data.len());
+                }
                 for byte in data.iter().copied() {
                     hal().console.put_byte(byte);
                 }
@@ -1646,8 +1665,6 @@ fn external_mount_path(target: &str, absolute: &str) -> Option<String> {
         .and_then(|suffix| suffix.strip_prefix('/'))
         .map(|suffix| format!("/{}", suffix))
 }
-
-
 
 fn append_dirent(out: &mut Vec<u8>, index: usize, name: &str, file_type: u8) {
     let reclen = align_up(19 + name.len() + 1, 8) as u16;

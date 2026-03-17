@@ -33,3 +33,29 @@ make test
 `make qemu` expects `cargo` and `qemu-system-riscv64` to be installed and
 available in `PATH`.
 
+## Parallel Stage1 Workflow
+
+Use worktrees + branches to run `riscv64` and `loongarch64` in parallel:
+
+```bash
+make parallel-setup
+```
+
+This provisions:
+
+- `integration/stage1` in the main repo
+- `arch/riscv-stage1` in `../whuse-rv`
+- `arch/loongarch-stage1` in `../whuse-la`
+
+Stage1 validation (real execution mode, `WHUSE_OSCOMP_COMPAT=0`) is available
+as:
+
+```bash
+make stage1-riscv
+make stage1-loongarch
+make stage1-both
+```
+
+The stage1 runner writes independent logs under `/tmp/rv-stage1-*.log` and
+`/tmp/la-stage1-*.log`, and checks required `step-begin/step-end` markers up to
+the `iozone` phase gates.

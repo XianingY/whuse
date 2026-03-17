@@ -510,20 +510,12 @@ fn prepare_oscomp_images() -> ExitCode {
     }
     let dst_rv = oscomp_image_path("rv");
     let dst_la = oscomp_image_path("la");
-    if let Err(err) = fs::copy(&src_rv, &dst_rv) {
-        eprintln!(
-            "failed to copy {} -> {}: {err}",
-            src_rv.display(),
-            dst_rv.display()
-        );
+    if let Err(err) = refresh_oscomp_image(&src_rv, &dst_rv) {
+        eprintln!("{err}");
         return ExitCode::from(1);
     }
-    if let Err(err) = fs::copy(&src_la, &dst_la) {
-        eprintln!(
-            "failed to copy {} -> {}: {err}",
-            src_la.display(),
-            dst_la.display()
-        );
+    if let Err(err) = refresh_oscomp_image(&src_la, &dst_la) {
+        eprintln!("{err}");
         return ExitCode::from(1);
     }
 
@@ -538,6 +530,51 @@ fn prepare_oscomp_images() -> ExitCode {
         dst_la.display()
     );
     ExitCode::SUCCESS
+}
+
+fn refresh_oscomp_image(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
+    if same_file_metadata(src, dst)? {
+        return Ok(());
+    }
+    fs::copy(src, dst).map(|_| ()).map_err(|err| {
+        format!(
+            "failed to copy {} -> {}: {err}",
+            src.display(),
+            dst.display()
+        )
+    })
+}
+
+fn same_file_metadata(src: &PathBuf, dst: &PathBuf) -> Result<bool, String> {
+    if src == dst {
+        return Ok(true);
+    }
+
+    let src_meta = fs::metadata(src)
+        .map_err(|err| format!("failed to stat source image {}: {err}", src.display()))?;
+    let dst_meta = match fs::metadata(dst) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "failed to stat target image {}: {err}",
+                dst.display()
+            ));
+        }
+    };
+
+    if src_meta.len() != dst_meta.len() {
+        return Ok(false);
+    }
+
+    let src_modified = src_meta
+        .modified()
+        .map_err(|err| format!("failed to read mtime for {}: {err}", src.display()))?;
+    let dst_modified = dst_meta
+        .modified()
+        .map_err(|err| format!("failed to read mtime for {}: {err}", dst.display()))?;
+
+    Ok(dst_modified >= src_modified)
 }
 
 fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {

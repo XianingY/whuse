@@ -245,7 +245,7 @@ pub const SIGNAL_TRAMPOLINE_CODE: [u8; 8] = [
 ];
 #[cfg(not(target_arch = "riscv64"))]
 pub const SIGNAL_TRAMPOLINE_CODE: [u8; 8] = [0u8; 8];
-const SYSCALL_TRACE: bool = false;
+const SYSCALL_TRACE: bool = true;
 const ENOSYS_TRACE: bool = true;
 
 fn trace_line(line: &str) {
@@ -943,10 +943,20 @@ impl SyscallDispatcher {
 
     fn sys_brk(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let requested = args.0[0];
+        if SYSCALL_TRACE {
+            trace_line(&format!("whuse: sys_brk requested={:#x}", requested));
+        }
         let process = procs.current_mut()?;
-        process
+        let res = process
             .address_space
-            .brk((requested != 0).then_some(requested))
+            .brk((requested != 0).then_some(requested));
+        if SYSCALL_TRACE {
+            match &res {
+                Ok(val) => trace_line(&format!("whuse: sys_brk success res={:#x}", val)),
+                Err(err) => trace_line(&format!("whuse: sys_brk failed err={}", err)),
+            }
+        }
+        res
     }
 
     fn sys_clone(
@@ -2529,9 +2539,6 @@ impl SyscallDispatcher {
                             let process = procs.current_mut()?;
                             process.futex_wait_addr = None;
                             process.futex_wait_deadline_ns = None;
-                            if cancellation_pending {
-                                process.cancellation_pending = false;
-                            }
                             log_always(&format!(
                                 "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x} sfp={} cancel={}",
                                 tid,
@@ -2576,15 +2583,8 @@ impl SyscallDispatcher {
                     }
                 }
                 let pending = procs.current()?.pending_signals & !procs.current()?.signal_mask;
-                if pending != 0
-                    || procs.current()?.signal_frame_pending
-                    || procs.current()?.cancellation_pending
-                {
+                if pending != 0 || procs.current()?.signal_frame_pending {
                     let current_tgid = procs.current()?.tgid;
-                    let cancellation_pending = procs.current()?.cancellation_pending;
-                    if cancellation_pending {
-                        procs.current_mut()?.cancellation_pending = false;
-                    }
                     log_always(&format!(
                         "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={} cancel={}",
                         tid,
@@ -2593,11 +2593,9 @@ impl SyscallDispatcher {
                         procs.current()?.signal_frame_pending,
                         procs.current()?.cancellation_pending
                     ));
-                    if cancellation_pending {
-                        for peer_tid in procs.wake_all_futex_waiters_in_tgid(current_tgid) {
-                            if peer_tid != tid {
-                                let _ = scheduler.wake_task(peer_tid);
-                            }
+                    for peer_tid in procs.wake_all_futex_waiters_in_tgid(current_tgid) {
+                        if peer_tid != tid {
+                            let _ = scheduler.wake_task(peer_tid);
                         }
                     }
                     return Err(EINTR);

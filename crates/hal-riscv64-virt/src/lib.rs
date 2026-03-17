@@ -340,14 +340,25 @@ pub static KERNEL_TRAP_HANDLER: core::sync::atomic::AtomicUsize =
 unsafe extern "C" fn __whuse_kernel_trap_handler(scause: usize, _sepc: usize) {
     let interrupt_bit = 1usize << (usize::BITS as usize - 1);
     let is_timer = (scause & interrupt_bit) != 0 && (scause & !interrupt_bit) == 5;
-    if !is_timer {
+    if is_timer {
+        let cb_ptr = KERNEL_TRAP_HANDLER.load(core::sync::atomic::Ordering::Relaxed);
+        if cb_ptr != 0 {
+            let cb: fn() = core::mem::transmute(cb_ptr);
+            cb();
+        }
         return;
     }
-    let cb_ptr = KERNEL_TRAP_HANDLER.load(core::sync::atomic::Ordering::Relaxed);
-    if cb_ptr != 0 {
-        let cb: fn() = core::mem::transmute(cb_ptr);
-        cb();
-    }
+
+    // Non-timer trap in kernel mode is fatal.
+    let mut console = hal_api::ConsoleWriter;
+    let _ = core::fmt::Write::write_fmt(
+        &mut console,
+        format_args!(
+            "\nwhuse: FATAL KERNEL TRAP scause={:#x} sepc={:#x}\n",
+            scause, _sepc
+        ),
+    );
+    panic!("unhandled kernel trap");
 }
 
 static mut MEMORY_MAP: [MemoryRegion; 2] = [

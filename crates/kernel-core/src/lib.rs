@@ -54,7 +54,9 @@ const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
 const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 30 * 1_000_000_000;
+const OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID: usize = 128;
 const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 10 * 1_000_000_000;
+const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 120 * 1_000_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
 const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
@@ -303,7 +305,10 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-skip:lmbench_testcode.sh:compat-hang\n",
     "    echo whuse-oscomp-step-end:lmbench_testcode.sh:124\n",
     "else\n",
+    "    echo whuse-oscomp-lmbench-marker:runner-start\n",
     "    run_step_with_timeout lmbench_testcode.sh 300 /musl/busybox sh ./lmbench_testcode.sh\n",
+    "    lmbench_rc=$?\n",
+    "    echo whuse-oscomp-lmbench-marker:runner-end:$lmbench_rc\n",
     "fi\n",
     "echo \"run lua_testcode.sh\"\n",
     "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
@@ -662,17 +667,26 @@ impl Kernel {
         self.watchdog_seen_name
             .retain(|tgid, _| watched.contains_key(tgid));
         for (tgid, name) in watched.iter() {
-            let reset_started_at = self
-                .watchdog_seen_name
-                .get(tgid)
-                .map(|previous| previous != name)
-                .unwrap_or(true);
+            let previous_name = self.watchdog_seen_name.get(tgid);
+            let reset_started_at = match previous_name {
+                None => true,
+                Some(previous) if previous == name => false,
+                Some(previous) => watchdog_name_change_resets_timer(previous, name),
+            };
             if reset_started_at {
                 self.watchdog_started_at.insert(*tgid, now);
-                self.watchdog_seen_name.insert(*tgid, name.clone());
+                if let Some(previous) = previous_name {
+                    if previous.contains("lmbench") || name.contains("lmbench") {
+                        logln(format_args!(
+                            "whuse-oscomp-lmbench-marker:proc-switch:tgid={}:from={}:to={}",
+                            tgid, previous, name
+                        ));
+                    }
+                }
             } else {
                 self.watchdog_started_at.entry(*tgid).or_insert(now);
             }
+            self.watchdog_seen_name.insert(*tgid, name.clone());
         }
         if OSCOMP_IOZONE_BUSYBOX_WINDOW_NS > 0
             && watched.values().any(|name| name.contains("iozone"))
@@ -708,7 +722,7 @@ impl Kernel {
             .iter()
             .filter_map(|(tgid, name)| {
                 let started = *self.watchdog_started_at.get(tgid)?;
-                let timeout_ns = oscomp_process_timeout_ns(name, in_iozone_busybox_window);
+                let timeout_ns = oscomp_process_timeout_ns(*tgid, name, in_iozone_busybox_window);
                 (now.saturating_sub(started) >= timeout_ns).then_some((
                     *tgid,
                     name.clone(),
@@ -751,6 +765,15 @@ impl Kernel {
                 name,
                 timeout_ns / 1_000_000_000,
             ));
+            if name.contains("lmbench") || name.contains("busybox") {
+                logln(format_args!(
+                    "whuse-oscomp-lmbench-marker:watchdog-timeout:tgid={}:name={}:timeout_s={}:exit=124:threads={}",
+                    tgid,
+                    name,
+                    timeout_ns / 1_000_000_000,
+                    exit.tids.len()
+                ));
+            }
             killed = true;
         }
         killed
@@ -1411,20 +1434,35 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
     ok
 }
 
-fn oscomp_process_timeout_ns(name: &str, in_iozone_busybox_window: bool) -> u64 {
-    if name == "./busybox" {
-        return OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS;
-    }
+fn oscomp_process_timeout_ns(tgid: usize, name: &str, in_iozone_busybox_window: bool) -> u64 {
     if is_libctest_entry_or_runner(name) {
         return OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS;
+    }
+    if name.contains("lmbench") {
+        return OSCOMP_LMBENCH_TIMEOUT_NS;
+    }
+    if name.contains("busybox") {
+        if tgid < OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID {
+            return OSCOMP_GROUP_TIMEOUT_NS;
+        }
+        if in_iozone_busybox_window {
+            return OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS;
+        }
+        return OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS;
     }
     if is_oscomp_heavy_process(name) {
         return OSCOMP_HEAVY_TIMEOUT_NS;
     }
-    if in_iozone_busybox_window && name.contains("busybox") {
-        return OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS;
-    }
     OSCOMP_GROUP_TIMEOUT_NS
+}
+
+fn watchdog_name_change_resets_timer(previous: &str, current: &str) -> bool {
+    let busybox_related = previous.contains("busybox") || current.contains("busybox");
+    let lmbench_related = previous.contains("lmbench") || current.contains("lmbench");
+    if busybox_related || lmbench_related {
+        return false;
+    }
+    true
 }
 
 fn is_libctest_entry_or_runner(name: &str) -> bool {

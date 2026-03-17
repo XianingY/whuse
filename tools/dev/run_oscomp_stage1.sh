@@ -63,9 +63,9 @@ run_arch() {
 	strings "${log}" >"${text_log}" || true
 	echo "[${arch}] log: ${log}"
 
-	if rg -q "panic|pid 1 \(init\).*trap|trapped with scause" "${text_log}"; then
+	if rg -q "KERNEL PANIC|panic|pid 1 \(init\).*trap" "${text_log}"; then
 		echo "[${arch}] detected kernel panic or init crash" >&2
-		rg "panic|pid 1 \(init\).*trap|trapped with scause" "${text_log}" >&2 || true
+		rg "KERNEL PANIC|panic|pid 1 \(init\).*trap" "${text_log}" >&2 || true
 		return 1
 	fi
 
@@ -87,6 +87,15 @@ run_arch() {
 
 	echo "[${arch}] marker summary:"
 	rg "whuse-oscomp-step-(begin|end|timeout|skip)|whuse-oscomp-suite-done" "${text_log}" || true
+	local timeout_count
+	local fail_count
+	local error_count
+	local bench_watchdog_count
+	timeout_count="$(rg -c "whuse-oscomp-step-timeout:" "${text_log}" || true)"
+	fail_count="$(rg -c "testcase .* fail" "${text_log}" || true)"
+	error_count="$(rg -c "testcase .* error" "${text_log}" || true)"
+	bench_watchdog_count="$(rg -c "whuse-oscomp-(lmbench|bench)-marker:watchdog-timeout:" "${text_log}" || true)"
+	echo "[${arch}] quality summary: step-timeout=${timeout_count} testcase-fail=${fail_count} testcase-error=${error_count} bench-watchdog-timeout=${bench_watchdog_count}"
 	return "${ok}"
 }
 

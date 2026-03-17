@@ -57,6 +57,7 @@ const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 30 * 1_000_000_000;
 const OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID: usize = 128;
 const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 10 * 1_000_000_000;
 const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 120 * 1_000_000_000;
+const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 120 * 1_000_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
 const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
@@ -219,6 +220,7 @@ const OSCOMP_BUSYBOX_COMPAT_SCRIPT: &str = concat!(
 );
 const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "set +e\n",
+    "export PATH=/musl:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
     "WHUSE_OSCOMP_COMPAT=${WHUSE_OSCOMP_COMPAT:-0}\n",
     "WHUSE_HAVE_TIMEOUT=0\n",
     "if /musl/busybox timeout 1 /musl/busybox true >/tmp/whuse-timeout-probe.log 2>&1; then\n",
@@ -324,7 +326,10 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-skip:unixbench_testcode.sh:compat-hang\n",
     "    echo whuse-oscomp-step-end:unixbench_testcode.sh:124\n",
     "else\n",
+    "    echo whuse-oscomp-unixbench-marker:runner-start\n",
     "    run_step_with_timeout unixbench_testcode.sh 300 /musl/busybox sh ./unixbench_testcode.sh\n",
+    "    unixbench_rc=$?\n",
+    "    echo whuse-oscomp-unixbench-marker:runner-end:$unixbench_rc\n",
     "fi\n",
     "echo \"run netperf_testcode.sh\"\n",
     "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
@@ -676,9 +681,13 @@ impl Kernel {
             if reset_started_at {
                 self.watchdog_started_at.insert(*tgid, now);
                 if let Some(previous) = previous_name {
-                    if previous.contains("lmbench") || name.contains("lmbench") {
+                    if previous.contains("lmbench")
+                        || name.contains("lmbench")
+                        || previous.contains("unixbench")
+                        || name.contains("unixbench")
+                    {
                         logln(format_args!(
-                            "whuse-oscomp-lmbench-marker:proc-switch:tgid={}:from={}:to={}",
+                            "whuse-oscomp-bench-marker:proc-switch:tgid={}:from={}:to={}",
                             tgid, previous, name
                         ));
                     }
@@ -765,9 +774,12 @@ impl Kernel {
                 name,
                 timeout_ns / 1_000_000_000,
             ));
-            if name.contains("lmbench") || name.contains("busybox") {
+            if name.contains("lmbench")
+                || name.contains("unixbench")
+                || name.contains("busybox")
+            {
                 logln(format_args!(
-                    "whuse-oscomp-lmbench-marker:watchdog-timeout:tgid={}:name={}:timeout_s={}:exit=124:threads={}",
+                    "whuse-oscomp-bench-marker:watchdog-timeout:tgid={}:name={}:timeout_s={}:exit=124:threads={}",
                     tgid,
                     name,
                     timeout_ns / 1_000_000_000,
@@ -1351,11 +1363,17 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
     for dir in ["/var", "/var/tmp", "/usr", "/usr/bin", "/lib"] {
         let _ = vfs.mkdir("/", dir, 0o755);
     }
+    install_busybox_exec_alias(vfs, "/musl/ls", "ls");
+    install_busybox_exec_alias(vfs, "/musl/which", "which");
     for (path, target) in [
         ("/bin/busybox", "/musl/busybox"),
         ("/bin/sh", "/musl/busybox"),
         ("/bin/bash", "/musl/busybox"),
+        ("/bin/ls", "/musl/ls"),
+        ("/bin/which", "/musl/which"),
         ("/busybox", "/musl/busybox"),
+        ("/usr/bin/ls", "/musl/ls"),
+        ("/usr/bin/which", "/musl/which"),
         ("/usr/bin/env", "/musl/busybox"),
         ("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so"),
         ("/lib/ld-musl-loongarch64.so.1", "/musl/lib/libc.so"),
@@ -1404,6 +1422,16 @@ fn install_fallback_symlink(vfs: &mut KernelVfs, path: &str, target: &str) {
     }
 }
 
+fn install_busybox_exec_alias(vfs: &mut KernelVfs, path: &str, applet: &str) {
+    let script = format!("#!/musl/busybox sh\nexec /musl/busybox {} \"$@\"\n", applet);
+    if let Err(err) = vfs.preload_external_file(path, script.as_bytes(), Some(0o100755)) {
+        logln(format_args!(
+            "whuse: failed busybox exec alias {} (applet={}) err={}",
+            path, applet, err
+        ));
+    }
+}
+
 fn install_oscomp_root_aliases(vfs: &mut KernelVfs) {
     for name in OSCOMP_ROOT_ALIAS_ENTRIES {
         let path = format!("/{}", name);
@@ -1441,6 +1469,9 @@ fn oscomp_process_timeout_ns(tgid: usize, name: &str, in_iozone_busybox_window: 
     if name.contains("lmbench") {
         return OSCOMP_LMBENCH_TIMEOUT_NS;
     }
+    if name.contains("unixbench") {
+        return OSCOMP_UNIXBENCH_TIMEOUT_NS;
+    }
     if name.contains("busybox") {
         if tgid < OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID {
             return OSCOMP_GROUP_TIMEOUT_NS;
@@ -1459,7 +1490,8 @@ fn oscomp_process_timeout_ns(tgid: usize, name: &str, in_iozone_busybox_window: 
 fn watchdog_name_change_resets_timer(previous: &str, current: &str) -> bool {
     let busybox_related = previous.contains("busybox") || current.contains("busybox");
     let lmbench_related = previous.contains("lmbench") || current.contains("lmbench");
-    if busybox_related || lmbench_related {
+    let unixbench_related = previous.contains("unixbench") || current.contains("unixbench");
+    if busybox_related || lmbench_related || unixbench_related {
         return false;
     }
     true

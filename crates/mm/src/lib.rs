@@ -8,7 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::ptr;
-use hal_api::{HalMemory, MemoryRegion, VmSpaceToken};
+use hal_api::{hal, HalMemory, MemoryRegion, VmSpaceToken};
 use spin::Mutex;
 
 pub type KernelResult<T> = Result<T, i32>;
@@ -52,6 +52,21 @@ const LOONGARCH_MMIO_BASE: usize = 0x1000_0000;
 const LOONGARCH_MMIO_SIZE: usize = 0x1000_0000;
 const LOONGARCH_PHYS_BASE: usize = 0x9000_0000;
 const LOONGARCH_PHYS_SIZE: usize = 512 * 1024 * 1024;
+
+#[inline]
+fn brk_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_BRK"), Some("1"))
+}
+
+fn brk_debug(line: &str) {
+    if !brk_debug_enabled() {
+        return;
+    }
+    for byte in line.bytes() {
+        hal().console.put_byte(byte);
+    }
+    hal().console.put_byte(b'\n');
+}
 
 #[derive(Clone, Debug)]
 pub struct MappingArea {
@@ -339,22 +354,43 @@ impl AddressSpace {
 
         let new_break = align_up(requested_break, 16);
         let old_break = self.inner.lock().program_break;
+        brk_debug(&alloc::format!(
+            "whuse-brk: begin requested={:#x} old={:#x} new={:#x}",
+            requested_break, old_break, new_break
+        ));
         if new_break > old_break {
             let map_start = align_up(old_break, PAGE_SIZE);
             let map_end = align_up(new_break, PAGE_SIZE);
             if map_end > map_start {
+                brk_debug(&alloc::format!(
+                    "whuse-brk: grow map_start={:#x} map_end={:#x} len={:#x}",
+                    map_start,
+                    map_end,
+                    map_end - map_start
+                ));
                 self.map_fixed_bytes(map_start, &[], map_end - map_start, DEFAULT_PROT)?;
+                brk_debug(&alloc::format!(
+                    "whuse-brk: grow-done map_start={:#x} map_end={:#x}",
+                    map_start, map_end
+                ));
             }
         } else if new_break < old_break {
             let unmap_start = align_up(new_break, PAGE_SIZE);
             let unmap_end = align_up(old_break, PAGE_SIZE);
             if unmap_end > unmap_start {
+                brk_debug(&alloc::format!(
+                    "whuse-brk: shrink unmap_start={:#x} unmap_end={:#x} len={:#x}",
+                    unmap_start,
+                    unmap_end,
+                    unmap_end - unmap_start
+                ));
                 let mut inner = self.inner.lock();
                 unmap_range_inner(&mut inner, unmap_start, unmap_end - unmap_start)?;
             }
         }
 
         self.inner.lock().program_break = new_break;
+        brk_debug(&alloc::format!("whuse-brk: done new={:#x}", new_break));
         Ok(new_break)
     }
 

@@ -1256,6 +1256,18 @@ impl ProcessTable {
             .collect()
     }
 
+    pub fn sigsuspend_blocked_with_pending_signal_tids(&self) -> Vec<usize> {
+        self.processes
+            .values()
+            .filter(|p| {
+                p.sigsuspend_saved_mask.is_some()
+                    && (p.pending_signals & !p.signal_mask) != 0
+                    && p.state != ProcessState::Exited
+            })
+            .map(|p| p.tid)
+            .collect()
+    }
+
     pub fn tgids_with_all_threads_futex_blocked(&self) -> Vec<usize> {
         static mut CHECK_COUNT: usize = 0;
         unsafe {

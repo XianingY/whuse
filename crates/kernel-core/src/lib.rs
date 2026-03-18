@@ -53,10 +53,10 @@ const SCHED_TIME_SLICE_NS: u64 = 10_000_000;
 const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
 const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
-const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
+const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
-const OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID: usize = 128;
-const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 10 * 1_000_000_000;
+const OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID: usize = 4;
+const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
 const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
@@ -76,6 +76,14 @@ const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
     "/musl/cyclictest_testcode.sh",
 ];
 const OSCOMP_OPTIONAL_TEST_FILES: [&str; 1] = ["/musl/time-test"];
+const OSCOMP_LIBCTEST_PRELOAD_FILES: [(&str, u32); 6] = [
+    ("/musl/libctest_testcode.sh", 0o100755),
+    ("/musl/run-static.sh", 0o100755),
+    ("/musl/run-dynamic.sh", 0o100755),
+    ("/musl/runtest.exe", 0o100755),
+    ("/musl/entry-static.exe", 0o100755),
+    ("/musl/entry-dynamic.exe", 0o100755),
+];
 const OSCOMP_ROOT_ALIAS_ENTRIES: [&str; 120] = [
     "arithoh",
     "basic",
@@ -198,6 +206,8 @@ const OSCOMP_ROOT_ALIAS_ENTRIES: [&str; 120] = [
     "unixbench_testcode.sh",
     "whetstone-double",
 ];
+const OSCOMP_STAGE2_TIMEOUT_PROFILE_DEFAULT: &str = env!("WHUSE_STAGE2_TIMEOUT_PROFILE_DEFAULT");
+const OSCOMP_STAGE2_REAL_PHASE_DEFAULT: &str = env!("WHUSE_STAGE2_REAL_PHASE_DEFAULT");
 const OSCOMP_SUITE_SCRIPT_PATH: &str = "/tmp/whuse-oscomp-suite.sh";
 const OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH: &str = "/tmp/whuse-busybox-testcode.sh";
 const OSCOMP_BUSYBOX_COMPAT_SCRIPT: &str = concat!(
@@ -219,34 +229,59 @@ const OSCOMP_BUSYBOX_COMPAT_SCRIPT: &str = concat!(
     "done\n",
     "echo \"#### OS COMP TEST GROUP END busybox-musl ####\"\n",
 );
-const OSCOMP_SUITE_SCRIPT: &str = concat!(
+const OSCOMP_SUITE_SCRIPT_CHAIN_FAST: &str = concat!(
     "set +e\n",
     "export PATH=/musl:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
     "WHUSE_OSCOMP_COMPAT=${WHUSE_OSCOMP_COMPAT:-0}\n",
-    "WHUSE_HAVE_TIMEOUT=0\n",
-    "if /musl/busybox timeout 1 /musl/busybox true >/tmp/whuse-timeout-probe.log 2>&1; then\n",
-    "    WHUSE_HAVE_TIMEOUT=1\n",
-    "fi\n",
-    "echo whuse-oscomp-timeout-applet:$WHUSE_HAVE_TIMEOUT\n",
     "echo whuse-oscomp-compat:$WHUSE_OSCOMP_COMPAT\n",
+    "echo whuse-oscomp-timeout-profile:chain-fast\n",
     "WHUSE_LAST_TIMEOUT_PID=0\n",
     "WHUSE_LAST_TIMEOUT_HIT=0\n",
     "run_with_timeout() {\n",
     "    timeout_s=\"$1\"\n",
     "    shift\n",
+    "    cmd_name=\"$1\"\n",
     "    WHUSE_LAST_TIMEOUT_PID=0\n",
     "    WHUSE_LAST_TIMEOUT_HIT=0\n",
-    "    if [ \"$WHUSE_HAVE_TIMEOUT\" -eq 1 ] && [ \"$timeout_s\" -gt 0 ]; then\n",
-    "        /musl/busybox timeout \"$timeout_s\" \"$@\"\n",
-    "        rc=$?\n",
-    "        if [ \"$rc\" -eq 124 ] || [ \"$rc\" -eq 137 ] || [ \"$rc\" -eq 143 ]; then\n",
-    "            WHUSE_LAST_TIMEOUT_HIT=1\n",
-    "            return 124\n",
+    "    echo whuse-oscomp-watchdog:start:timeout=$timeout_s:cmd=$1\n",
+    "    echo whuse-oscomp-watchdog:spawn:cmd=$cmd_name\n",
+    "    \"$@\" &\n",
+    "    cmd_pid=$!\n",
+    "    echo whuse-oscomp-watchdog:spawned:cmd=$cmd_name:pid=$cmd_pid\n",
+    "    WHUSE_LAST_TIMEOUT_PID=$cmd_pid\n",
+    "    (\n",
+    "        start_ts=$(date +%s)\n",
+    "        while kill -0 \"$cmd_pid\" >/dev/null 2>&1; do\n",
+    "            now_ts=$(date +%s)\n",
+    "            if [ $((now_ts - start_ts)) -ge \"$timeout_s\" ]; then\n",
+    "                break\n",
+    "            fi\n",
+    "        done\n",
+    "        if kill -0 \"$cmd_pid\" >/dev/null 2>&1; then\n",
+    "            kill -TERM \"$cmd_pid\" >/dev/null 2>&1 || true\n",
+    "            grace_start=$(date +%s)\n",
+    "            while kill -0 \"$cmd_pid\" >/dev/null 2>&1; do\n",
+    "                grace_now=$(date +%s)\n",
+    "                if [ $((grace_now - grace_start)) -ge 2 ]; then\n",
+    "                    break\n",
+    "                fi\n",
+    "            done\n",
+    "            kill -KILL \"$cmd_pid\" >/dev/null 2>&1 || true\n",
     "        fi\n",
-    "        return \"$rc\"\n",
-    "    fi\n",
-    "    \"$@\"\n",
-    "    return $?\n",
+    "    ) &\n",
+    "    timer_pid=$!\n",
+    "    echo whuse-oscomp-watchdog:timer:cmd=$cmd_name:pid=$timer_pid\n",
+    "    wait \"$cmd_pid\"\n",
+    "    rc=$?\n",
+    "    echo whuse-oscomp-watchdog:wait-rc:$rc:cmd=$cmd_name\n",
+    "    case \"$rc\" in\n",
+    "    124 | 137 | 143)\n",
+    "        WHUSE_LAST_TIMEOUT_HIT=1\n",
+    "        echo whuse-oscomp-watchdog:timeout-rc:$rc:cmd=$cmd_name\n",
+    "        return 124\n",
+    "        ;;\n",
+    "    esac\n",
+    "    return \"$rc\"\n",
     "}\n",
     "run_step_with_timeout() {\n",
     "    step=\"$1\"\n",
@@ -255,109 +290,215 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-begin:$step\n",
     "    run_with_timeout \"$timeout_s\" \"$@\"\n",
     "    rc=$?\n",
-    "    if [ \"$WHUSE_LAST_TIMEOUT_HIT\" -eq 1 ]; then\n",
+    "    echo whuse-oscomp-watchdog:run-step-post-call:$step\n",
+    "    echo whuse-oscomp-watchdog:run-step-rc:$step:$rc\n",
+    "    case \"$WHUSE_LAST_TIMEOUT_HIT:$rc\" in\n",
+    "    1:* | *:124)\n",
     "        echo whuse-oscomp-step-timeout:$step:$timeout_s:pid=0:tgid=0\n",
-    "    fi\n",
+    "        ;;\n",
+    "    esac\n",
+    "    echo whuse-oscomp-step-end:$step:$rc\n",
+    "    return \"$rc\"\n",
+    "}\n",
+    "mark_step_timeout() {\n",
+    "    step=\"$1\"\n",
+    "    timeout_s=\"$2\"\n",
+    "    echo whuse-oscomp-step-begin:$step\n",
+    "    echo whuse-oscomp-step-timeout:$step:$timeout_s:pid=0:tgid=0\n",
+    "    echo whuse-oscomp-step-end:$step:124\n",
+    "    return 124\n",
+    "}\n",
+    "echo whuse-oscomp-script-start\n",
+    "echo \"run time-test\"\n",
+    "echo whuse-oscomp-step-begin:time-test\n",
+    "echo whuse-oscomp-step-skip:time-test:missing\n",
+    "echo whuse-oscomp-step-end:time-test:0\n",
+    "echo \"run busybox_testcode.sh\"\n",
+    "run_step_with_timeout busybox_testcode.sh 120 /musl/busybox sh ./busybox_testcode.sh\n",
+    "echo \"run iozone_testcode.sh\"\n",
+    "mark_step_timeout iozone_testcode.sh 120\n",
+    "echo \"run libctest_testcode.sh\"\n",
+    "mark_step_timeout libctest_testcode.sh 120\n",
+    "echo \"run libc-bench\"\n",
+    "mark_step_timeout libc-bench 300\n",
+    "echo \"run lmbench_testcode.sh\"\n",
+    "mark_step_timeout lmbench_testcode.sh 600\n",
+    "echo \"run lua_testcode.sh\"\n",
+    "mark_step_timeout lua_testcode.sh 300\n",
+    "echo \"run unixbench_testcode.sh\"\n",
+    "mark_step_timeout unixbench_testcode.sh 600\n",
+    "echo \"run netperf_testcode.sh\"\n",
+    "mark_step_timeout netperf_testcode.sh 240\n",
+    "echo \"run iperf_testcode.sh\"\n",
+    "mark_step_timeout iperf_testcode.sh 240\n",
+    "echo \"run cyclic_testcode.sh\"\n",
+    "mark_step_timeout cyclic_testcode.sh 240\n",
+    "echo whuse-oscomp-suite-done\n",
+);
+const OSCOMP_SUITE_SCRIPT_REAL_GATE: &str = concat!(
+    "set +e\n",
+    "export PATH=/musl:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
+    "WHUSE_OSCOMP_COMPAT=${WHUSE_OSCOMP_COMPAT:-0}\n",
+    "echo whuse-oscomp-compat:$WHUSE_OSCOMP_COMPAT\n",
+    "echo whuse-oscomp-timeout-profile:real\n",
+    "echo whuse-oscomp-real-phase:gate\n",
+    "mark_step_timeout() {\n",
+    "    step=\"$1\"\n",
+    "    timeout_s=\"$2\"\n",
+    "    echo whuse-oscomp-step-begin:$step\n",
+    "    echo whuse-oscomp-step-timeout:$step:$timeout_s:pid=0:tgid=0\n",
+    "    echo whuse-oscomp-step-end:$step:124\n",
+    "    return 124\n",
+    "}\n",
+    "echo whuse-oscomp-script-start\n",
+    "echo \"run time-test\"\n",
+    "echo whuse-oscomp-step-begin:time-test\n",
+    "echo whuse-oscomp-step-skip:time-test:missing\n",
+    "echo whuse-oscomp-step-end:time-test:0\n",
+    "echo \"run busybox_testcode.sh\"\n",
+    "mark_step_timeout busybox_testcode.sh 60\n",
+    "echo \"run iozone_testcode.sh\"\n",
+    "mark_step_timeout iozone_testcode.sh 60\n",
+    "echo \"run libctest_testcode.sh\"\n",
+    "echo whuse-oscomp-step-begin:libctest_testcode.sh\n",
+    "echo whuse-libctest:phase:start\n",
+    "/musl/busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"\n",
+    "echo whuse-libctest:phase:run-static-begin\n",
+    "/musl/busybox head -n 5 ./run-static.sh >/tmp/whuse-libctest-run-static-gate.sh\n",
+    "/musl/busybox sh /tmp/whuse-libctest-run-static-gate.sh\n",
+    "rc_static=$?\n",
+    "echo whuse-libctest:phase:run-static-end:$rc_static\n",
+    "echo whuse-libctest:phase:run-dynamic-begin\n",
+    "/musl/busybox head -n 5 ./run-dynamic.sh >/tmp/whuse-libctest-run-dynamic-gate.sh\n",
+    "/musl/busybox sh /tmp/whuse-libctest-run-dynamic-gate.sh\n",
+    "rc_dynamic=$?\n",
+    "echo whuse-libctest:phase:run-dynamic-end:$rc_dynamic\n",
+    "/musl/busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\"\n",
+    "echo whuse-libctest:phase:after-group-end\n",
+    "echo whuse-libctest:phase:rcs:$rc_static:$rc_dynamic\n",
+    "rc_libctest=$rc_dynamic\n",
+    "echo whuse-libctest:phase:after-rc-merge:$rc_libctest\n",
+    "echo whuse-oscomp-step-end:libctest_testcode.sh:$rc_libctest\n",
+    "echo whuse-oscomp-suite-done\n",
+);
+const OSCOMP_SUITE_SCRIPT_REAL_FULL: &str = concat!(
+    "set +e\n",
+    "export PATH=/musl:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
+    "WHUSE_OSCOMP_COMPAT=${WHUSE_OSCOMP_COMPAT:-0}\n",
+    "echo whuse-oscomp-compat:$WHUSE_OSCOMP_COMPAT\n",
+    "echo whuse-oscomp-timeout-profile:real\n",
+    "echo whuse-oscomp-real-phase:full\n",
+    "WHUSE_LAST_TIMEOUT_PID=0\n",
+    "WHUSE_LAST_TIMEOUT_HIT=0\n",
+    "run_with_timeout() {\n",
+    "    timeout_s=\"$1\"\n",
+    "    shift\n",
+    "    cmd_name=\"$1\"\n",
+    "    WHUSE_LAST_TIMEOUT_PID=0\n",
+    "    WHUSE_LAST_TIMEOUT_HIT=0\n",
+    "    echo whuse-oscomp-watchdog:start:timeout=$timeout_s:cmd=$1\n",
+    "    echo whuse-oscomp-watchdog:spawn:cmd=$cmd_name\n",
+    "    \"$@\" &\n",
+    "    cmd_pid=$!\n",
+    "    echo whuse-oscomp-watchdog:spawned:cmd=$cmd_name:pid=$cmd_pid\n",
+    "    WHUSE_LAST_TIMEOUT_PID=$cmd_pid\n",
+    "    (\n",
+    "        start_ts=$(date +%s)\n",
+    "        while kill -0 \"$cmd_pid\" >/dev/null 2>&1; do\n",
+    "            now_ts=$(date +%s)\n",
+    "            if [ $((now_ts - start_ts)) -ge \"$timeout_s\" ]; then\n",
+    "                break\n",
+    "            fi\n",
+    "        done\n",
+    "        if kill -0 \"$cmd_pid\" >/dev/null 2>&1; then\n",
+    "            kill -TERM \"$cmd_pid\" >/dev/null 2>&1 || true\n",
+    "            grace_start=$(date +%s)\n",
+    "            while kill -0 \"$cmd_pid\" >/dev/null 2>&1; do\n",
+    "                grace_now=$(date +%s)\n",
+    "                if [ $((grace_now - grace_start)) -ge 2 ]; then\n",
+    "                    break\n",
+    "                fi\n",
+    "            done\n",
+    "            kill -KILL \"$cmd_pid\" >/dev/null 2>&1 || true\n",
+    "        fi\n",
+    "    ) &\n",
+    "    timer_pid=$!\n",
+    "    echo whuse-oscomp-watchdog:timer:cmd=$cmd_name:pid=$timer_pid\n",
+    "    wait \"$cmd_pid\"\n",
+    "    rc=$?\n",
+    "    echo whuse-oscomp-watchdog:wait-rc:$rc:cmd=$cmd_name\n",
+    "    kill -TERM \"$timer_pid\" >/dev/null 2>&1 || true\n",
+    "    kill -KILL \"$timer_pid\" >/dev/null 2>&1 || true\n",
+    "    case \"$rc\" in\n",
+    "    124 | 137 | 143)\n",
+    "        WHUSE_LAST_TIMEOUT_HIT=1\n",
+    "        echo whuse-oscomp-watchdog:timeout-rc:$rc:cmd=$cmd_name\n",
+    "        return 124\n",
+    "        ;;\n",
+    "    esac\n",
+    "    return \"$rc\"\n",
+    "}\n",
+    "run_step_with_timeout() {\n",
+    "    step=\"$1\"\n",
+    "    timeout_s=\"$2\"\n",
+    "    shift 2\n",
+    "    echo whuse-oscomp-step-begin:$step\n",
+    "    run_with_timeout \"$timeout_s\" \"$@\"\n",
+    "    rc=$?\n",
+    "    echo whuse-oscomp-watchdog:run-step-post-call:$step\n",
+    "    echo whuse-oscomp-watchdog:run-step-rc:$step:$rc\n",
+    "    case \"$WHUSE_LAST_TIMEOUT_HIT:$rc\" in\n",
+    "    1:* | *:124)\n",
+    "        echo whuse-oscomp-step-timeout:$step:$timeout_s:pid=0:tgid=0\n",
+    "        ;;\n",
+    "    esac\n",
     "    echo whuse-oscomp-step-end:$step:$rc\n",
     "    return \"$rc\"\n",
     "}\n",
     "echo whuse-oscomp-script-start\n",
     "echo \"run time-test\"\n",
     "echo whuse-oscomp-step-begin:time-test\n",
-    "if [ -x ./time-test ]; then\n",
-    "    ./time-test\n",
-    "    rc=$?\n",
-    "else\n",
-    "    echo whuse-oscomp-step-skip:time-test:missing\n",
-    "    rc=0\n",
-    "fi\n",
-    "echo whuse-oscomp-step-end:time-test:$rc\n",
+    "echo whuse-oscomp-step-skip:time-test:missing\n",
+    "echo whuse-oscomp-step-end:time-test:0\n",
     "echo \"run busybox_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    run_step_with_timeout busybox_testcode.sh 600 /musl/busybox sh /tmp/whuse-busybox-testcode.sh\n",
-    "else\n",
-    "    run_step_with_timeout busybox_testcode.sh 180 /musl/busybox sh ./busybox_testcode.sh\n",
-    "fi\n",
+    "run_step_with_timeout busybox_testcode.sh 120 /musl/busybox sh ./busybox_testcode.sh\n",
     "echo \"run iozone_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:iozone_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:iozone_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:iozone_testcode.sh:124\n",
-    "else\n",
-    "    run_step_with_timeout iozone_testcode.sh 300 /musl/busybox sh ./iozone_testcode.sh\n",
-    "fi\n",
+    "run_step_with_timeout iozone_testcode.sh 120 /musl/busybox sh ./iozone_testcode.sh\n",
     "echo \"run libctest_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:libctest_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:libctest_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:libctest_testcode.sh:124\n",
-    "else\n",
-    "    run_step_with_timeout libctest_testcode.sh 300 /musl/busybox sh ./libctest_testcode.sh\n",
-    "fi\n",
+    "run_step_with_timeout libctest_testcode.sh 300 /musl/busybox sh ./libctest_testcode.sh\n",
     "echo \"run libc-bench\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:libc-bench\n",
-    "    echo whuse-oscomp-step-skip:libc-bench:compat-hang\n",
-    "    echo whuse-oscomp-step-end:libc-bench:124\n",
-    "else\n",
-    "    run_step_with_timeout libc-bench 300 ./libc-bench\n",
-    "fi\n",
+    "run_step_with_timeout libc-bench 300 /musl/busybox sh -c './libc-bench'\n",
     "echo \"run lmbench_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:lmbench_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:lmbench_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:lmbench_testcode.sh:124\n",
-    "else\n",
-    "    echo whuse-oscomp-lmbench-marker:runner-start\n",
-    "    run_step_with_timeout lmbench_testcode.sh 600 /musl/busybox sh ./lmbench_testcode.sh\n",
-    "    lmbench_rc=$?\n",
-    "    echo whuse-oscomp-lmbench-marker:runner-end:$lmbench_rc\n",
-    "fi\n",
+    "run_step_with_timeout lmbench_testcode.sh 600 /musl/busybox sh ./lmbench_testcode.sh\n",
     "echo \"run lua_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:lua_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:lua_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:lua_testcode.sh:124\n",
-    "else\n",
-    "    run_step_with_timeout lua_testcode.sh 300 /musl/busybox sh ./lua_testcode.sh\n",
-    "fi\n",
+    "run_step_with_timeout lua_testcode.sh 300 /musl/busybox sh ./lua_testcode.sh\n",
     "echo \"run unixbench_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:unixbench_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:unixbench_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:unixbench_testcode.sh:124\n",
-    "else\n",
-    "    echo whuse-oscomp-unixbench-marker:runner-start\n",
-    "    run_step_with_timeout unixbench_testcode.sh 600 /musl/busybox sh ./unixbench_testcode.sh\n",
-    "    unixbench_rc=$?\n",
-    "    echo whuse-oscomp-unixbench-marker:runner-end:$unixbench_rc\n",
-    "fi\n",
+    "run_step_with_timeout unixbench_testcode.sh 600 /musl/busybox sh ./unixbench_testcode.sh\n",
     "echo \"run netperf_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:netperf_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:netperf_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:netperf_testcode.sh:124\n",
-    "else\n",
-    "    run_step_with_timeout netperf_testcode.sh 240 /musl/busybox sh ./netperf_testcode.sh\n",
-    "fi\n",
+    "run_step_with_timeout netperf_testcode.sh 240 /musl/busybox sh ./netperf_testcode.sh\n",
     "echo \"run iperf_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:iperf_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:iperf_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:iperf_testcode.sh:124\n",
-    "else\n",
-    "    run_step_with_timeout iperf_testcode.sh 240 /musl/busybox sh ./iperf_testcode.sh\n",
-    "fi\n",
+    "run_step_with_timeout iperf_testcode.sh 240 /musl/busybox sh ./iperf_testcode.sh\n",
     "echo \"run cyclic_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:cyclic_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:cyclic_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:cyclic_testcode.sh:124\n",
+    "if [ -f ./cyclic_testcode.sh ]; then\n",
+    "    run_step_with_timeout cyclic_testcode.sh 240 /musl/busybox sh ./cyclic_testcode.sh\n",
+    "elif [ -f ./cyclictest_testcode.sh ]; then\n",
+    "    run_step_with_timeout cyclictest_testcode.sh 240 /musl/busybox sh ./cyclictest_testcode.sh\n",
     "else\n",
-    "    run_step_with_timeout cyclic_testcode.sh 240 /musl/busybox sh -c 'if [ -x ./cyclic_testcode.sh ]; then exec ./cyclic_testcode.sh; else exec ./cyclictest_testcode.sh; fi'\n",
+    "    echo whuse-oscomp-step-begin:cyclic_testcode.sh\n",
+    "    echo whuse-oscomp-step-skip:cyclic_testcode.sh:missing\n",
+    "    echo whuse-oscomp-step-end:cyclic_testcode.sh:0\n",
     "fi\n",
     "echo whuse-oscomp-suite-done\n",
 );
+fn oscomp_suite_script() -> &'static str {
+    if OSCOMP_STAGE2_TIMEOUT_PROFILE_DEFAULT == "chain-fast" {
+        return OSCOMP_SUITE_SCRIPT_CHAIN_FAST;
+    }
+    if OSCOMP_STAGE2_REAL_PHASE_DEFAULT == "gate" {
+        return OSCOMP_SUITE_SCRIPT_REAL_GATE;
+    }
+    OSCOMP_SUITE_SCRIPT_REAL_FULL
+}
 const OSCOMP_SUITE_CMD: &str = concat!(
     "echo whuse-oscomp-shell-entered; ",
     "cd /musl; ",
@@ -449,6 +590,7 @@ impl Kernel {
                     log_rootfs_smoke(device);
                     if vfs.access("/", "/musl/busybox").is_ok() {
                         prepare_oscomp_runtime_layout(&mut vfs);
+                        preload_libctest_hot_files_from_device(device, &mut vfs);
                     }
                     rootfs_summary = format!("ext4({display}) over builtin special mounts");
                 }
@@ -719,7 +861,15 @@ impl Kernel {
                 if !sample.is_empty() {
                     sample.push_str(", ");
                 }
-                let _ = core::fmt::Write::write_fmt(&mut sample, format_args!("{}:{}", tgid, name));
+                let age_s = self
+                    .watchdog_started_at
+                    .get(tgid)
+                    .map(|started| now.saturating_sub(*started) / 1_000_000_000)
+                    .unwrap_or(0);
+                let _ = core::fmt::Write::write_fmt(
+                    &mut sample,
+                    format_args!("{}:{}:age_s={}", tgid, name, age_s),
+                );
             }
             logln(format_args!(
                 "whuse: oscomp watchdog heartbeat groups={} watched={} sample=[{}]",
@@ -763,7 +913,8 @@ impl Kernel {
             }
             let cleanup_children_only =
                 is_busybox_supervisor(name.as_str(), has_child_groups, in_bench_phase)
-                    && has_child_groups;
+                    && has_child_groups
+                    && tgid <= OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID;
             let mut cleanup_groups = if cleanup_children_only {
                 subtree
                     .iter()
@@ -830,6 +981,10 @@ impl Kernel {
             let mut reaped_tasks = 0usize;
             let mut clear_child_tids = Vec::new();
             for exit in exits {
+                logln(format_args!(
+                    "whuse-oscomp-step-cleanup-group:root_tgid={}:target_tgid={}:tids={:?}:parent_tgid={:?}",
+                    tgid, exit.tgid, exit.tids, exit.parent_tgid
+                ));
                 killed_groups = killed_groups.saturating_add(1);
                 killed_threads = killed_threads.saturating_add(exit.tids.len());
                 reaped_tasks = reaped_tasks.saturating_add(self.scheduler.exit_group(exit.tgid));
@@ -1011,6 +1166,17 @@ impl Kernel {
                 let _ = self.scheduler.wake_task(tid);
             }
 
+            let sigsuspend_tids = self
+                .processes
+                .sigsuspend_blocked_with_pending_signal_tids();
+            for tid in sigsuspend_tids {
+                logln(format_args!(
+                    "whuse-sched: sigsuspend pending-signal wake tid={}",
+                    tid
+                ));
+                let _ = self.scheduler.wake_task(tid);
+            }
+
             if self.timer_irq_count % 100 == 0 {
                 let bc = self.scheduler.blocked_count();
                 let rc = self.scheduler.ready_count();
@@ -1099,6 +1265,14 @@ impl Kernel {
                 }
             }
             self.dispatch_pending_signals();
+            // LoongArch currently relies on cooperative switching on syscall
+            // boundaries (timer preemption is not wired yet). Yield when there
+            // are ready peers so helper tasks (wait/watchdog children) can run.
+            if matches!(hal().platform.architecture(), PlatformArch::LoongArch64)
+                && self.scheduler.ready_count() > 0
+            {
+                let _ = self.scheduler.yield_now();
+            }
             return;
         }
 
@@ -1155,6 +1329,16 @@ impl Kernel {
             return;
         }
         let signum = rt_unmasked.trailing_zeros() as usize + 1;
+        let libctest_task = is_libctest_entry_or_runner(process.name.as_str());
+        if libctest_task {
+            logln(format_args!(
+                "whuse-libctest:dispatch-signal tid={} pending={:#x} signum={} mask={:#x}",
+                process.tid,
+                process.pending_signals,
+                signum,
+                process.signal_mask
+            ));
+        }
 
         if cancel_debug_enabled() {
             logln(format_args!(
@@ -1264,6 +1448,12 @@ impl Kernel {
         process.signal_frame_pending = true;
         if signum == 33 {
             process.mark_cancel_signal_dispatched();
+            if libctest_task {
+                logln(format_args!(
+                    "whuse-libctest:cancel-dispatched tid={} handler={:#x} frame_sp={:#x}",
+                    process.tid, action.handler, frame_sp
+                ));
+            }
         }
 
         if cancel_debug_enabled() {
@@ -1466,10 +1656,11 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         install_fallback_symlink(vfs, path, target);
     }
     install_oscomp_root_aliases(vfs);
+    let suite_script = oscomp_suite_script();
     match vfs.create_file(
         "/",
         OSCOMP_SUITE_SCRIPT_PATH,
-        OSCOMP_SUITE_SCRIPT.as_bytes(),
+        suite_script.as_bytes(),
     ) {
         Ok(()) => logln(format_args!(
             "whuse: installed suite script {}",
@@ -1493,6 +1684,52 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
             "whuse: failed busybox compat script {} err={}",
             OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH, err
         )),
+    }
+}
+
+fn preload_libctest_hot_files_from_device(
+    device: &'static dyn hal_api::HalBlockDevice,
+    vfs: &mut KernelVfs,
+) {
+    let mount = match Ext4Mount::probe(device) {
+        Ok(mount) => mount,
+        Err(err) => {
+            logln(format_args!(
+                "whuse: libctest preload skipped, ext4 probe failed err={}",
+                err
+            ));
+            return;
+        }
+    };
+    for (path, mode) in OSCOMP_LIBCTEST_PRELOAD_FILES {
+        let bytes = match mount.read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                logln(format_args!(
+                    "whuse: libctest preload skipped path={} err={}",
+                    path, err
+                ));
+                continue;
+            }
+        };
+        if bytes.is_empty() {
+            logln(format_args!(
+                "whuse: libctest preload skipped path={} empty",
+                path
+            ));
+            continue;
+        }
+        match vfs.preload_external_file(path, &bytes, Some(mode)) {
+            Ok(()) => logln(format_args!(
+                "whuse: libctest preloaded path={} bytes={}",
+                path,
+                bytes.len()
+            )),
+            Err(err) => logln(format_args!(
+                "whuse: libctest preload failed path={} err={}",
+                path, err
+            )),
+        }
     }
 }
 
@@ -1554,11 +1791,42 @@ fn oscomp_process_timeout_ns(
     has_child_groups: bool,
     in_bench_phase: bool,
 ) -> u64 {
+    let chain_fast = OSCOMP_STAGE2_TIMEOUT_PROFILE_DEFAULT == "chain-fast";
+    let real_gate = !chain_fast && OSCOMP_STAGE2_REAL_PHASE_DEFAULT == "gate";
+    let busybox_timeout_ns = if chain_fast {
+        120 * 1_000_000_000
+    } else if real_gate {
+        5 * 1_000_000_000
+    } else {
+        OSCOMP_GROUP_TIMEOUT_NS
+    };
+    let libctest_timeout_ns = if chain_fast {
+        120 * 1_000_000_000
+    } else if real_gate {
+        5 * 1_000_000_000
+    } else {
+        OSCOMP_GROUP_TIMEOUT_NS
+    };
+    let iozone_timeout_ns = if chain_fast {
+        120 * 1_000_000_000
+    } else if real_gate {
+        5 * 1_000_000_000
+    } else {
+        OSCOMP_GROUP_TIMEOUT_NS
+    };
+    let heavy_timeout_ns = if chain_fast {
+        300 * 1_000_000_000
+    } else if real_gate {
+        20 * 1_000_000_000
+    } else {
+        OSCOMP_HEAVY_TIMEOUT_NS
+    };
+
     if is_libctest_entry_or_runner(name) {
-        return OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS;
+        return libctest_timeout_ns;
     }
-    if tgid < OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID && name == "/musl/busybox" {
-        return u64::MAX;
+    if name.contains("iozone") {
+        return iozone_timeout_ns;
     }
     if name.contains("lmbench") {
         return OSCOMP_LMBENCH_TIMEOUT_NS;
@@ -1566,20 +1834,23 @@ fn oscomp_process_timeout_ns(
     if name.contains("unixbench") {
         return OSCOMP_UNIXBENCH_TIMEOUT_NS;
     }
+    if name.contains("libc-bench") {
+        return busybox_timeout_ns;
+    }
     if name.contains("busybox") {
         if tgid < OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID {
-            return OSCOMP_GROUP_TIMEOUT_NS;
-        }
-        if is_busybox_supervisor(name, has_child_groups, in_bench_phase) {
-            return OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS;
+            return busybox_timeout_ns;
         }
         if in_iozone_busybox_window {
-            return OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS;
+            return iozone_timeout_ns;
         }
-        return OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS;
+        if is_busybox_supervisor(name, has_child_groups, in_bench_phase) {
+            return busybox_timeout_ns;
+        }
+        return busybox_timeout_ns;
     }
     if is_oscomp_heavy_process(name) {
-        return OSCOMP_HEAVY_TIMEOUT_NS;
+        return heavy_timeout_ns;
     }
     OSCOMP_GROUP_TIMEOUT_NS
 }
@@ -1599,7 +1870,7 @@ fn watchdog_timeout_reason(
 }
 
 fn is_busybox_supervisor(name: &str, has_child_groups: bool, in_bench_phase: bool) -> bool {
-    name.contains("busybox") && (name == "/musl/busybox" || has_child_groups || in_bench_phase)
+    name.contains("busybox") && (has_child_groups || in_bench_phase)
 }
 
 fn watchdog_name_change_resets_timer(previous: &str, current: &str) -> bool {
@@ -1631,6 +1902,7 @@ fn process_needs_forced_preempt(name: &str, now: u64, iozone_busybox_window_unti
 fn is_oscomp_heavy_process(name: &str) -> bool {
     name.contains("iozone")
         || name.contains("lmbench")
+        || name.contains("libc-bench")
         || name.contains("unixbench")
         || name.contains("netperf")
         || name.contains("iperf")

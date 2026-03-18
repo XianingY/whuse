@@ -367,46 +367,73 @@ impl AddressSpace {
     }
 
     pub fn read_bytes(&self, addr: usize, len: usize) -> KernelResult<Vec<u8>> {
-        let inner = self.inner.lock();
-        let (segment, offset) = find_segment(&inner.mappings, addr, len)?;
-        match &segment.storage {
-            SegmentStorage::Owned { ptr, .. } => unsafe {
-                Ok(core::slice::from_raw_parts((ptr + offset) as *const u8, len).to_vec())
-            },
-            SegmentStorage::Host { ptr, .. } => unsafe {
-                Ok(core::slice::from_raw_parts((ptr + offset) as *const u8, len).to_vec())
-            },
+        if len == 0 {
+            return Ok(Vec::new());
         }
+        let inner = self.inner.lock();
+        let mut out = Vec::with_capacity(len);
+        let mut cursor = addr;
+        let mut remaining = len;
+        while remaining > 0 {
+            let (segment, offset) = find_segment(&inner.mappings, cursor, 1)?;
+            let available = segment.area.len.saturating_sub(offset);
+            let take = available.min(remaining);
+            match &segment.storage {
+                SegmentStorage::Owned { ptr, .. } => unsafe {
+                    out.extend_from_slice(core::slice::from_raw_parts(
+                        (ptr + offset) as *const u8,
+                        take,
+                    ));
+                },
+                SegmentStorage::Host { ptr, .. } => unsafe {
+                    out.extend_from_slice(core::slice::from_raw_parts(
+                        (ptr + offset) as *const u8,
+                        take,
+                    ));
+                },
+            }
+            cursor = cursor.checked_add(take).ok_or(EFAULT)?;
+            remaining -= take;
+        }
+        Ok(out)
     }
 
     pub fn write_bytes(&self, addr: usize, bytes: &[u8]) -> KernelResult<()> {
-        let mut inner = self.inner.lock();
-        let (segment, offset) = find_segment_mut(&mut inner.mappings, addr, bytes.len())?;
-        match &mut segment.storage {
-            SegmentStorage::Owned { ptr, .. } => {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        (*ptr + offset) as *mut u8,
-                        bytes.len(),
-                    );
-                }
-                Ok(())
-            }
-            SegmentStorage::Host { ptr, len } => {
-                if offset + bytes.len() > *len {
-                    return Err(EFAULT);
-                }
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        (*ptr + offset) as *mut u8,
-                        bytes.len(),
-                    );
-                }
-                Ok(())
-            }
+        if bytes.is_empty() {
+            return Ok(());
         }
+        let mut inner = self.inner.lock();
+        let mut cursor = addr;
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let (segment, offset) = find_segment_mut(&mut inner.mappings, cursor, 1)?;
+            let available = segment.area.len.saturating_sub(offset);
+            let take = available.min(bytes.len() - written);
+            match &mut segment.storage {
+                SegmentStorage::Owned { ptr, .. } => unsafe {
+                    ptr::copy_nonoverlapping(
+                        bytes[written..written + take].as_ptr(),
+                        (*ptr + offset) as *mut u8,
+                        take,
+                    );
+                },
+                SegmentStorage::Host { ptr, len } => {
+                    if offset + take > *len {
+                        return Err(EFAULT);
+                    }
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            bytes[written..written + take].as_ptr(),
+                            (*ptr + offset) as *mut u8,
+                            take,
+                        );
+                    }
+                }
+            }
+            cursor = cursor.checked_add(take).ok_or(EFAULT)?;
+            written += take;
+        }
+        Ok(())
     }
 
     pub fn read_cstr(&self, addr: usize) -> KernelResult<String> {
@@ -1321,6 +1348,16 @@ mod tests {
         aspace.install_bytes(0x2fff, b"A");
         aspace.install_bytes(0x3000, b"BC\0");
         assert_eq!(aspace.read_cstr(0x2fff).unwrap(), "ABC");
+    }
+
+    #[test]
+    fn read_and_write_bytes_across_adjacent_segments() {
+        let aspace = AddressSpace::new_user();
+        aspace.install_bytes(0x4000, b"ab");
+        aspace.install_bytes(0x4002, b"cd");
+        assert_eq!(aspace.read_bytes(0x4001, 3).unwrap(), b"bcd");
+        aspace.write_bytes(0x4001, b"XYZ").unwrap();
+        assert_eq!(aspace.read_bytes(0x4000, 4).unwrap(), b"aXYZ");
     }
 
     #[test]

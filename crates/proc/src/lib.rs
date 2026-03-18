@@ -27,6 +27,7 @@ const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 const ROBUST_LIST_MAX_SCAN: usize = 2048;
 const ROBUST_HEAD_WORDS: usize = 3;
+const PROCESS_NAME_MAX_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessState {
@@ -163,6 +164,19 @@ pub struct Process {
     pub vfork_parent_tid: Option<usize>,
 }
 
+pub fn clamp_process_name(name: &str) -> String {
+    if name.len() <= PROCESS_NAME_MAX_BYTES {
+        return name.to_string();
+    }
+    let mut end = PROCESS_NAME_MAX_BYTES;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut clipped = name[..end].to_string();
+    clipped.push_str("...");
+    clipped
+}
+
 pub struct ProcessTable {
     next_pid: usize,
     current_tid: usize,
@@ -184,7 +198,7 @@ impl Process {
             pgid: parent.unwrap_or(pid),
             sid: parent.unwrap_or(pid),
             parent,
-            name: name.to_string(),
+            name: clamp_process_name(name),
             cwd: String::from("/"),
             uid: 0,
             euid: 0,
@@ -223,7 +237,7 @@ impl Process {
     }
 
     pub fn add_fd(&mut self, handle: FileHandle) -> i32 {
-        let mut fd = 3;
+        let mut fd = 0;
         while self.fds.contains_key(&fd) {
             fd += 1;
         }
@@ -1351,13 +1365,15 @@ impl ProcessTable {
     }
 
     pub fn process_snapshots(&self) -> Vec<ProcessSnapshot> {
+        const PROCESS_SNAPSHOT_LIMIT: usize = 4096;
         self.processes
             .values()
             .filter(|process| process.state != ProcessState::Exited)
+            .take(PROCESS_SNAPSHOT_LIMIT)
             .map(|process| ProcessSnapshot {
                 tid: process.tid,
                 tgid: process.tgid,
-                name: process.name.clone(),
+                name: clamp_process_name(&process.name),
                 state: process.state,
                 is_thread: process.is_thread,
             })
@@ -1762,6 +1778,7 @@ fn push_unique_addr(addrs: &mut Vec<usize>, addr: usize) {
 #[cfg(test)]
 mod tests {
     use super::{ProcessTable, SigAction, WaitSelector};
+    use vfs::KernelVfs;
 
     #[test]
     fn process_accessors_expose_competition_state() {
@@ -2005,5 +2022,34 @@ mod tests {
         process.reset_image(0x2000, None);
         assert!(!process.cancel_signal_seen);
         assert!(!process.cancel_interrupt_once);
+    }
+
+    #[test]
+    fn add_fd_reuses_lowest_available_slot() {
+        let mut table = ProcessTable::new();
+        let pid = table.spawn_init("init", 0x1000);
+        table.set_current(pid).unwrap();
+        let mut vfs = KernelVfs::new();
+
+        let fd0 = table
+            .current_mut()
+            .unwrap()
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+        let fd1 = table
+            .current_mut()
+            .unwrap()
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+        let fd2 = table
+            .current_mut()
+            .unwrap()
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+        assert_eq!((fd0, fd1, fd2), (0, 1, 2));
+
+        table.current_mut().unwrap().close_fd(1).unwrap();
+        let reused = table
+            .current_mut()
+            .unwrap()
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+        assert_eq!(reused, 1);
     }
 }

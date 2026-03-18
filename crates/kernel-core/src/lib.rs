@@ -1088,6 +1088,7 @@ impl Kernel {
         }
 
         if is_syscall {
+            let trap_tid = self.processes.current_tid().ok();
             let result = self.syscalls.dispatch(
                 sysno,
                 SyscallArgs(args),
@@ -1095,7 +1096,33 @@ impl Kernel {
                 &mut self.scheduler,
                 &mut self.vfs,
             );
-            if let Ok(process) = self.processes.current_mut() {
+            if let Some(tid) = trap_tid {
+                if let Ok(process) = self.processes.find_by_tid_mut(tid) {
+                    let blocked_restart = result == EAGAIN_RET
+                        && matches!(
+                            sysno,
+                            SYS_WAIT
+                                | SYS_READ
+                                | SYS_READV
+                                | SYS_RT_SIGSUSPEND
+                                | SYS_RT_SIGTIMEDWAIT
+                                | SYS_FUTEX
+                                | SYS_PPOLL
+                                | SYS_PSELECT6
+                                | SYS_EPOLL_PWAIT
+                                | SYS_EPOLL_PWAIT2
+                                | SYS_NANOSLEEP
+                                | SYS_CLOCK_NANOSLEEP
+                        );
+                    if !blocked_restart {
+                        process.trap_frame.set_retval(result as usize);
+                        if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN) || (result as i32) < 0
+                        {
+                            process.trap_frame.sepc = sepc + 4;
+                        }
+                    }
+                }
+            } else if let Ok(process) = self.processes.current_mut() {
                 let blocked_restart = result == EAGAIN_RET
                     && matches!(
                         sysno,
@@ -1183,14 +1210,7 @@ impl Kernel {
             return;
         }
 
-        // Only dispatch real-time signals (signum >= 32) to user handlers.
-        // Standard signals (SIGCHLD etc.) are handled internally and should not
-        // invoke user handlers here to avoid re-entrancy issues in musl/busybox.
-        let rt_unmasked = unmasked & !((1u64 << 31) - 1);
-        if rt_unmasked == 0 {
-            return;
-        }
-        let signum = rt_unmasked.trailing_zeros() as usize + 1;
+        let signum = unmasked.trailing_zeros() as usize + 1;
 
         if cancel_debug_enabled() {
             logln(format_args!(

@@ -416,27 +416,38 @@ impl AddressSpace {
         while offset < MAX_STR_LEN {
             let page_offset = (addr + offset) & (PAGE_SIZE - 1);
             let chunk_len = (PAGE_SIZE - page_offset).min(MAX_STR_LEN - offset);
-            let chunk = {
-                let mut result = self.read_bytes(addr + offset, chunk_len);
-                if result.is_err() && chunk_len > 1 {
-                    result = self.read_bytes(addr + offset, 1);
+            match self.read_bytes(addr + offset, chunk_len) {
+                Ok(chunk) => {
+                    if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+                        out.extend_from_slice(&chunk[..nul]);
+                        return String::from_utf8(out).map_err(|_| EFAULT);
+                    }
+                    out.extend_from_slice(&chunk);
+                    offset += chunk.len();
                 }
-                match result {
-                    Ok(c) => c,
-                    Err(_) => {
-                        if out.is_empty() {
-                            return Err(EFAULT);
+                Err(_) => {
+                    // Fallback for short mappings that cannot satisfy the
+                    // whole chunk in one shot: probe byte-by-byte.
+                    let mut progressed = 0usize;
+                    while progressed < chunk_len && offset < MAX_STR_LEN {
+                        let byte = match self.read_bytes(addr + offset, 1) {
+                            Ok(bytes) => bytes[0],
+                            Err(_) => {
+                                if out.is_empty() {
+                                    return Err(EFAULT);
+                                }
+                                return Err(EFAULT);
+                            }
+                        };
+                        if byte == 0 {
+                            return String::from_utf8(out).map_err(|_| EFAULT);
                         }
-                        break;
+                        out.push(byte);
+                        offset += 1;
+                        progressed += 1;
                     }
                 }
-            };
-            if let Some(nul) = chunk.iter().position(|&b| b == 0) {
-                out.extend_from_slice(&chunk[..nul]);
-                return String::from_utf8(out).map_err(|_| EFAULT);
             }
-            out.extend_from_slice(&chunk);
-            offset += chunk.len();
         }
         Err(EFAULT)
     }
@@ -1302,6 +1313,14 @@ mod tests {
         aspace.write_bytes(addr, b"abc").unwrap();
         assert_eq!(aspace.read_bytes(addr, 3).unwrap(), b"abc");
         aspace.unmap(addr, 8192).unwrap();
+    }
+
+    #[test]
+    fn read_cstr_across_short_segments() {
+        let aspace = AddressSpace::new_user();
+        aspace.install_bytes(0x2fff, b"A");
+        aspace.install_bytes(0x3000, b"BC\0");
+        assert_eq!(aspace.read_cstr(0x2fff).unwrap(), "ABC");
     }
 
     #[test]

@@ -54,11 +54,11 @@ const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
 const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
-const OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
+const OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS: u64 = 300 * 1_000_000_000;
 const OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID: usize = 128;
 const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 10 * 1_000_000_000;
-const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
-const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
+const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 300 * 1_000_000_000;
+const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 300 * 1_000_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
 const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
@@ -309,7 +309,7 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:lmbench_testcode.sh:124\n",
     "else\n",
     "    echo whuse-oscomp-lmbench-marker:runner-start\n",
-    "    run_step_with_timeout lmbench_testcode.sh 600 /musl/busybox sh ./lmbench_testcode.sh\n",
+    "    run_step_with_timeout lmbench_testcode.sh 300 /musl/busybox sh ./lmbench_testcode.sh\n",
     "    lmbench_rc=$?\n",
     "    echo whuse-oscomp-lmbench-marker:runner-end:$lmbench_rc\n",
     "fi\n",
@@ -328,7 +328,7 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:unixbench_testcode.sh:124\n",
     "else\n",
     "    echo whuse-oscomp-unixbench-marker:runner-start\n",
-    "    run_step_with_timeout unixbench_testcode.sh 600 /musl/busybox sh ./unixbench_testcode.sh\n",
+    "    run_step_with_timeout unixbench_testcode.sh 300 /musl/busybox sh ./unixbench_testcode.sh\n",
     "    unixbench_rc=$?\n",
     "    echo whuse-oscomp-unixbench-marker:runner-end:$unixbench_rc\n",
     "fi\n",
@@ -761,9 +761,7 @@ impl Kernel {
                 self.watchdog_seen_name.remove(&tgid);
                 continue;
             }
-            let cleanup_children_only =
-                is_busybox_supervisor(name.as_str(), has_child_groups, in_bench_phase)
-                    && has_child_groups;
+            let cleanup_children_only = false;
             let mut cleanup_groups = if cleanup_children_only {
                 subtree
                     .iter()
@@ -829,6 +827,7 @@ impl Kernel {
             let mut killed_threads = 0usize;
             let mut reaped_tasks = 0usize;
             let mut clear_child_tids = Vec::new();
+            let mut robust_futex_addrs = Vec::new();
             for exit in exits {
                 killed_groups = killed_groups.saturating_add(1);
                 killed_threads = killed_threads.saturating_add(exit.tids.len());
@@ -840,10 +839,32 @@ impl Kernel {
                         parent_tgid, woke
                     ));
                 }
+                if let Some(vfork_parent_tid) = exit.vfork_parent_tid {
+                    let woke = self.scheduler.wake_task(vfork_parent_tid);
+                    if vfork_debug_enabled() {
+                        logln(format_args!(
+                            "whuse-vfork-release: child_tgid={} parent_tid={} reason=watchdog woke={}",
+                            exit.tgid, vfork_parent_tid, woke
+                        ));
+                    }
+                }
                 clear_child_tids.extend(exit.clear_child_tids);
+                robust_futex_addrs.extend(exit.robust_futex_addrs);
             }
             for addr in clear_child_tids {
                 for tid in self.processes.wake_futex(addr, usize::MAX) {
+                    let _ = self.scheduler.wake_task(tid);
+                }
+            }
+            for addr in robust_futex_addrs {
+                let woken = self.processes.wake_futex(addr, 1);
+                if robust_debug_enabled() {
+                    logln(format_args!(
+                        "whuse-robust-exit: wake addr={:#x} woken={:?}",
+                        addr, woken
+                    ));
+                }
+                for tid in woken {
                     let _ = self.scheduler.wake_task(tid);
                 }
             }
@@ -1123,12 +1144,27 @@ impl Kernel {
             if exit.group_exited {
                 self.scheduler.exit_group(exit.tgid);
             }
+            if let Some(vfork_parent_tid) = exit.vfork_parent_tid {
+                let _ = self.scheduler.wake_task(vfork_parent_tid);
+            }
             if let Some(parent_tgid) = exit.parent_tgid {
                 let _ = self.processes.deliver_signal(parent_tgid, 17);
                 let _ = self.scheduler.wake_task(parent_tgid);
             }
             if let Some(addr) = exit.clear_child_tid {
                 for tid in self.processes.wake_futex(addr, usize::MAX) {
+                    let _ = self.scheduler.wake_task(tid);
+                }
+            }
+            for addr in exit.robust_futex_addrs {
+                let woken = self.processes.wake_futex(addr, 1);
+                if robust_debug_enabled() {
+                    logln(format_args!(
+                        "whuse-robust-exit: trap-exit addr={:#x} woken={:?}",
+                        addr, woken
+                    ));
+                }
+                for tid in woken {
                     let _ = self.scheduler.wake_task(tid);
                 }
             }
@@ -1195,6 +1231,18 @@ impl Kernel {
                     }
                     if let Some(addr) = exit.clear_child_tid {
                         for wtid in self.processes.wake_futex(addr, usize::MAX) {
+                            let _ = self.scheduler.wake_task(wtid);
+                        }
+                    }
+                    for addr in exit.robust_futex_addrs {
+                        let woken = self.processes.wake_futex(addr, 1);
+                        if robust_debug_enabled() {
+                            logln(format_args!(
+                                "whuse-robust-exit: signal-exit addr={:#x} woken={:?}",
+                                addr, woken
+                            ));
+                        }
+                        for wtid in woken {
                             let _ = self.scheduler.wake_task(wtid);
                         }
                     }
@@ -1291,6 +1339,20 @@ impl Kernel {
 
 fn cancel_debug_enabled() -> bool {
     match option_env!("WHUSE_DEBUG_CANCEL") {
+        Some("1") => true,
+        _ => false,
+    }
+}
+
+fn robust_debug_enabled() -> bool {
+    match option_env!("WHUSE_DEBUG_ROBUST") {
+        Some("1") => true,
+        _ => false,
+    }
+}
+
+fn vfork_debug_enabled() -> bool {
+    match option_env!("WHUSE_DEBUG_VFORK") {
         Some("1") => true,
         _ => false,
     }
@@ -1450,15 +1512,18 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
     }
     install_busybox_exec_alias(vfs, "/musl/ls", "ls");
     install_busybox_exec_alias(vfs, "/musl/which", "which");
+    install_busybox_exec_alias(vfs, "/musl/sleep", "sleep");
     for (path, target) in [
         ("/bin/busybox", "/musl/busybox"),
         ("/bin/sh", "/musl/busybox"),
         ("/bin/bash", "/musl/busybox"),
         ("/bin/ls", "/musl/ls"),
         ("/bin/which", "/musl/which"),
+        ("/bin/sleep", "/musl/sleep"),
         ("/busybox", "/musl/busybox"),
         ("/usr/bin/ls", "/musl/ls"),
         ("/usr/bin/which", "/musl/which"),
+        ("/usr/bin/sleep", "/musl/sleep"),
         ("/usr/bin/env", "/musl/busybox"),
         ("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so"),
         ("/lib/ld-musl-loongarch64.so.1", "/musl/lib/libc.so"),

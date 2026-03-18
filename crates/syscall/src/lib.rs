@@ -121,16 +121,24 @@ pub const SYS_NANOSLEEP: usize = 101;
 pub const SYS_GETITIMER: usize = 102;
 pub const SYS_SETITIMER: usize = 103;
 pub const SYS_CLOCK_GETRES: usize = 114;
+pub const SYS_SCHED_SETPARAM: usize = 118;
+pub const SYS_SCHED_SETSCHEDULER: usize = 119;
+pub const SYS_SCHED_GETSCHEDULER: usize = 120;
+pub const SYS_SCHED_GETPARAM: usize = 121;
+pub const SYS_SCHED_SETAFFINITY: usize = 122;
+pub const SYS_SCHED_GETAFFINITY: usize = 123;
 pub const SYS_SCHED_YIELD: usize = 124;
 pub const SYS_KILL: usize = 129;
 pub const SYS_TKILL: usize = 130;
 pub const SYS_TGKILL: usize = 131;
 pub const SYS_SIGALTSTACK: usize = 132;
 pub const SYS_RT_SIGSUSPEND: usize = 133;
+pub const SYS_SIGNAL: usize = 48; // Legacy signal syscall for lmbench
 pub const SYS_SIGACTION: usize = 134;
 pub const SYS_SIGPROCMASK: usize = 135;
 pub const SYS_RT_SIGPENDING: usize = 136;
 pub const SYS_RT_SIGTIMEDWAIT: usize = 137;
+pub const SYS_RT_SIGQUEUEINFO: usize = 138;
 pub const SYS_RT_SIGRETURN: usize = 139;
 pub const SYS_GETPRIORITY: usize = 141;
 pub const SYS_SETGID: usize = 144;
@@ -294,6 +302,39 @@ fn cancel_debug_enabled() -> bool {
 fn cancel_debug(line: &str) {
     if cancel_debug_enabled() {
         log_always(line);
+    }
+}
+
+fn robust_debug_enabled() -> bool {
+    match option_env!("WHUSE_DEBUG_ROBUST") {
+        Some("1") => true,
+        _ => false,
+    }
+}
+
+fn robust_debug(line: &str) {
+    if robust_debug_enabled() {
+        log_always(line);
+    }
+}
+
+fn vfork_debug_enabled() -> bool {
+    match option_env!("WHUSE_DEBUG_VFORK") {
+        Some("1") => true,
+        _ => false,
+    }
+}
+
+fn vfork_debug(line: &str) {
+    if vfork_debug_enabled() {
+        log_always(line);
+    }
+}
+
+fn open_path_debug_enabled() -> bool {
+    match option_env!("WHUSE_DEBUG_OPEN_PATH") {
+        Some("1") => true,
+        _ => false,
     }
 }
 
@@ -564,10 +605,17 @@ impl SyscallDispatcher {
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
         let dirfd = args.0[0] as i32;
-        let path = procs
-            .current()?
-            .read_user_cstr(args.0[1])
-            .map_err(|_| EFAULT)?;
+        let path_ptr = args.0[1];
+        let path = procs.current()?.read_user_cstr(path_ptr).map_err(|_| {
+            if open_path_debug_enabled() {
+                log_always(&format!(
+                    "whuse-openat-path-efault: tid={} ptr={:#x}",
+                    procs.current_tid().unwrap_or(0),
+                    path_ptr
+                ));
+            }
+            EFAULT
+        })?;
         let raw_flags = args.0[2] as u32;
         let flags = normalize_open_flags(raw_flags);
         let mode = args.0[3] as u32;
@@ -708,11 +756,25 @@ impl SyscallDispatcher {
         let (is_pipe, written) = {
             let process = procs.current_mut()?;
             process.sync_fd_offset_from_alias(fd)?;
-            let handle = process.fd_mut(fd)?;
-            let is_pipe = vfs.is_pipe(handle);
-            let written = vfs.write(handle, &data)?;
-            process.sync_fd_offset_to_aliases(fd)?;
-            (is_pipe, written)
+            match process.fd_mut(fd) {
+                Ok(handle) => {
+                    let is_pipe = vfs.is_pipe(handle);
+                    let written = vfs.write(handle, &data)?;
+                    process.sync_fd_offset_to_aliases(fd)?;
+                    (is_pipe, written)
+                }
+                Err(EBADF) => {
+                    if fd == 3 && process.name.contains("lmbench") {
+                        trace_line(&format!(
+                            "whuse-debug: lmbench write EBADF fd=3 tgid={} fds={:?}",
+                            process.tgid,
+                            process.fds.keys().collect::<Vec<_>>()
+                        ));
+                    }
+                    return Err(EBADF);
+                }
+                Err(e) => return Err(e),
+            }
         };
         if is_pipe && written != 0 {
             let _ = scheduler.wake_all_blocked();
@@ -723,6 +785,135 @@ impl SyscallDispatcher {
     fn sys_sched_yield(&self, scheduler: &mut Scheduler) -> Result<usize, i32> {
         let _ = scheduler.yield_now();
         Ok(0)
+    }
+
+    fn sys_sched_setparam(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        const MAX_RT_PRIO: i32 = 99;
+        let pid = args.0[0];
+        let param_ptr = args.0[1];
+        if param_ptr == 0 {
+            return Err(EFAULT);
+        }
+        if pid != 0 && !procs.has_pid(pid) {
+            return Err(ESRCH);
+        }
+        let priority = read_i32(procs.current()?, param_ptr)?;
+        if !(0..=MAX_RT_PRIO).contains(&priority) {
+            return Err(EINVAL);
+        }
+        Ok(0)
+    }
+
+    fn sys_sched_getparam(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        let pid = args.0[0];
+        let param_ptr = args.0[1];
+        if param_ptr == 0 {
+            return Err(EFAULT);
+        }
+        if pid != 0 && !procs.has_pid(pid) {
+            return Err(ESRCH);
+        }
+        procs
+            .current_mut()?
+            .write_user_bytes(param_ptr, &0i32.to_le_bytes())
+            .map_err(|_| EFAULT)?;
+        Ok(0)
+    }
+
+    fn sys_sched_setscheduler(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        let pid = args.0[0];
+        let policy = args.0[1] as i32;
+        let param_ptr = args.0[2];
+        if pid != 0 && !procs.has_pid(pid) {
+            return Err(ESRCH);
+        }
+        if !matches!(policy, 0 | 1 | 2 | 3 | 5 | 6 | 7) {
+            return Err(EINVAL);
+        }
+        let _ = self.sys_sched_setparam(SyscallArgs([pid, param_ptr, 0, 0, 0, 0]), procs)?;
+        Ok(0)
+    }
+
+    fn sys_sched_getscheduler(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        let pid = args.0[0];
+        if pid != 0 && !procs.has_pid(pid) {
+            return Err(ESRCH);
+        }
+        Ok(0)
+    }
+
+    fn sys_sched_setaffinity(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        const MAX_CPUSET_BYTES: usize = 4096;
+        let pid = args.0[0];
+        let cpusetsize = args.0[1];
+        let mask_ptr = args.0[2];
+        if cpusetsize == 0 || cpusetsize > MAX_CPUSET_BYTES {
+            return Err(EINVAL);
+        }
+        if mask_ptr == 0 {
+            return Err(EFAULT);
+        }
+        if pid != 0 && !procs.has_pid(pid) {
+            return Err(ESRCH);
+        }
+        let mask = procs
+            .current()?
+            .read_user_bytes(mask_ptr, cpusetsize)
+            .map_err(|_| EFAULT)?;
+        let any_set = mask.iter().any(|byte| *byte != 0);
+        let cpu0_set = mask.first().is_some_and(|byte| (byte & 1) != 0);
+        if !any_set || !cpu0_set {
+            return Err(EINVAL);
+        }
+        Ok(0)
+    }
+
+    fn sys_sched_getaffinity(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        const MAX_CPUSET_BYTES: usize = 4096;
+        const KERNEL_CPU_MASK_BYTES: usize = size_of::<usize>();
+        let pid = args.0[0];
+        let cpusetsize = args.0[1];
+        let mask_ptr = args.0[2];
+        if cpusetsize < KERNEL_CPU_MASK_BYTES || cpusetsize > MAX_CPUSET_BYTES {
+            return Err(EINVAL);
+        }
+        if mask_ptr == 0 {
+            return Err(EFAULT);
+        }
+        if pid != 0 && !procs.has_pid(pid) {
+            return Err(ESRCH);
+        }
+        let mut mask = vec![0u8; cpusetsize];
+        mask[0] = 1;
+        procs
+            .current_mut()?
+            .write_user_bytes(mask_ptr, &mask)
+            .map_err(|_| EFAULT)?;
+        Ok(KERNEL_CPU_MASK_BYTES)
     }
 
     fn sys_set_tid_address(
@@ -765,7 +956,6 @@ impl SyscallDispatcher {
             return Err(EFAULT);
         }
         let now = hal().timer.monotonic_nanos();
-        let pending = procs.pending_signals()?;
         if procs.current()?.sleep_deadline_ns.is_none() {
             let requested = read_timespec_ns(procs.current()?, req_ptr)?;
             if requested == 0 {
@@ -793,7 +983,7 @@ impl SyscallDispatcher {
         let requested = procs.current()?.sleep_requested_ns;
         let remain_ptr = procs.current()?.sleep_remain_ptr;
 
-        if pending != 0 {
+        if blocking_syscall_interrupted(procs)? {
             if let Some(ptr) = remain_ptr {
                 let remain = deadline.saturating_sub(now).min(requested);
                 procs
@@ -848,6 +1038,13 @@ impl SyscallDispatcher {
         };
         if exit_group {
             scheduler.exit_group(exit.tgid);
+            if let Some(vfork_parent_tid) = exit.vfork_parent_tid {
+                let woke = scheduler.wake_task(vfork_parent_tid);
+                vfork_debug(&format!(
+                    "whuse-vfork-release: child_tgid={} parent_tid={} reason=exit-group woke={}",
+                    exit.tgid, vfork_parent_tid, woke
+                ));
+            }
             if let Some(parent_tgid) = exit.parent_tgid {
                 let _ = procs.deliver_signal(parent_tgid, SIGCHLD);
                 let woke = scheduler.wake_task(parent_tgid);
@@ -856,10 +1053,27 @@ impl SyscallDispatcher {
                     parent_tgid, woke
                 ));
             }
+            for addr in exit.robust_futex_addrs {
+                let woken = procs.wake_futex(addr, 1);
+                robust_debug(&format!(
+                    "whuse-robust-exit: exit_group addr={:#x} woken={:?}",
+                    addr, woken
+                ));
+                for tid in woken {
+                    let _ = scheduler.wake_task(tid);
+                }
+            }
         } else {
             scheduler.remove_task(exit.tid);
             if exit.group_exited {
                 scheduler.exit_group(exit.tgid);
+            }
+            if let Some(vfork_parent_tid) = exit.vfork_parent_tid {
+                let woke = scheduler.wake_task(vfork_parent_tid);
+                vfork_debug(&format!(
+                    "whuse-vfork-release: child_tgid={} parent_tid={} reason=exit woke={}",
+                    exit.tgid, vfork_parent_tid, woke
+                ));
             }
             if let Some(parent_tgid) = exit.parent_tgid {
                 let _ = procs.deliver_signal(parent_tgid, SIGCHLD);
@@ -887,6 +1101,16 @@ impl SyscallDispatcher {
                     "whuse-debug: exit tid={} no clear_child_tid",
                     exit.tid
                 ));
+            }
+            for addr in exit.robust_futex_addrs {
+                let woken = procs.wake_futex(addr, 1);
+                robust_debug(&format!(
+                    "whuse-robust-exit: exit tid={} addr={:#x} woken={:?}",
+                    exit.tid, addr, woken
+                ));
+                for tid in woken {
+                    let _ = scheduler.wake_task(tid);
+                }
             }
         }
         if let Some(applet) = BUSYBOX_APPLETS.lock().remove(&exit.tgid) {
@@ -993,15 +1217,11 @@ impl SyscallDispatcher {
         if flags & CLONE_NAMESPACE_MASK != 0 {
             return Err(EINVAL);
         }
-        let mut compat_flags = flags & !CLONE_VFORK;
-        if flags & CLONE_VFORK != 0 {
-            compat_flags &= !CLONE_VM;
-            trace_line(&format!(
-                "whuse: clone parent_tgid={} flags={:#x} downgraded_vfork=true",
-                parent_pid, flags
-            ));
-        }
+        let compat_flags = flags;
         if (compat_flags & CLONE_THREAD) != 0 {
+            if (compat_flags & CLONE_VFORK) != 0 {
+                return Err(EINVAL);
+            }
             let required = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
             if compat_flags & required != required {
                 return Err(EINVAL);
@@ -1036,8 +1256,10 @@ impl SyscallDispatcher {
 
         let child_stack = args.0[1];
         let shared_vm = (compat_flags & CLONE_VM) != 0;
+        let vfork = (compat_flags & CLONE_VFORK) != 0;
         let parent_tid = args.0[2];
         let child_tid_ptr = args.0[3];
+        let parent_task_tid = procs.current_tid()?;
         let pid = if shared_vm {
             procs.fork_process_from_current_shared()?
         } else {
@@ -1069,6 +1291,14 @@ impl SyscallDispatcher {
             procs.set_thread_stack_pointer(pid, child_stack)?;
         }
         scheduler.spawn(&name, pid, pid);
+        if vfork {
+            procs.set_vfork_parent_tid(pid, parent_task_tid)?;
+            vfork_debug(&format!(
+                "whuse-vfork-block: parent_tid={} child_tgid={} flags={:#x}",
+                parent_task_tid, pid, flags
+            ));
+            let _ = scheduler.block_current();
+        }
         Ok(pid)
     }
 
@@ -1125,6 +1355,7 @@ impl SyscallDispatcher {
         args: SyscallArgs,
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
+        scheduler: &mut Scheduler,
     ) -> Result<usize, i32> {
         let mut path = procs
             .current()?
@@ -1269,6 +1500,15 @@ impl SyscallDispatcher {
             if let Some(program) =
                 resolve_exec_payload(&file_data).or_else(|| builtin_program(&path))
             {
+                if let Some(parent_tid) = procs.release_current_vfork_parent()? {
+                    let woke = scheduler.wake_task(parent_tid);
+                    vfork_debug(&format!(
+                        "whuse-vfork-release: child_tgid={} parent_tid={} reason=execve-builtin woke={}",
+                        procs.current_tgid().unwrap_or(0),
+                        parent_tid,
+                        woke
+                    ));
+                }
                 let entry = BUILTIN_EXEC_BASE + program.entry;
                 procs.execve_current_image(entry, None)?;
                 let process = procs.current_mut()?;
@@ -1294,6 +1534,15 @@ impl SyscallDispatcher {
                     tgid, path, entry
                 ));
                 return Ok(0);
+            }
+            if let Some(parent_tid) = procs.release_current_vfork_parent()? {
+                let woke = scheduler.wake_task(parent_tid);
+                vfork_debug(&format!(
+                    "whuse-vfork-release: child_tgid={} parent_tid={} reason=execve-elf woke={}",
+                    procs.current_tgid().unwrap_or(0),
+                    parent_tid,
+                    woke
+                ));
             }
             procs.execve_current_image(0, None)?;
             let loaded = {
@@ -1831,14 +2080,14 @@ impl SyscallDispatcher {
             return Ok(ready);
         }
 
-        let process = procs.current_mut()?;
-        if process.pending_signals & !process.signal_mask != 0 {
-            process.epoll_wait_deadline_ns = None;
+        if blocking_syscall_interrupted(procs)? {
+            procs.current_mut()?.epoll_wait_deadline_ns = None;
             return Err(EINTR);
         }
 
         let now = hal().timer.monotonic_nanos();
         let timeout_ptr = args.0[2];
+        let process = procs.current_mut()?;
         if process.epoll_wait_deadline_ns.is_none() {
             if timeout_ptr != 0 {
                 let requested = read_timespec_ns(process, timeout_ptr)?;
@@ -1919,14 +2168,14 @@ impl SyscallDispatcher {
             return Ok(ready.len());
         }
 
-        let process = procs.current_mut()?;
-        if process.pending_signals & !process.signal_mask != 0 {
-            process.epoll_wait_deadline_ns = None;
+        if blocking_syscall_interrupted(procs)? {
+            procs.current_mut()?.epoll_wait_deadline_ns = None;
             return Err(EINTR);
         }
 
         let now = hal().timer.monotonic_nanos();
         let timeout_ptr = args.0[4];
+        let process = procs.current_mut()?;
         if process.epoll_wait_deadline_ns.is_none() {
             if timeout_ptr != 0 {
                 let requested = read_timespec_ns(process, timeout_ptr)?;
@@ -1998,13 +2247,19 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
+        const AT_SYMLINK_NOFOLLOW: usize = 0x100;
         let dirfd = args.0[0] as i32;
         let path = procs
             .current()?
             .read_user_cstr(args.0[1])
             .map_err(|_| EFAULT)?;
+        let flags = args.0[3];
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
-        let stat = vfs.stat_path(&cwd, &path)?;
+        let stat = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+            vfs.stat_path_nofollow(&cwd, &path)?
+        } else {
+            vfs.stat_path(&cwd, &path)?
+        };
         if matches!(
             BUSYBOX_APPLETS
                 .lock()
@@ -2033,7 +2288,7 @@ impl SyscallDispatcher {
             .read_user_cstr(args.0[0])
             .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
-        vfs.access(&cwd, &path)?;
+        let _ = vfs.stat_path(&cwd, &path)?;
         procs
             .current_mut()?
             .write_user_bytes(args.0[1], &statfs_bytes())
@@ -2047,14 +2302,15 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
+        let dirfd = args.0[0] as i32;
         let path = procs
             .current()?
             .read_user_cstr(args.0[1])
             .map_err(|_| EFAULT)?;
-        let cwd = procs.current()?.cwd.clone();
+        let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
         let _mode = args.0[2];
         let _flags = args.0[3];
-        vfs.access(&cwd, &path)?;
+        let _ = vfs.stat_path(&cwd, &path)?;
         Ok(0)
     }
 
@@ -2064,24 +2320,38 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         scheduler: &mut Scheduler,
     ) -> Result<usize, i32> {
-        let pid = if args.0[0] == 0 {
-            procs.current_pid()?
-        } else {
-            args.0[0]
-        };
+        let raw_pid = args.0[0] as isize;
         let sig = args.0[1];
         log_always(&format!(
             "whuse-debug: kill/tkill target={} sig={} caller_tid={}",
-            pid,
+            raw_pid,
             sig,
             procs.current_tid().unwrap_or(0)
         ));
         if sig > 64 {
             return Err(EINVAL);
         }
+        if raw_pid == isize::MIN {
+            return Err(EINVAL);
+        }
+
+        let targets = if raw_pid > 0 {
+            let target_tid = procs.send_signal_tid(raw_pid as usize, sig)?;
+            vec![target_tid]
+        } else if raw_pid == 0 {
+            let pgid = procs.current_pgid()?;
+            procs.send_signal_pgid(pgid, sig, None)?
+        } else if raw_pid == -1 {
+            let caller_tgid = procs.current_tgid()?;
+            procs.send_signal_all(sig, Some(caller_tgid), false)?
+        } else {
+            let pgid = (-raw_pid) as usize;
+            procs.send_signal_pgid(pgid, sig, None)?
+        };
         if sig != 0 {
-            procs.deliver_signal(pid, sig)?;
-            let _ = scheduler.wake_task(pid);
+            for tid in targets {
+                let _ = scheduler.wake_task(tid);
+            }
         }
         Ok(0)
     }
@@ -2107,6 +2377,49 @@ impl SyscallDispatcher {
             let _ = scheduler.wake_task(tid);
         }
         Ok(0)
+    }
+
+    fn sys_tkill(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        scheduler: &mut Scheduler,
+    ) -> Result<usize, i32> {
+        let tid = args.0[0];
+        let sig = args.0[1];
+        log_always(&format!("whuse-debug: tkill tid={} sig={}", tid, sig));
+        if sig > 64 {
+            return Err(EINVAL);
+        }
+        let target_tid = procs.send_signal_exact_tid(tid, sig)?;
+        if sig != 0 {
+            let _ = scheduler.wake_task(target_tid);
+        }
+        Ok(0)
+    }
+
+    fn sys_signal(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
+        let signal = args.0[0];
+        let handler = args.0[1];
+
+        if signal == 0 || signal > 31 {
+            return Err(EINVAL);
+        }
+
+        // Convert legacy signal() to rt_sigaction
+        let mut new_action = SigAction::default();
+        new_action.handler = handler;
+        new_action.flags = 0x04000000; // SA_RESTORER flag for RISC-V
+
+        let old_action = procs
+            .current()?
+            .signal_actions
+            .get(&signal)
+            .copied()
+            .unwrap_or_default();
+        procs.set_sigaction(signal, new_action)?;
+
+        Ok(old_action.handler)
     }
 
     fn sys_sigaction(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
@@ -2828,6 +3141,10 @@ impl SyscallDispatcher {
             procs.current_mut()?.epoll_wait_deadline_ns = None;
             return Ok(0);
         }
+        if blocking_syscall_interrupted(procs)? {
+            procs.current_mut()?.epoll_wait_deadline_ns = None;
+            return Err(EINTR);
+        }
         let now = hal().timer.monotonic_nanos();
         let process = procs.current_mut()?;
         if process.epoll_wait_deadline_ns.is_none() {
@@ -3058,8 +3375,15 @@ impl SyscallDispatcher {
             }
             return Ok(0);
         }
-        let cwd = procs.current()?.cwd.clone();
-        vfs.access(&cwd, &path)?;
+        if path.is_empty() {
+            return if path_ptr == 0 {
+                Err(EFAULT)
+            } else {
+                Err(ENOENT)
+            };
+        }
+        let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
+        let _ = vfs.stat_path(&cwd, &path)?;
         Ok(0)
     }
 
@@ -3203,7 +3527,6 @@ impl SyscallDispatcher {
             return Err(EFAULT);
         }
         let now = hal().timer.monotonic_nanos();
-        let pending = procs.pending_signals()?;
         if procs.current()?.sleep_deadline_ns.is_none() {
             let requested = read_timespec_ns(procs.current()?, req_ptr)?;
             let absolute = (flags & TIMER_ABSTIME) != 0;
@@ -3223,7 +3546,7 @@ impl SyscallDispatcher {
         let requested_ns = procs.current()?.sleep_requested_ns;
         let remain_ptr = procs.current()?.sleep_remain_ptr;
 
-        if pending != 0 {
+        if blocking_syscall_interrupted(procs)? {
             if !sleep_absolute {
                 if let Some(ptr) = remain_ptr {
                     let remain = deadline.saturating_sub(now).min(requested_ns);
@@ -3305,8 +3628,8 @@ impl SyscallDispatcher {
             let process = procs.current_mut()?;
             process.sigsuspend_saved_mask = Some(old_mask);
             process.signal_mask = new_mask;
-            restore_now = procs.pending_signals()? != 0;
-        } else if procs.pending_signals()? != 0 {
+            restore_now = blocking_syscall_interrupted(procs)?;
+        } else if blocking_syscall_interrupted(procs)? {
             restore_now = true;
         }
         if restore_now {
@@ -4093,6 +4416,32 @@ fn selector_from_wait(pid: i32, current_pgid: usize) -> WaitSelector {
     }
 }
 
+fn blocking_syscall_interrupted(procs: &mut ProcessTable) -> Result<bool, i32> {
+    let pending = procs.pending_signals()?;
+    let (tid, signal_frame_pending, cancel_seen, cancel_once) = {
+        let process = procs.current()?;
+        (
+            process.tid,
+            process.signal_frame_pending,
+            process.cancel_signal_seen,
+            process.cancel_interrupt_once,
+        )
+    };
+    if pending == 0 && !signal_frame_pending && !cancel_once {
+        return Ok(false);
+    }
+    let consumed = if cancel_once {
+        procs.current_mut()?.consume_cancel_interrupt_once()
+    } else {
+        false
+    };
+    cancel_debug(&format!(
+        "whuse-debug: blocking EINTR tid={} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
+        tid, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
+    ));
+    Ok(true)
+}
+
 fn read_sigaction(process: &proc::Process, addr: usize) -> Result<SigAction, i32> {
     let bytes = process.read_user_bytes(addr, 32).map_err(|_| EFAULT)?;
     let handler = usize::from_le_bytes(bytes[0..8].try_into().unwrap());
@@ -4519,21 +4868,23 @@ mod tests {
     use super::{
         SyscallArgs, SyscallDispatcher, SYS_ACCEPT, SYS_BIND, SYS_CLOCK_GETRES, SYS_CLONE,
         SYS_CLOSE, SYS_CONNECT, SYS_COPY_FILE_RANGE, SYS_DUP3, SYS_EPOLL_CREATE1, SYS_EPOLL_CTL,
-        SYS_EPOLL_PWAIT, SYS_EVENTFD2, SYS_FACCESSAT2, SYS_FALLOCATE, SYS_FCHDIR, SYS_FCHMOD,
-        SYS_FCHMODAT, SYS_FCHOWN, SYS_FCHOWNAT, SYS_FDATASYNC, SYS_FLOCK, SYS_FSTATFS, SYS_FSYNC,
-        SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER, SYS_GETPRIORITY, SYS_GETSID,
-        SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTIMEOFDAY, SYS_GET_ROBUST_LIST, SYS_LINKAT,
-        SYS_LISTEN, SYS_LSEEK, SYS_MEMBARRIER, SYS_MEMFD_CREATE, SYS_MKDIR, SYS_MLOCK, SYS_MLOCK2,
-        SYS_MSYNC, SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL, SYS_PIPE,
-        SYS_PPOLL, SYS_PRCTL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PRLIMIT64, SYS_PSELECT6,
-        SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RENAMEAT,
-        SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE, SYS_RT_SIGPENDING, SYS_RT_SIGRETURN,
-        SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SECCOMP, SYS_SENDMSG, SYS_SENDTO, SYS_SETGID,
-        SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_ROBUST_LIST,
-        SYS_SET_TID_ADDRESS, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET, SYS_SHUTDOWN,
-        SYS_SIGACTION, SYS_SIGALTSTACK, SYS_SIGPROCMASK, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SPLICE,
-        SYS_STATX, SYS_SYMLINKAT, SYS_TIMES, SYS_TRUNCATE, SYS_UMASK, SYS_UNAME, SYS_UTIMENSAT,
-        SYS_WAIT, SYS_WRITE, SYS_WRITEV,
+        SYS_EPOLL_PWAIT, SYS_EVENTFD2, SYS_EXIT, SYS_FACCESSAT2, SYS_FALLOCATE, SYS_FCHDIR,
+        SYS_FCHMOD, SYS_FCHMODAT, SYS_FCHOWN, SYS_FCHOWNAT, SYS_FDATASYNC, SYS_FLOCK, SYS_FSTATAT,
+        SYS_FSTATFS, SYS_FSYNC, SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER,
+        SYS_GETPRIORITY, SYS_GETSID, SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTIMEOFDAY,
+        SYS_GET_ROBUST_LIST, SYS_LINKAT, SYS_LISTEN, SYS_LSEEK, SYS_MEMBARRIER, SYS_MEMFD_CREATE,
+        SYS_MKDIR, SYS_MLOCK, SYS_MLOCK2, SYS_MSYNC, SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN,
+        SYS_PIDFD_SEND_SIGNAL, SYS_PIPE, SYS_PPOLL, SYS_PRCTL, SYS_PREAD64, SYS_PREADV,
+        SYS_PREADV2, SYS_PRLIMIT64, SYS_PSELECT6, SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2,
+        SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RENAMEAT, SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE,
+        SYS_RT_SIGPENDING, SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT,
+        SYS_SCHED_GETAFFINITY, SYS_SCHED_GETPARAM, SYS_SCHED_GETSCHEDULER, SYS_SCHED_SETAFFINITY,
+        SYS_SCHED_SETPARAM, SYS_SCHED_SETSCHEDULER, SYS_SECCOMP, SYS_SENDMSG, SYS_SENDTO,
+        SYS_SETGID, SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID,
+        SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET,
+        SYS_SHUTDOWN, SYS_SIGACTION, SYS_SIGALTSTACK, SYS_SIGNAL, SYS_SIGPROCMASK, SYS_SOCKET,
+        SYS_SOCKETPAIR, SYS_SPLICE, SYS_STATFS, SYS_STATX, SYS_SYMLINKAT, SYS_TIMES, SYS_TRUNCATE,
+        SYS_UMASK, SYS_UNAME, SYS_UTIMENSAT, SYS_WAIT, SYS_WRITE, SYS_WRITEV,
     };
     use hal_api::{
         register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
@@ -5302,6 +5653,742 @@ mod tests {
     }
 
     #[test]
+    fn kill_supports_process_group_and_broadcast_targets() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        let child_a = procs.spawn("child-a", Some(init), 0x1000);
+        let child_b = procs.spawn("child-b", Some(init), 0x1000);
+        let outsider = procs.spawn("outsider", Some(init), 0x1000);
+        procs.set_current(init).unwrap();
+        procs.setpgid(child_a, 42).unwrap();
+        procs.setpgid(child_b, 42).unwrap();
+        procs.setpgid(outsider, 77).unwrap();
+        procs.set_current(child_a).unwrap();
+
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.spawn("child-a", child_a, child_a);
+        scheduler.spawn("child-b", child_b, child_b);
+        scheduler.spawn("outsider", outsider, outsider);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let sigbit = |sig: usize| 1u64 << (sig - 1);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_KILL,
+                SyscallArgs([0, 10, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        for tid in [child_a, child_b] {
+            procs.set_current(tid).unwrap();
+            assert_ne!(procs.current().unwrap().pending_signals & sigbit(10), 0);
+            procs.current_mut().unwrap().pending_signals = 0;
+        }
+        procs.set_current(outsider).unwrap();
+        assert_eq!(procs.current().unwrap().pending_signals & sigbit(10), 0);
+
+        procs.set_current(child_a).unwrap();
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_KILL,
+                SyscallArgs([(-42isize) as usize, 12, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        for tid in [child_a, child_b] {
+            procs.set_current(tid).unwrap();
+            assert_ne!(procs.current().unwrap().pending_signals & sigbit(12), 0);
+            procs.current_mut().unwrap().pending_signals = 0;
+        }
+        procs.set_current(outsider).unwrap();
+        assert_eq!(procs.current().unwrap().pending_signals & sigbit(12), 0);
+
+        procs.set_current(child_a).unwrap();
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_KILL,
+                SyscallArgs([(-1isize) as usize, 14, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        procs.set_current(init).unwrap();
+        assert_eq!(procs.current().unwrap().pending_signals & sigbit(14), 0);
+        procs.set_current(child_a).unwrap();
+        assert_eq!(procs.current().unwrap().pending_signals & sigbit(14), 0);
+        for tid in [child_b, outsider] {
+            procs.set_current(tid).unwrap();
+            assert_ne!(procs.current().unwrap().pending_signals & sigbit(14), 0);
+            procs.current_mut().unwrap().pending_signals = 0;
+        }
+
+        procs.set_current(child_a).unwrap();
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_KILL,
+                SyscallArgs([(-1isize) as usize, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        for tid in [init, child_a, child_b, outsider] {
+            procs.set_current(tid).unwrap();
+            assert_eq!(procs.current().unwrap().pending_signals, 0);
+        }
+    }
+
+    #[test]
+    fn tkill_targets_exact_tid() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        let child = procs.spawn("child", Some(init), 0x1000);
+        procs.set_current(child).unwrap();
+        let thread = procs.clone_thread_from_current(0, None).unwrap();
+        procs.set_current(init).unwrap();
+
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.spawn("child", child, child);
+        scheduler.spawn("thread", thread, child);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let sigbit = |sig: usize| 1u64 << (sig - 1);
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_TKILL,
+                SyscallArgs([thread, 10, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        procs.set_current(thread).unwrap();
+        assert_ne!(procs.current().unwrap().pending_signals & sigbit(10), 0);
+        procs.set_current(child).unwrap();
+        assert_eq!(procs.current().unwrap().pending_signals & sigbit(10), 0);
+
+        procs.set_current(init).unwrap();
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_TKILL,
+                SyscallArgs([999_999, 10, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::ESRCH as isize)
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_TKILL,
+                SyscallArgs([thread, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn cancel_interrupt_once_interrupts_sleep_and_sigsuspend() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let req = super::timespec_to_bytes(Timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        });
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb000, &req);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb100, &[0; 16]);
+
+        {
+            let process = procs.current_mut().unwrap();
+            process.cancel_interrupt_once = true;
+        }
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_NANOSLEEP,
+                SyscallArgs([0xb000, 0xb100, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINTR as isize)
+        );
+        {
+            let process = procs.current().unwrap();
+            assert!(!process.cancel_interrupt_once);
+            assert_eq!(process.sleep_deadline_ns, None);
+        }
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb200, &req);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb300, &[0; 16]);
+        {
+            let process = procs.current_mut().unwrap();
+            process.cancel_interrupt_once = true;
+        }
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_CLOCK_NANOSLEEP,
+                SyscallArgs([0, 0, 0xb200, 0xb300, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINTR as isize)
+        );
+        {
+            let process = procs.current().unwrap();
+            assert!(!process.cancel_interrupt_once);
+            assert_eq!(process.sleep_deadline_ns, None);
+        }
+
+        {
+            let process = procs.current_mut().unwrap();
+            process.cancel_interrupt_once = true;
+            process.signal_mask = 0x1234;
+            process.sigsuspend_saved_mask = None;
+        }
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_RT_SIGSUSPEND,
+                SyscallArgs([0, 8, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINTR as isize)
+        );
+        {
+            let process = procs.current().unwrap();
+            assert!(!process.cancel_interrupt_once);
+            assert_eq!(process.sigsuspend_saved_mask, None);
+            assert_eq!(process.signal_mask, 0x1234);
+        }
+    }
+
+    #[test]
+    fn cancel_interrupt_once_interrupts_poll_select_and_epoll() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let mut pollfd = [0u8; 8];
+        pollfd[..4].copy_from_slice(&(-1i32).to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xc000, &pollfd);
+
+        {
+            let process = procs.current_mut().unwrap();
+            process.cancel_interrupt_once = true;
+        }
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_PPOLL,
+                SyscallArgs([0xc000, 1, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINTR as isize)
+        );
+        assert!(!procs.current().unwrap().cancel_interrupt_once);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_PPOLL,
+                SyscallArgs([0xc000, 1, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EAGAIN as isize)
+        );
+
+        {
+            let process = procs.current_mut().unwrap();
+            process.cancel_interrupt_once = true;
+        }
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_PSELECT6,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINTR as isize)
+        );
+        assert!(!procs.current().unwrap().cancel_interrupt_once);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_PSELECT6,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EAGAIN as isize)
+        );
+
+        let epfd = dispatcher.dispatch(
+            SYS_EPOLL_CREATE1,
+            SyscallArgs([0, 0, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        ) as usize;
+        {
+            let process = procs.current_mut().unwrap();
+            process.cancel_interrupt_once = true;
+        }
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_EPOLL_PWAIT,
+                SyscallArgs([epfd, 0, 1, 100, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINTR as isize)
+        );
+        assert!(!procs.current().unwrap().cancel_interrupt_once);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_EPOLL_PWAIT,
+                SyscallArgs([epfd, 0, 1, 100, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EAGAIN as isize)
+        );
+    }
+
+    #[test]
+    fn sched_affinity_single_cpu_mask_and_bounds() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xc100, &[0; 16]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_GETAFFINITY,
+                SyscallArgs([0, 8, 0xc100, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            core::mem::size_of::<usize>() as isize
+        );
+        let mask = procs.current().unwrap().read_user_bytes(0xc100, 8).unwrap();
+        assert_eq!(mask[0] & 1, 1);
+        assert!(mask[1..].iter().all(|byte| *byte == 0));
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_GETAFFINITY,
+                SyscallArgs([0, 4, 0xc100, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINVAL as isize)
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_GETAFFINITY,
+                SyscallArgs([9999, 8, 0xc100, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::ESRCH as isize)
+        );
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xc200, &[1u8; 8]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_SETAFFINITY,
+                SyscallArgs([0, 8, 0xc200, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xc300, &[0u8; 8]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_SETAFFINITY,
+                SyscallArgs([0, 8, 0xc300, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINVAL as isize)
+        );
+    }
+
+    #[test]
+    fn sched_param_and_scheduler_min_compat() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xce00, &10i32.to_le_bytes());
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_SETPARAM,
+                SyscallArgs([0, 0xce00, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xce08, &0x7fi32.to_le_bytes());
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_GETPARAM,
+                SyscallArgs([0, 0xce08, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        let got = procs.current().unwrap().read_user_bytes(0xce08, 4).unwrap();
+        assert_eq!(i32::from_le_bytes(got.try_into().unwrap()), 0);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_SETSCHEDULER,
+                SyscallArgs([0, 1, 0xce00, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_GETSCHEDULER,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_SETSCHEDULER,
+                SyscallArgs([0, 9, 0xce00, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINVAL as isize)
+        );
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xce10, &120i32.to_le_bytes());
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_SETPARAM,
+                SyscallArgs([0, 0xce10, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINVAL as isize)
+        );
+    }
+
+    #[test]
+    fn utimensat_and_statfs_return_enotdir_for_non_directory_component() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xcf00, b"/dev/null/invalid\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xcf80, &[0u8; 120]);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_UTIMENSAT,
+                SyscallArgs([(super::AT_FDCWD as isize) as usize, 0xcf00, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::ENOTDIR as isize)
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_STATFS,
+                SyscallArgs([0xcf00, 0xcf80, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::ENOTDIR as isize)
+        );
+    }
+
+    #[test]
+    fn clone_vfork_blocks_parent_until_child_exit() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let parent = procs.spawn_init("init", 0x1000);
+        procs.set_current(parent).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", parent, parent);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let child = dispatcher.dispatch(
+            SYS_CLONE,
+            SyscallArgs([super::CLONE_VFORK | super::CLONE_VM, 0, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        ) as usize;
+        assert!(child > 0);
+        assert!(scheduler.is_blocked(parent));
+        assert_eq!(scheduler.current_thread_id(), Some(child));
+
+        procs.set_current(child).unwrap();
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_EXIT,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert!(!scheduler.is_blocked(parent));
+        assert!(scheduler.is_ready(parent) || scheduler.current_thread_id() == Some(parent));
+    }
+
+    #[test]
+    fn fstatat_symlink_follow_and_nofollow() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd000, b"/tmp/real\0");
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                (super::AT_FDCWD as isize) as usize,
+                0xd000,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 3);
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd100, b"/tmp/real\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd200, b"/tmp/link\0");
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SYMLINKAT,
+                SyscallArgs([0xd100, 0, 0xd200, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd300, &[0; 128]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSTATAT,
+                SyscallArgs([(super::AT_FDCWD as isize) as usize, 0xd200, 0xd300, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        let follow = procs
+            .current()
+            .unwrap()
+            .read_user_bytes(0xd300, 128)
+            .unwrap();
+        let mut mode_bytes = [0u8; 4];
+        mode_bytes.copy_from_slice(&follow[16..20]);
+        let follow_mode = u32::from_le_bytes(mode_bytes);
+        assert_eq!(follow_mode & 0o170000, 0o100000);
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd380, &[0; 128]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSTATAT,
+                SyscallArgs([
+                    (super::AT_FDCWD as isize) as usize,
+                    0xd200,
+                    0xd380,
+                    0x100,
+                    0,
+                    0
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        let nofollow = procs
+            .current()
+            .unwrap()
+            .read_user_bytes(0xd380, 128)
+            .unwrap();
+        mode_bytes.copy_from_slice(&nofollow[16..20]);
+        let nofollow_mode = u32::from_le_bytes(mode_bytes);
+        assert_eq!(nofollow_mode & 0o170000, 0o120000);
+    }
+
+    #[test]
     fn rt_sigreturn_arms_cancel_interrupt_once() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
@@ -5657,6 +6744,12 @@ mod tests {
             SYS_GETITIMER,
             SYS_SETITIMER,
             SYS_CLOCK_GETRES,
+            SYS_SCHED_SETPARAM,
+            SYS_SCHED_GETPARAM,
+            SYS_SCHED_SETSCHEDULER,
+            SYS_SCHED_GETSCHEDULER,
+            SYS_SCHED_SETAFFINITY,
+            SYS_SCHED_GETAFFINITY,
             SYS_SIGALTSTACK,
             SYS_RT_SIGSUSPEND,
             SYS_RT_SIGPENDING,
@@ -5711,6 +6804,7 @@ mod tests {
             SYS_SETUID,
             SYS_SETGID,
             SYS_SIGACTION,
+            SYS_SIGNAL,
             SYS_SIGPROCMASK,
             SYS_RT_SIGTIMEDWAIT,
         ];

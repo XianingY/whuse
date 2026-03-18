@@ -7,6 +7,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::mem::size_of;
 use hal_api::TrapFrame;
 use mm::{AddressSpace, KernelResult as MmResult};
 use vfs::{FileHandle, HANDLE_FLAG_CLOEXEC};
@@ -14,6 +15,7 @@ use vfs::{FileHandle, HANDLE_FLAG_CLOEXEC};
 pub type KernelResult<T> = Result<T, i32>;
 
 const EBADF: i32 = 9;
+const EAGAIN: i32 = 11;
 const ECHILD: i32 = 10;
 const ENOENT: i32 = 2;
 const EINVAL: i32 = 22;
@@ -21,6 +23,13 @@ const ESRCH: i32 = 3;
 
 const USER_STACK_SIZE: usize = 8192;
 const USER_STACK_TOP: usize = 0x7fff_f000;
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+const ROBUST_LIST_MAX_SCAN: usize = 2048;
+const ROBUST_HEAD_WORDS: usize = 3;
+const PROCESS_NAME_MAX_BYTES: usize = 256;
+const FORK_CLONE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessState {
@@ -72,13 +81,15 @@ pub enum WaitSelector {
     Pgid(usize),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ThreadExit {
     pub tid: usize,
     pub tgid: usize,
     pub clear_child_tid: Option<usize>,
+    pub robust_futex_addrs: Vec<usize>,
     pub group_exited: bool,
     pub parent_tgid: Option<usize>,
+    pub vfork_parent_tid: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -86,7 +97,9 @@ pub struct GroupExit {
     pub tgid: usize,
     pub tids: Vec<usize>,
     pub clear_child_tids: Vec<usize>,
+    pub robust_futex_addrs: Vec<usize>,
     pub parent_tgid: Option<usize>,
+    pub vfork_parent_tid: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,6 +161,22 @@ pub struct Process {
     /// One-shot futex interrupt token armed by rt_sigreturn after SIGCANCEL.
     /// FUTEX_WAIT consumes this token and returns -EINTR once.
     pub cancel_interrupt_once: bool,
+    /// Parent task id blocked by CLONE_VFORK. Set on the child process until
+    /// the child reaches execve/exit and releases the parent.
+    pub vfork_parent_tid: Option<usize>,
+}
+
+pub fn clamp_process_name(name: &str) -> String {
+    if name.len() <= PROCESS_NAME_MAX_BYTES {
+        return name.to_string();
+    }
+    let mut end = PROCESS_NAME_MAX_BYTES;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut clipped = name[..end].to_string();
+    clipped.push_str("...");
+    clipped
 }
 
 pub struct ProcessTable {
@@ -171,7 +200,7 @@ impl Process {
             pgid: parent.unwrap_or(pid),
             sid: parent.unwrap_or(pid),
             parent,
-            name: name.to_string(),
+            name: clamp_process_name(name),
             cwd: String::from("/"),
             uid: 0,
             euid: 0,
@@ -205,11 +234,12 @@ impl Process {
             signal_frame_pending: false,
             cancel_signal_seen: false,
             cancel_interrupt_once: false,
+            vfork_parent_tid: None,
         }
     }
 
     pub fn add_fd(&mut self, handle: FileHandle) -> i32 {
-        let mut fd = 3;
+        let mut fd = 0;
         while self.fds.contains_key(&fd) {
             fd += 1;
         }
@@ -336,6 +366,57 @@ impl Process {
         false
     }
 
+    fn collect_robust_futex_addrs_for_exit(&mut self) -> Vec<usize> {
+        let Some((head, len)) = self.robust_list else {
+            return Vec::new();
+        };
+        if len < ROBUST_HEAD_WORDS * size_of::<usize>() {
+            return Vec::new();
+        }
+
+        let list_next = match read_user_usize(self, head) {
+            Ok(next) => next,
+            Err(_) => return Vec::new(),
+        };
+        let futex_offset = match read_user_isize(self, head + size_of::<usize>()) {
+            Ok(offset) => offset,
+            Err(_) => return Vec::new(),
+        };
+        let list_op_pending = match read_user_usize(self, head + size_of::<usize>() * 2) {
+            Ok(ptr) => ptr,
+            Err(_) => 0,
+        };
+
+        let mut addrs = Vec::new();
+        let mut seen = Vec::new();
+        let mut node = list_next;
+        for _ in 0..ROBUST_LIST_MAX_SCAN {
+            if node == 0 || node == head {
+                break;
+            }
+            if seen.iter().any(|seen_node| *seen_node == node) {
+                break;
+            }
+            seen.push(node);
+            if let Some(addr) = robust_futex_addr(node, futex_offset) {
+                maybe_mark_owner_died(self, addr, self.tid);
+                push_unique_addr(&mut addrs, addr);
+            }
+            node = match read_user_usize(self, node) {
+                Ok(next) => next,
+                Err(_) => break,
+            };
+        }
+
+        if list_op_pending != 0 && list_op_pending != head {
+            if let Some(addr) = robust_futex_addr(list_op_pending, futex_offset) {
+                maybe_mark_owner_died(self, addr, self.tid);
+                push_unique_addr(&mut addrs, addr);
+            }
+        }
+        addrs
+    }
+
     pub fn reset_image(&mut self, entry: usize, stack_pointer: Option<usize>) {
         self.address_space.clear();
         self.user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
@@ -363,6 +444,7 @@ impl Process {
         self.signal_frame_pending = false;
         self.cancel_signal_seen = false;
         self.cancel_interrupt_once = false;
+        self.vfork_parent_tid = None;
     }
 
     fn fork_from(&self, pid: usize) -> Self {
@@ -417,6 +499,7 @@ impl Process {
             signal_frame_pending: false,
             cancel_signal_seen: false,
             cancel_interrupt_once: false,
+            vfork_parent_tid: None,
         }
     }
 
@@ -472,6 +555,7 @@ impl Process {
             signal_frame_pending: false,
             cancel_signal_seen: false,
             cancel_interrupt_once: false,
+            vfork_parent_tid: None,
         }
     }
 
@@ -538,6 +622,7 @@ impl Process {
             signal_frame_pending: false,
             cancel_signal_seen: false,
             cancel_interrupt_once: false,
+            vfork_parent_tid: None,
         }
     }
 
@@ -624,6 +709,10 @@ impl ProcessTable {
         self.current_tgid()
     }
 
+    pub fn current_pgid(&self) -> KernelResult<usize> {
+        Ok(self.current()?.pgid)
+    }
+
     pub fn has_pid(&self, pid: usize) -> bool {
         self.processes.contains_key(&pid)
             || self.processes.values().any(|process| process.tgid == pid)
@@ -653,6 +742,39 @@ impl ProcessTable {
         } else {
             Err(EBADF)
         }
+    }
+
+    pub fn set_vfork_parent_tid(
+        &mut self,
+        child_tid: usize,
+        parent_tid: usize,
+    ) -> KernelResult<()> {
+        let child = self.find_by_tid_mut(child_tid)?;
+        child.vfork_parent_tid = Some(parent_tid);
+        Ok(())
+    }
+
+    pub fn release_vfork_parent_for_tgid(&mut self, tgid: usize) -> Option<usize> {
+        let mut parent_tid = None;
+        let tids = self
+            .processes
+            .iter()
+            .filter_map(|(tid, process)| (process.tgid == tgid).then_some(*tid))
+            .collect::<Vec<_>>();
+        for tid in tids {
+            if let Some(process) = self.processes.get_mut(&tid) {
+                if parent_tid.is_none() {
+                    parent_tid = process.vfork_parent_tid;
+                }
+                process.vfork_parent_tid = None;
+            }
+        }
+        parent_tid
+    }
+
+    pub fn release_current_vfork_parent(&mut self) -> KernelResult<Option<usize>> {
+        let tgid = self.current_tgid()?;
+        Ok(self.release_vfork_parent_for_tgid(tgid))
     }
 
     pub fn wait(&mut self, parent_pid: usize, pid: i32) -> KernelResult<(usize, i32)> {
@@ -712,6 +834,15 @@ impl ProcessTable {
 
     pub fn fork_process_from_current(&mut self) -> KernelResult<usize> {
         let pid = self.next_id();
+        let clone_bytes = self
+            .current()?
+            .address_space
+            .estimated_private_clone_bytes();
+        if clone_bytes > 0
+            && self.task_count().saturating_mul(clone_bytes) > FORK_CLONE_BUDGET_BYTES
+        {
+            return Err(EAGAIN);
+        }
         let parent = self.current()?.fork_from(pid);
         self.processes.insert(pid, parent);
         Ok(pid)
@@ -932,17 +1063,108 @@ impl ProcessTable {
         self.send_signal(pid, signal)
     }
 
-    pub fn send_signal(&mut self, pid: usize, signal: usize) -> KernelResult<()> {
+    pub fn send_signal_tid(&mut self, pid: usize, signal: usize) -> KernelResult<usize> {
         if signal > 64 {
             return Err(EINVAL);
         }
         if signal == 0 {
-            return Ok(());
+            return self.resolve_target_tid(pid);
         }
         let target_tid = self.resolve_target_tid(pid)?;
         let process = self.processes.get_mut(&target_tid).ok_or(ENOENT)?;
+        if process.state == ProcessState::Exited {
+            return Err(ESRCH);
+        }
         process.pending_signals |= 1u64 << (signal - 1);
+        Ok(target_tid)
+    }
+
+    pub fn send_signal_exact_tid(&mut self, tid: usize, signal: usize) -> KernelResult<usize> {
+        if signal > 64 {
+            return Err(EINVAL);
+        }
+        let process = self.processes.get_mut(&tid).ok_or(ESRCH)?;
+        if process.state == ProcessState::Exited {
+            return Err(ESRCH);
+        }
+        if signal == 0 {
+            return Ok(tid);
+        }
+        process.pending_signals |= 1u64 << (signal - 1);
+        Ok(tid)
+    }
+
+    pub fn send_signal(&mut self, pid: usize, signal: usize) -> KernelResult<()> {
+        let _ = self.send_signal_tid(pid, signal)?;
         Ok(())
+    }
+
+    pub fn send_signal_pgid(
+        &mut self,
+        pgid: usize,
+        signal: usize,
+        exclude_tgid: Option<usize>,
+    ) -> KernelResult<Vec<usize>> {
+        if signal > 64 {
+            return Err(EINVAL);
+        }
+        let targets = self
+            .processes
+            .values()
+            .filter(|process| {
+                !process.is_thread
+                    && process.state != ProcessState::Exited
+                    && process.pgid == pgid
+                    && exclude_tgid.map_or(true, |tgid| process.tgid != tgid)
+            })
+            .map(|process| process.tid)
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Err(ESRCH);
+        }
+        if signal == 0 {
+            return Ok(targets);
+        }
+        for tid in &targets {
+            if let Some(process) = self.processes.get_mut(tid) {
+                process.pending_signals |= 1u64 << (signal - 1);
+            }
+        }
+        Ok(targets)
+    }
+
+    pub fn send_signal_all(
+        &mut self,
+        signal: usize,
+        exclude_tgid: Option<usize>,
+        include_init: bool,
+    ) -> KernelResult<Vec<usize>> {
+        if signal > 64 {
+            return Err(EINVAL);
+        }
+        let targets = self
+            .processes
+            .values()
+            .filter(|process| {
+                !process.is_thread
+                    && process.state != ProcessState::Exited
+                    && (include_init || process.tgid > 1)
+                    && exclude_tgid.map_or(true, |tgid| process.tgid != tgid)
+            })
+            .map(|process| process.tid)
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Err(ESRCH);
+        }
+        if signal == 0 {
+            return Ok(targets);
+        }
+        for tid in &targets {
+            if let Some(process) = self.processes.get_mut(tid) {
+                process.pending_signals |= 1u64 << (signal - 1);
+            }
+        }
+        Ok(targets)
     }
 
     pub fn clear_pending_signal(&mut self, signal: usize) -> KernelResult<()> {
@@ -1058,6 +1280,8 @@ impl ProcessTable {
         let current_tid = self.current_tid()?;
         let current_tgid = self.current_tgid()?;
         let parent_tgid = self.current()?.parent;
+        let vfork_parent_tid = self.current()?.vfork_parent_tid;
+        let robust_futex_addrs = self.current_mut()?.collect_robust_futex_addrs_for_exit();
         let clear_child_tid = self.current()?.clear_child_tid;
         if let Some(addr) = clear_child_tid {
             let _ = self
@@ -1096,8 +1320,10 @@ impl ProcessTable {
             tid: current_tid,
             tgid: current_tgid,
             clear_child_tid,
+            robust_futex_addrs,
             group_exited: !group_alive,
             parent_tgid,
+            vfork_parent_tid,
         })
     }
 
@@ -1105,6 +1331,8 @@ impl ProcessTable {
         let current_tgid = self.current_tgid()?;
         let current_tid = self.current_tid()?;
         let parent_tgid = self.current()?.parent;
+        let vfork_parent_tid = self.current()?.vfork_parent_tid;
+        let mut robust_futex_addrs = Vec::new();
         let clear_child_tid = self.current()?.clear_child_tid;
         let tids = self
             .processes
@@ -1113,6 +1341,9 @@ impl ProcessTable {
             .collect::<Vec<_>>();
         for tid in tids {
             if let Some(process) = self.processes.get_mut(&tid) {
+                for addr in process.collect_robust_futex_addrs_for_exit() {
+                    push_unique_addr(&mut robust_futex_addrs, addr);
+                }
                 if let Some(addr) = process.clear_child_tid {
                     let _ = process.write_user_bytes(addr, &0u32.to_le_bytes());
                 }
@@ -1130,8 +1361,10 @@ impl ProcessTable {
             tid: current_tid,
             tgid: current_tgid,
             clear_child_tid,
+            robust_futex_addrs,
             group_exited: true,
             parent_tgid,
+            vfork_parent_tid,
         })
     }
 
@@ -1142,14 +1375,23 @@ impl ProcessTable {
             .count()
     }
 
-    pub fn process_snapshots(&self) -> Vec<ProcessSnapshot> {
+    pub fn task_count(&self) -> usize {
         self.processes
             .values()
             .filter(|process| process.state != ProcessState::Exited)
+            .count()
+    }
+
+    pub fn process_snapshots(&self) -> Vec<ProcessSnapshot> {
+        const PROCESS_SNAPSHOT_LIMIT: usize = 4096;
+        self.processes
+            .values()
+            .filter(|process| process.state != ProcessState::Exited)
+            .take(PROCESS_SNAPSHOT_LIMIT)
             .map(|process| ProcessSnapshot {
                 tid: process.tid,
                 tgid: process.tgid,
-                name: process.name.clone(),
+                name: clamp_process_name(&process.name),
                 state: process.state,
                 is_thread: process.is_thread,
             })
@@ -1250,6 +1492,18 @@ impl ProcessTable {
                         || p.signal_frame_pending
                         || p.cancel_signal_seen
                         || p.cancel_interrupt_once)
+                    && p.state != ProcessState::Exited
+            })
+            .map(|p| p.tid)
+            .collect()
+    }
+
+    pub fn sigsuspend_blocked_with_pending_signal_tids(&self) -> Vec<usize> {
+        self.processes
+            .values()
+            .filter(|p| {
+                p.sigsuspend_saved_mask.is_some()
+                    && (p.pending_signals & !p.signal_mask) != 0
                     && p.state != ProcessState::Exited
             })
             .map(|p| p.tid)
@@ -1377,9 +1631,17 @@ impl ProcessTable {
             .processes
             .get(&tids[0])
             .and_then(|process| process.parent);
+        let vfork_parent_tid = self
+            .processes
+            .get(&tids[0])
+            .and_then(|process| process.vfork_parent_tid);
         let mut clear_child_tids = Vec::new();
+        let mut robust_futex_addrs = Vec::new();
         for tid in &tids {
             if let Some(process) = self.processes.get_mut(tid) {
+                for addr in process.collect_robust_futex_addrs_for_exit() {
+                    push_unique_addr(&mut robust_futex_addrs, addr);
+                }
                 if let Some(addr) = process.clear_child_tid {
                     let _ = process.write_user_bytes(addr, &0u32.to_le_bytes());
                     clear_child_tids.push(addr);
@@ -1398,7 +1660,9 @@ impl ProcessTable {
             tgid,
             tids,
             clear_child_tids,
+            robust_futex_addrs,
             parent_tgid,
+            vfork_parent_tid,
         }))
     }
 
@@ -1456,12 +1720,16 @@ impl ProcessTable {
     }
 
     fn resolve_target_tid(&self, pid: usize) -> KernelResult<usize> {
-        if self.processes.contains_key(&pid) {
-            return Ok(pid);
+        if let Some(process) = self.processes.get(&pid) {
+            if process.state != ProcessState::Exited {
+                return Ok(pid);
+            }
         }
         self.processes
             .values()
-            .find(|process| process.tgid == pid && !process.is_thread)
+            .find(|process| {
+                process.tgid == pid && !process.is_thread && process.state != ProcessState::Exited
+            })
             .map(|process| process.tid)
             .ok_or(ESRCH)
     }
@@ -1487,9 +1755,60 @@ fn selector_matches(selector: WaitSelector, process: &Process) -> bool {
     }
 }
 
+fn read_user_usize(process: &Process, addr: usize) -> KernelResult<usize> {
+    let bytes = process
+        .read_user_bytes(addr, size_of::<usize>())
+        .map_err(|_| EINVAL)?;
+    let mut raw = [0u8; size_of::<usize>()];
+    raw.copy_from_slice(&bytes[..size_of::<usize>()]);
+    Ok(usize::from_le_bytes(raw))
+}
+
+fn read_user_isize(process: &Process, addr: usize) -> KernelResult<isize> {
+    let bytes = process
+        .read_user_bytes(addr, size_of::<isize>())
+        .map_err(|_| EINVAL)?;
+    let mut raw = [0u8; size_of::<isize>()];
+    raw.copy_from_slice(&bytes[..size_of::<isize>()]);
+    Ok(isize::from_le_bytes(raw))
+}
+
+fn read_user_u32(process: &Process, addr: usize) -> KernelResult<u32> {
+    let bytes = process.read_user_bytes(addr, 4).map_err(|_| EINVAL)?;
+    let mut raw = [0u8; 4];
+    raw.copy_from_slice(&bytes[..4]);
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn robust_futex_addr(node: usize, futex_offset: isize) -> Option<usize> {
+    if futex_offset >= 0 {
+        node.checked_add(futex_offset as usize)
+    } else {
+        node.checked_sub((-futex_offset) as usize)
+    }
+}
+
+fn maybe_mark_owner_died(process: &mut Process, futex_addr: usize, exiting_tid: usize) {
+    let Ok(word) = read_user_u32(process, futex_addr) else {
+        return;
+    };
+    if (word & FUTEX_TID_MASK) != ((exiting_tid as u32) & FUTEX_TID_MASK) {
+        return;
+    }
+    let owner_died = (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+    let _ = process.write_user_bytes(futex_addr, &owner_died.to_le_bytes());
+}
+
+fn push_unique_addr(addrs: &mut Vec<usize>, addr: usize) {
+    if !addrs.iter().any(|existing| *existing == addr) {
+        addrs.push(addr);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProcessTable, SigAction, WaitSelector};
+    use vfs::KernelVfs;
 
     #[test]
     fn process_accessors_expose_competition_state() {
@@ -1584,6 +1903,111 @@ mod tests {
     }
 
     #[test]
+    fn robust_exit_marks_owner_died_and_reports_wake_addr() {
+        let mut table = ProcessTable::new();
+        let leader = table.spawn_init("init", 0x1000);
+        table.set_current(leader).unwrap();
+        let exiting = table.clone_thread_from_current(0, None).unwrap();
+        let waiter = table.clone_thread_from_current(0, None).unwrap();
+        table
+            .find_by_tid_mut(exiting)
+            .unwrap()
+            .address_space
+            .map_anonymous_at(0x2000, 0x2000, 0b11)
+            .unwrap();
+
+        const HEAD: usize = 0x2000;
+        const NODE: usize = 0x3000;
+        const FUTEX: usize = NODE + 0x20;
+        let mut head = [0u8; 24];
+        head[0..8].copy_from_slice(&NODE.to_le_bytes());
+        head[8..16].copy_from_slice(&(0x20isize).to_le_bytes());
+        head[16..24].copy_from_slice(&0usize.to_le_bytes());
+        let mut node = [0u8; 8];
+        node.copy_from_slice(&HEAD.to_le_bytes());
+
+        table
+            .find_by_tid_mut(exiting)
+            .unwrap()
+            .write_user_bytes(HEAD, &head)
+            .unwrap();
+        table
+            .find_by_tid_mut(exiting)
+            .unwrap()
+            .write_user_bytes(NODE, &node)
+            .unwrap();
+        table
+            .find_by_tid_mut(exiting)
+            .unwrap()
+            .write_user_bytes(FUTEX, &(exiting as u32).to_le_bytes())
+            .unwrap();
+
+        table.set_current(exiting).unwrap();
+        table.set_robust_list(HEAD, 24).unwrap();
+        table.enqueue_futex_waiter(FUTEX, waiter);
+        table.find_by_tid_mut(waiter).unwrap().futex_wait_addr = Some(FUTEX);
+
+        let exit = table.exit_current_thread(0).unwrap();
+        assert_eq!(exit.robust_futex_addrs, vec![FUTEX]);
+
+        let futex_word = table
+            .find_by_tid_mut(leader)
+            .unwrap()
+            .read_user_bytes(FUTEX, 4)
+            .unwrap();
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&futex_word);
+        let value = u32::from_le_bytes(raw);
+        assert_ne!(value & super::FUTEX_OWNER_DIED, 0);
+        assert_eq!(value & super::FUTEX_TID_MASK, 0);
+    }
+
+    #[test]
+    fn robust_exit_cycle_scan_is_bounded() {
+        let mut table = ProcessTable::new();
+        let leader = table.spawn_init("init", 0x1000);
+        table.set_current(leader).unwrap();
+        let exiting = table.clone_thread_from_current(0, None).unwrap();
+        table
+            .find_by_tid_mut(exiting)
+            .unwrap()
+            .address_space
+            .map_anonymous_at(0x2000, 0x2000, 0b11)
+            .unwrap();
+
+        const HEAD: usize = 0x2100;
+        const NODE: usize = 0x3100;
+        const FUTEX: usize = NODE + 0x20;
+        let mut head = [0u8; 24];
+        head[0..8].copy_from_slice(&NODE.to_le_bytes());
+        head[8..16].copy_from_slice(&(0x20isize).to_le_bytes());
+        head[16..24].copy_from_slice(&0usize.to_le_bytes());
+        let mut node = [0u8; 8];
+        node.copy_from_slice(&NODE.to_le_bytes());
+
+        table
+            .find_by_tid_mut(exiting)
+            .unwrap()
+            .write_user_bytes(HEAD, &head)
+            .unwrap();
+        table
+            .find_by_tid_mut(exiting)
+            .unwrap()
+            .write_user_bytes(NODE, &node)
+            .unwrap();
+        table
+            .find_by_tid_mut(exiting)
+            .unwrap()
+            .write_user_bytes(FUTEX, &(exiting as u32).to_le_bytes())
+            .unwrap();
+
+        table.set_current(exiting).unwrap();
+        table.set_robust_list(HEAD, 24).unwrap();
+        let exit = table.exit_current_thread(0).unwrap();
+        assert_eq!(exit.robust_futex_addrs, vec![FUTEX]);
+    }
+
+    #[test]
     fn descendant_cleanup_reaps_process_subtree() {
         let mut table = ProcessTable::new();
         let init = table.spawn_init("init", 0x1000);
@@ -1628,5 +2052,34 @@ mod tests {
         process.reset_image(0x2000, None);
         assert!(!process.cancel_signal_seen);
         assert!(!process.cancel_interrupt_once);
+    }
+
+    #[test]
+    fn add_fd_reuses_lowest_available_slot() {
+        let mut table = ProcessTable::new();
+        let pid = table.spawn_init("init", 0x1000);
+        table.set_current(pid).unwrap();
+        let mut vfs = KernelVfs::new();
+
+        let fd0 = table
+            .current_mut()
+            .unwrap()
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+        let fd1 = table
+            .current_mut()
+            .unwrap()
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+        let fd2 = table
+            .current_mut()
+            .unwrap()
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+        assert_eq!((fd0, fd1, fd2), (0, 1, 2));
+
+        table.current_mut().unwrap().close_fd(1).unwrap();
+        let reused = table
+            .current_mut()
+            .unwrap()
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+        assert_eq!(reused, 1);
     }
 }

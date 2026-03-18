@@ -29,6 +29,8 @@ qemu-system-loongarch64 --version
 debugfs -V
 xz --version
 docker --version
+docker run --rm docker.educg.net/cg/os-contest:20260104 qemu-system-riscv64 --version
+docker run --rm docker.educg.net/cg/os-contest:20260104 qemu-system-loongarch64 --version
 ```
 
 ## 2) Variables and Conventions
@@ -45,10 +47,12 @@ export LA_IMG="$REPO_ROOT/target/oscomp/sdcard-la.img"
 Key runtime env vars:
 
 - `WHUSE_DISK_IMAGE`: override QEMU disk image path.
+- `WHUSE_EXTRA_DISK_IMAGE`: optional second disk (`disk.img` / `disk-la.img`) path.
 - `WHUSE_OSCOMP_TESTSUITS_DIR`: override testsuits directory used by `cargo xtask oscomp-images`.
 - `WHUSE_OSCOMP_SKIP_BUILD=1`: skip `make sdcard` when preparing oscomp images.
 - `WHUSE_OSCOMP_DOCKER_IMAGE`: docker image for testsuits `make sdcard` fallback.
-- `WHUSE_OSCOMP_COMPAT`: suite mode switch (`1`=current compat-heavy flow, `0`=target real execution flow).
+- `WHUSE_OSCOMP_COMPAT`: suite mode switch (`0`=real execution flow, `1`=compat fallback).
+- `WHUSE_QEMU_MODE`: `contest` (docker qemu) or `host` (local qemu).
 
 ## 3) Standard Command Blocks
 
@@ -75,8 +79,8 @@ Expected output image paths:
 ### 3.3 Run full suite (RISC-V / LoongArch)
 
 ```bash
-timeout 3600s env WHUSE_DISK_IMAGE="$RV_IMG" cargo xtask qemu-riscv > /tmp/rv-full.log 2>&1
-timeout 3600s env WHUSE_DISK_IMAGE="$LA_IMG" cargo xtask qemu-loongarch > /tmp/la-full.log 2>&1
+timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$RV_IMG" cargo xtask oscomp-riscv > /tmp/rv-full.log 2>&1
+timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$LA_IMG" cargo xtask oscomp-loongarch > /tmp/la-full.log 2>&1
 ```
 
 ### 3.4 Log extraction quick checks
@@ -89,11 +93,12 @@ Use `strings` first — QEMU log output is binary-mixed; plain `grep` will repor
 
 ## 4) Current Flow (可复现现状 / Default Today)
 
-Current default is compat-heavy because suite script sets:
+Current recommended default for validation is real execution (`WHUSE_OSCOMP_COMPAT=0`) and contest-mode QEMU:
 
-- `WHUSE_OSCOMP_COMPAT=${WHUSE_OSCOMP_COMPAT:-1}`
+- `WHUSE_OSCOMP_COMPAT=${WHUSE_OSCOMP_COMPAT:-0}`
+- `WHUSE_QEMU_MODE=contest`
 
-That means without explicit override, runtime uses compat behavior.
+Host quick mode remains available via `WHUSE_QEMU_MODE=host`.
 
 ### 4.1 Current RISC-V/LoongArch full run (repro baseline)
 
@@ -105,8 +110,8 @@ Preconditions:
 Commands:
 
 ```bash
-timeout 3600s env WHUSE_DISK_IMAGE="$RV_IMG" cargo xtask qemu-riscv > /tmp/rv-current.log 2>&1
-timeout 3600s env WHUSE_DISK_IMAGE="$LA_IMG" cargo xtask qemu-loongarch > /tmp/la-current.log 2>&1
+timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$RV_IMG" cargo xtask oscomp-riscv > /tmp/rv-current.log 2>&1
+timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$LA_IMG" cargo xtask oscomp-loongarch > /tmp/la-current.log 2>&1
 ```
 
 Acceptance markers:
@@ -116,7 +121,7 @@ Acceptance markers:
   - `whuse-oscomp-step-begin:busybox_testcode.sh`
   - `whuse-oscomp-step-end:busybox_testcode.sh:*`
   - `whuse-oscomp-suite-done`
-- Compat mode often contains (expected under current default):
+- Compat mode often contains (expected only if `WHUSE_OSCOMP_COMPAT=1`):
   - `whuse-oscomp-step-skip:*:compat-hang`
 
 Failure handling:

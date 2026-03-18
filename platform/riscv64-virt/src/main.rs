@@ -227,6 +227,11 @@ struct LockedBuddyAllocator<const ORDER: usize>(Mutex<buddy_allocator::Heap<ORDE
 #[cfg(target_os = "none")]
 unsafe impl<const ORDER: usize> GlobalAlloc for LockedBuddyAllocator<ORDER> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let mut caller_ra = 0usize;
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!("mv {}, ra", out(reg) caller_ra);
+        }
         let cpu = hal_api::hal().cpu;
         let enabled = cpu.interrupts_enabled();
         if enabled {
@@ -242,10 +247,18 @@ unsafe impl<const ORDER: usize> GlobalAlloc for LockedBuddyAllocator<ORDER> {
             cpu.enable_interrupts();
         }
         if res.is_null() && layout.size() > 0 {
+            let mut current_ra = 0usize;
+            #[cfg(target_arch = "riscv64")]
+            unsafe {
+                core::arch::asm!("mv {}, ra", out(reg) current_ra);
+            }
             let mut console = hal_api::ConsoleWriter;
             let _ = core::fmt::Write::write_fmt(
                 &mut console,
-                format_args!("whuse: alloc failed layout={:?}\n", layout),
+                format_args!(
+                    "whuse: alloc failed layout={:?} caller_ra={:#x} current_ra={:#x}\n",
+                    layout, caller_ra, current_ra
+                ),
             );
         }
         res

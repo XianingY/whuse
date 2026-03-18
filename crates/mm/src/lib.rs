@@ -367,46 +367,73 @@ impl AddressSpace {
     }
 
     pub fn read_bytes(&self, addr: usize, len: usize) -> KernelResult<Vec<u8>> {
-        let inner = self.inner.lock();
-        let (segment, offset) = find_segment(&inner.mappings, addr, len)?;
-        match &segment.storage {
-            SegmentStorage::Owned { ptr, .. } => unsafe {
-                Ok(core::slice::from_raw_parts((ptr + offset) as *const u8, len).to_vec())
-            },
-            SegmentStorage::Host { ptr, .. } => unsafe {
-                Ok(core::slice::from_raw_parts((ptr + offset) as *const u8, len).to_vec())
-            },
+        if len == 0 {
+            return Ok(Vec::new());
         }
+        let inner = self.inner.lock();
+        let mut out = Vec::new();
+        let mut cursor = addr;
+        let mut remaining = len;
+        while remaining > 0 {
+            let (segment, offset) = find_segment(&inner.mappings, cursor, 1)?;
+            let available = segment.area.len.saturating_sub(offset);
+            let take = available.min(remaining);
+            match &segment.storage {
+                SegmentStorage::Owned { ptr, .. } => unsafe {
+                    out.extend_from_slice(core::slice::from_raw_parts(
+                        (ptr + offset) as *const u8,
+                        take,
+                    ));
+                },
+                SegmentStorage::Host { ptr, .. } => unsafe {
+                    out.extend_from_slice(core::slice::from_raw_parts(
+                        (ptr + offset) as *const u8,
+                        take,
+                    ));
+                },
+            }
+            cursor = cursor.checked_add(take).ok_or(EFAULT)?;
+            remaining -= take;
+        }
+        Ok(out)
     }
 
     pub fn write_bytes(&self, addr: usize, bytes: &[u8]) -> KernelResult<()> {
-        let mut inner = self.inner.lock();
-        let (segment, offset) = find_segment_mut(&mut inner.mappings, addr, bytes.len())?;
-        match &mut segment.storage {
-            SegmentStorage::Owned { ptr, .. } => {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        (*ptr + offset) as *mut u8,
-                        bytes.len(),
-                    );
-                }
-                Ok(())
-            }
-            SegmentStorage::Host { ptr, len } => {
-                if offset + bytes.len() > *len {
-                    return Err(EFAULT);
-                }
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        (*ptr + offset) as *mut u8,
-                        bytes.len(),
-                    );
-                }
-                Ok(())
-            }
+        if bytes.is_empty() {
+            return Ok(());
         }
+        let mut inner = self.inner.lock();
+        let mut cursor = addr;
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let (segment, offset) = find_segment_mut(&mut inner.mappings, cursor, 1)?;
+            let available = segment.area.len.saturating_sub(offset);
+            let take = available.min(bytes.len() - written);
+            match &mut segment.storage {
+                SegmentStorage::Owned { ptr, .. } => unsafe {
+                    ptr::copy_nonoverlapping(
+                        bytes[written..written + take].as_ptr(),
+                        (*ptr + offset) as *mut u8,
+                        take,
+                    );
+                },
+                SegmentStorage::Host { ptr, len } => {
+                    if offset + take > *len {
+                        return Err(EFAULT);
+                    }
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            bytes[written..written + take].as_ptr(),
+                            (*ptr + offset) as *mut u8,
+                            take,
+                        );
+                    }
+                }
+            }
+            cursor = cursor.checked_add(take).ok_or(EFAULT)?;
+            written += take;
+        }
+        Ok(())
     }
 
     pub fn read_cstr(&self, addr: usize) -> KernelResult<String> {
@@ -416,27 +443,38 @@ impl AddressSpace {
         while offset < MAX_STR_LEN {
             let page_offset = (addr + offset) & (PAGE_SIZE - 1);
             let chunk_len = (PAGE_SIZE - page_offset).min(MAX_STR_LEN - offset);
-            let chunk = {
-                let mut result = self.read_bytes(addr + offset, chunk_len);
-                if result.is_err() && chunk_len > 1 {
-                    result = self.read_bytes(addr + offset, 1);
+            match self.read_bytes(addr + offset, chunk_len) {
+                Ok(chunk) => {
+                    if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+                        out.extend_from_slice(&chunk[..nul]);
+                        return String::from_utf8(out).map_err(|_| EFAULT);
+                    }
+                    out.extend_from_slice(&chunk);
+                    offset += chunk.len();
                 }
-                match result {
-                    Ok(c) => c,
-                    Err(_) => {
-                        if out.is_empty() {
-                            return Err(EFAULT);
+                Err(_) => {
+                    // Fallback for short mappings that cannot satisfy the
+                    // whole chunk in one shot: probe byte-by-byte.
+                    let mut progressed = 0usize;
+                    while progressed < chunk_len && offset < MAX_STR_LEN {
+                        let byte = match self.read_bytes(addr + offset, 1) {
+                            Ok(bytes) => bytes[0],
+                            Err(_) => {
+                                if out.is_empty() {
+                                    return Err(EFAULT);
+                                }
+                                return Err(EFAULT);
+                            }
+                        };
+                        if byte == 0 {
+                            return String::from_utf8(out).map_err(|_| EFAULT);
                         }
-                        break;
+                        out.push(byte);
+                        offset += 1;
+                        progressed += 1;
                     }
                 }
-            };
-            if let Some(nul) = chunk.iter().position(|&b| b == 0) {
-                out.extend_from_slice(&chunk[..nul]);
-                return String::from_utf8(out).map_err(|_| EFAULT);
             }
-            out.extend_from_slice(&chunk);
-            offset += chunk.len();
         }
         Err(EFAULT)
     }
@@ -481,6 +519,16 @@ impl AddressSpace {
 
     pub fn is_shared(&self) -> bool {
         alloc::sync::Arc::strong_count(&self.inner) > 1
+    }
+
+    pub fn estimated_private_clone_bytes(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.mappings.values().fold(0usize, |acc, segment| {
+            let page_offset = segment.area.start & (PAGE_SIZE - 1);
+            let seg_len = segment.area.len.max(1);
+            let map_len = align_up(page_offset + seg_len, PAGE_SIZE);
+            acc.saturating_add(map_len.saturating_add(PAGE_SIZE))
+        })
     }
 
     pub fn load_static_elf(
@@ -951,7 +999,18 @@ fn create_owned_storage(addr: usize, mut data: Vec<u8>) -> SegmentStorage {
     let len = data.len();
     let page_offset = addr & (PAGE_SIZE - 1);
     let map_len = align_up(page_offset + len, PAGE_SIZE);
-    let mut bytes = vec![0u8; map_len + PAGE_SIZE];
+    let total = map_len + PAGE_SIZE;
+    if total >= 700_000 {
+        let mut console = hal_api::ConsoleWriter;
+        let _ = core::fmt::Write::write_fmt(
+            &mut console,
+            format_args!(
+                "whuse-debug: create_owned_storage huge total={} addr={:#x} len={} map_len={} page_off={}\n",
+                total, addr, len, map_len, page_offset
+            ),
+        );
+    }
+    let mut bytes = vec![0u8; total];
     let raw_ptr = bytes.as_mut_ptr() as usize;
     let aligned_base = align_up(raw_ptr, PAGE_SIZE);
     let ptr = aligned_base + page_offset;
@@ -1302,6 +1361,24 @@ mod tests {
         aspace.write_bytes(addr, b"abc").unwrap();
         assert_eq!(aspace.read_bytes(addr, 3).unwrap(), b"abc");
         aspace.unmap(addr, 8192).unwrap();
+    }
+
+    #[test]
+    fn read_cstr_across_short_segments() {
+        let aspace = AddressSpace::new_user();
+        aspace.install_bytes(0x2fff, b"A");
+        aspace.install_bytes(0x3000, b"BC\0");
+        assert_eq!(aspace.read_cstr(0x2fff).unwrap(), "ABC");
+    }
+
+    #[test]
+    fn read_and_write_bytes_across_adjacent_segments() {
+        let aspace = AddressSpace::new_user();
+        aspace.install_bytes(0x4000, b"ab");
+        aspace.install_bytes(0x4002, b"cd");
+        assert_eq!(aspace.read_bytes(0x4001, 3).unwrap(), b"bcd");
+        aspace.write_bytes(0x4001, b"XYZ").unwrap();
+        assert_eq!(aspace.read_bytes(0x4000, 4).unwrap(), b"aXYZ");
     }
 
     #[test]

@@ -1,8 +1,9 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const RISCV_TARGET: &str = "riscv64gc-unknown-none-elf";
@@ -10,6 +11,35 @@ const RISCV_PACKAGE: &str = "whuse-riscv64-virt";
 const LOONGARCH_TARGET: &str = "loongarch64-unknown-none-softfloat";
 const LOONGARCH_PACKAGE: &str = "whuse-loongarch64-virt";
 const LOONGARCH_BOOTROM_PACKAGE: &str = "whuse-loongarch64-bootrom";
+const CONTEST_DOCKER_IMAGE: &str = "docker.educg.net/cg/os-contest:20260104";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QemuMode {
+    Host,
+    Contest,
+}
+
+impl QemuMode {
+    fn from_env(default: QemuMode) -> QemuMode {
+        match env::var("WHUSE_QEMU_MODE")
+            .unwrap_or_else(|_| {
+                match default {
+                    QemuMode::Host => "host",
+                    QemuMode::Contest => "contest",
+                }
+                .to_string()
+            })
+            .as_str()
+        {
+            "host" => QemuMode::Host,
+            "contest" => QemuMode::Contest,
+            other => {
+                eprintln!("unknown WHUSE_QEMU_MODE={other}, fallback to {:?}", default);
+                default
+            }
+        }
+    }
+}
 
 fn main() -> ExitCode {
     let command = env::args().nth(1).unwrap_or_else(|| "build".to_string());
@@ -20,7 +50,9 @@ fn main() -> ExitCode {
         "image-loongarch" => build_rootfs_image("loongarch64"),
         "check" => cargo(&["check", "--workspace"]),
         "qemu" | "qemu-riscv" => qemu_riscv(),
+        "qemu-riscv-contest" => qemu_riscv_mode(QemuMode::Contest),
         "qemu-loongarch" => qemu_loongarch(),
+        "qemu-loongarch-contest" => qemu_loongarch_mode(QemuMode::Contest),
         "oscomp-images" => prepare_oscomp_images(),
         "oscomp-riscv" => oscomp_riscv(),
         "oscomp-loongarch" => oscomp_loongarch(),
@@ -254,7 +286,10 @@ fn oscomp_riscv() -> ExitCode {
     if image_status != ExitCode::SUCCESS {
         return image_status;
     }
-    qemu_riscv_with_disk(Some(oscomp_image_path("rv")))
+    qemu_riscv_with_disk_and_mode(
+        Some(oscomp_image_path("rv")),
+        QemuMode::from_env(QemuMode::Contest),
+    )
 }
 
 fn oscomp_loongarch() -> ExitCode {
@@ -262,11 +297,18 @@ fn oscomp_loongarch() -> ExitCode {
     if image_status != ExitCode::SUCCESS {
         return image_status;
     }
-    qemu_loongarch_with_disk(Some(oscomp_image_path("la")))
+    qemu_loongarch_with_disk_and_mode(
+        Some(oscomp_image_path("la")),
+        QemuMode::from_env(QemuMode::Contest),
+    )
 }
 
 fn qemu_riscv() -> ExitCode {
-    qemu_riscv_with_disk(
+    qemu_riscv_mode(QemuMode::from_env(QemuMode::Host))
+}
+
+fn qemu_riscv_mode(mode: QemuMode) -> ExitCode {
+    qemu_riscv_with_disk_and_mode(
         env::var("WHUSE_DISK_IMAGE")
             .ok()
             .map(PathBuf::from)
@@ -278,24 +320,28 @@ fn qemu_riscv() -> ExitCode {
                 let image = rootfs_image_path("riscv64");
                 image.exists().then_some(image)
             }),
+        mode,
     )
 }
 
-fn qemu_riscv_with_disk(disk: Option<PathBuf>) -> ExitCode {
+fn qemu_riscv_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> ExitCode {
     let build_status = build_kernel(RISCV_PACKAGE, RISCV_TARGET);
     if build_status != ExitCode::SUCCESS {
         return build_status;
     }
-    if let Some(disk) = disk.as_ref() {
-        if let Some((pid, cmdline)) = detect_qemu_disk_holder(disk) {
-            eprintln!(
-                "disk image {} is currently in use by pid {} ({})",
-                disk.display(),
-                pid,
-                cmdline
-            );
-            eprintln!("stop the running qemu process (or use a different image) and retry");
-            return ExitCode::from(1);
+    let extra_disk = extra_disk_path("disk.img");
+    if mode == QemuMode::Host {
+        for disk in [disk.as_ref(), extra_disk.as_ref()].into_iter().flatten() {
+            if let Some((pid, cmdline)) = detect_qemu_disk_holder(disk) {
+                eprintln!(
+                    "disk image {} is currently in use by pid {} ({})",
+                    disk.display(),
+                    pid,
+                    cmdline
+                );
+                eprintln!("stop the running qemu process (or use a different image) and retry");
+                return ExitCode::from(1);
+            }
         }
     }
 
@@ -303,45 +349,22 @@ fn qemu_riscv_with_disk(disk: Option<PathBuf>) -> ExitCode {
         .join(RISCV_TARGET)
         .join("debug")
         .join(RISCV_PACKAGE);
-
-    let mut command = Command::new("qemu-system-riscv64");
-    command.args([
-        "-machine",
-        "virt",
-        "-m",
-        "256M",
-        "-smp",
-        "1",
-        "-nographic",
-        "-bios",
-        "default",
-        "-kernel",
-    ]);
-    command.arg(kernel);
-    if let Some(disk) = disk {
-        command.arg("-drive");
-        command.arg(format!("file={},if=none,format=raw,id=x0", disk.display()));
-        command.args([
-            "-device",
-            "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
-            "-device",
-            "virtio-net-device,netdev=net0",
-            "-netdev",
-            "user,id=net0",
-        ]);
-    }
-
-    match command.status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
-        Err(err) => {
-            eprintln!("failed to execute qemu-system-riscv64: {err}");
-            ExitCode::from(1)
-        }
-    }
+    let args = build_qemu_riscv_args(&kernel, disk.as_ref(), extra_disk.as_ref());
+    let used_paths = collect_used_paths(&[Some(kernel.clone()), disk.clone(), extra_disk.clone()]);
+    run_qemu(
+        "qemu-system-riscv64",
+        &args,
+        &used_paths,
+        mode,
+    )
 }
 
 fn qemu_loongarch() -> ExitCode {
-    qemu_loongarch_with_disk(
+    qemu_loongarch_mode(QemuMode::from_env(QemuMode::Host))
+}
+
+fn qemu_loongarch_mode(mode: QemuMode) -> ExitCode {
+    qemu_loongarch_with_disk_and_mode(
         env::var("WHUSE_DISK_IMAGE")
             .ok()
             .map(PathBuf::from)
@@ -353,10 +376,11 @@ fn qemu_loongarch() -> ExitCode {
                 let image = rootfs_image_path("loongarch64");
                 image.exists().then_some(image)
             }),
+        mode,
     )
 }
 
-fn qemu_loongarch_with_disk(disk: Option<PathBuf>) -> ExitCode {
+fn qemu_loongarch_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> ExitCode {
     let bootrom_status = build_kernel(LOONGARCH_BOOTROM_PACKAGE, LOONGARCH_TARGET);
     if bootrom_status != ExitCode::SUCCESS {
         return bootrom_status;
@@ -365,16 +389,19 @@ fn qemu_loongarch_with_disk(disk: Option<PathBuf>) -> ExitCode {
     if build_status != ExitCode::SUCCESS {
         return build_status;
     }
-    if let Some(disk) = disk.as_ref() {
-        if let Some((pid, cmdline)) = detect_qemu_disk_holder(disk) {
-            eprintln!(
-                "disk image {} is currently in use by pid {} ({})",
-                disk.display(),
-                pid,
-                cmdline
-            );
-            eprintln!("stop the running qemu process (or use a different image) and retry");
-            return ExitCode::from(1);
+    let extra_disk = extra_disk_path("disk-la.img");
+    if mode == QemuMode::Host {
+        for disk in [disk.as_ref(), extra_disk.as_ref()].into_iter().flatten() {
+            if let Some((pid, cmdline)) = detect_qemu_disk_holder(disk) {
+                eprintln!(
+                    "disk image {} is currently in use by pid {} ({})",
+                    disk.display(),
+                    pid,
+                    cmdline
+                );
+                eprintln!("stop the running qemu process (or use a different image) and retry");
+                return ExitCode::from(1);
+            }
         }
     }
 
@@ -403,49 +430,231 @@ fn qemu_loongarch_with_disk(disk: Option<PathBuf>) -> ExitCode {
         return kernel_objcopy;
     }
 
-    let mut command = Command::new("qemu-system-loongarch64");
-    command.args([
-        "-machine",
-        "virt",
-        "-cpu",
-        "la464",
-        "-m",
-        "1G",
-        "-smp",
-        "1",
-        "-nographic",
-        "-serial",
-        "stdio",
-        "-monitor",
-        "none",
-        "-bios",
+    let args =
+        build_qemu_loongarch_args(&bootrom_bin, &kernel_bin, disk.as_ref(), extra_disk.as_ref());
+    let used_paths = collect_used_paths(&[
+        Some(bootrom_bin.clone()),
+        Some(kernel_bin.clone()),
+        disk.clone(),
+        extra_disk.clone(),
     ]);
-    command.arg(&bootrom_bin);
-    command.arg("-device");
-    command.arg(format!(
-        "loader,file={},addr=0x90000000,force-raw=on",
-        kernel_bin.display()
-    ));
+    run_qemu(
+        "qemu-system-loongarch64",
+        &args,
+        &used_paths,
+        mode,
+    )
+}
+
+fn build_qemu_riscv_args(
+    kernel: &Path,
+    disk: Option<&PathBuf>,
+    extra_disk: Option<&PathBuf>,
+) -> Vec<String> {
+    let mut args = vec![
+        "-machine".to_string(),
+        "virt".to_string(),
+        "-m".to_string(),
+        "256M".to_string(),
+        "-smp".to_string(),
+        "1".to_string(),
+        "-nographic".to_string(),
+        "-bios".to_string(),
+        "default".to_string(),
+        "-kernel".to_string(),
+        kernel.display().to_string(),
+        "-no-reboot".to_string(),
+        "-rtc".to_string(),
+        "base=utc".to_string(),
+    ];
     if let Some(disk) = disk {
-        command.arg("-drive");
-        command.arg(format!("file={},if=none,format=raw,id=x0", disk.display()));
-        command.args([
-            "-device",
-            "virtio-blk-pci,drive=x0",
-            "-device",
-            "virtio-net-pci,netdev=net0",
-            "-netdev",
-            "user,id=net0",
-        ]);
+        args.push("-drive".to_string());
+        args.push(format!("file={},if=none,format=raw,id=x0", disk.display()));
+        args.push("-device".to_string());
+        args.push("virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0".to_string());
+        args.push("-device".to_string());
+        args.push("virtio-net-device,netdev=net".to_string());
+        args.push("-netdev".to_string());
+        args.push("user,id=net".to_string());
+    }
+    if let Some(extra) = extra_disk {
+        args.push("-drive".to_string());
+        args.push(format!("file={},if=none,format=raw,id=x1", extra.display()));
+        args.push("-device".to_string());
+        args.push("virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1".to_string());
+    }
+    args
+}
+
+fn build_qemu_loongarch_args(
+    bootrom_bin: &Path,
+    kernel_bin: &Path,
+    disk: Option<&PathBuf>,
+    extra_disk: Option<&PathBuf>,
+) -> Vec<String> {
+    let mut args = vec![
+        "-machine".to_string(),
+        "virt".to_string(),
+        "-cpu".to_string(),
+        "la464".to_string(),
+        "-m".to_string(),
+        "1G".to_string(),
+        "-smp".to_string(),
+        "1".to_string(),
+        "-nographic".to_string(),
+        "-serial".to_string(),
+        "stdio".to_string(),
+        "-monitor".to_string(),
+        "none".to_string(),
+        "-bios".to_string(),
+        bootrom_bin.display().to_string(),
+        "-device".to_string(),
+        format!(
+            "loader,file={},addr=0x90000000,force-raw=on",
+            kernel_bin.display()
+        ),
+        "-no-reboot".to_string(),
+        "-rtc".to_string(),
+        "base=utc".to_string(),
+    ];
+    if let Some(disk) = disk {
+        args.push("-drive".to_string());
+        args.push(format!("file={},if=none,format=raw,id=x0", disk.display()));
+        args.push("-device".to_string());
+        args.push("virtio-blk-pci,drive=x0".to_string());
+    }
+    if let Some(extra) = extra_disk {
+        args.push("-drive".to_string());
+        args.push(format!("file={},if=none,format=raw,id=x1", extra.display()));
+        args.push("-device".to_string());
+        args.push("virtio-blk-pci,drive=x1".to_string());
+    }
+    args.push("-device".to_string());
+    args.push("virtio-net-pci,netdev=net0".to_string());
+    args.push("-netdev".to_string());
+    args.push("user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555".to_string());
+    args
+}
+
+fn extra_disk_path(default_name: &str) -> Option<PathBuf> {
+    if let Ok(value) = env::var("WHUSE_EXTRA_DISK_IMAGE") {
+        let path = PathBuf::from(value);
+        return Some(if path.is_absolute() {
+            path
+        } else {
+            repo_root().join(path)
+        });
+    }
+    let default = repo_root().join(default_name);
+    default.exists().then_some(default)
+}
+
+fn collect_used_paths(paths: &[Option<PathBuf>]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter_map(|path| path.as_ref().cloned())
+        .collect()
+}
+
+fn run_qemu(
+    binary: &str,
+    args: &[String],
+    used_paths: &[PathBuf],
+    mode: QemuMode,
+) -> ExitCode {
+    match mode {
+        QemuMode::Host => match Command::new(binary).args(args).status() {
+            Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+            Err(err) => {
+                eprintln!("failed to execute {binary}: {err}");
+                ExitCode::from(1)
+            }
+        },
+        QemuMode::Contest => run_qemu_in_contest_docker(binary, args, used_paths),
+    }
+}
+
+fn run_qemu_in_contest_docker(binary: &str, args: &[String], used_paths: &[PathBuf]) -> ExitCode {
+    let image = env::var("WHUSE_OSCOMP_DOCKER_IMAGE")
+        .unwrap_or_else(|_| CONTEST_DOCKER_IMAGE.to_string());
+    let root = repo_root();
+    let root_canonical = fs::canonicalize(&root).unwrap_or(root);
+    let mount_root = format!("{}:/work", root_canonical.display());
+    let extra_mounts = collect_extra_mounts(used_paths, &root_canonical);
+
+    let mut command = Command::new("docker");
+    command
+        .arg("run")
+        .arg("--rm")
+        .arg("--privileged")
+        .arg("--network")
+        .arg("host")
+        .arg("-v")
+        .arg(mount_root)
+        .arg("-w")
+        .arg("/work");
+    for mount in extra_mounts {
+        command.arg("-v").arg(mount);
+    }
+    command.arg(image).arg(binary);
+    for arg in args {
+        command.arg(remap_qemu_arg_for_container(arg, &root_canonical));
     }
 
     match command.status() {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(err) => {
-            eprintln!("failed to execute qemu-system-loongarch64: {err}");
+            eprintln!("failed to execute contest docker qemu runner: {err}");
             ExitCode::from(1)
         }
     }
+}
+
+fn collect_extra_mounts(paths: &[PathBuf], repo_root: &Path) -> Vec<String> {
+    let mut mounts = BTreeSet::new();
+    for path in paths {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if canonical.starts_with(repo_root) {
+            continue;
+        }
+        if let Some(parent) = canonical.parent() {
+            mounts.insert(format!("{}:{}", parent.display(), parent.display()));
+        }
+    }
+    mounts.into_iter().collect()
+}
+
+fn remap_qemu_arg_for_container(arg: &str, repo_root: &Path) -> String {
+    if let Some(file_index) = arg.find("file=") {
+        let start = file_index + "file=".len();
+        let end = arg[start..]
+            .find(',')
+            .map(|idx| start + idx)
+            .unwrap_or(arg.len());
+        let mut out = arg.to_string();
+        let original = &arg[start..end];
+        let mapped = remap_path_for_container(original, repo_root);
+        out.replace_range(start..end, &mapped);
+        return out;
+    }
+    if arg.starts_with('/') {
+        return remap_path_for_container(arg, repo_root);
+    }
+    arg.to_string()
+}
+
+fn remap_path_for_container(path: &str, repo_root: &Path) -> String {
+    let candidate = PathBuf::from(path);
+    let canonical = fs::canonicalize(&candidate).unwrap_or(candidate.clone());
+    if canonical.starts_with(repo_root) {
+        if let Ok(relative) = canonical.strip_prefix(repo_root) {
+            return Path::new("/work").join(relative).display().to_string();
+        }
+    }
+    canonical.display().to_string()
 }
 
 fn oscomp_image_path(tag: &str) -> PathBuf {

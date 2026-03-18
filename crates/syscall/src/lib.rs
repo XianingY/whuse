@@ -284,11 +284,38 @@ fn log_always(line: &str) {
     hal().console.put_byte(b'\n');
 }
 
+#[inline]
+fn stage2_openat_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_STAGE2_OPENAT"), Some("1"))
+}
+
 fn cancel_debug_enabled() -> bool {
     match option_env!("WHUSE_DEBUG_CANCEL") {
         Some("1") => true,
         _ => false,
     }
+}
+
+fn is_libctest_task_name(name: &str) -> bool {
+    name == "./runtest.exe"
+        || (name.starts_with("entry-") && name.ends_with(".exe"))
+        || name == "entry.exe"
+}
+
+fn is_libctest_openat_probe_task(name: &str, tgid: usize, cwd: &str) -> bool {
+    is_libctest_task_name(name) || (name == "/musl/busybox" && tgid > 2 && cwd == "/musl")
+}
+
+fn is_libctest_probe_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/musl/run-static.sh"
+            | "/musl/run-dynamic.sh"
+            | "/musl/libctest_testcode.sh"
+            | "/musl/runtest.exe"
+            | "/musl/entry-static.exe"
+            | "/musl/entry-dynamic.exe"
+    )
 }
 
 fn cancel_debug(line: &str) {
@@ -571,10 +598,56 @@ impl SyscallDispatcher {
         let raw_flags = args.0[2] as u32;
         let flags = normalize_open_flags(raw_flags);
         let mode = args.0[3] as u32;
+        let (tid, tgid, name, proc_cwd) = {
+            let process = procs.current()?;
+            (
+                process.tid,
+                process.tgid,
+                process.name.clone(),
+                process.cwd.clone(),
+            )
+        };
+        let openat_probe = stage2_openat_debug_enabled()
+            && is_libctest_openat_probe_task(name.as_str(), tgid, proc_cwd.as_str());
+        if openat_probe {
+            log_always(&format!(
+                "whuse-libctest:openat-enter tid={} tgid={} name={} dirfd={} cwd={} path={} raw_flags={:#x} flags={:#x}",
+                tid, tgid, name, dirfd, proc_cwd, path, raw_flags, flags
+            ));
+        }
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
-        let mut handle = vfs.open(&cwd, &path, flags, mode)?;
+        if openat_probe {
+            log_always(&format!(
+                "whuse-libctest:openat-vfs-open-begin tid={} tgid={} cwd={} path={}",
+                tid, tgid, cwd, path
+            ));
+        }
+        let mut handle = match vfs.open(&cwd, &path, flags, mode) {
+            Ok(handle) => handle,
+            Err(err) => {
+                if openat_probe {
+                    log_always(&format!(
+                        "whuse-libctest:openat-vfs-open-err tid={} tgid={} err={} cwd={} path={}",
+                        tid, tgid, err, cwd, path
+                    ));
+                }
+                return Err(err);
+            }
+        };
+        if openat_probe {
+            log_always(&format!(
+                "whuse-libctest:openat-vfs-open-ok tid={} tgid={} resolved={}",
+                tid, tgid, handle.path
+            ));
+        }
         handle.flags = with_cloexec_flag(handle.flags, (raw_flags as usize & O_CLOEXEC) != 0);
         let fd = procs.current_mut()?.add_fd(handle);
+        if openat_probe {
+            log_always(&format!(
+                "whuse-libctest:openat-exit tid={} tgid={} fd={}",
+                tid, tgid, fd
+            ));
+        }
         Ok(fd as usize)
     }
 
@@ -667,11 +740,35 @@ impl SyscallDispatcher {
             process.sync_fd_offset_from_alias(fd)?;
             let proc_name = process.name.clone();
             let proc_tgid = process.tgid;
+            let proc_tid = process.tid;
+            let proc_cwd = process.cwd.clone();
             let handle = process.fd_mut(fd)?;
             let is_pipe = vfs.is_pipe(handle);
             let pipe_path = handle.path.clone();
+            let probe = stage2_openat_debug_enabled()
+                && is_libctest_openat_probe_task(proc_name.as_str(), proc_tgid, proc_cwd.as_str())
+                && is_libctest_probe_path(pipe_path.as_str());
+            if probe {
+                log_always(&format!(
+                    "whuse-libctest:read-enter tid={} tgid={} fd={} path={} count={} off={}",
+                    proc_tid, proc_tgid, fd, pipe_path, count, handle.offset
+                ));
+            }
             match vfs.read(handle, count) {
-                Ok(bytes) => bytes,
+                Ok(bytes) => {
+                    if probe {
+                        log_always(&format!(
+                            "whuse-libctest:read-ok tid={} tgid={} fd={} path={} bytes={} off={}",
+                            proc_tid,
+                            proc_tgid,
+                            fd,
+                            pipe_path,
+                            bytes.len(),
+                            handle.offset
+                        ));
+                    }
+                    bytes
+                }
                 Err(EAGAIN) if is_pipe => {
                     trace_enosys(&format!(
                         "whuse: pipe read block tgid={} name={} fd={} path={}",
@@ -680,7 +777,15 @@ impl SyscallDispatcher {
                     let _ = scheduler.block_current();
                     return Err(EAGAIN);
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    if probe {
+                        log_always(&format!(
+                            "whuse-libctest:read-err tid={} tgid={} fd={} path={} err={}",
+                            proc_tid, proc_tgid, fd, pipe_path, err
+                        ));
+                    }
+                    return Err(err);
+                }
             }
         };
         procs.current_mut()?.sync_fd_offset_to_aliases(fd)?;
@@ -953,10 +1058,8 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs
-            .current()?
-            .read_user_cstr(args.0[0])
-            .map_err(|_| EFAULT)?;
+        let path_ptr = args.0[0];
+        let path = procs.current()?.read_user_cstr(path_ptr).map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let new_cwd = vfs.chdir(&cwd, &path)?;
         procs.current_mut()?.cwd = new_cwd;
@@ -1464,6 +1567,18 @@ impl SyscallDispatcher {
         let options = args.0[2] as u32;
         let _rusage = args.0[3];
         let parent_pid = procs.current_pid()?;
+        let (parent_name, parent_cwd) = {
+            let process = procs.current()?;
+            (process.name.clone(), process.cwd.clone())
+        };
+        let busybox_wait_debug =
+            parent_name.contains("busybox") && parent_cwd == "/musl" && wait_pid > 0;
+        if busybox_wait_debug {
+            log_always(&format!(
+                "whuse-wait: enter tgid={} name={} wait_pid={} options={:#x}",
+                parent_pid, parent_name, wait_pid, options
+            ));
+        }
         trace_line(&format!(
             "whuse: wait enter tgid={} wait_pid={} status_ptr={:#x} options={:#x}",
             parent_pid, wait_pid, status_ptr, options
@@ -1472,6 +1587,12 @@ impl SyscallDispatcher {
         let (child_pid, status) = match procs.wait_child(parent_pid, selector, options) {
             Ok(pair) => pair,
             Err(err) => {
+                if busybox_wait_debug {
+                    log_always(&format!(
+                        "whuse-wait: err tgid={} wait_pid={} err={}",
+                        parent_pid, wait_pid, err
+                    ));
+                }
                 trace_line(&format!(
                     "whuse: wait error tgid={} err={}",
                     parent_pid, err
@@ -1480,6 +1601,12 @@ impl SyscallDispatcher {
             }
         };
         if child_pid == 0 {
+            if busybox_wait_debug {
+                log_always(&format!(
+                    "whuse-wait: no-exited-child tgid={} wait_pid={} options={:#x}",
+                    parent_pid, wait_pid, options
+                ));
+            }
             if options & WNOHANG != 0 {
                 trace_line(&format!(
                     "whuse: wait return tgid={} child=0 wnohang",
@@ -1496,6 +1623,12 @@ impl SyscallDispatcher {
                 .current_mut()?
                 .write_user_bytes(status_ptr, &(status as i32).to_le_bytes())
                 .map_err(|_| EFAULT)?;
+        }
+        if busybox_wait_debug {
+            log_always(&format!(
+                "whuse-wait: return tgid={} child={} status={}",
+                parent_pid, child_pid, status
+            ));
         }
         trace_line(&format!(
             "whuse: wait return tgid={} child={} status={}",
@@ -2533,6 +2666,30 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let uaddr = args.0[0];
         let op = args.0[1] & 0x7f;
+        let (current_tid, current_tgid, libctest_task) = if let Ok(process) = procs.current() {
+            (
+                process.tid,
+                process.tgid,
+                is_libctest_task_name(process.name.as_str()),
+            )
+        } else {
+            (0, 0, false)
+        };
+        if libctest_task
+            && (op == FUTEX_WAIT
+                || op == FUTEX_WAIT_BITSET
+                || op == FUTEX_WAKE
+                || op == FUTEX_WAKE_BITSET)
+        {
+            log_always(&format!(
+                "whuse-libctest:futex-enter tid={} tgid={} op={} uaddr={:#x} val={}",
+                current_tid,
+                current_tgid,
+                op,
+                uaddr,
+                args.0[2] as i32
+            ));
+        }
         trace_line(&format!(
             "whuse: futex tgid={} op={} uaddr=0x{:x}",
             procs.current_tgid().unwrap_or(0),
@@ -2561,6 +2718,12 @@ impl SyscallDispatcher {
                             } else {
                                 false
                             };
+                            if libctest_task {
+                                log_always(&format!(
+                                    "whuse-libctest:futex-eintr tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
+                                    tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
+                                ));
+                            }
                             cancel_debug(&format!(
                                 "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
                                 tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
@@ -2595,6 +2758,12 @@ impl SyscallDispatcher {
                     } else {
                         false
                     };
+                    if libctest_task {
+                        log_always(&format!(
+                            "whuse-libctest:futex-eintr-fresh tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
+                            tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
+                        ));
+                    }
                     cancel_debug(&format!(
                         "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
                         tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
@@ -2630,6 +2799,12 @@ impl SyscallDispatcher {
                         process.futex_wait_addr = Some(uaddr);
                         process.futex_wait_deadline_ns = Some(deadline);
                     }
+                    if libctest_task {
+                        log_always(&format!(
+                            "whuse-libctest:futex-block tid={} addr={:#x} val={} deadline={}",
+                            tid, uaddr, val, deadline
+                        ));
+                    }
                     let _ = scheduler.block_current();
                     Err(EAGAIN)
                 }
@@ -2637,6 +2812,15 @@ impl SyscallDispatcher {
             FUTEX_WAKE | FUTEX_WAKE_BITSET => {
                 let wake_count = val.max(0) as usize;
                 let woke = procs.wake_futex(uaddr, wake_count);
+                if libctest_task {
+                    log_always(&format!(
+                        "whuse-libctest:futex-wake tid={} addr={:#x} req={} woke={}",
+                        current_tid,
+                        uaddr,
+                        wake_count,
+                        woke.len()
+                    ));
+                }
                 for tid in &woke {
                     procs.clear_futex_wait_state(*tid);
                     let _ = scheduler.wake_task(*tid);
@@ -3294,8 +3478,15 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let set_ptr = args.0[0];
         let size = args.0[1].max(8);
-        let mut restore_now = false;
-        if procs.current()?.sigsuspend_saved_mask.is_none() {
+        let (wait_debug, cooperative_polling, tgid) = {
+            let process = procs.current()?;
+            (
+                process.name.contains("busybox") && process.cwd == "/musl",
+                process.name.contains("busybox") && process.cwd == "/musl",
+                process.tgid,
+            )
+        };
+        let pending_unmasked = if procs.current()?.sigsuspend_saved_mask.is_none() {
             let new_mask = if set_ptr == 0 {
                 0
             } else {
@@ -3305,17 +3496,34 @@ impl SyscallDispatcher {
             let process = procs.current_mut()?;
             process.sigsuspend_saved_mask = Some(old_mask);
             process.signal_mask = new_mask;
-            restore_now = procs.pending_signals()? != 0;
-        } else if procs.pending_signals()? != 0 {
-            restore_now = true;
-        }
-        if restore_now {
+            procs.pending_signals()?
+        } else {
+            procs.pending_signals()?
+        };
+        if pending_unmasked != 0 {
+            let signum = pending_unmasked.trailing_zeros() as usize + 1;
+            // Standard signals (e.g. SIGCHLD) are not routed through
+            // dispatch_pending_signals handlers; consume one here so
+            // sigsuspend does not spin forever on the same pending bit.
+            if signum < 32 {
+                let _ = procs.clear_pending_signal(signum);
+                if wait_debug {
+                    log_always(&format!(
+                        "whuse-sigsuspend: consume-standard-signal tgid={} signum={}",
+                        tgid, signum
+                    ));
+                }
+            }
             if let Some(old_mask) = procs.current()?.sigsuspend_saved_mask {
                 let process = procs.current_mut()?;
                 process.signal_mask = old_mask;
                 process.sigsuspend_saved_mask = None;
             }
             return Err(EINTR);
+        }
+        if cooperative_polling {
+            let _ = scheduler.yield_now();
+            return Err(EAGAIN);
         }
         let _ = scheduler.block_current();
         Err(EAGAIN)
@@ -3338,6 +3546,7 @@ impl SyscallDispatcher {
         const FCSR_OFF: usize = MCTX_OFF + 32 * 8;
 
         let process = procs.current_mut().map_err(|_| ESRCH)?;
+        let libctest_task = is_libctest_task_name(process.name.as_str());
         let frame_sp = process.trap_frame.regs[2];
 
         let frame = process
@@ -3362,6 +3571,16 @@ impl SyscallDispatcher {
             process.cancel_interrupt_once,
             saved_pc
         ));
+        if libctest_task {
+            log_always(&format!(
+                "whuse-libctest:rt_sigreturn tid={} sfp={} cancel_seen={} cancel_once={} saved_pc={:#x}",
+                process.tid,
+                process.signal_frame_pending,
+                process.cancel_signal_seen,
+                process.cancel_interrupt_once,
+                saved_pc
+            ));
+        }
         process.signal_mask = saved_mask;
         process.signal_frame_pending = false;
         process.arm_cancel_interrupt_once();

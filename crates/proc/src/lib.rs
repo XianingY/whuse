@@ -15,6 +15,7 @@ use vfs::{FileHandle, HANDLE_FLAG_CLOEXEC};
 pub type KernelResult<T> = Result<T, i32>;
 
 const EBADF: i32 = 9;
+const EAGAIN: i32 = 11;
 const ECHILD: i32 = 10;
 const ENOENT: i32 = 2;
 const EINVAL: i32 = 22;
@@ -28,6 +29,7 @@ const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 const ROBUST_LIST_MAX_SCAN: usize = 2048;
 const ROBUST_HEAD_WORDS: usize = 3;
 const PROCESS_NAME_MAX_BYTES: usize = 256;
+const FORK_CLONE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessState {
@@ -832,6 +834,15 @@ impl ProcessTable {
 
     pub fn fork_process_from_current(&mut self) -> KernelResult<usize> {
         let pid = self.next_id();
+        let clone_bytes = self
+            .current()?
+            .address_space
+            .estimated_private_clone_bytes();
+        if clone_bytes > 0
+            && self.task_count().saturating_mul(clone_bytes) > FORK_CLONE_BUDGET_BYTES
+        {
+            return Err(EAGAIN);
+        }
         let parent = self.current()?.fork_from(pid);
         self.processes.insert(pid, parent);
         Ok(pid)
@@ -1361,6 +1372,13 @@ impl ProcessTable {
         self.processes
             .values()
             .filter(|process| !process.is_thread && process.state != ProcessState::Exited)
+            .count()
+    }
+
+    pub fn task_count(&self) -> usize {
+        self.processes
+            .values()
+            .filter(|process| process.state != ProcessState::Exited)
             .count()
     }
 

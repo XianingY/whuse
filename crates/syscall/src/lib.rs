@@ -52,6 +52,8 @@ const ENOTTY: i32 = 25;
 const ENOSYS: i32 = 38;
 const ETIMEDOUT: i32 = 110;
 const EPROTOTYPE: i32 = 91;
+const MAX_SELECT_NFDS: usize = 1 << 16;
+const CLONE_TASK_LIMIT: usize = 512;
 const AT_FDCWD: i32 = -100;
 const SIGCHLD: usize = 17;
 
@@ -1260,6 +1262,9 @@ impl SyscallDispatcher {
         let parent_tid = args.0[2];
         let child_tid_ptr = args.0[3];
         let parent_task_tid = procs.current_tid()?;
+        if procs.task_count() >= CLONE_TASK_LIMIT {
+            return Err(EAGAIN);
+        }
         let pid = if shared_vm {
             procs.fork_process_from_current_shared()?
         } else {
@@ -2118,6 +2123,9 @@ impl SyscallDispatcher {
         scheduler: &mut Scheduler,
     ) -> Result<usize, i32> {
         let nfds = args.0[0];
+        if nfds > MAX_SELECT_NFDS {
+            return Err(EINVAL);
+        }
         let readfds = args.0[1];
         let writefds = args.0[2];
         let exceptfds = args.0[3];
@@ -2158,9 +2166,16 @@ impl SyscallDispatcher {
                 .map_err(|_| EFAULT)?;
         }
         if exceptfds != 0 {
+            let except_len = fd_set_len(nfds);
+            if except_len >= 700_000 {
+                log_always(&format!(
+                    "whuse-debug: pselect exceptfds huge nfds={} bytes={}",
+                    nfds, except_len
+                ));
+            }
             procs
                 .current_mut()?
-                .write_user_bytes(exceptfds, &vec![0u8; fd_set_len(nfds)])
+                .write_user_bytes(exceptfds, &vec![0u8; except_len])
                 .map_err(|_| EFAULT)?;
         }
         if !ready.is_empty() {
@@ -2626,19 +2641,24 @@ impl SyscallDispatcher {
         let old_len = args.0[1];
         let new_len = args.0[2];
         let _flags = args.0[3];
-        let bytes = {
-            let process = procs.current()?;
-            process
-                .address_space
-                .read_bytes(old_addr, old_len.min(new_len))
-                .map_err(|_| EFAULT)?
-        };
         let process = procs.current_mut()?;
         let new_addr = process.address_space.map_anonymous(new_len, 0b11)?;
-        process
-            .address_space
-            .write_bytes(new_addr, &bytes)
-            .map_err(|_| EFAULT)?;
+        let copy_len = old_len.min(new_len);
+        let mut copied = 0usize;
+        while copied < copy_len {
+            let chunk_len = core::cmp::min(4096, copy_len - copied);
+            let src = old_addr.checked_add(copied).ok_or(EFAULT)?;
+            let dst = new_addr.checked_add(copied).ok_or(EFAULT)?;
+            let bytes = process
+                .address_space
+                .read_bytes(src, chunk_len)
+                .map_err(|_| EFAULT)?;
+            process
+                .address_space
+                .write_bytes(dst, &bytes)
+                .map_err(|_| EFAULT)?;
+            copied += chunk_len;
+        }
         process.address_space.unmap(old_addr, old_len)?;
         Ok(new_addr)
     }
@@ -2684,15 +2704,22 @@ impl SyscallDispatcher {
         let buf = args.0[0];
         let len = args.0[1];
         let _flags = args.0[2];
-        let mut bytes = vec![0u8; len];
         let pattern = 0x42_49_4c_47_4b_43_55_46u64.to_le_bytes();
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = pattern[index % pattern.len()];
+        const CHUNK_SIZE: usize = 256;
+        let mut scratch = [0u8; CHUNK_SIZE];
+        let mut written = 0usize;
+        while written < len {
+            let chunk_len = core::cmp::min(CHUNK_SIZE, len - written);
+            for (index, byte) in scratch[..chunk_len].iter_mut().enumerate() {
+                *byte = pattern[(written + index) % pattern.len()];
+            }
+            let addr = buf.checked_add(written).ok_or(EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(addr, &scratch[..chunk_len])
+                .map_err(|_| EFAULT)?;
+            written += chunk_len;
         }
-        procs
-            .current_mut()?
-            .write_user_bytes(buf, &bytes)
-            .map_err(|_| EFAULT)?;
         Ok(len)
     }
 
@@ -4273,9 +4300,17 @@ fn fd_set_len(nfds: usize) -> usize {
 }
 
 fn read_fd_set(process: &proc::Process, addr: usize, nfds: usize) -> Result<Vec<usize>, i32> {
-    let raw = process
-        .read_user_bytes(addr, fd_set_len(nfds))
-        .map_err(|_| EFAULT)?;
+    if nfds > MAX_SELECT_NFDS {
+        return Err(EINVAL);
+    }
+    let set_len = fd_set_len(nfds);
+    if set_len >= 700_000 {
+        log_always(&format!(
+            "whuse-debug: read_fd_set huge nfds={} bytes={}",
+            nfds, set_len
+        ));
+    }
+    let raw = process.read_user_bytes(addr, set_len).map_err(|_| EFAULT)?;
     let mut out = Vec::new();
     for fd in 0..nfds {
         let byte = fd / 8;
@@ -4291,7 +4326,19 @@ fn read_fd_set(process: &proc::Process, addr: usize, nfds: usize) -> Result<Vec<
 }
 
 fn fd_set_bytes(fds: &[usize], nfds: usize) -> Vec<u8> {
-    let mut out = vec![0u8; fd_set_len(nfds)];
+    if nfds > MAX_SELECT_NFDS {
+        return Vec::new();
+    }
+    let set_len = fd_set_len(nfds);
+    if set_len >= 700_000 {
+        log_always(&format!(
+            "whuse-debug: fd_set_bytes huge nfds={} bytes={} fds={}",
+            nfds,
+            set_len,
+            fds.len()
+        ));
+    }
+    let mut out = vec![0u8; set_len];
     for fd in fds.iter().copied().filter(|fd| *fd < nfds) {
         out[fd / 8] |= 1 << (fd % 8);
     }

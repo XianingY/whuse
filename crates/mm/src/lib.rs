@@ -371,7 +371,7 @@ impl AddressSpace {
             return Ok(Vec::new());
         }
         let inner = self.inner.lock();
-        let mut out = Vec::with_capacity(len);
+        let mut out = Vec::new();
         let mut cursor = addr;
         let mut remaining = len;
         while remaining > 0 {
@@ -519,6 +519,16 @@ impl AddressSpace {
 
     pub fn is_shared(&self) -> bool {
         alloc::sync::Arc::strong_count(&self.inner) > 1
+    }
+
+    pub fn estimated_private_clone_bytes(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.mappings.values().fold(0usize, |acc, segment| {
+            let page_offset = segment.area.start & (PAGE_SIZE - 1);
+            let seg_len = segment.area.len.max(1);
+            let map_len = align_up(page_offset + seg_len, PAGE_SIZE);
+            acc.saturating_add(map_len.saturating_add(PAGE_SIZE))
+        })
     }
 
     pub fn load_static_elf(
@@ -989,7 +999,18 @@ fn create_owned_storage(addr: usize, mut data: Vec<u8>) -> SegmentStorage {
     let len = data.len();
     let page_offset = addr & (PAGE_SIZE - 1);
     let map_len = align_up(page_offset + len, PAGE_SIZE);
-    let mut bytes = vec![0u8; map_len + PAGE_SIZE];
+    let total = map_len + PAGE_SIZE;
+    if total >= 700_000 {
+        let mut console = hal_api::ConsoleWriter;
+        let _ = core::fmt::Write::write_fmt(
+            &mut console,
+            format_args!(
+                "whuse-debug: create_owned_storage huge total={} addr={:#x} len={} map_len={} page_off={}\n",
+                total, addr, len, map_len, page_offset
+            ),
+        );
+    }
+    let mut bytes = vec![0u8; total];
     let raw_ptr = bytes.as_mut_ptr() as usize;
     let aligned_base = align_up(raw_ptr, PAGE_SIZE);
     let ptr = aligned_base + page_offset;

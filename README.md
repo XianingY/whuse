@@ -3,9 +3,8 @@
 Whuse is a Rust rewrite of the original RuOK kernel project, rebuilt as a
 self-contained workspace rooted in this repository.
 
-The first implementation target is `riscv64 + qemu virt`, with a modular
-crate layout that mirrors the original HAL/kernel/process/filesystem/syscall
-split while using Rust traits and ownership boundaries.
+The project now tracks both `riscv64` and `loongarch64` with OSCOMP-oriented
+build and run entrypoints.
 
 ## Workspace layout
 
@@ -21,41 +20,62 @@ split while using Rust traits and ownership boundaries.
 - `platform/riscv64-virt`: platform binary and RISC-V entry assembly
 - `tools/xtask`: build/check/qemu helper entrypoints
 
+## Build Outputs (Competition)
+
+The competition runner executes `make all` and expects:
+
+- `kernel-rv`
+- `kernel-la`
+
+Optional extra disk images:
+
+- `disk.img` (RISC-V extra disk)
+- `disk-la.img` (LoongArch extra disk)
+
 ## Commands
 
 ```bash
-make build
+make all
 make check
-make qemu
 make test
+make oscomp-images
 ```
 
-`make qemu` expects `cargo` and `qemu-system-riscv64` to be installed and
-available in `PATH`.
+## Run Modes
 
-## Parallel Stage1 Workflow
+`xtask` supports two QEMU modes:
 
-Use worktrees + branches to run `riscv64` and `loongarch64` in parallel:
+- `contest` (default for `oscomp-*`): run QEMU inside the contest docker image.
+- `host` (default for `qemu-*`): run QEMU directly on host tools.
+
+Environment controls:
+
+- `WHUSE_QEMU_MODE=contest|host`
+- `WHUSE_DISK_IMAGE=<path>` for primary disk
+- `WHUSE_EXTRA_DISK_IMAGE=<path>` for second disk
+- `WHUSE_OSCOMP_TESTSUITS_DIR=<path>` testsuits source
+- `WHUSE_OSCOMP_DOCKER_IMAGE=<image>` contest image (default `docker.educg.net/cg/os-contest:20260104`)
+- `WHUSE_OSCOMP_COMPAT=0` for real execution flow
+
+## Competition-Aligned Entry Points
 
 ```bash
-make parallel-setup
+make oscomp-riscv-contest
+make oscomp-loongarch-contest
 ```
 
-This provisions:
-
-- `integration/stage1` in the main repo
-- `arch/riscv-stage1` in `../whuse-rv`
-- `arch/loongarch-stage1` in `../whuse-la`
-
-Stage1 validation (real execution mode, `WHUSE_OSCOMP_COMPAT=0`) is available
-as:
+Host quick mode:
 
 ```bash
-make stage1-riscv
-make stage1-loongarch
-make stage1-both
+make oscomp-riscv-host
+make oscomp-loongarch-host
 ```
 
-The stage1 runner writes independent logs under `/tmp/rv-stage1-*.log` and
-`/tmp/la-stage1-*.log`, and checks required `step-begin/step-end` markers up to
-the `iozone` phase gates.
+## Performance Gate (Merge Policy)
+
+Before merging feature branches into `master`, compare each architecture against
+its own baseline:
+
+- `step-begin/step-end` coverage must not regress.
+- Any step previously ending with `:0` must not regress to non-zero.
+- Runtime regression tolerance is within `<=3%` jitter.

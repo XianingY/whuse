@@ -585,7 +585,9 @@ impl VirtioBlockDevice {
                 let mut driver =
                     VirtIOBlk::<LoongArchVirtioHal, _>::new(SomeTransport::from(transport))
                         .map_err(virtio_error_to_errno)?;
-                driver.enable_interrupts();
+                // LoongArch virt platform currently does not wire a functional IRQ controller
+                // in this HAL; keep virtio-blk in polling mode to avoid blocking forever on
+                // completion paths that wait for queue interrupts.
                 let info = VirtioBlockConfig {
                     transport: hal_virtio::TransportKind::Pci,
                     irq: None,

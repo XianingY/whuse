@@ -3,6 +3,7 @@ name = "kernel-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [dependencies]
 fs-ext4 = { path = "../fs-ext4" }

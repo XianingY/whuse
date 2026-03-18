@@ -521,13 +521,13 @@ fn build_qemu_loongarch_args(
         args.push("-drive".to_string());
         args.push(format!("file={},if=none,format=raw,id=x0", disk.display()));
         args.push("-device".to_string());
-        args.push("virtio-blk-pci,drive=x0,bus=virtio-mmio-bus.0".to_string());
+        args.push("virtio-blk-pci,drive=x0".to_string());
     }
     if let Some(extra) = extra_disk {
         args.push("-drive".to_string());
         args.push(format!("file={},if=none,format=raw,id=x1", extra.display()));
         args.push("-device".to_string());
-        args.push("virtio-blk-pci,drive=x1,bus=virtio-mmio-bus.1".to_string());
+        args.push("virtio-blk-pci,drive=x1".to_string());
     }
     args.push("-device".to_string());
     args.push("virtio-net-pci,netdev=net0".to_string());

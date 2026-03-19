@@ -53,6 +53,8 @@ Key runtime env vars:
 - `WHUSE_OSCOMP_DOCKER_IMAGE`: docker image for testsuits `make sdcard` fallback.
 - `WHUSE_OSCOMP_COMPAT`: suite mode switch (`0`=real execution flow, `1`=compat fallback).
 - `WHUSE_QEMU_MODE`: `contest` (docker qemu) or `host` (local qemu).
+- `WHUSE_QEMU_RISCV_MEM`: RISC-V QEMU RAM size (default `1G`).
+- `WHUSE_QEMU_LOONGARCH_MEM`: LoongArch QEMU RAM size (default `1G`).
 
 ## 3) Standard Command Blocks
 

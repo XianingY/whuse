@@ -21,7 +21,10 @@ const ENOENT: i32 = 2;
 const EINVAL: i32 = 22;
 const ESRCH: i32 = 3;
 
-const USER_STACK_SIZE: usize = 8192;
+/// Small shadow buffer kept in-kernel for process bookkeeping only.
+const USER_STACK_SHADOW_SIZE: usize = 8192;
+/// Actual user stack virtual mapping size used across exec/clone paths.
+const USER_STACK_MAP_SIZE: usize = 0x80_000;
 const USER_STACK_TOP: usize = 0x7fff_f000;
 const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
@@ -188,10 +191,10 @@ pub struct ProcessTable {
 
 impl Process {
     pub fn new(name: &str, pid: usize, parent: Option<usize>, entry: usize) -> Self {
-        let user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
+        let user_stack = vec![0u8; USER_STACK_SHADOW_SIZE].into_boxed_slice();
         let address_space = AddressSpace::new_user();
-        let stack_base = USER_STACK_TOP - USER_STACK_SIZE;
-        let _ = address_space.map_fixed_bytes(stack_base, &[], USER_STACK_SIZE, 0b11);
+        let stack_base = USER_STACK_TOP - USER_STACK_MAP_SIZE;
+        let _ = address_space.map_fixed_bytes(stack_base, &[], USER_STACK_MAP_SIZE, 0b11);
         let sp = USER_STACK_TOP - 16;
         Self {
             pid,
@@ -419,11 +422,11 @@ impl Process {
 
     pub fn reset_image(&mut self, entry: usize, stack_pointer: Option<usize>) {
         self.address_space.clear();
-        self.user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
-        let stack_base = USER_STACK_TOP - USER_STACK_SIZE;
+        self.user_stack = vec![0u8; USER_STACK_SHADOW_SIZE].into_boxed_slice();
+        let stack_base = USER_STACK_TOP - USER_STACK_MAP_SIZE;
         let _ = self
             .address_space
-            .map_fixed_bytes(stack_base, &[], USER_STACK_SIZE, 0b11);
+            .map_fixed_bytes(stack_base, &[], USER_STACK_MAP_SIZE, 0b11);
         let sp = stack_pointer.unwrap_or(USER_STACK_TOP - 16);
         self.trap_frame = TrapFrame::new_user(entry, sp);
         self.state = ProcessState::Ready;
@@ -560,12 +563,12 @@ impl Process {
     }
 
     fn clone_thread_from(&self, tid: usize, stack: usize, tls: Option<usize>) -> Self {
-        let user_stack = vec![0u8; USER_STACK_SIZE].into_boxed_slice();
+        let user_stack = vec![0u8; USER_STACK_SHADOW_SIZE].into_boxed_slice();
         let address_space = self.address_space.clone();
         let fallback_sp = if stack == 0 {
             address_space
-                .map_anonymous(USER_STACK_SIZE, 0b11)
-                .map(|base| base + USER_STACK_SIZE - 16)
+                .map_anonymous(USER_STACK_MAP_SIZE, 0b11)
+                .map(|base| base + USER_STACK_MAP_SIZE - 16)
                 .unwrap_or(USER_STACK_TOP - 16)
         } else {
             USER_STACK_TOP - 16

@@ -351,12 +351,7 @@ fn qemu_riscv_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> ExitC
         .join(RISCV_PACKAGE);
     let args = build_qemu_riscv_args(&kernel, disk.as_ref(), extra_disk.as_ref());
     let used_paths = collect_used_paths(&[Some(kernel.clone()), disk.clone(), extra_disk.clone()]);
-    run_qemu(
-        "qemu-system-riscv64",
-        &args,
-        &used_paths,
-        mode,
-    )
+    run_qemu("qemu-system-riscv64", &args, &used_paths, mode)
 }
 
 fn qemu_loongarch() -> ExitCode {
@@ -430,20 +425,19 @@ fn qemu_loongarch_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> E
         return kernel_objcopy;
     }
 
-    let args =
-        build_qemu_loongarch_args(&bootrom_bin, &kernel_bin, disk.as_ref(), extra_disk.as_ref());
+    let args = build_qemu_loongarch_args(
+        &bootrom_bin,
+        &kernel_bin,
+        disk.as_ref(),
+        extra_disk.as_ref(),
+    );
     let used_paths = collect_used_paths(&[
         Some(bootrom_bin.clone()),
         Some(kernel_bin.clone()),
         disk.clone(),
         extra_disk.clone(),
     ]);
-    run_qemu(
-        "qemu-system-loongarch64",
-        &args,
-        &used_paths,
-        mode,
-    )
+    run_qemu("qemu-system-loongarch64", &args, &used_paths, mode)
 }
 
 fn build_qemu_riscv_args(
@@ -451,11 +445,12 @@ fn build_qemu_riscv_args(
     disk: Option<&PathBuf>,
     extra_disk: Option<&PathBuf>,
 ) -> Vec<String> {
+    let memory = env::var("WHUSE_QEMU_RISCV_MEM").unwrap_or_else(|_| "1G".to_string());
     let mut args = vec![
         "-machine".to_string(),
         "virt".to_string(),
         "-m".to_string(),
-        "256M".to_string(),
+        memory,
         "-smp".to_string(),
         "1".to_string(),
         "-nographic".to_string(),
@@ -492,13 +487,14 @@ fn build_qemu_loongarch_args(
     disk: Option<&PathBuf>,
     extra_disk: Option<&PathBuf>,
 ) -> Vec<String> {
+    let memory = env::var("WHUSE_QEMU_LOONGARCH_MEM").unwrap_or_else(|_| "1G".to_string());
     let mut args = vec![
         "-machine".to_string(),
         "virt".to_string(),
         "-cpu".to_string(),
         "la464".to_string(),
         "-m".to_string(),
-        "1G".to_string(),
+        memory,
         "-smp".to_string(),
         "1".to_string(),
         "-nographic".to_string(),
@@ -556,12 +552,7 @@ fn collect_used_paths(paths: &[Option<PathBuf>]) -> Vec<PathBuf> {
         .collect()
 }
 
-fn run_qemu(
-    binary: &str,
-    args: &[String],
-    used_paths: &[PathBuf],
-    mode: QemuMode,
-) -> ExitCode {
+fn run_qemu(binary: &str, args: &[String], used_paths: &[PathBuf], mode: QemuMode) -> ExitCode {
     match mode {
         QemuMode::Host => match Command::new(binary).args(args).status() {
             Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
@@ -575,8 +566,8 @@ fn run_qemu(
 }
 
 fn run_qemu_in_contest_docker(binary: &str, args: &[String], used_paths: &[PathBuf]) -> ExitCode {
-    let image = env::var("WHUSE_OSCOMP_DOCKER_IMAGE")
-        .unwrap_or_else(|_| CONTEST_DOCKER_IMAGE.to_string());
+    let image =
+        env::var("WHUSE_OSCOMP_DOCKER_IMAGE").unwrap_or_else(|_| CONTEST_DOCKER_IMAGE.to_string());
     let root = repo_root();
     let root_canonical = fs::canonicalize(&root).unwrap_or(root);
     let mount_root = format!("{}:/work", root_canonical.display());

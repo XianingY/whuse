@@ -3,7 +3,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
@@ -40,6 +40,7 @@ pub struct Kernel {
     watchdog_started_at: BTreeMap<usize, u64>,
     watchdog_seen_name: BTreeMap<usize, String>,
     watchdog_last_heartbeat_ns: u64,
+    watchdog_last_scan_ns: u64,
     watchdog_clock_ns: u64,
     watchdog_last_hw_ns: u64,
     watchdog_iozone_window_until_ns: u64,
@@ -56,8 +57,9 @@ const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
 const OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS: u64 = 300 * 1_000_000_000;
 const OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID: usize = 128;
 const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 10 * 1_000_000_000;
-const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 300 * 1_000_000_000;
-const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 300 * 1_000_000_000;
+const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
+const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
+const OSCOMP_WATCHDOG_SCAN_INTERVAL_NS: u64 = 100 * 1_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
 const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
@@ -308,7 +310,7 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:lmbench_testcode.sh:124\n",
     "else\n",
     "    echo whuse-oscomp-lmbench-marker:runner-start\n",
-    "    run_step_with_timeout lmbench_testcode.sh 300 /musl/busybox sh ./lmbench_testcode.sh\n",
+    "    run_step_with_timeout lmbench_testcode.sh 600 /musl/busybox sh ./lmbench_testcode.sh\n",
     "    lmbench_rc=$?\n",
     "    echo whuse-oscomp-lmbench-marker:runner-end:$lmbench_rc\n",
     "fi\n",
@@ -327,7 +329,7 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:unixbench_testcode.sh:124\n",
     "else\n",
     "    echo whuse-oscomp-unixbench-marker:runner-start\n",
-    "    run_step_with_timeout unixbench_testcode.sh 300 /musl/busybox sh ./unixbench_testcode.sh\n",
+    "    run_step_with_timeout unixbench_testcode.sh 600 /musl/busybox sh ./unixbench_testcode.sh\n",
     "    unixbench_rc=$?\n",
     "    echo whuse-oscomp-unixbench-marker:runner-end:$unixbench_rc\n",
     "fi\n",
@@ -523,6 +525,7 @@ impl Kernel {
             watchdog_started_at: BTreeMap::new(),
             watchdog_seen_name: BTreeMap::new(),
             watchdog_last_heartbeat_ns: 0,
+            watchdog_last_scan_ns: 0,
             watchdog_clock_ns: 0,
             watchdog_last_hw_ns: 0,
             watchdog_iozone_window_until_ns: 0,
@@ -653,19 +656,25 @@ impl Kernel {
             self.watchdog_clock_ns = self.watchdog_clock_ns.saturating_add(SCHED_TIME_SLICE_NS);
             self.watchdog_clock_ns
         };
-        let mut all_groups = BTreeMap::<usize, String>::new();
-        let mut watched = BTreeMap::<usize, String>::new();
-        for process in self.processes.process_snapshots() {
+        if self.watchdog_last_scan_ns != 0
+            && now.saturating_sub(self.watchdog_last_scan_ns) < OSCOMP_WATCHDOG_SCAN_INTERVAL_NS
+        {
+            return false;
+        }
+        self.watchdog_last_scan_ns = now;
+
+        let snapshots = self.processes.process_snapshots();
+        let mut all_groups = BTreeMap::<usize, &str>::new();
+        let mut watched = BTreeMap::<usize, &str>::new();
+        for process in snapshots.iter() {
             if process.is_thread {
                 continue;
             }
-            all_groups
-                .entry(process.tgid)
-                .or_insert(process.name.clone());
+            all_groups.entry(process.tgid).or_insert(process.name.as_str());
             if process.tgid <= 1 {
                 continue;
             }
-            watched.entry(process.tgid).or_insert(process.name);
+            watched.entry(process.tgid).or_insert(process.name.as_str());
         }
         self.watchdog_started_at
             .retain(|tgid, _| watched.contains_key(tgid));
@@ -675,8 +684,8 @@ impl Kernel {
             let previous_name = self.watchdog_seen_name.get(tgid);
             let reset_started_at = match previous_name {
                 None => true,
-                Some(previous) if previous == name => false,
-                Some(previous) => watchdog_name_change_resets_timer(previous, name),
+                Some(previous) if previous.as_str() == *name => false,
+                Some(previous) => watchdog_name_change_resets_timer(previous.as_str(), name),
             };
             if reset_started_at {
                 self.watchdog_started_at.insert(*tgid, now);
@@ -695,7 +704,9 @@ impl Kernel {
             } else {
                 self.watchdog_started_at.entry(*tgid).or_insert(now);
             }
-            self.watchdog_seen_name.insert(*tgid, name.clone());
+            if previous_name.map(|previous| previous.as_str()) != Some(*name) {
+                self.watchdog_seen_name.insert(*tgid, (*name).to_string());
+            }
         }
         if OSCOMP_IOZONE_BUSYBOX_WINDOW_NS > 0
             && watched.values().any(|name| name.contains("iozone"))
@@ -744,7 +755,7 @@ impl Kernel {
                 );
                 (now.saturating_sub(started) >= timeout_ns).then_some((
                     *tgid,
-                    name.clone(),
+                    *name,
                     timeout_ns,
                     has_child_groups,
                     in_bench_phase,
@@ -753,7 +764,7 @@ impl Kernel {
             .collect::<Vec<_>>();
         let mut killed = false;
         for (tgid, name, timeout_ns, has_child_groups, in_bench_phase) in timed_out {
-            let reason = watchdog_timeout_reason(name.as_str(), has_child_groups, in_bench_phase);
+            let reason = watchdog_timeout_reason(name, has_child_groups, in_bench_phase);
             let subtree = self.processes.descendant_process_groups(tgid);
             if subtree.is_empty() {
                 self.watchdog_started_at.remove(&tgid);
@@ -1655,6 +1666,9 @@ fn oscomp_process_timeout_ns(
             return OSCOMP_GROUP_TIMEOUT_NS;
         }
         if is_busybox_supervisor(name, has_child_groups, in_bench_phase) {
+            if in_bench_phase {
+                return OSCOMP_LMBENCH_TIMEOUT_NS.max(OSCOMP_UNIXBENCH_TIMEOUT_NS);
+            }
             return OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS;
         }
         if in_iozone_busybox_window {

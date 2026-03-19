@@ -24,6 +24,7 @@ const USER_STACK_TOP: usize = 0x7fff_f000;
 const USER_MMAP_BASE: usize = 0x5000_0000;
 const DEFAULT_PROT: usize = 0b11;
 const PAGE_SIZE: usize = 4096;
+const DEBUG_LARGE_SEGMENT_ALLOC: bool = false;
 
 const RISCV_PTE_V: u64 = 1 << 0;
 const RISCV_PTE_R: u64 = 1 << 1;
@@ -1000,7 +1001,7 @@ fn create_owned_storage(addr: usize, mut data: Vec<u8>) -> SegmentStorage {
     let page_offset = addr & (PAGE_SIZE - 1);
     let map_len = align_up(page_offset + len, PAGE_SIZE);
     let total = map_len + PAGE_SIZE;
-    if total >= 700_000 {
+    if DEBUG_LARGE_SEGMENT_ALLOC && total >= 700_000 {
         let mut console = hal_api::ConsoleWriter;
         let _ = core::fmt::Write::write_fmt(
             &mut console,

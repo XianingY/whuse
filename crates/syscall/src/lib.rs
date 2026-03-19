@@ -238,7 +238,9 @@ const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
 const MAP_FIXED_NOREPLACE: usize = 0x10_0000;
 const BUILTIN_EXEC_BASE: usize = 0x0080_0000;
-pub const SIGNAL_TRAMPOLINE_BASE: usize = 0x7fff_0000;
+// Keep signal trampoline away from the default user stack range
+// (0x7ff7_f000..0x7fff_f000) to avoid turning stack pages read-only.
+pub const SIGNAL_TRAMPOLINE_BASE: usize = 0x7ff0_0000;
 #[cfg(target_arch = "riscv64")]
 pub const SIGNAL_TRAMPOLINE_CODE: [u8; 8] = [
     0x93, 0x08, 0xb0, 0x08, // addi a7, zero, 0x8b (= 139 = SYS_RT_SIGRETURN)
@@ -1059,7 +1061,10 @@ impl SyscallDispatcher {
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
         let path_ptr = args.0[0];
-        let path = procs.current()?.read_user_cstr(path_ptr).map_err(|_| EFAULT)?;
+        let path = procs
+            .current()?
+            .read_user_cstr(path_ptr)
+            .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let new_cwd = vfs.chdir(&cwd, &path)?;
         procs.current_mut()?.cwd = new_cwd;
@@ -2683,11 +2688,7 @@ impl SyscallDispatcher {
         {
             log_always(&format!(
                 "whuse-libctest:futex-enter tid={} tgid={} op={} uaddr={:#x} val={}",
-                current_tid,
-                current_tgid,
-                op,
-                uaddr,
-                args.0[2] as i32
+                current_tid, current_tgid, op, uaddr, args.0[2] as i32
             ));
         }
         trace_line(&format!(

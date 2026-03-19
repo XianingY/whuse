@@ -51,6 +51,8 @@ make oscomp-images
 Environment controls:
 
 - `WHUSE_QEMU_MODE=contest|host`
+- `WHUSE_QEMU_RISCV_MEM=<size>` RISC-V QEMU memory (default `1G`)
+- `WHUSE_QEMU_LOONGARCH_MEM=<size>` LoongArch QEMU memory (default `1G`)
 - `WHUSE_DISK_IMAGE=<path>` for primary disk
 - `WHUSE_EXTRA_DISK_IMAGE=<path>` for second disk
 - `WHUSE_OSCOMP_TESTSUITS_DIR=<path>` testsuits source

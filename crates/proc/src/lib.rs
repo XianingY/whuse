@@ -433,6 +433,8 @@ impl Process {
         self.exit_code = None;
         self.pending_signals = 0;
         self.signal_mask = 0;
+        self.signal_actions.clear();
+        self.sigaltstack = None;
         self.clear_child_tid = None;
         self.tid_address = None;
         self.robust_list = None;
@@ -1401,6 +1403,14 @@ impl ProcessTable {
             .collect()
     }
 
+    pub fn live_tids_in_tgid(&self, tgid: usize) -> Vec<usize> {
+        self.processes
+            .values()
+            .filter(|process| process.tgid == tgid && process.state != ProcessState::Exited)
+            .map(|process| process.tid)
+            .collect()
+    }
+
     pub fn has_child_process_group(&self, tgid: usize) -> bool {
         self.processes.values().any(|process| {
             !process.is_thread
@@ -2084,5 +2094,30 @@ mod tests {
             .unwrap()
             .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
         assert_eq!(reused, 1);
+    }
+
+    #[test]
+    fn reset_image_clears_signal_handlers_and_altstack() {
+        let mut table = ProcessTable::new();
+        let pid = table.spawn_init("init", 0x1000);
+        table.set_current(pid).unwrap();
+        table
+            .set_sigaction(
+                10,
+                SigAction {
+                    handler: 0x84e98,
+                    flags: 0x1234,
+                    restorer: 0x7ff0_0000,
+                    mask: 0xffff,
+                },
+            )
+            .unwrap();
+        table.current_mut().unwrap().sigaltstack = Some((0x7000, 0x2000, 0));
+        table.current_mut().unwrap().reset_image(0x2000, None);
+
+        let process = table.current().unwrap();
+        assert!(process.signal_actions.is_empty());
+        assert_eq!(process.sigaltstack, None);
+        assert_eq!(table.sigaction(10).unwrap(), SigAction::default());
     }
 }

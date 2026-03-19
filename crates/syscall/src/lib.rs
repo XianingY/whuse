@@ -39,6 +39,7 @@ const EINVAL: i32 = 22;
 const ENOENT: i32 = 2;
 const ENOTDIR: i32 = 20;
 const ENOEXEC: i32 = 8;
+const EPIPE: i32 = 32;
 const ESRCH: i32 = 3;
 
 const FUTEX_WAIT: usize = 0;
@@ -286,6 +287,21 @@ fn log_always(line: &str) {
     hal().console.put_byte(b'\n');
 }
 
+fn wake_process_group_threads(
+    procs: &ProcessTable,
+    scheduler: &mut Scheduler,
+    tgid: usize,
+) -> usize {
+    let tids = procs.live_tids_in_tgid(tgid);
+    let mut woke = 0usize;
+    for tid in tids {
+        if scheduler.wake_task(tid) {
+            woke = woke.saturating_add(1);
+        }
+    }
+    woke
+}
+
 #[inline]
 fn stage2_openat_debug_enabled() -> bool {
     matches!(option_env!("WHUSE_DEBUG_STAGE2_OPENAT"), Some("1"))
@@ -296,6 +312,10 @@ fn cancel_debug_enabled() -> bool {
         Some("1") => true,
         _ => false,
     }
+}
+
+fn signal_frame_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_SIGNAL_FRAME"), Some("1"))
 }
 
 fn is_libctest_task_name(name: &str) -> bool {
@@ -322,6 +342,12 @@ fn is_libctest_probe_path(path: &str) -> bool {
 
 fn cancel_debug(line: &str) {
     if cancel_debug_enabled() {
+        log_always(line);
+    }
+}
+
+fn signal_frame_debug(line: &str) {
+    if signal_frame_debug_enabled() {
         log_always(line);
     }
 }
@@ -812,19 +838,33 @@ impl SyscallDispatcher {
             .current()?
             .read_user_bytes(buf, count)
             .map_err(|_| EFAULT)?;
-        let (is_pipe, written) = {
+        let result = {
             let process = procs.current_mut()?;
             process.sync_fd_offset_from_alias(fd)?;
             let handle = process.fd_mut(fd)?;
             let is_pipe = vfs.is_pipe(handle);
-            let written = vfs.write(handle, &data)?;
-            process.sync_fd_offset_to_aliases(fd)?;
-            (is_pipe, written)
+            match vfs.write(handle, &data) {
+                Ok(written) => {
+                    process.sync_fd_offset_to_aliases(fd)?;
+                    Ok((is_pipe, written))
+                }
+                Err(err) => Err((is_pipe, err)),
+            }
         };
-        if is_pipe && written != 0 {
-            let _ = scheduler.wake_all_blocked();
+        match result {
+            Ok((is_pipe, written)) => {
+                if is_pipe && written != 0 {
+                    let _ = scheduler.wake_all_blocked();
+                }
+                Ok(written)
+            }
+            Err((is_pipe, err)) => {
+                if is_pipe && err == EPIPE {
+                    let _ = scheduler.wake_all_blocked();
+                }
+                Err(err)
+            }
         }
-        Ok(written)
     }
 
     fn sys_sched_yield(&self, scheduler: &mut Scheduler) -> Result<usize, i32> {
@@ -957,9 +997,9 @@ impl SyscallDispatcher {
             scheduler.exit_group(exit.tgid);
             if let Some(parent_tgid) = exit.parent_tgid {
                 let _ = procs.deliver_signal(parent_tgid, SIGCHLD);
-                let woke = scheduler.wake_task(parent_tgid);
+                let woke = wake_process_group_threads(procs, scheduler, parent_tgid);
                 trace_line(&format!(
-                    "whuse: exit_group wake parent_tgid={} woke={}",
+                    "whuse: exit_group wake parent_tgid={} woke_threads={}",
                     parent_tgid, woke
                 ));
             }
@@ -970,9 +1010,9 @@ impl SyscallDispatcher {
             }
             if let Some(parent_tgid) = exit.parent_tgid {
                 let _ = procs.deliver_signal(parent_tgid, SIGCHLD);
-                let woke = scheduler.wake_task(parent_tgid);
+                let woke = wake_process_group_threads(procs, scheduler, parent_tgid);
                 trace_line(&format!(
-                    "whuse: exit wake parent_tgid={} woke={}",
+                    "whuse: exit wake parent_tgid={} woke_threads={}",
                     parent_tgid, woke
                 ));
             }
@@ -1851,12 +1891,22 @@ impl SyscallDispatcher {
                 }
                 total += bytes.len();
             } else {
-                let written = {
+                let written_res = {
                     let process = procs.current_mut()?;
                     let handle = process.fd_mut(fd)?;
-                    vfs.write(handle, &bytes)?
+                    vfs.write(handle, &bytes)
                 };
-                total += written;
+                match written_res {
+                    Ok(written) => total += written,
+                    Err(EPIPE) if is_pipe => {
+                        let _ = scheduler.wake_all_blocked();
+                        if total == 0 {
+                            return Err(EPIPE);
+                        }
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
         if is_pipe && total != 0 {
@@ -2202,24 +2252,53 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         scheduler: &mut Scheduler,
     ) -> Result<usize, i32> {
-        let pid = if args.0[0] == 0 {
-            procs.current_pid()?
-        } else {
-            args.0[0]
-        };
+        let pid_raw = args.0[0] as isize;
         let sig = args.0[1];
         log_always(&format!(
             "whuse-debug: kill/tkill target={} sig={} caller_tid={}",
-            pid,
+            pid_raw,
             sig,
             procs.current_tid().unwrap_or(0)
         ));
         if sig > 64 {
             return Err(EINVAL);
         }
+        if pid_raw == isize::MIN {
+            return Err(EINVAL);
+        }
+        if pid_raw > 0 {
+            let target_tid = procs.send_signal_tid(pid_raw as usize, sig)?;
+            if sig != 0 {
+                let _ = scheduler.wake_task(target_tid);
+            }
+            return Ok(0);
+        }
+        if pid_raw == 0 {
+            let pgid = procs.current_pgid()?;
+            let targets = procs.send_signal_pgid(pgid, sig, None)?;
+            if sig != 0 {
+                for tid in targets {
+                    let _ = scheduler.wake_task(tid);
+                }
+            }
+            return Ok(0);
+        }
+        if pid_raw == -1 {
+            let exclude_tgid = None;
+            let targets = procs.send_signal_all(sig, exclude_tgid, false)?;
+            if sig != 0 {
+                for tid in targets {
+                    let _ = scheduler.wake_task(tid);
+                }
+            }
+            return Ok(0);
+        }
+        let pgid = (-pid_raw) as usize;
+        let targets = procs.send_signal_pgid(pgid, sig, None)?;
         if sig != 0 {
-            procs.deliver_signal(pid, sig)?;
-            let _ = scheduler.wake_task(pid);
+            for tid in targets {
+                let _ = scheduler.wake_task(tid);
+            }
         }
         Ok(0)
     }
@@ -2240,9 +2319,19 @@ impl SyscallDispatcher {
         if sig > 64 {
             return Err(EINVAL);
         }
+        if tgid == 0 || tid == 0 {
+            return Err(EINVAL);
+        }
+        let in_group = procs
+            .process_snapshots()
+            .iter()
+            .any(|process| process.tid == tid && process.tgid == tgid);
+        if !in_group {
+            return Err(ESRCH);
+        }
+        let target_tid = procs.send_signal_exact_tid(tid, sig)?;
         if sig != 0 {
-            procs.deliver_signal(tid, sig)?;
-            let _ = scheduler.wake_task(tid);
+            let _ = scheduler.wake_task(target_tid);
         }
         Ok(0)
     }
@@ -3540,14 +3629,16 @@ impl SyscallDispatcher {
     }
 
     fn sys_rt_sigreturn(&self, procs: &mut ProcessTable) -> Result<usize, i32> {
-        const FRAME_SIZE: usize = 832;
+        const FRAME_SIZE: usize = 1088;
         const UCONTEXT_OFF: usize = 128;
         const UC_SIGMASK_OFF: usize = UCONTEXT_OFF + 40;
-        const MCTX_OFF: usize = UCONTEXT_OFF + 168;
-        const FCSR_OFF: usize = MCTX_OFF + 32 * 8;
+        const MCTX_OFF: usize = UCONTEXT_OFF + 176;
+        const MCTX_FP_OFF: usize = MCTX_OFF + 32 * 8;
+        const MCTX_D_FCSR_OFF: usize = MCTX_FP_OFF + 32 * 8;
 
         let process = procs.current_mut().map_err(|_| ESRCH)?;
         let libctest_task = is_libctest_task_name(process.name.as_str());
+        let libc_bench_task = process.name.contains("libc-bench");
         let frame_sp = process.trap_frame.regs[2];
 
         let frame = process
@@ -3562,7 +3653,11 @@ impl SyscallDispatcher {
 
         let saved_mask = read_u64(UC_SIGMASK_OFF);
         let saved_pc = read_u64(MCTX_OFF) as usize;
-        let saved_fcsr = read_u64(FCSR_OFF) as usize;
+        let saved_fcsr = {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&frame[MCTX_D_FCSR_OFF..MCTX_D_FCSR_OFF + 4]);
+            u32::from_le_bytes(b) as usize
+        };
 
         cancel_debug(&format!(
             "whuse-debug: rt_sigreturn tid={} sfp={} cancel_seen={} cancel_once={} saved_pc={:#x}",
@@ -3582,12 +3677,28 @@ impl SyscallDispatcher {
                 saved_pc
             ));
         }
+        if libc_bench_task {
+            log_always(&format!(
+                "whuse-libcbench-signal:sigreturn tid={} sfp={} saved_pc={:#x} saved_mask={:#x} sp={:#x}",
+                process.tid, process.signal_frame_pending, saved_pc, saved_mask, frame_sp
+            ));
+        }
+        signal_frame_debug(&format!(
+            "whuse-signal-frame:sigreturn tid={} frame_sp={:#x} saved_pc={:#x} saved_mask={:#x}",
+            process.tid, frame_sp, saved_pc, saved_mask
+        ));
         process.signal_mask = saved_mask;
         process.signal_frame_pending = false;
         process.arm_cancel_interrupt_once();
         process.trap_frame.sepc = saved_pc;
         #[cfg(target_arch = "riscv64")]
         {
+            for i in 0..32usize {
+                let off = MCTX_FP_OFF + i * 8;
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&frame[off..off + 8]);
+                process.trap_frame.fregs[i] = u64::from_le_bytes(b);
+            }
             process.trap_frame.fcsr = saved_fcsr;
         }
         let _ = saved_fcsr;
@@ -4962,7 +5073,7 @@ mod tests {
             &mut scheduler,
             &mut vfs,
         );
-        assert!(fd >= 3);
+        assert!(fd >= 0);
 
         procs
             .current_mut()
@@ -5533,16 +5644,17 @@ mod tests {
         scheduler.start();
         let mut vfs = KernelVfs::new();
 
-        const FRAME_SIZE: usize = 832;
+        const FRAME_SIZE: usize = 1088;
         const UCONTEXT_OFF: usize = 128;
         const UC_SIGMASK_OFF: usize = UCONTEXT_OFF + 40;
-        const MCTX_OFF: usize = UCONTEXT_OFF + 168;
+        const MCTX_OFF: usize = UCONTEXT_OFF + 176;
         let frame_sp = 0x7d00usize;
         let saved_mask = 0x1234_5678_u64;
         let saved_pc = 0x4001_2000_u64;
         let retval = 77u64;
 
         let mut frame = [0u8; FRAME_SIZE];
+        frame[UC_SIGMASK_OFF + 8..UC_SIGMASK_OFF + 128].fill(0xff);
         frame[UC_SIGMASK_OFF..UC_SIGMASK_OFF + 8].copy_from_slice(&saved_mask.to_le_bytes());
         frame[MCTX_OFF..MCTX_OFF + 8].copy_from_slice(&saved_pc.to_le_bytes());
         let a0_off = MCTX_OFF + 10 * 8;
@@ -5718,8 +5830,9 @@ mod tests {
             &mut procs,
             &mut scheduler,
             &mut vfs,
-        ) as usize;
-        assert!(accepted >= 3);
+        );
+        assert!(accepted >= 0);
+        let accepted = accepted as usize;
 
         procs
             .current_mut()

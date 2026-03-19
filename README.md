@@ -18,6 +18,12 @@ All primary validation in this repository is aligned to:
 Current measured QEMU in the contest image is `10.0.2` for both
 `qemu-system-riscv64` and `qemu-system-loongarch64`.
 
+## Rust Toolchain Policy
+
+To avoid rustup rolling updates during contest compile, this repository pins
+Rust to `1.94.0` with `profile = "minimal"` in
+`rust-toolchain.toml` instead of using floating `stable`.
+
 ## Workspace layout
 
 - `crates/hal-api`: shared HAL traits and global registration

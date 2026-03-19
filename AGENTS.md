@@ -62,6 +62,9 @@ Key runtime env vars:
 - `WHUSE_QEMU_MODE`: `contest` (docker qemu) or `host` (local qemu).
 - `WHUSE_QEMU_RISCV_MEM`: RISC-V QEMU RAM size (default `1G`).
 - `WHUSE_QEMU_LOONGARCH_MEM`: LoongArch QEMU RAM size (default `1G`).
+- `WHUSE_LTP_PROFILE`: LTP mode (`score`=whitelist/blacklist high-yield, `full`=broader execution).
+- `WHUSE_LTP_WHITELIST`: LTP score whitelist path (default `/musl/ltp_score_whitelist.txt`).
+- `WHUSE_LTP_BLACKLIST`: LTP score blacklist path (default `/musl/ltp_score_blacklist.txt`).
 
 ## 3) Standard Command Blocks
 
@@ -102,6 +105,12 @@ strings /tmp/rv-full.log | grep "whuse-oscomp-step-\|whuse-oscomp-suite-done\|pa
 ```
 
 Use `strings` first — QEMU log output is binary-mixed; plain `grep` will report "binary file matches" with no output.
+
+### 3.5 LTP-focused run (RISC-V)
+
+```bash
+TIMEOUT_SECS=2400 WHUSE_LTP_PROFILE=score tools/dev/run_oscomp_stage2.sh ltp-riscv
+```
 
 ## 4) Current Flow (可复现现状 / Default Today)
 

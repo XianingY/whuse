@@ -2,6 +2,7 @@
 	oscomp-riscv oscomp-loongarch oscomp-riscv-contest oscomp-loongarch-contest \
 	oscomp-riscv-host oscomp-loongarch-host oscomp-images parallel-setup \
 	stage1-riscv stage1-loongarch stage1-both stage2-riscv stage2-riscv-3x \
+	stage2-riscv-ltp \
 	stage2-loongarch-chain stage2-loongarch-gate-smoke-120 stage2-loongarch-gate-300 \
 	stage2-loongarch-full-3600 qemu-clean-loongarch package-kernels contest-selfcheck
 
@@ -87,6 +88,9 @@ stage1-both:
 
 stage2-riscv:
 	TIMEOUT_SECS=$${TIMEOUT_SECS:-3600} tools/dev/run_oscomp_stage2.sh riscv
+
+stage2-riscv-ltp:
+	TIMEOUT_SECS=$${TIMEOUT_SECS:-2400} WHUSE_LTP_PROFILE=$${WHUSE_LTP_PROFILE:-score} tools/dev/run_oscomp_stage2.sh ltp-riscv
 
 stage2-riscv-3x:
 	RUNS=$${RUNS:-3} TIMEOUT_SECS=$${TIMEOUT_SECS:-3600} WHUSE_STAGE2_IMAGE_POLICY=$${WHUSE_STAGE2_IMAGE_POLICY:-auto} WHUSE_OSCOMP_COMPAT=$${WHUSE_OSCOMP_COMPAT:-0} WHUSE_STAGE2_STOP_ON_SUITE_DONE=$${WHUSE_STAGE2_STOP_ON_SUITE_DONE:-1} tools/dev/run_oscomp_stage2_3x.sh

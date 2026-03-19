@@ -89,6 +89,9 @@ Environment controls:
 - `WHUSE_OSCOMP_TESTSUITS_DIR=<path>` testsuits source
 - `WHUSE_OSCOMP_DOCKER_IMAGE=<image>` contest image (default `docker.educg.net/cg/os-contest:20260104`)
 - `WHUSE_OSCOMP_COMPAT=0` for real execution flow
+- `WHUSE_LTP_PROFILE=score|full` (`score` by default for high-yield LTP convergence)
+- `WHUSE_LTP_WHITELIST=/musl/ltp_score_whitelist.txt`
+- `WHUSE_LTP_BLACKLIST=/musl/ltp_score_blacklist.txt`
 
 ## Competition-Aligned Entry Points
 
@@ -103,6 +106,12 @@ Host quick mode:
 ```bash
 make oscomp-riscv-host
 make oscomp-loongarch-host
+```
+
+LTP-focused run:
+
+```bash
+make stage2-riscv-ltp
 ```
 
 ## Performance Gate (Merge Policy)

@@ -11,8 +11,11 @@ TS="$(date +%Y%m%d-%H%M%S)"
 
 export WHUSE_OSCOMP_DOCKER_IMAGE="${WHUSE_OSCOMP_DOCKER_IMAGE:-docker.educg.net/cg/os-contest:20260104}"
 export WHUSE_OSCOMP_COMPAT="${WHUSE_OSCOMP_COMPAT:-0}"
+export WHUSE_QEMU_MODE="${WHUSE_QEMU_MODE:-contest}"
 export WHUSE_STAGE2_USE_IMAGE_COPY="${WHUSE_STAGE2_USE_IMAGE_COPY:-0}"
 export WHUSE_STAGE2_STOP_ON_SUITE_DONE="${WHUSE_STAGE2_STOP_ON_SUITE_DONE:-1}"
+export WHUSE_STAGE2_ONLY_STEP="${WHUSE_STAGE2_ONLY_STEP:-}"
+export WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE:-score}"
 WHUSE_STAGE2_IMAGE_POLICY="${WHUSE_STAGE2_IMAGE_POLICY:-auto}"
 
 RV_IMG="${REPO_ROOT}/target/oscomp/sdcard-rv.img"
@@ -50,6 +53,7 @@ required_musl_entries=(
     "netperf_testcode.sh"
     "iperf_testcode.sh"
     "cyclictest_testcode.sh"
+    "ltp_testcode.sh"
 )
 
 runtime_images=()
@@ -102,6 +106,7 @@ ensure_oscomp_images() {
     case "${MODE}" in
     riscv) requested_arches=("rv") ;;
     loongarch) requested_arches=("la") ;;
+    ltp-riscv) requested_arches=("rv") ;;
     both) requested_arches=("rv" "la") ;;
     *)
         echo "usage: $0 [riscv|loongarch|both]" >&2
@@ -164,6 +169,37 @@ prepare_runtime_image() {
     cp --reflink=auto "${src}" "${dst}"
     runtime_images+=("${dst}")
     echo "${dst}"
+}
+
+write_runtime_image_config() {
+    local image="$1"
+    local target="$2"
+    local value="$3"
+    local tmp
+    tmp="$(mktemp)"
+    printf '%s\n' "${value}" >"${tmp}"
+    debugfs -w -R "rm ${target}" "${image}" >/dev/null 2>&1 || true
+    if ! debugfs -w -R "write ${tmp} ${target}" "${image}" >/dev/null 2>&1; then
+        rm -f "${tmp}"
+        echo "failed to write runtime config ${target} into ${image}" >&2
+        return 1
+    fi
+    rm -f "${tmp}"
+}
+
+inject_ltp_runtime_config() {
+    local image="$1"
+    write_runtime_image_config "${image}" "/musl/.whuse_oscomp_only_step" "ltp_testcode.sh"
+    write_runtime_image_config "${image}" "/musl/.whuse_ltp_profile" "${WHUSE_LTP_PROFILE}"
+    if [[ -n "${WHUSE_LTP_WHITELIST:-}" ]]; then
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_whitelist" "${WHUSE_LTP_WHITELIST}"
+    fi
+    if [[ -n "${WHUSE_LTP_BLACKLIST:-}" ]]; then
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_blacklist" "${WHUSE_LTP_BLACKLIST}"
+    fi
+    if [[ -n "${WHUSE_LTP_STEP_TIMEOUT:-}" ]]; then
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_step_timeout" "${WHUSE_LTP_STEP_TIMEOUT}"
+    fi
 }
 
 run_arch() {
@@ -254,6 +290,56 @@ run_arch() {
     return "${ok}"
 }
 
+run_ltp_riscv() {
+    local log="/tmp/rv-ltp-stage2-${TS}.log"
+    local text_log="/tmp/rv-ltp-stage2-${TS}.strings.log"
+    local runtime_image
+    local saved_use_copy="${WHUSE_STAGE2_USE_IMAGE_COPY}"
+    WHUSE_STAGE2_USE_IMAGE_COPY=1
+    runtime_image="$(prepare_runtime_image "rv" "${RV_IMG}")"
+    WHUSE_STAGE2_USE_IMAGE_COPY="${saved_use_copy}"
+    inject_ltp_runtime_config "${runtime_image}"
+
+    echo "[rv-ltp] running ltp-only, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, profile=${WHUSE_LTP_PROFILE}"
+    timeout "${TIMEOUT_SECS}s" env \
+        WHUSE_DISK_IMAGE="${runtime_image}" \
+        WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE}" \
+        "${XTASK_CMD[@]}" qemu-riscv >"${log}" 2>&1 || true
+
+    strings "${log}" >"${text_log}" || true
+    echo "[rv-ltp] log: ${log}"
+
+    if rg -q "KERNEL PANIC|panic|pid 1 \(init\).*trap" "${text_log}"; then
+        echo "[rv-ltp] detected kernel panic or init crash" >&2
+        rg "KERNEL PANIC|panic|pid 1 \(init\).*trap" "${text_log}" >&2 || true
+        return 1
+    fi
+
+    local ok=0
+    if rg -q "whuse-oscomp-step-begin:ltp_testcode.sh" "${text_log}"; then
+        echo "[rv-ltp] step-begin ok: ltp_testcode.sh"
+    else
+        echo "[rv-ltp] missing step-begin: ltp_testcode.sh" >&2
+        ok=1
+    fi
+    if rg -q "whuse-oscomp-step-end:ltp_testcode.sh:" "${text_log}" || rg -q "whuse-oscomp-step-timeout:ltp_testcode.sh" "${text_log}"; then
+        echo "[rv-ltp] step-close ok: ltp_testcode.sh"
+    else
+        echo "[rv-ltp] missing step-close: ltp_testcode.sh" >&2
+        ok=1
+    fi
+
+    local tpass tfail tbrok tconf timeout_count
+    tpass="$(count_matches "TPASS" "${text_log}")"
+    tfail="$(count_matches "TFAIL" "${text_log}")"
+    tbrok="$(count_matches "TBROK" "${text_log}")"
+    tconf="$(count_matches "TCONF" "${text_log}")"
+    timeout_count="$(count_matches "whuse-oscomp-step-timeout:ltp_testcode.sh" "${text_log}")"
+    echo "[rv-ltp] summary: TPASS=${tpass} TFAIL=${tfail} TBROK=${tbrok} TCONF=${tconf} step-timeout=${timeout_count}"
+    rg "whuse-oscomp-step-(begin|end|timeout|skip):ltp_testcode.sh|whuse-oscomp-suite-done|whuse-ltp-skip-case:" "${text_log}" || true
+    return "${ok}"
+}
+
 count_matches() {
     local pattern="$1"
     local log_file="$2"
@@ -281,12 +367,15 @@ riscv)
 loongarch)
     run_arch "la" "${LA_IMG}" "qemu-loongarch"
     ;;
+ltp-riscv)
+    run_ltp_riscv
+    ;;
 both)
     run_arch "rv" "${RV_IMG}" "qemu-riscv"
     run_arch "la" "${LA_IMG}" "qemu-loongarch"
     ;;
 *)
-    echo "usage: $0 [riscv|loongarch|both]" >&2
+    echo "usage: $0 [riscv|loongarch|ltp-riscv|both]" >&2
     exit 2
     ;;
 esac

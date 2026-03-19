@@ -1229,9 +1229,16 @@ fn find_segment(
     addr: usize,
     len: usize,
 ) -> KernelResult<(&Segment, usize)> {
+    let end = addr.checked_add(len).ok_or(EFAULT)?;
     mappings
         .iter()
-        .find(|(base, segment)| **base <= addr && addr + len <= **base + segment.area.len)
+        .find(|(base, segment)| {
+            let seg_start = **base;
+            let Some(seg_end) = seg_start.checked_add(segment.area.len) else {
+                return false;
+            };
+            seg_start <= addr && end <= seg_end
+        })
         .map(|(base, segment)| (segment, addr - *base))
         .ok_or(EFAULT)
 }
@@ -1241,9 +1248,16 @@ fn find_segment_mut(
     addr: usize,
     len: usize,
 ) -> KernelResult<(&mut Segment, usize)> {
+    let end = addr.checked_add(len).ok_or(EFAULT)?;
     mappings
         .iter_mut()
-        .find(|(base, segment)| **base <= addr && addr + len <= **base + segment.area.len)
+        .find(|(base, segment)| {
+            let seg_start = **base;
+            let Some(seg_end) = seg_start.checked_add(segment.area.len) else {
+                return false;
+            };
+            seg_start <= addr && end <= seg_end
+        })
         .map(|(base, segment)| (segment, addr - *base))
         .ok_or(EFAULT)
 }

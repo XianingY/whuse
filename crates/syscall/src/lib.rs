@@ -562,12 +562,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs
-            .current()?
-            .read_user_cstr(args.0[1])
-            .map_err(|_| EFAULT)?;
-        let cwd = procs.current()?.cwd.clone();
-        let _ = args.0[0];
+        let dirfd = args.0[0] as i32;
+        let path_ptr = args.0[1];
+        let path = procs.current()?.read_user_cstr(path_ptr).map_err(|_| EFAULT)?;
+        let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
         let _ = args.0[2];
         vfs.unlink(&cwd, &path)?;
         Ok(0)
@@ -2235,13 +2233,18 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs
-            .current()?
-            .read_user_cstr(args.0[1])
-            .map_err(|_| EFAULT)?;
-        let cwd = procs.current()?.cwd.clone();
+        let dirfd = args.0[0] as i32;
+        let flags = args.0[3];
+        let path = read_at_path_allow_empty(procs.current()?, args.0[1], flags)?;
         let _mode = args.0[2];
-        let _flags = args.0[3];
+        if path.is_empty() && (flags & AT_EMPTY_PATH_FLAG) != 0 {
+            if dirfd == AT_FDCWD {
+                return Ok(0);
+            }
+            let _ = procs.current()?.fd(dirfd)?;
+            return Ok(0);
+        }
+        let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
         vfs.access(&cwd, &path)?;
         Ok(0)
     }
@@ -2672,13 +2675,9 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        const AT_EMPTY_PATH: usize = 0x1000;
         let dirfd = args.0[0] as i32;
-        let path = procs
-            .current()?
-            .read_user_cstr(args.0[1])
-            .map_err(|_| EFAULT)?;
         let flags = args.0[2];
+        let path = read_at_path_allow_empty(procs.current()?, args.0[1], flags)?;
         if let Some(applet) = BUSYBOX_APPLETS.lock().get(&procs.current_tgid()?).cloned() {
             if applet == "du" {
                 trace_enosys(&format!(
@@ -2687,7 +2686,7 @@ impl SyscallDispatcher {
                 ));
             }
         }
-        let stat = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        let stat = if path.is_empty() && (flags & AT_EMPTY_PATH_FLAG) != 0 {
             if dirfd == AT_FDCWD {
                 let cwd = procs.current()?.cwd.clone();
                 vfs.stat_path(&cwd, &cwd)?
@@ -3268,13 +3267,18 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs
-            .current()?
-            .read_user_cstr(args.0[1])
-            .map_err(|_| EFAULT)?;
-        let cwd = procs.current()?.cwd.clone();
+        let dirfd = args.0[0] as i32;
+        let flags = args.0[3];
+        let path = read_at_path_allow_empty(procs.current()?, args.0[1], flags)?;
         let _mode = args.0[2];
-        let _flags = args.0[3];
+        if path.is_empty() && (flags & AT_EMPTY_PATH_FLAG) != 0 {
+            if dirfd == AT_FDCWD {
+                return Ok(0);
+            }
+            let _ = procs.current()?.fd(dirfd)?;
+            return Ok(0);
+        }
+        let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
         vfs.access(&cwd, &path)?;
         Ok(0)
     }
@@ -3285,14 +3289,20 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
-        let path = procs
-            .current()?
-            .read_user_cstr(args.0[1])
-            .map_err(|_| EFAULT)?;
-        let cwd = procs.current()?.cwd.clone();
+        let dirfd = args.0[0] as i32;
+        let flags = args.0[4];
+        let path_ptr = args.0[1];
+        let path = read_at_path_allow_empty(procs.current()?, path_ptr, flags)?;
         let _owner = args.0[2];
         let _group = args.0[3];
-        let _flags = args.0[4];
+        if path.is_empty() && (flags & AT_EMPTY_PATH_FLAG) != 0 {
+            if dirfd == AT_FDCWD {
+                return Ok(0);
+            }
+            let _ = procs.current()?.fd(dirfd)?;
+            return Ok(0);
+        }
+        let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
         vfs.access(&cwd, &path)?;
         Ok(0)
     }
@@ -4192,6 +4202,22 @@ fn resolve_at_cwd(
         return Err(ENOTDIR);
     }
     Ok(handle.path.clone())
+}
+
+const AT_EMPTY_PATH_FLAG: usize = 0x1000;
+
+fn read_at_path_allow_empty(
+    process: &proc::Process,
+    path_ptr: usize,
+    flags: usize,
+) -> Result<String, i32> {
+    if path_ptr == 0 {
+        if (flags & AT_EMPTY_PATH_FLAG) != 0 {
+            return Ok(String::new());
+        }
+        return Err(EFAULT);
+    }
+    process.read_user_cstr(path_ptr).map_err(|_| EFAULT)
 }
 
 fn timespec_to_bytes(ts: Timespec) -> [u8; 16] {

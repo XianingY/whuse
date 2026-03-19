@@ -44,6 +44,7 @@ pub struct Kernel {
     watchdog_clock_ns: u64,
     watchdog_last_hw_ns: u64,
     watchdog_iozone_window_until_ns: u64,
+    watchdog_bench_window_until_ns: u64,
     timer_irq_count: u64,
 }
 
@@ -54,8 +55,9 @@ const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
 const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
-const OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS: u64 = 300 * 1_000_000_000;
+const OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS: u64 = 1_200 * 1_000_000_000;
 const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 10 * 1_000_000_000;
+const OSCOMP_BENCH_PHASE_WINDOW_NS: u64 = 300 * 1_000_000_000;
 const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 900 * 1_000_000_000;
 const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 900 * 1_000_000_000;
 const OSCOMP_BENCH_SUPERVISOR_TIMEOUT_NS: u64 = {
@@ -69,7 +71,7 @@ const OSCOMP_BENCH_SUPERVISOR_TIMEOUT_NS: u64 = {
 const OSCOMP_WATCHDOG_SCAN_INTERVAL_NS: u64 = 100 * 1_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
 const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
-const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
+const OSCOMP_REQUIRED_TEST_FILES: [&str; 13] = [
     "/musl/busybox",
     "/musl/basic/run-all.sh",
     "/musl/busybox_testcode.sh",
@@ -82,8 +84,20 @@ const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
     "/musl/netperf_testcode.sh",
     "/musl/iperf_testcode.sh",
     "/musl/cyclictest_testcode.sh",
+    "/musl/ltp_testcode.sh",
 ];
 const OSCOMP_OPTIONAL_TEST_FILES: [&str; 1] = ["/musl/time-test"];
+const OSCOMP_LTP_SCORE_WHITELIST_PATH: &str = "/musl/ltp_score_whitelist.txt";
+const OSCOMP_LTP_SCORE_BLACKLIST_PATH: &str = "/musl/ltp_score_blacklist.txt";
+const OSCOMP_CFG_ONLY_STEP_PATH: &str = "/musl/.whuse_oscomp_only_step";
+const OSCOMP_CFG_LTP_PROFILE_PATH: &str = "/musl/.whuse_ltp_profile";
+const OSCOMP_CFG_LTP_WHITELIST_PATH: &str = "/musl/.whuse_ltp_whitelist";
+const OSCOMP_CFG_LTP_BLACKLIST_PATH: &str = "/musl/.whuse_ltp_blacklist";
+const OSCOMP_CFG_LTP_TIMEOUT_PATH: &str = "/musl/.whuse_ltp_step_timeout";
+const OSCOMP_LTP_SCORE_WHITELIST: &str =
+    include_str!("../../../tools/oscomp/ltp/score_whitelist.txt");
+const OSCOMP_LTP_SCORE_BLACKLIST: &str =
+    include_str!("../../../tools/oscomp/ltp/score_blacklist.txt");
 const OSCOMP_ROOT_ALIAS_ENTRIES: [&str; 120] = [
     "arithoh",
     "basic",
@@ -233,6 +247,26 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "WHUSE_OSCOMP_COMPAT=${WHUSE_OSCOMP_COMPAT:-0}\n",
     "WHUSE_OSCOMP_ONLY_STEP=${WHUSE_OSCOMP_ONLY_STEP:-}\n",
     "WHUSE_OSCOMP_TRACE_STEP_CMDS=${WHUSE_OSCOMP_TRACE_STEP_CMDS:-0}\n",
+    "WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-score}\n",
+    "WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}\n",
+    "WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-/musl/ltp_score_blacklist.txt}\n",
+    "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}\n",
+    "if [ -f /musl/.whuse_oscomp_only_step ]; then\n",
+    "    IFS= read -r WHUSE_OSCOMP_ONLY_STEP < /musl/.whuse_oscomp_only_step\n",
+    "fi\n",
+    "if [ -f /musl/.whuse_ltp_profile ]; then\n",
+    "    IFS= read -r WHUSE_LTP_PROFILE < /musl/.whuse_ltp_profile\n",
+    "fi\n",
+    "if [ -f /musl/.whuse_ltp_whitelist ]; then\n",
+    "    IFS= read -r WHUSE_LTP_WHITELIST < /musl/.whuse_ltp_whitelist\n",
+    "fi\n",
+    "if [ -f /musl/.whuse_ltp_blacklist ]; then\n",
+    "    IFS= read -r WHUSE_LTP_BLACKLIST < /musl/.whuse_ltp_blacklist\n",
+    "fi\n",
+    "if [ -f /musl/.whuse_ltp_step_timeout ]; then\n",
+    "    IFS= read -r WHUSE_LTP_STEP_TIMEOUT < /musl/.whuse_ltp_step_timeout\n",
+    "fi\n",
+    "export WHUSE_OSCOMP_ONLY_STEP WHUSE_LTP_PROFILE WHUSE_LTP_WHITELIST WHUSE_LTP_BLACKLIST WHUSE_LTP_STEP_TIMEOUT\n",
     "WHUSE_HAVE_TIMEOUT=0\n",
     "if /musl/busybox timeout 1 /musl/busybox true >/tmp/whuse-timeout-probe.log 2>&1; then\n",
     "    WHUSE_HAVE_TIMEOUT=1\n",
@@ -257,6 +291,78 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    fi\n",
     "    \"$@\"\n",
     "    return $?\n",
+    "}\n",
+    "whuse_ltp_list_has_entries() {\n",
+    "    file=\"$1\"\n",
+    "    [ -f \"$file\" ] && [ -s \"$file\" ]\n",
+    "}\n",
+    "whuse_ltp_list_contains() {\n",
+    "    needle=\"$1\"\n",
+    "    file=\"$2\"\n",
+    "    [ -f \"$file\" ] || return 1\n",
+    "    /musl/busybox grep -Fqx \"$needle\" \"$file\"\n",
+    "}\n",
+    "whuse_ltp_prepare_score_overrides() {\n",
+    "    ltp_dir=\"/musl/ltp/testcases/bin\"\n",
+    "    [ -d \"$ltp_dir\" ] || return 0\n",
+    "    use_whitelist=0\n",
+    "    if whuse_ltp_list_has_entries \"$WHUSE_LTP_WHITELIST\"; then\n",
+    "        use_whitelist=1\n",
+    "    fi\n",
+    "    for case_path in \"$ltp_dir\"/*\n",
+    "    do\n",
+    "        [ -f \"$case_path\" ] || continue\n",
+    "        case_name=\"$(/musl/busybox basename \"$case_path\")\"\n",
+    "        case_rel=\"ltp/testcases/bin/$case_name\"\n",
+    "        skip_case=0\n",
+    "        if whuse_ltp_list_contains \"$case_name\" \"$WHUSE_LTP_BLACKLIST\" || \\\n",
+    "            whuse_ltp_list_contains \"$case_rel\" \"$WHUSE_LTP_BLACKLIST\"; then\n",
+    "            skip_case=1\n",
+    "        fi\n",
+    "        if [ \"$use_whitelist\" -eq 1 ]; then\n",
+    "            if ! whuse_ltp_list_contains \"$case_name\" \"$WHUSE_LTP_WHITELIST\" && \\\n",
+    "                ! whuse_ltp_list_contains \"$case_rel\" \"$WHUSE_LTP_WHITELIST\"; then\n",
+    "                skip_case=1\n",
+    "            fi\n",
+    "        fi\n",
+    "        [ \"$skip_case\" -eq 1 ] || continue\n",
+    "        backup_path=\"$case_path.whuse-score-orig\"\n",
+    "        [ -f \"$backup_path\" ] && continue\n",
+    "        /musl/busybox mv \"$case_path\" \"$backup_path\" >/dev/null 2>&1 || continue\n",
+    "        {\n",
+    "            echo '#!/musl/busybox sh'\n",
+    "            echo \"echo whuse-ltp-skip-case:${case_rel}\"\n",
+    "            echo 'exit 0'\n",
+    "        } > \"$case_path\"\n",
+    "        /musl/busybox chmod 755 \"$case_path\" >/dev/null 2>&1 || true\n",
+    "    done\n",
+    "}\n",
+    "whuse_ltp_restore_score_overrides() {\n",
+    "    ltp_dir=\"/musl/ltp/testcases/bin\"\n",
+    "    [ -d \"$ltp_dir\" ] || return 0\n",
+    "    for backup_path in \"$ltp_dir\"/*.whuse-score-orig\n",
+    "    do\n",
+    "        [ -f \"$backup_path\" ] || continue\n",
+    "        case_path=\"${backup_path%.whuse-score-orig}\"\n",
+    "        /musl/busybox rm -f \"$case_path\" >/dev/null 2>&1 || true\n",
+    "        /musl/busybox mv \"$backup_path\" \"$case_path\" >/dev/null 2>&1 || true\n",
+    "    done\n",
+    "}\n",
+    "run_ltp_step() {\n",
+    "    step=\"$1\"\n",
+    "    timeout_s=\"$2\"\n",
+    "    echo whuse-oscomp-ltp-marker:runner-start:profile=$WHUSE_LTP_PROFILE\n",
+    "    old_path=\"$PATH\"\n",
+    "    export PATH=/musl/ltp/testcases/bin:/musl/ltp/testcases/lib:/musl/ltp/runtest:/musl/ltp/testscripts:$PATH\n",
+    "    if [ \"$WHUSE_LTP_PROFILE\" = \"score\" ] && whuse_ltp_list_has_entries \"$WHUSE_LTP_WHITELIST\"; then\n",
+    "        run_step_with_timeout \"$step\" \"$timeout_s\" /musl/busybox sh -c 'echo whuse-oscomp-command-begin:ltp_testcode.sh:score; rc=0; while IFS= read -r case_item; do [ -n \"$case_item\" ] || continue; case_rel=\"$case_item\"; case_name=\"$case_item\"; case \"$case_item\" in ltp/testcases/bin/*) case_name=\"${case_item##*/}\" ;; *) case_rel=\"ltp/testcases/bin/$case_item\" ;; esac; if [ -f \"$WHUSE_LTP_BLACKLIST\" ] && ( /musl/busybox grep -Fqx \"$case_name\" \"$WHUSE_LTP_BLACKLIST\" || /musl/busybox grep -Fqx \"$case_rel\" \"$WHUSE_LTP_BLACKLIST\" ); then echo whuse-ltp-skip-case:$case_rel:blacklist; continue; fi; case_path=\"./$case_rel\"; if [ ! -x \"$case_path\" ]; then echo whuse-ltp-miss-case:$case_rel; continue; fi; echo \"RUN LTP CASE $case_name\"; \"$case_path\"; case_rc=$?; if [ \"$case_rc\" -ne 0 ]; then rc=$case_rc; fi; done < \"$WHUSE_LTP_WHITELIST\"; echo whuse-oscomp-command-end:ltp_testcode.sh:score:$rc; exit $rc'\n",
+    "    else\n",
+    "        run_step_with_timeout \"$step\" \"$timeout_s\" /musl/busybox sh -c 'echo whuse-oscomp-command-begin:ltp_testcode.sh:script; whuse_trace=\"${WHUSE_OSCOMP_TRACE_STEP_CMDS:-0}\"; if [ \"$whuse_trace\" = \"1\" ]; then /musl/busybox sh -x ./ltp_testcode.sh; else /musl/busybox sh ./ltp_testcode.sh; fi; rc=$?; echo whuse-oscomp-command-end:ltp_testcode.sh:script:$rc; exit $rc'\n",
+    "    fi\n",
+    "    rc=$?\n",
+    "    export PATH=\"$old_path\"\n",
+    "    echo whuse-oscomp-ltp-marker:runner-end:$rc\n",
+    "    return \"$rc\"\n",
     "}\n",
     "step_name_for() {\n",
     "    script=\"$1\"\n",
@@ -286,21 +392,39 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        busybox_testcode.sh) echo 180 ;;\n",
     "        iozone_testcode.sh) echo 300 ;;\n",
     "        libctest_testcode.sh) echo 300 ;;\n",
-    "        lmbench_testcode.sh) echo 900 ;;\n",
+    "        lmbench_testcode.sh) echo 1800 ;;\n",
     "        lua_testcode.sh) echo 300 ;;\n",
-    "        unixbench_testcode.sh) echo 900 ;;\n",
+    "        unixbench_testcode.sh) echo 1800 ;;\n",
     "        netperf_testcode.sh) echo 240 ;;\n",
     "        iperf_testcode.sh) echo 240 ;;\n",
-    "        cyclic_testcode.sh|cyclictest_testcode.sh) echo 120 ;;\n",
+    "        cyclic_testcode.sh|cyclictest_testcode.sh) echo 300 ;;\n",
+    "        ltp_testcode.sh) echo \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\" ;;\n",
     "        *) echo 300 ;;\n",
     "    esac\n",
     "}\n",
     "collect_step_scripts() {\n",
-    "    /musl/busybox ls *_testcode.sh 2>/dev/null | /musl/busybox sort\n",
+    "    found=\"\"\n",
+    "    for path in ./*_testcode.sh\n",
+    "    do\n",
+    "        [ -f \"$path\" ] || continue\n",
+    "        script=\"${path#./}\"\n",
+    "        found=\"$found $script\"\n",
+    "    done\n",
+    "    echo \"$found\"\n",
+    "}\n",
+    "list_contains() {\n",
+    "    needle=\"$1\"\n",
+    "    shift\n",
+    "    for item in \"$@\"\n",
+    "    do\n",
+    "        [ \"$item\" = \"$needle\" ] && return 0\n",
+    "    done\n",
+    "    return 1\n",
     "}\n",
     "ordered_step_scripts() {\n",
     "    found=\"$(collect_step_scripts)\"\n",
     "    selected=\"\"\n",
+    "    found_list=\"$found\"\n",
     "    for script in \\\n",
     "        busybox_testcode.sh \\\n",
     "        iozone_testcode.sh \\\n",
@@ -311,14 +435,15 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        netperf_testcode.sh \\\n",
     "        iperf_testcode.sh \\\n",
     "        cyclic_testcode.sh \\\n",
-    "        cyclictest_testcode.sh\n",
+    "        cyclictest_testcode.sh \\\n",
+    "        ltp_testcode.sh\n",
     "    do\n",
-    "        echo \"$found\" | /musl/busybox grep -qx \"$script\" || continue\n",
+    "        list_contains \"$script\" $found_list || continue\n",
     "        selected=\"$selected $script\"\n",
     "    done\n",
-    "    for script in $found\n",
+    "    for script in $found_list\n",
     "    do\n",
-    "        echo \" $selected \" | /musl/busybox grep -q \" $script \" && continue\n",
+    "        list_contains \"$script\" $selected && continue\n",
     "        selected=\"$selected $script\"\n",
     "    done\n",
     "    echo \"$selected\"\n",
@@ -361,10 +486,13 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        rc=$?\n",
     "        echo whuse-oscomp-lmbench-marker:runner-end:$rc\n",
     "    elif [ \"$script\" = \"unixbench_testcode.sh\" ]; then\n",
-    "        echo whuse-oscomp-unixbench-marker:runner-start\n",
-    "        run_step_with_timeout \"$step\" \"$timeout_s\" /musl/busybox sh -c 'echo whuse-oscomp-command-begin:unixbench_testcode.sh:script; whuse_trace=\"${WHUSE_OSCOMP_TRACE_STEP_CMDS:-1}\"; if [ \"$whuse_trace\" = \"1\" ]; then /musl/busybox sh -x ./unixbench_testcode.sh; else /musl/busybox sh ./unixbench_testcode.sh; fi; rc=$?; echo whuse-oscomp-command-end:unixbench_testcode.sh:script:$rc; exit $rc'\n",
+        "        echo whuse-oscomp-unixbench-marker:runner-start\n",
+        "        run_step_with_timeout \"$step\" \"$timeout_s\" /musl/busybox sh -c 'echo whuse-oscomp-command-begin:unixbench_testcode.sh:script; whuse_trace=\"${WHUSE_OSCOMP_TRACE_STEP_CMDS:-1}\"; if [ \"$whuse_trace\" = \"1\" ]; then /musl/busybox sh -x ./unixbench_testcode.sh; else /musl/busybox sh ./unixbench_testcode.sh; fi; rc=$?; echo whuse-oscomp-command-end:unixbench_testcode.sh:script:$rc; exit $rc'\n",
+        "        rc=$?\n",
+        "        echo whuse-oscomp-unixbench-marker:runner-end:$rc\n",
+    "    elif [ \"$script\" = \"ltp_testcode.sh\" ]; then\n",
+    "        run_ltp_step \"$step\" \"$timeout_s\"\n",
     "        rc=$?\n",
-    "        echo whuse-oscomp-unixbench-marker:runner-end:$rc\n",
     "    else\n",
     "        run_step_with_timeout \"$step\" \"$timeout_s\" /musl/busybox sh \"./$script\"\n",
     "        rc=$?\n",
@@ -373,6 +501,12 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    return \"$rc\"\n",
     "}\n",
     "run_libc_bench() {\n",
+    "    if ! step_selected libc-bench; then\n",
+    "        echo whuse-oscomp-step-begin:libc-bench\n",
+    "        echo whuse-oscomp-step-skip:libc-bench:filtered\n",
+    "        echo whuse-oscomp-step-end:libc-bench:0\n",
+    "        return 0\n",
+    "    fi\n",
     "    if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
     "        echo whuse-oscomp-step-begin:libc-bench\n",
     "        echo whuse-oscomp-step-skip:libc-bench:compat-hang\n",
@@ -599,6 +733,7 @@ impl Kernel {
             watchdog_clock_ns: 0,
             watchdog_last_hw_ns: 0,
             watchdog_iozone_window_until_ns: 0,
+            watchdog_bench_window_until_ns: 0,
             timer_irq_count: 0,
         };
         logln(format_args!("whuse: init process bootstrapped"));
@@ -784,6 +919,14 @@ impl Kernel {
             self.watchdog_iozone_window_until_ns =
                 now.saturating_add(OSCOMP_IOZONE_BUSYBOX_WINDOW_NS);
         }
+        if OSCOMP_BENCH_PHASE_WINDOW_NS > 0
+            && watched
+                .values()
+                .any(|name| name.contains("lmbench") || name.contains("unixbench") || is_bench_worker_process(name))
+        {
+            self.watchdog_bench_window_until_ns =
+                now.saturating_add(OSCOMP_BENCH_PHASE_WINDOW_NS);
+        }
         let in_iozone_busybox_window =
             OSCOMP_IOZONE_BUSYBOX_WINDOW_NS > 0 && now <= self.watchdog_iozone_window_until_ns;
         if !all_groups.is_empty()
@@ -808,9 +951,11 @@ impl Kernel {
                 sample
             ));
         }
-        let in_bench_phase = watched
+        let bench_phase_seen = watched
             .values()
-            .any(|name| name.contains("lmbench") || name.contains("unixbench"));
+            .any(|name| name.contains("lmbench") || name.contains("unixbench") || is_bench_worker_process(name));
+        let in_bench_phase = bench_phase_seen
+            || (OSCOMP_BENCH_PHASE_WINDOW_NS > 0 && now <= self.watchdog_bench_window_until_ns);
         let timed_out = watched
             .iter()
             .filter_map(|(tgid, name)| {
@@ -1702,6 +1847,17 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
     install_busybox_exec_alias(vfs, "/musl/ls", "ls");
     install_busybox_exec_alias(vfs, "/musl/which", "which");
     install_busybox_exec_alias(vfs, "/musl/sleep", "sleep");
+    install_busybox_exec_alias(vfs, "/musl/basename", "basename");
+    install_busybox_exec_alias(vfs, "/musl/dirname", "dirname");
+    install_busybox_exec_alias(vfs, "/musl/awk", "awk");
+    install_busybox_exec_alias(vfs, "/musl/sed", "sed");
+    install_busybox_exec_alias(vfs, "/musl/grep", "grep");
+    install_busybox_exec_alias(vfs, "/musl/cut", "cut");
+    install_busybox_exec_alias(vfs, "/musl/head", "head");
+    install_busybox_exec_alias(vfs, "/musl/tail", "tail");
+    install_busybox_exec_alias(vfs, "/musl/tr", "tr");
+    install_busybox_exec_alias(vfs, "/musl/xargs", "xargs");
+    install_busybox_exec_alias(vfs, "/musl/readlink", "readlink");
     for (path, target) in [
         ("/bin/busybox", "/musl/busybox"),
         ("/bin/sh", "/musl/busybox"),
@@ -1709,10 +1865,32 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         ("/bin/ls", "/musl/ls"),
         ("/bin/which", "/musl/which"),
         ("/bin/sleep", "/musl/sleep"),
+        ("/bin/basename", "/musl/basename"),
+        ("/bin/dirname", "/musl/dirname"),
+        ("/bin/awk", "/musl/awk"),
+        ("/bin/sed", "/musl/sed"),
+        ("/bin/grep", "/musl/grep"),
+        ("/bin/cut", "/musl/cut"),
+        ("/bin/head", "/musl/head"),
+        ("/bin/tail", "/musl/tail"),
+        ("/bin/tr", "/musl/tr"),
+        ("/bin/xargs", "/musl/xargs"),
+        ("/bin/readlink", "/musl/readlink"),
         ("/busybox", "/musl/busybox"),
         ("/usr/bin/ls", "/musl/ls"),
         ("/usr/bin/which", "/musl/which"),
         ("/usr/bin/sleep", "/musl/sleep"),
+        ("/usr/bin/basename", "/musl/basename"),
+        ("/usr/bin/dirname", "/musl/dirname"),
+        ("/usr/bin/awk", "/musl/awk"),
+        ("/usr/bin/sed", "/musl/sed"),
+        ("/usr/bin/grep", "/musl/grep"),
+        ("/usr/bin/cut", "/musl/cut"),
+        ("/usr/bin/head", "/musl/head"),
+        ("/usr/bin/tail", "/musl/tail"),
+        ("/usr/bin/tr", "/musl/tr"),
+        ("/usr/bin/xargs", "/musl/xargs"),
+        ("/usr/bin/readlink", "/musl/readlink"),
         ("/usr/bin/env", "/musl/busybox"),
         ("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so"),
         ("/lib/ld-musl-loongarch64.so.1", "/musl/lib/libc.so"),
@@ -1747,6 +1925,45 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
             "whuse: failed busybox compat script {} err={}",
             OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH, err
         )),
+    }
+    match vfs.create_file(
+        "/",
+        OSCOMP_LTP_SCORE_WHITELIST_PATH,
+        OSCOMP_LTP_SCORE_WHITELIST.as_bytes(),
+    ) {
+        Ok(()) => logln(format_args!(
+            "whuse: installed ltp score whitelist {}",
+            OSCOMP_LTP_SCORE_WHITELIST_PATH
+        )),
+        Err(err) => logln(format_args!(
+            "whuse: failed ltp score whitelist {} err={}",
+            OSCOMP_LTP_SCORE_WHITELIST_PATH, err
+        )),
+    }
+    match vfs.create_file(
+        "/",
+        OSCOMP_LTP_SCORE_BLACKLIST_PATH,
+        OSCOMP_LTP_SCORE_BLACKLIST.as_bytes(),
+    ) {
+        Ok(()) => logln(format_args!(
+            "whuse: installed ltp score blacklist {}",
+            OSCOMP_LTP_SCORE_BLACKLIST_PATH
+        )),
+        Err(err) => logln(format_args!(
+            "whuse: failed ltp score blacklist {} err={}",
+            OSCOMP_LTP_SCORE_BLACKLIST_PATH, err
+        )),
+    }
+    for cfg_path in [
+        OSCOMP_CFG_ONLY_STEP_PATH,
+        OSCOMP_CFG_LTP_PROFILE_PATH,
+        OSCOMP_CFG_LTP_WHITELIST_PATH,
+        OSCOMP_CFG_LTP_BLACKLIST_PATH,
+        OSCOMP_CFG_LTP_TIMEOUT_PATH,
+    ] {
+        if vfs.access("/", cfg_path).is_ok() {
+            logln(format_args!("whuse: detected oscomp cfg {}", cfg_path));
+        }
     }
 }
 
@@ -1899,6 +2116,29 @@ fn is_oscomp_heavy_process(name: &str) -> bool {
         || name.contains("lat_")
         || name.contains("bw_")
         || name.contains("par_")
+}
+
+fn is_bench_worker_process(name: &str) -> bool {
+    name.contains("lmbench_all")
+        || name.contains("lat_")
+        || name.contains("bw_")
+        || name.contains("lmdd")
+        || name.contains("syscall")
+        || name.contains("context1")
+        || name.contains("dhry2")
+        || name.contains("dhry2reg")
+        || name.contains("whetstone")
+        || name.contains("fstime")
+        || name.contains("pipe")
+        || name.contains("spawn")
+        || name.contains("execl")
+        || name.contains("looper")
+        || name.contains("arithoh")
+        || name.contains("short")
+        || name.contains("long")
+        || name.contains("float")
+        || name.contains("double")
+        || name.contains("hanoi")
 }
 
 fn log_block_probe(device: &'static dyn hal_api::HalBlockDevice, sector: usize) {

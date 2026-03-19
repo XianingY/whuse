@@ -1,0 +1,10 @@
+[package]
+name = "hal-virtio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fdt.workspace = true
+spin.workspace = true
+virtio-drivers.workspace = true

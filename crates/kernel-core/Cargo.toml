@@ -1,0 +1,16 @@
+[package]
+name = "kernel-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+fs-ext4 = { path = "../fs-ext4" }
+hal-api = { path = "../hal-api" }
+mm = { path = "../mm" }
+proc = { path = "../proc" }
+syscall = { path = "../syscall" }
+task = { path = "../task" }
+user-init = { path = "../user-init" }
+vfs = { path = "../vfs" }

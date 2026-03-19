@@ -1,0 +1,11 @@
+[package]
+name = "hal-riscv64-virt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hal-api = { path = "../hal-api" }
+hal-virtio = { path = "../hal-virtio" }
+spin.workspace = true
+virtio-drivers.workspace = true

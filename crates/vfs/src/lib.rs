@@ -27,9 +27,12 @@ const EAGAIN: i32 = 11;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
+const ENOSPC: i32 = 28;
+const ENOMEM: i32 = 12;
 const EPIPE: i32 = 32;
 const EROFS: i32 = 30;
 const ENOTEMPTY: i32 = 39;
+const INMEM_FILE_SIZE_LIMIT: usize = 64 * 1024 * 1024;
 
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
@@ -672,7 +675,7 @@ impl KernelVfs {
     pub fn truncate(&mut self, handle: &mut FileHandle, len: usize) -> KernelResult<()> {
         match &mut *handle.node.data.lock() {
             NodeData::File(buf) | NodeData::ProcFile(buf) => {
-                buf.resize(len, 0);
+                ensure_file_size(buf, len)?;
                 handle.offset = handle.offset.min(len);
                 Ok(())
             }
@@ -711,9 +714,7 @@ impl KernelVfs {
         match &mut *handle.node.data.lock() {
             NodeData::File(buf) | NodeData::ProcFile(buf) => {
                 let size = offset.saturating_add(len);
-                if buf.len() < size {
-                    buf.resize(size, 0);
-                }
+                ensure_file_size(buf, size)?;
                 Ok(())
             }
             NodeData::Ext4File(_) | NodeData::Ext4Dir(_) => Err(EROFS),
@@ -1542,10 +1543,11 @@ impl KernelObject for FileHandle {
             NodeData::Directory(_) => Err(EISDIR),
             NodeData::File(buf) | NodeData::ProcFile(buf) => {
                 if self.offset > buf.len() {
-                    buf.resize(self.offset, 0);
+                    ensure_file_size(buf, self.offset)?;
                 }
-                if self.offset + data.len() > buf.len() {
-                    buf.resize(self.offset + data.len(), 0);
+                let end = self.offset.saturating_add(data.len());
+                if end > buf.len() {
+                    ensure_file_size(buf, end)?;
                 }
                 buf[self.offset..self.offset + data.len()].copy_from_slice(data);
                 self.offset += data.len();
@@ -1760,6 +1762,19 @@ impl Node {
             data: Mutex::new(NodeData::PidFd(pid)),
         }
     }
+}
+
+fn ensure_file_size(buf: &mut Vec<u8>, size: usize) -> KernelResult<()> {
+    if size <= buf.len() {
+        return Ok(());
+    }
+    if size > INMEM_FILE_SIZE_LIMIT {
+        return Err(ENOSPC);
+    }
+    let additional = size - buf.len();
+    buf.try_reserve_exact(additional).map_err(|_| ENOMEM)?;
+    buf.resize(size, 0);
+    Ok(())
 }
 
 fn normalize_path(cwd: &str, path: &str) -> String {

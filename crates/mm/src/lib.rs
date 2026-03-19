@@ -223,7 +223,10 @@ impl AddressSpace {
                 break start;
             }
         };
-        self.map_owned(start, vec![0; aligned], prot)?;
+        let mut zeros = Vec::new();
+        zeros.try_reserve_exact(aligned).map_err(|_| ENOMEM)?;
+        zeros.resize(aligned, 0);
+        self.map_owned(start, zeros, prot)?;
         Ok(start)
     }
 
@@ -255,7 +258,9 @@ impl AddressSpace {
         if mem_len == 0 || bytes.len() > mem_len {
             return Err(EINVAL);
         }
-        let mut buffer = vec![0; mem_len];
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(mem_len).map_err(|_| ENOMEM)?;
+        buffer.resize(mem_len, 0);
         buffer[..bytes.len()].copy_from_slice(bytes);
         self.map_owned(addr, buffer, prot)
     }
@@ -373,12 +378,16 @@ impl AddressSpace {
         }
         let inner = self.inner.lock();
         let mut out = Vec::new();
+        out.try_reserve(len).map_err(|_| ENOMEM)?;
         let mut cursor = addr;
         let mut remaining = len;
         while remaining > 0 {
             let (segment, offset) = find_segment(&inner.mappings, cursor, 1)?;
             let available = segment.area.len.saturating_sub(offset);
             let take = available.min(remaining);
+            if take == 0 {
+                return Err(EFAULT);
+            }
             match &segment.storage {
                 SegmentStorage::Owned { ptr, .. } => unsafe {
                     out.extend_from_slice(core::slice::from_raw_parts(
@@ -572,8 +581,21 @@ impl AddressSpace {
             if data_end > image.len() {
                 return Err(ENOEXEC);
             }
-            let bytes = &image[ph.offset..data_end];
-            self.map_fixed_bytes(ph.vaddr, bytes, ph.mem_size, elf_flags_to_prot(ph.flags))?;
+            let seg_start = align_down(ph.vaddr, PAGE_SIZE);
+            let page_offset = ph.vaddr - seg_start;
+            let seg_mem_len = page_offset.checked_add(ph.mem_size).ok_or(ENOEXEC)?;
+            let mut seg_bytes = Vec::new();
+            seg_bytes
+                .try_reserve_exact(page_offset + ph.file_size)
+                .map_err(|_| ENOMEM)?;
+            seg_bytes.resize(page_offset, 0);
+            seg_bytes.extend_from_slice(&image[ph.offset..data_end]);
+            self.map_fixed_bytes(
+                seg_start,
+                &seg_bytes,
+                seg_mem_len,
+                elf_flags_to_prot(ph.flags),
+            )?;
             let seg_end = ph.vaddr.checked_add(ph.mem_size).ok_or(ENOEXEC)?;
             highest_end = highest_end.max(align_up(seg_end, PAGE_SIZE));
             load_segments += 1;

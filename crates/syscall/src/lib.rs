@@ -3291,6 +3291,10 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let dirfd = args.0[0] as i32;
         let flags = args.0[4];
+        let allowed_flags = AT_EMPTY_PATH_FLAG | AT_SYMLINK_NOFOLLOW_FLAG;
+        if (flags & !allowed_flags) != 0 {
+            return Err(EINVAL);
+        }
         let path_ptr = args.0[1];
         let path = read_at_path_allow_empty(procs.current()?, path_ptr, flags)?;
         let _owner = args.0[2];
@@ -4205,6 +4209,7 @@ fn resolve_at_cwd(
 }
 
 const AT_EMPTY_PATH_FLAG: usize = 0x1000;
+const AT_SYMLINK_NOFOLLOW_FLAG: usize = 0x100;
 
 fn read_at_path_allow_empty(
     process: &proc::Process,

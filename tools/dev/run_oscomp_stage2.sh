@@ -16,6 +16,7 @@ export WHUSE_STAGE2_USE_IMAGE_COPY="${WHUSE_STAGE2_USE_IMAGE_COPY:-0}"
 export WHUSE_STAGE2_STOP_ON_SUITE_DONE="${WHUSE_STAGE2_STOP_ON_SUITE_DONE:-1}"
 export WHUSE_STAGE2_ONLY_STEP="${WHUSE_STAGE2_ONLY_STEP:-}"
 export WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE:-score}"
+export WHUSE_LTP_STEP_TIMEOUT="${WHUSE_LTP_STEP_TIMEOUT:-1800}"
 WHUSE_STAGE2_IMAGE_POLICY="${WHUSE_STAGE2_IMAGE_POLICY:-auto}"
 
 RV_IMG="${REPO_ROOT}/target/oscomp/sdcard-rv.img"
@@ -294,17 +295,45 @@ run_ltp_riscv() {
     local log="/tmp/rv-ltp-stage2-${TS}.log"
     local text_log="/tmp/rv-ltp-stage2-${TS}.strings.log"
     local runtime_image
+    local suite_done_seen=0
+    local terminated_by_suite_done=0
     local saved_use_copy="${WHUSE_STAGE2_USE_IMAGE_COPY}"
     WHUSE_STAGE2_USE_IMAGE_COPY=1
     runtime_image="$(prepare_runtime_image "rv" "${RV_IMG}")"
     WHUSE_STAGE2_USE_IMAGE_COPY="${saved_use_copy}"
     inject_ltp_runtime_config "${runtime_image}"
 
-    echo "[rv-ltp] running ltp-only, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, profile=${WHUSE_LTP_PROFILE}"
-    timeout "${TIMEOUT_SECS}s" env \
-        WHUSE_DISK_IMAGE="${runtime_image}" \
-        WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE}" \
-        "${XTASK_CMD[@]}" qemu-riscv >"${log}" 2>&1 || true
+    echo "[rv-ltp] running ltp-only, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, profile=${WHUSE_LTP_PROFILE}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"
+    if [[ "${WHUSE_STAGE2_STOP_ON_SUITE_DONE}" == "1" ]]; then
+        local runner_pid
+        setsid timeout "${TIMEOUT_SECS}s" env \
+            WHUSE_DISK_IMAGE="${runtime_image}" \
+            WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE}" \
+            "${XTASK_CMD[@]}" qemu-riscv >"${log}" 2>&1 &
+        runner_pid=$!
+        while kill -0 "${runner_pid}" 2>/dev/null; do
+            if [[ -f "${log}" ]] && grep -a -q "whuse-oscomp-suite-done" "${log}"; then
+                suite_done_seen=1
+                terminated_by_suite_done=1
+                kill -TERM -- "-${runner_pid}" 2>/dev/null || true
+                for _ in $(seq 1 10); do
+                    if ! kill -0 "${runner_pid}" 2>/dev/null; then
+                        break
+                    fi
+                    sleep 1
+                done
+                kill -KILL -- "-${runner_pid}" 2>/dev/null || true
+                break
+            fi
+            sleep 2
+        done
+        wait "${runner_pid}" 2>/dev/null || true
+    else
+        timeout "${TIMEOUT_SECS}s" env \
+            WHUSE_DISK_IMAGE="${runtime_image}" \
+            WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE}" \
+            "${XTASK_CMD[@]}" qemu-riscv >"${log}" 2>&1 || true
+    fi
 
     strings "${log}" >"${text_log}" || true
     echo "[rv-ltp] log: ${log}"
@@ -335,7 +364,10 @@ run_ltp_riscv() {
     tbrok="$(count_matches "TBROK" "${text_log}")"
     tconf="$(count_matches "TCONF" "${text_log}")"
     timeout_count="$(count_matches "whuse-oscomp-step-timeout:ltp_testcode.sh" "${text_log}")"
-    echo "[rv-ltp] summary: TPASS=${tpass} TFAIL=${tfail} TBROK=${tbrok} TCONF=${tconf} step-timeout=${timeout_count}"
+    if [[ "${suite_done_seen}" == "0" ]] && rg -q "whuse-oscomp-suite-done" "${text_log}"; then
+        suite_done_seen=1
+    fi
+    echo "[rv-ltp] summary: TPASS=${tpass} TFAIL=${tfail} TBROK=${tbrok} TCONF=${tconf} step-timeout=${timeout_count} suite_done_seen=${suite_done_seen} terminated_by_suite_done=${terminated_by_suite_done}"
     rg "whuse-oscomp-step-(begin|end|timeout|skip):ltp_testcode.sh|whuse-oscomp-suite-done|whuse-ltp-skip-case:" "${text_log}" || true
     return "${ok}"
 }

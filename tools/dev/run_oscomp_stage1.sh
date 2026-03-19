@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+XTASK_CMD=(cargo run --manifest-path "${REPO_ROOT}/tools/xtask/Cargo.toml" --)
 
 MODE="${1:-both}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-3600}"
@@ -241,7 +242,7 @@ run_xtask_with_timeout() {
 
 	start_ts="$(date +%s)"
 	deadline=$((start_ts + TIMEOUT_SECS))
-	setsid env WHUSE_DISK_IMAGE="${runtime_image}" cargo xtask "${xtask_cmd}" >"${log}" 2>&1 &
+	setsid env WHUSE_DISK_IMAGE="${runtime_image}" "${XTASK_CMD[@]}" "${xtask_cmd}" >"${log}" 2>&1 &
 	local runner_pid=$!
 	local runner_pgid="${runner_pid}"
 	active_run_pid="${runner_pid}"
@@ -504,7 +505,7 @@ else
 	echo "building/checking workspace..."
 	make check
 	echo "preparing oscomp images..."
-	cargo xtask oscomp-images
+	"${XTASK_CMD[@]}" oscomp-images
 fi
 
 case "${MODE}" in

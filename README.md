@@ -23,6 +23,17 @@ Current measured QEMU in the contest image is `10.0.2` for both
 To avoid rustup rolling updates during contest compile, this repository pins
 Rust to `1.94.0` with `profile = "minimal"` in
 `rust-toolchain.toml` instead of using floating `stable`.
+
+## Xtask Invocation Policy (Contest-Safe)
+
+Contest builds must not depend on Cargo alias loading from `.cargo/config.toml`.
+This repository's build scripts call xtask explicitly via:
+
+```bash
+cargo run --manifest-path tools/xtask/Cargo.toml -- <command>
+```
+
+`make` targets already use this explicit form internally.
 ## Workspace layout
 
 - `crates/hal-api`: shared HAL traits and global registration

@@ -45,7 +45,11 @@ export REPO_ROOT="$(pwd)"
 export TESTSUITS_DIR="${WHUSE_OSCOMP_TESTSUITS_DIR:-$(dirname "$REPO_ROOT")/testsuits-for-oskernel}"
 export RV_IMG="$REPO_ROOT/target/oscomp/sdcard-rv.img"
 export LA_IMG="$REPO_ROOT/target/oscomp/sdcard-la.img"
+export XTASK="cargo run --manifest-path $REPO_ROOT/tools/xtask/Cargo.toml --"
 ```
+
+Contest-safe rule: do not rely on `cargo xtask` alias resolution. Prefer
+`make ...` targets or explicit `${XTASK} <cmd>`.
 
 Key runtime env vars:
 
@@ -74,7 +78,7 @@ make contest-selfcheck
 ### 3.2 Prepare SD-card images (dual-arch)
 
 ```bash
-cargo xtask oscomp-images
+${XTASK} oscomp-images
 ```
 
 Expected output image paths:
@@ -85,8 +89,8 @@ Expected output image paths:
 ### 3.3 Run full suite (RISC-V / LoongArch)
 
 ```bash
-timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$RV_IMG" cargo xtask oscomp-riscv > /tmp/rv-full.log 2>&1
-timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$LA_IMG" cargo xtask oscomp-loongarch > /tmp/la-full.log 2>&1
+timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$RV_IMG" ${XTASK} oscomp-riscv > /tmp/rv-full.log 2>&1
+timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$LA_IMG" ${XTASK} oscomp-loongarch > /tmp/la-full.log 2>&1
 ```
 
 LoongArch contest profile is `-kernel kernel-la` based. Bootrom/loader remains host-debug only.

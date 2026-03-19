@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+XTASK_CMD=(cargo run --manifest-path "${REPO_ROOT}/tools/xtask/Cargo.toml" --)
 
 MODE="${1:-riscv}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-3600}"
@@ -121,7 +122,7 @@ ensure_oscomp_images() {
     case "${WHUSE_STAGE2_IMAGE_POLICY}" in
     always)
         echo "image policy=always, rebuilding oscomp images"
-        cargo xtask oscomp-images
+        "${XTASK_CMD[@]}" oscomp-images
         ;;
     never)
         if (( needs_rebuild != 0 )); then
@@ -132,7 +133,7 @@ ensure_oscomp_images() {
     auto)
         if (( needs_rebuild != 0 )); then
             echo "image policy=auto, rebuilding oscomp images due to missing/incomplete image"
-            cargo xtask oscomp-images
+            "${XTASK_CMD[@]}" oscomp-images
         else
             echo "image policy=auto, using existing validated image(s)"
         fi
@@ -179,7 +180,7 @@ run_arch() {
     echo "[${arch}] running ${xtask_cmd}, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"
     if [[ "${WHUSE_STAGE2_STOP_ON_SUITE_DONE}" == "1" ]]; then
         local runner_pid
-        setsid timeout "${TIMEOUT_SECS}s" env WHUSE_DISK_IMAGE="${runtime_image}" cargo xtask "${xtask_cmd}" >"${log}" 2>&1 &
+        setsid timeout "${TIMEOUT_SECS}s" env WHUSE_DISK_IMAGE="${runtime_image}" "${XTASK_CMD[@]}" "${xtask_cmd}" >"${log}" 2>&1 &
         runner_pid=$!
         while kill -0 "${runner_pid}" 2>/dev/null; do
             if [[ -f "${log}" ]] && grep -a -q "whuse-oscomp-suite-done" "${log}"; then
@@ -201,7 +202,7 @@ run_arch() {
         done
         wait "${runner_pid}" || true
     else
-        timeout "${TIMEOUT_SECS}s" env WHUSE_DISK_IMAGE="${runtime_image}" cargo xtask "${xtask_cmd}" >"${log}" 2>&1 || true
+        timeout "${TIMEOUT_SECS}s" env WHUSE_DISK_IMAGE="${runtime_image}" "${XTASK_CMD[@]}" "${xtask_cmd}" >"${log}" 2>&1 || true
     fi
     strings "${log}" >"${text_log}" || true
     echo "[${arch}] log: ${log}"

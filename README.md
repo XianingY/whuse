@@ -123,6 +123,12 @@ its own baseline:
 - Any step previously ending with `:0` must not regress to non-zero.
 - Runtime regression tolerance is within `<=3%` jitter.
 
+## Branch Policy (Competition Submit)
+
+- `master` is the only development branch.
+- GitLab `main` is treated as a publish mirror for competition submissions.
+- Do not develop directly on `main`; sync `master -> main` only after validation.
+
 ## Competition Flow Notes
 
 - `make all` always produces `kernel-rv` and `kernel-la` at repository root.

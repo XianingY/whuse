@@ -15,8 +15,14 @@ fn main() {
         "chain-fast" => "chain-fast",
         _ => "real",
     };
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let default_real_phase = if target_arch == "loongarch64" {
+        "gate"
+    } else {
+        "full"
+    };
     let real_phase = match env::var("WHUSE_STAGE2_REAL_PHASE")
-        .unwrap_or_else(|_| String::from("full"))
+        .unwrap_or_else(|_| default_real_phase.to_string())
         .as_str()
     {
         "gate" => "gate",
@@ -34,6 +40,7 @@ fn main() {
         .as_str()
     {
         "time-test" => "time-test",
+        "basic" => "basic",
         "busybox" => "busybox",
         "iozone" => "iozone",
         "libctest" => "libctest",
@@ -43,10 +50,10 @@ fn main() {
         "unixbench" => "unixbench",
         "netperf" => "netperf",
         "iperf" => "iperf",
+        "ltp" => "ltp",
         "cyclic" => "cyclic",
         _ => "all",
     };
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let default_iozone_profile = if target_arch == "riscv64" {
         "full"
     } else {

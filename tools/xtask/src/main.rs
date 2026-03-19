@@ -56,6 +56,7 @@ fn main() -> ExitCode {
         "oscomp-images" => prepare_oscomp_images(),
         "oscomp-riscv" => oscomp_riscv(),
         "oscomp-loongarch" => oscomp_loongarch(),
+        "contest-selfcheck" => contest_selfcheck(),
         other => {
             eprintln!("unknown xtask command: {other}");
             ExitCode::from(2)
@@ -196,6 +197,19 @@ fn rootfs_image_path(arch: &str) -> PathBuf {
         .join("target")
         .join("rootfs")
         .join(format!("{arch}.ext4"))
+}
+
+fn package_kernel_artifact(source: &Path, output_name: &str) -> Result<PathBuf, String> {
+    let output = repo_root().join(output_name);
+    fs::copy(source, &output)
+        .map(|_| output.clone())
+        .map_err(|err| {
+            format!(
+                "failed to package kernel artifact {} -> {}: {err}",
+                source.display(),
+                output.display()
+            )
+        })
 }
 
 fn build_rootfs_image(arch: &str) -> ExitCode {
@@ -345,10 +359,22 @@ fn qemu_riscv_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> ExitC
         }
     }
 
-    let kernel = PathBuf::from("target")
+    let built_kernel = PathBuf::from("target")
         .join(RISCV_TARGET)
         .join("debug")
         .join(RISCV_PACKAGE);
+    let packaged_kernel = match package_kernel_artifact(&built_kernel, "kernel-rv") {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+    let kernel = if mode == QemuMode::Contest {
+        packaged_kernel
+    } else {
+        built_kernel
+    };
     let args = build_qemu_riscv_args(&kernel, disk.as_ref(), extra_disk.as_ref());
     let used_paths = collect_used_paths(&[Some(kernel.clone()), disk.clone(), extra_disk.clone()]);
     run_qemu("qemu-system-riscv64", &args, &used_paths, mode)
@@ -376,10 +402,6 @@ fn qemu_loongarch_mode(mode: QemuMode) -> ExitCode {
 }
 
 fn qemu_loongarch_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> ExitCode {
-    let bootrom_status = build_kernel(LOONGARCH_BOOTROM_PACKAGE, LOONGARCH_TARGET);
-    if bootrom_status != ExitCode::SUCCESS {
-        return bootrom_status;
-    }
     let build_status = build_kernel(LOONGARCH_PACKAGE, LOONGARCH_TARGET);
     if build_status != ExitCode::SUCCESS {
         return build_status;
@@ -400,6 +422,32 @@ fn qemu_loongarch_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> E
         }
     }
 
+    let kernel_elf = PathBuf::from("target")
+        .join(LOONGARCH_TARGET)
+        .join("debug")
+        .join(LOONGARCH_PACKAGE);
+    let packaged_kernel = match package_kernel_artifact(&kernel_elf, "kernel-la") {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+    if mode == QemuMode::Contest {
+        let args = build_qemu_loongarch_contest_args(
+            &packaged_kernel,
+            disk.as_ref(),
+            extra_disk.as_ref(),
+        );
+        let used_paths =
+            collect_used_paths(&[Some(packaged_kernel), disk.clone(), extra_disk.clone()]);
+        return run_qemu("qemu-system-loongarch64", &args, &used_paths, mode);
+    }
+
+    let bootrom_status = build_kernel(LOONGARCH_BOOTROM_PACKAGE, LOONGARCH_TARGET);
+    if bootrom_status != ExitCode::SUCCESS {
+        return bootrom_status;
+    }
     let bootrom_elf = PathBuf::from("target")
         .join(LOONGARCH_TARGET)
         .join("debug")
@@ -408,10 +456,6 @@ fn qemu_loongarch_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> E
         .join(LOONGARCH_TARGET)
         .join("debug")
         .join(format!("{LOONGARCH_BOOTROM_PACKAGE}.bin"));
-    let kernel_elf = PathBuf::from("target")
-        .join(LOONGARCH_TARGET)
-        .join("debug")
-        .join(LOONGARCH_PACKAGE);
     let kernel_bin = PathBuf::from("target")
         .join(LOONGARCH_TARGET)
         .join("debug")
@@ -425,7 +469,7 @@ fn qemu_loongarch_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> E
         return kernel_objcopy;
     }
 
-    let args = build_qemu_loongarch_args(
+    let args = build_qemu_loongarch_host_args(
         &bootrom_bin,
         &kernel_bin,
         disk.as_ref(),
@@ -481,7 +525,7 @@ fn build_qemu_riscv_args(
     args
 }
 
-fn build_qemu_loongarch_args(
+fn build_qemu_loongarch_host_args(
     bootrom_bin: &Path,
     kernel_bin: &Path,
     disk: Option<&PathBuf>,
@@ -529,6 +573,45 @@ fn build_qemu_loongarch_args(
     args.push("virtio-net-pci,netdev=net0".to_string());
     args.push("-netdev".to_string());
     args.push("user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555".to_string());
+    args
+}
+
+fn build_qemu_loongarch_contest_args(
+    kernel: &Path,
+    disk: Option<&PathBuf>,
+    extra_disk: Option<&PathBuf>,
+) -> Vec<String> {
+    let memory = env::var("WHUSE_QEMU_LOONGARCH_MEM").unwrap_or_else(|_| "1G".to_string());
+    let mut args = vec![
+        "-machine".to_string(),
+        "virt".to_string(),
+        "-kernel".to_string(),
+        kernel.display().to_string(),
+        "-m".to_string(),
+        memory,
+        "-nographic".to_string(),
+        "-smp".to_string(),
+        "1".to_string(),
+        "-no-reboot".to_string(),
+        "-rtc".to_string(),
+        "base=utc".to_string(),
+    ];
+    if let Some(disk) = disk {
+        args.push("-drive".to_string());
+        args.push(format!("file={},if=none,format=raw,id=x0", disk.display()));
+        args.push("-device".to_string());
+        args.push("virtio-blk-pci,drive=x0".to_string());
+    }
+    args.push("-device".to_string());
+    args.push("virtio-net-pci,netdev=net0".to_string());
+    args.push("-netdev".to_string());
+    args.push("user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555".to_string());
+    if let Some(extra) = extra_disk {
+        args.push("-drive".to_string());
+        args.push(format!("file={},if=none,format=raw,id=x1", extra.display()));
+        args.push("-device".to_string());
+        args.push("virtio-blk-pci,drive=x1".to_string());
+    }
     args
 }
 
@@ -730,6 +813,168 @@ fn prepare_oscomp_images() -> ExitCode {
         dst_la.display()
     );
     ExitCode::SUCCESS
+}
+
+fn contest_selfcheck() -> ExitCode {
+    let mut ok = true;
+    let root = repo_root();
+
+    let expected_artifacts = ["kernel-rv", "kernel-la"];
+    for artifact in expected_artifacts {
+        let path = root.join(artifact);
+        if path.exists() {
+            println!("contest-selfcheck: found artifact {}", path.display());
+        } else {
+            eprintln!(
+                "contest-selfcheck: missing artifact {} (run `make all` first)",
+                path.display()
+            );
+            ok = false;
+        }
+    }
+
+    let testsuits = testsuits_root();
+    if testsuits.exists() {
+        println!("contest-selfcheck: testsuits={}", testsuits.display());
+        if testsuits.join(".git").exists() {
+            if let Ok(branch) = git_output(&testsuits, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+                println!("contest-selfcheck: testsuits-branch={}", branch);
+                if branch.trim() != "pre-2025" {
+                    eprintln!(
+                        "contest-selfcheck: testsuits branch is {}, expected pre-2025",
+                        branch
+                    );
+                    ok = false;
+                }
+            }
+        }
+    } else {
+        eprintln!(
+            "contest-selfcheck: testsuits missing at {} (set WHUSE_OSCOMP_TESTSUITS_DIR)",
+            testsuits.display()
+        );
+        ok = false;
+    }
+
+    let contest_image =
+        env::var("WHUSE_OSCOMP_DOCKER_IMAGE").unwrap_or_else(|_| CONTEST_DOCKER_IMAGE.to_string());
+    match docker_qemu_version(&contest_image, "qemu-system-riscv64") {
+        Ok(version) => {
+            println!("contest-selfcheck: riscv-qemu={}", version);
+            if !version.contains("10.0.2") {
+                eprintln!("contest-selfcheck: expected qemu 10.0.2 in contest image");
+                ok = false;
+            }
+        }
+        Err(err) => {
+            eprintln!("contest-selfcheck: failed to probe riscv qemu version: {err}");
+            ok = false;
+        }
+    }
+    match docker_qemu_version(&contest_image, "qemu-system-loongarch64") {
+        Ok(version) => {
+            println!("contest-selfcheck: loongarch-qemu={}", version);
+            if !version.contains("10.0.2") {
+                eprintln!("contest-selfcheck: expected qemu 10.0.2 in contest image");
+                ok = false;
+            }
+        }
+        Err(err) => {
+            eprintln!("contest-selfcheck: failed to probe loongarch qemu version: {err}");
+            ok = false;
+        }
+    }
+
+    let rv_args = build_qemu_riscv_args(
+        Path::new("kernel-rv"),
+        Some(&PathBuf::from("sdcard-rv.img")),
+        Some(&PathBuf::from("disk.img")),
+    );
+    let rv_line = rv_args.join(" ");
+    println!("contest-selfcheck: riscv-args={}", rv_line);
+    if !line_contains_all(
+        &rv_line,
+        &[
+            "-machine virt",
+            "-kernel kernel-rv",
+            "-no-reboot",
+            "-rtc base=utc",
+            "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
+            "virtio-net-device,netdev=net",
+            "user,id=net",
+            "virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1",
+        ],
+    ) {
+        eprintln!("contest-selfcheck: riscv contest args drift from expected profile");
+        ok = false;
+    }
+
+    let la_args = build_qemu_loongarch_contest_args(
+        Path::new("kernel-la"),
+        Some(&PathBuf::from("sdcard-la.img")),
+        Some(&PathBuf::from("disk-la.img")),
+    );
+    let la_line = la_args.join(" ");
+    println!("contest-selfcheck: loongarch-args={}", la_line);
+    if !line_contains_all(
+        &la_line,
+        &[
+            "-kernel kernel-la",
+            "-no-reboot",
+            "-rtc base=utc",
+            "virtio-blk-pci,drive=x0",
+            "virtio-net-pci,netdev=net0",
+            "user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555",
+            "virtio-blk-pci,drive=x1",
+        ],
+    ) {
+        eprintln!("contest-selfcheck: loongarch contest args drift from expected profile");
+        ok = false;
+    }
+
+    if ok {
+        println!("contest-selfcheck: PASS");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("contest-selfcheck: FAIL");
+        ExitCode::from(1)
+    }
+}
+
+fn docker_qemu_version(image: &str, binary: &str) -> Result<String, String> {
+    let output = Command::new("docker")
+        .args(["run", "--rm", image, binary, "--version"])
+        .output()
+        .map_err(|err| format!("failed to execute docker run: {err}"))?;
+    if !output.status.success() {
+        return Err(format!("docker run exit code {:?}", output.status.code()));
+    }
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let line = text.lines().next().unwrap_or_default().trim().to_string();
+    if line.is_empty() {
+        return Err("empty version output".to_string());
+    }
+    Ok(line)
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .map_err(|err| format!("failed to execute git {:?}: {err}", args))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {:?} exit code {:?}",
+            args,
+            output.status.code()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn line_contains_all(line: &str, tokens: &[&str]) -> bool {
+    tokens.iter().all(|token| line.contains(token))
 }
 
 fn refresh_oscomp_image(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
@@ -1023,4 +1268,54 @@ fn detect_qemu_disk_holder(disk: &PathBuf) -> Option<(u32, String)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_qemu_loongarch_contest_args, build_qemu_riscv_args};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn riscv_contest_args_match_expected_profile() {
+        let args = build_qemu_riscv_args(
+            Path::new("kernel-rv"),
+            Some(&PathBuf::from("sdcard-rv.img")),
+            Some(&PathBuf::from("disk.img")),
+        )
+        .join(" ");
+        for token in [
+            "-machine virt",
+            "-kernel kernel-rv",
+            "-no-reboot",
+            "-rtc base=utc",
+            "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
+            "virtio-net-device,netdev=net",
+            "user,id=net",
+            "virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1",
+        ] {
+            assert!(args.contains(token), "missing token: {token}");
+        }
+    }
+
+    #[test]
+    fn loongarch_contest_args_match_expected_profile() {
+        let args = build_qemu_loongarch_contest_args(
+            Path::new("kernel-la"),
+            Some(&PathBuf::from("sdcard-la.img")),
+            Some(&PathBuf::from("disk-la.img")),
+        )
+        .join(" ");
+        for token in [
+            "-machine virt",
+            "-kernel kernel-la",
+            "-no-reboot",
+            "-rtc base=utc",
+            "virtio-blk-pci,drive=x0",
+            "virtio-net-pci,netdev=net0",
+            "user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555",
+            "virtio-blk-pci,drive=x1",
+        ] {
+            assert!(args.contains(token), "missing token: {token}");
+        }
+    }
 }

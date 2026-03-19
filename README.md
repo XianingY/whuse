@@ -6,6 +6,18 @@ self-contained workspace rooted in this repository.
 The project now tracks both `riscv64` and `loongarch64` with OSCOMP-oriented
 build and run entrypoints.
 
+## Competition Baseline (2026-01-04 Image)
+
+All primary validation in this repository is aligned to:
+
+- Contest image: `docker.educg.net/cg/os-contest:20260104`
+- Testsuits branch: `pre-2025`
+- Contest runner mode: `WHUSE_QEMU_MODE=contest`
+- Real flow mode: `WHUSE_OSCOMP_COMPAT=0`
+
+Current measured QEMU in the contest image is `10.0.2` for both
+`qemu-system-riscv64` and `qemu-system-loongarch64`.
+
 ## Workspace layout
 
 - `crates/hal-api`: shared HAL traits and global registration
@@ -39,6 +51,7 @@ make all
 make check
 make test
 make oscomp-images
+make contest-selfcheck
 ```
 
 ## Run Modes
@@ -47,6 +60,8 @@ make oscomp-images
 
 - `contest` (default for `oscomp-*`): run QEMU inside the contest docker image.
 - `host` (default for `qemu-*`): run QEMU directly on host tools.
+
+Competition scoring should use `contest` mode only.
 
 Environment controls:
 
@@ -64,6 +79,7 @@ Environment controls:
 ```bash
 make oscomp-riscv-contest
 make oscomp-loongarch-contest
+make contest-selfcheck
 ```
 
 Host quick mode:
@@ -81,3 +97,18 @@ its own baseline:
 - `step-begin/step-end` coverage must not regress.
 - Any step previously ending with `:0` must not regress to non-zero.
 - Runtime regression tolerance is within `<=3%` jitter.
+
+## Competition Flow Notes
+
+- `make all` always produces `kernel-rv` and `kernel-la` at repository root.
+- Contest LoongArch boot path uses `-kernel kernel-la` (not bootrom/loader).
+- Test execution is scan-driven: the kernel discovers `*_testcode.sh` from disk,
+  runs them serially, emits `step-begin/end/timeout/skip`, and prints
+  group `START/END` markers for scoring.
+
+| Item | Previous | Contest-aligned now |
+| --- | --- | --- |
+| LoongArch contest boot | bootrom + loader | direct `-kernel kernel-la` |
+| Testsuite execution | fixed built-in order | disk scan `*_testcode.sh` (serial) |
+| Default oscomp mode | implicit/mixed | explicit `contest` |
+| Baseline self-check | manual | `make contest-selfcheck` |

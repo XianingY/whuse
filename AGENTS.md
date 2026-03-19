@@ -33,6 +33,9 @@ docker run --rm docker.educg.net/cg/os-contest:20260104 qemu-system-riscv64 --ve
 docker run --rm docker.educg.net/cg/os-contest:20260104 qemu-system-loongarch64 --version
 ```
 
+Contest baseline in this repo follows the measured image output above
+(currently QEMU `10.0.2` on `os-contest:20260104`), not older document snapshots.
+
 ## 2) Variables and Conventions
 
 Use variables/relative paths only. Do not hardcode machine-private absolute paths.
@@ -65,6 +68,7 @@ make test
 make check
 make build-riscv
 make build-loongarch
+make contest-selfcheck
 ```
 
 ### 3.2 Prepare SD-card images (dual-arch)
@@ -84,6 +88,8 @@ Expected output image paths:
 timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$RV_IMG" cargo xtask oscomp-riscv > /tmp/rv-full.log 2>&1
 timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$LA_IMG" cargo xtask oscomp-loongarch > /tmp/la-full.log 2>&1
 ```
+
+LoongArch contest profile is `-kernel kernel-la` based. Bootrom/loader remains host-debug only.
 
 ### 3.4 Log extraction quick checks
 

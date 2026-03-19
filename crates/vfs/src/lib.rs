@@ -27,6 +27,7 @@ const EAGAIN: i32 = 11;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
+const EPIPE: i32 = 32;
 const EROFS: i32 = 30;
 const ENOTEMPTY: i32 = 39;
 
@@ -1555,6 +1556,12 @@ impl KernelObject for FileHandle {
                 if self.pipe_end == PipeEnd::Read {
                     return Err(EINVAL);
                 }
+                if data.is_empty() {
+                    return Ok(0);
+                }
+                if state.readers == 0 {
+                    return Err(EPIPE);
+                }
                 state.buf.extend(data.iter().copied());
                 Ok(data.len())
             }
@@ -1993,6 +2000,22 @@ mod tests {
             .open("/", "/tmp/object.txt", O_CREAT | O_RDWR, 0o644)
             .unwrap();
         assert_eq!(regular.object_kind(), ObjectKind::Regular);
+    }
+
+    #[test]
+    fn pipe_write_returns_epipe_after_last_reader_close() {
+        let mut vfs = KernelVfs::new();
+        let (_read_end, mut write_end) = vfs.create_pipe().unwrap();
+        drop(_read_end);
+        assert_eq!(vfs.write(&mut write_end, b"x"), Err(super::EPIPE));
+    }
+
+    #[test]
+    fn pipe_read_returns_eof_after_last_writer_close() {
+        let mut vfs = KernelVfs::new();
+        let (mut read_end, _write_end) = vfs.create_pipe().unwrap();
+        drop(_write_end);
+        assert_eq!(vfs.read(&mut read_end, 16).unwrap(), Vec::new());
     }
 
     #[test]

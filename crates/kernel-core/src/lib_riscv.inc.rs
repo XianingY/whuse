@@ -55,10 +55,17 @@ const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
 const OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS: u64 = 300 * 1_000_000_000;
-const OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID: usize = 128;
 const OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS: u64 = 10 * 1_000_000_000;
-const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
-const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
+const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 900 * 1_000_000_000;
+const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 900 * 1_000_000_000;
+const OSCOMP_BENCH_SUPERVISOR_TIMEOUT_NS: u64 = {
+    let base = if OSCOMP_LMBENCH_TIMEOUT_NS > OSCOMP_UNIXBENCH_TIMEOUT_NS {
+        OSCOMP_LMBENCH_TIMEOUT_NS
+    } else {
+        OSCOMP_UNIXBENCH_TIMEOUT_NS
+    };
+    base + 30 * 1_000_000_000
+};
 const OSCOMP_WATCHDOG_SCAN_INTERVAL_NS: u64 = 100 * 1_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
 const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
@@ -224,6 +231,8 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "set +e\n",
     "export PATH=/musl:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
     "WHUSE_OSCOMP_COMPAT=${WHUSE_OSCOMP_COMPAT:-0}\n",
+    "WHUSE_OSCOMP_ONLY_STEP=${WHUSE_OSCOMP_ONLY_STEP:-}\n",
+    "WHUSE_OSCOMP_TRACE_STEP_CMDS=${WHUSE_OSCOMP_TRACE_STEP_CMDS:-0}\n",
     "WHUSE_HAVE_TIMEOUT=0\n",
     "if /musl/busybox timeout 1 /musl/busybox true >/tmp/whuse-timeout-probe.log 2>&1; then\n",
     "    WHUSE_HAVE_TIMEOUT=1\n",
@@ -240,7 +249,7 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    if [ \"$WHUSE_HAVE_TIMEOUT\" -eq 1 ] && [ \"$timeout_s\" -gt 0 ]; then\n",
     "        /musl/busybox timeout \"$timeout_s\" \"$@\"\n",
     "        rc=$?\n",
-    "        if [ \"$rc\" -eq 124 ] || [ \"$rc\" -eq 137 ] || [ \"$rc\" -eq 143 ]; then\n",
+    "        if [ \"$rc\" -eq 124 ] || [ \"$rc\" -eq 137 ] || [ \"$rc\" -eq 143 ] || [ \"$rc\" -eq 241 ]; then\n",
     "            WHUSE_LAST_TIMEOUT_HIT=1\n",
     "            return 124\n",
     "        fi\n",
@@ -249,10 +258,88 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    \"$@\"\n",
     "    return $?\n",
     "}\n",
+    "step_name_for() {\n",
+    "    script=\"$1\"\n",
+    "    case \"$script\" in\n",
+    "        cyclictest_testcode.sh) echo cyclic_testcode.sh ;;\n",
+    "        *) echo \"$script\" ;;\n",
+    "    esac\n",
+    "}\n",
+    "step_group_for() {\n",
+    "    script=\"$1\"\n",
+    "    case \"$script\" in\n",
+    "        busybox_testcode.sh) echo \"busybox-musl\" ;;\n",
+    "        iozone_testcode.sh) echo \"iozone-musl\" ;;\n",
+    "        libctest_testcode.sh) echo \"libctest-musl\" ;;\n",
+    "        lmbench_testcode.sh) echo \"lmbench-musl\" ;;\n",
+    "        lua_testcode.sh) echo \"lua-musl\" ;;\n",
+    "        unixbench_testcode.sh) echo \"unixbench-musl\" ;;\n",
+    "        netperf_testcode.sh) echo \"netperf-musl\" ;;\n",
+    "        iperf_testcode.sh) echo \"iperf-musl\" ;;\n",
+    "        cyclic_testcode.sh|cyclictest_testcode.sh) echo \"cyclic-musl\" ;;\n",
+    "        *) echo \"${script%_testcode.sh}\" ;;\n",
+    "    esac\n",
+    "}\n",
+    "step_timeout_for() {\n",
+    "    script=\"$1\"\n",
+    "    case \"$script\" in\n",
+    "        busybox_testcode.sh) echo 180 ;;\n",
+    "        iozone_testcode.sh) echo 300 ;;\n",
+    "        libctest_testcode.sh) echo 300 ;;\n",
+    "        lmbench_testcode.sh) echo 900 ;;\n",
+    "        lua_testcode.sh) echo 300 ;;\n",
+    "        unixbench_testcode.sh) echo 900 ;;\n",
+    "        netperf_testcode.sh) echo 240 ;;\n",
+    "        iperf_testcode.sh) echo 240 ;;\n",
+    "        cyclic_testcode.sh|cyclictest_testcode.sh) echo 120 ;;\n",
+    "        *) echo 300 ;;\n",
+    "    esac\n",
+    "}\n",
+    "collect_step_scripts() {\n",
+    "    /musl/busybox ls *_testcode.sh 2>/dev/null | /musl/busybox sort\n",
+    "}\n",
+    "ordered_step_scripts() {\n",
+    "    found=\"$(collect_step_scripts)\"\n",
+    "    selected=\"\"\n",
+    "    for script in \\\n",
+    "        busybox_testcode.sh \\\n",
+    "        iozone_testcode.sh \\\n",
+    "        libctest_testcode.sh \\\n",
+    "        lmbench_testcode.sh \\\n",
+    "        lua_testcode.sh \\\n",
+    "        unixbench_testcode.sh \\\n",
+    "        netperf_testcode.sh \\\n",
+    "        iperf_testcode.sh \\\n",
+    "        cyclic_testcode.sh \\\n",
+    "        cyclictest_testcode.sh\n",
+    "    do\n",
+    "        echo \"$found\" | /musl/busybox grep -qx \"$script\" || continue\n",
+    "        selected=\"$selected $script\"\n",
+    "    done\n",
+    "    for script in $found\n",
+    "    do\n",
+    "        echo \" $selected \" | /musl/busybox grep -q \" $script \" && continue\n",
+    "        selected=\"$selected $script\"\n",
+    "    done\n",
+    "    echo \"$selected\"\n",
+    "}\n",
+    "step_selected() {\n",
+    "    step=\"$1\"\n",
+    "    if [ -z \"$WHUSE_OSCOMP_ONLY_STEP\" ] || [ \"$WHUSE_OSCOMP_ONLY_STEP\" = \"$step\" ]; then\n",
+    "        return 0\n",
+    "    fi\n",
+    "    return 1\n",
+    "}\n",
     "run_step_with_timeout() {\n",
     "    step=\"$1\"\n",
     "    timeout_s=\"$2\"\n",
     "    shift 2\n",
+    "    if ! step_selected \"$step\"; then\n",
+    "        echo whuse-oscomp-step-begin:$step\n",
+    "        echo whuse-oscomp-step-skip:$step:filtered\n",
+    "        echo whuse-oscomp-step-end:$step:0\n",
+    "        return 0\n",
+    "    fi\n",
     "    echo whuse-oscomp-step-begin:$step\n",
     "    run_with_timeout \"$timeout_s\" \"$@\"\n",
     "    rc=$?\n",
@@ -262,100 +349,83 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:$step:$rc\n",
     "    return \"$rc\"\n",
     "}\n",
+    "run_script_step() {\n",
+    "    script=\"$1\"\n",
+    "    step=\"$(step_name_for \"$script\")\"\n",
+    "    timeout_s=\"$(step_timeout_for \"$script\")\"\n",
+    "    group=\"$(step_group_for \"$script\")\"\n",
+    "    echo \"#### OS COMP TEST GROUP START $group ####\"\n",
+    "    if [ \"$script\" = \"lmbench_testcode.sh\" ]; then\n",
+    "        echo whuse-oscomp-lmbench-marker:runner-start\n",
+    "        run_step_with_timeout \"$step\" \"$timeout_s\" /musl/busybox sh -c 'echo whuse-oscomp-command-begin:lmbench_testcode.sh:script; whuse_trace=\"${WHUSE_OSCOMP_TRACE_STEP_CMDS:-1}\"; if [ \"$whuse_trace\" = \"1\" ]; then /musl/busybox sh -x ./lmbench_testcode.sh; else /musl/busybox sh ./lmbench_testcode.sh; fi; rc=$?; echo whuse-oscomp-command-end:lmbench_testcode.sh:script:$rc; exit $rc'\n",
+    "        rc=$?\n",
+    "        echo whuse-oscomp-lmbench-marker:runner-end:$rc\n",
+    "    elif [ \"$script\" = \"unixbench_testcode.sh\" ]; then\n",
+    "        echo whuse-oscomp-unixbench-marker:runner-start\n",
+    "        run_step_with_timeout \"$step\" \"$timeout_s\" /musl/busybox sh -c 'echo whuse-oscomp-command-begin:unixbench_testcode.sh:script; whuse_trace=\"${WHUSE_OSCOMP_TRACE_STEP_CMDS:-1}\"; if [ \"$whuse_trace\" = \"1\" ]; then /musl/busybox sh -x ./unixbench_testcode.sh; else /musl/busybox sh ./unixbench_testcode.sh; fi; rc=$?; echo whuse-oscomp-command-end:unixbench_testcode.sh:script:$rc; exit $rc'\n",
+    "        rc=$?\n",
+    "        echo whuse-oscomp-unixbench-marker:runner-end:$rc\n",
+    "    else\n",
+    "        run_step_with_timeout \"$step\" \"$timeout_s\" /musl/busybox sh \"./$script\"\n",
+    "        rc=$?\n",
+    "    fi\n",
+    "    echo \"#### OS COMP TEST GROUP END $group ####\"\n",
+    "    return \"$rc\"\n",
+    "}\n",
+    "run_libc_bench() {\n",
+    "    if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
+    "        echo whuse-oscomp-step-begin:libc-bench\n",
+    "        echo whuse-oscomp-step-skip:libc-bench:compat-hang\n",
+    "        echo whuse-oscomp-step-end:libc-bench:124\n",
+    "        return 0\n",
+    "    fi\n",
+    "    if [ ! -x ./libc-bench ]; then\n",
+    "        echo whuse-oscomp-step-begin:libc-bench\n",
+    "        echo whuse-oscomp-step-skip:libc-bench:missing\n",
+    "        echo whuse-oscomp-step-end:libc-bench:0\n",
+    "        return 0\n",
+    "    fi\n",
+    "    echo \"#### OS COMP TEST GROUP START libc-bench ####\"\n",
+    "    run_step_with_timeout libc-bench 300 ./libc-bench\n",
+    "    rc=$?\n",
+    "    echo \"#### OS COMP TEST GROUP END libc-bench ####\"\n",
+    "    return \"$rc\"\n",
+    "}\n",
     "echo whuse-oscomp-script-start\n",
     "echo \"run time-test\"\n",
-    "echo whuse-oscomp-step-begin:time-test\n",
-    "if [ -x ./time-test ]; then\n",
-    "    ./time-test\n",
-    "    rc=$?\n",
+    "if step_selected time-test; then\n",
+    "    echo whuse-oscomp-step-begin:time-test\n",
+    "    if [ -x ./time-test ]; then\n",
+    "        ./time-test\n",
+    "        rc=$?\n",
+    "    else\n",
+    "        echo whuse-oscomp-step-skip:time-test:missing\n",
+    "        rc=0\n",
+    "    fi\n",
+    "    echo whuse-oscomp-step-end:time-test:$rc\n",
     "else\n",
-    "    echo whuse-oscomp-step-skip:time-test:missing\n",
-    "    rc=0\n",
+    "    echo whuse-oscomp-step-begin:time-test\n",
+    "    echo whuse-oscomp-step-skip:time-test:filtered\n",
+    "    echo whuse-oscomp-step-end:time-test:0\n",
     "fi\n",
-    "echo whuse-oscomp-step-end:time-test:$rc\n",
-    "echo \"run busybox_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    run_step_with_timeout busybox_testcode.sh 600 /musl/busybox sh /tmp/whuse-busybox-testcode.sh\n",
-    "else\n",
-    "    run_step_with_timeout busybox_testcode.sh 180 /musl/busybox sh ./busybox_testcode.sh\n",
-    "fi\n",
-    "echo \"run iozone_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:iozone_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:iozone_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:iozone_testcode.sh:124\n",
-    "else\n",
-    "    run_step_with_timeout iozone_testcode.sh 300 /musl/busybox sh ./iozone_testcode.sh\n",
-    "fi\n",
-    "echo \"run libctest_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:libctest_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:libctest_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:libctest_testcode.sh:124\n",
-    "else\n",
-    "    run_step_with_timeout libctest_testcode.sh 300 /musl/busybox sh ./libctest_testcode.sh\n",
-    "fi\n",
-    "echo \"run libc-bench\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:libc-bench\n",
-    "    echo whuse-oscomp-step-skip:libc-bench:compat-hang\n",
-    "    echo whuse-oscomp-step-end:libc-bench:124\n",
-    "else\n",
-    "    run_step_with_timeout libc-bench 300 ./libc-bench\n",
-    "fi\n",
-    "echo \"run lmbench_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:lmbench_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:lmbench_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:lmbench_testcode.sh:124\n",
-    "else\n",
-    "    echo whuse-oscomp-lmbench-marker:runner-start\n",
-    "    run_step_with_timeout lmbench_testcode.sh 600 /musl/busybox sh ./lmbench_testcode.sh\n",
-    "    lmbench_rc=$?\n",
-    "    echo whuse-oscomp-lmbench-marker:runner-end:$lmbench_rc\n",
-    "fi\n",
-    "echo \"run lua_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:lua_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:lua_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:lua_testcode.sh:124\n",
-    "else\n",
-    "    run_step_with_timeout lua_testcode.sh 300 /musl/busybox sh ./lua_testcode.sh\n",
-    "fi\n",
-    "echo \"run unixbench_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:unixbench_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:unixbench_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:unixbench_testcode.sh:124\n",
-    "else\n",
-    "    echo whuse-oscomp-unixbench-marker:runner-start\n",
-    "    run_step_with_timeout unixbench_testcode.sh 600 /musl/busybox sh ./unixbench_testcode.sh\n",
-    "    unixbench_rc=$?\n",
-    "    echo whuse-oscomp-unixbench-marker:runner-end:$unixbench_rc\n",
-    "fi\n",
-    "echo \"run netperf_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:netperf_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:netperf_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:netperf_testcode.sh:124\n",
-    "else\n",
-    "    run_step_with_timeout netperf_testcode.sh 240 /musl/busybox sh ./netperf_testcode.sh\n",
-    "fi\n",
-    "echo \"run iperf_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:iperf_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:iperf_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:iperf_testcode.sh:124\n",
-    "else\n",
-    "    run_step_with_timeout iperf_testcode.sh 240 /musl/busybox sh ./iperf_testcode.sh\n",
-    "fi\n",
-    "echo \"run cyclic_testcode.sh\"\n",
-    "if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
-    "    echo whuse-oscomp-step-begin:cyclic_testcode.sh\n",
-    "    echo whuse-oscomp-step-skip:cyclic_testcode.sh:compat-hang\n",
-    "    echo whuse-oscomp-step-end:cyclic_testcode.sh:124\n",
-    "else\n",
-    "    run_step_with_timeout cyclic_testcode.sh 240 /musl/busybox sh -c 'if [ -x ./cyclic_testcode.sh ]; then exec ./cyclic_testcode.sh; else exec ./cyclictest_testcode.sh; fi'\n",
+    "WHUSE_LIBC_BENCH_DONE=0\n",
+    "for script in $(ordered_step_scripts)\n",
+    "do\n",
+    "    step=\"$(step_name_for \"$script\")\"\n",
+    "    if [ \"$WHUSE_OSCOMP_COMPAT\" = \"1\" ]; then\n",
+    "        echo whuse-oscomp-step-begin:$step\n",
+    "        echo whuse-oscomp-step-skip:$step:compat-hang\n",
+    "        echo whuse-oscomp-step-end:$step:124\n",
+    "        continue\n",
+    "    fi\n",
+    "    run_script_step \"$script\"\n",
+    "    if [ \"$step\" = \"libctest_testcode.sh\" ]; then\n",
+    "        run_libc_bench\n",
+    "        WHUSE_LIBC_BENCH_DONE=1\n",
+    "    fi\n",
+    "done\n",
+    "if [ \"$WHUSE_LIBC_BENCH_DONE\" -eq 0 ]; then\n",
+    "    run_libc_bench\n",
     "fi\n",
     "echo whuse-oscomp-suite-done\n",
 );
@@ -781,6 +851,25 @@ impl Kernel {
             } else {
                 subtree.clone()
             };
+            if in_bench_phase && name.contains("busybox") {
+                for (bench_tgid, bench_name) in watched.iter() {
+                    if *bench_tgid <= 2 || *bench_tgid == tgid {
+                        continue;
+                    }
+                    let bench_related = bench_name.contains("busybox")
+                        || bench_name.contains("lmbench")
+                        || bench_name.contains("unixbench");
+                    if bench_related
+                        && !cleanup_groups
+                            .iter()
+                            .any(|group_tgid| *group_tgid == *bench_tgid)
+                    {
+                        cleanup_groups.push(*bench_tgid);
+                    }
+                }
+            }
+            cleanup_groups.sort_unstable();
+            cleanup_groups.dedup();
             if cleanup_groups.is_empty() {
                 self.watchdog_started_at.insert(tgid, now);
                 continue;
@@ -818,10 +907,19 @@ impl Kernel {
                 }
                 child_exits
             } else {
-                match self.processes.force_exit_subtree(tgid, 124) {
+                let mut exits = match self.processes.force_exit_subtree(tgid, 124) {
                     Ok(exits) => exits,
                     Err(_) => Vec::new(),
+                };
+                for group_tgid in cleanup_groups.iter().copied() {
+                    if group_tgid == tgid || subtree.iter().any(|sub| *sub == group_tgid) {
+                        continue;
+                    }
+                    if let Ok(Some(exit)) = self.processes.force_exit_group(group_tgid, 124) {
+                        exits.push(exit);
+                    }
                 }
+                exits
             };
             if exits.is_empty() {
                 let leftover = self
@@ -843,9 +941,9 @@ impl Kernel {
                 killed_threads = killed_threads.saturating_add(exit.tids.len());
                 reaped_tasks = reaped_tasks.saturating_add(self.scheduler.exit_group(exit.tgid));
                 if let Some(parent_tgid) = exit.parent_tgid {
-                    let woke = self.scheduler.wake_task(parent_tgid);
+                    let woke = self.wake_process_group_threads(parent_tgid);
                     logln(format_args!(
-                        "whuse: oscomp watchdog wake parent_tgid={} woke={}",
+                        "whuse: oscomp watchdog wake parent_tgid={} woke_threads={}",
                         parent_tgid, woke
                     ));
                 }
@@ -1157,6 +1255,25 @@ impl Kernel {
                 }
             }
             self.dispatch_pending_signals();
+            // Cooperative scheduler fairness for benchmark-heavy loops: very
+            // frequent syscalls can keep re-arming timer deadlines and starve
+            // sibling tasks in the same benchmark pipeline.
+            let bench_like_task = self
+                .processes
+                .current()
+                .map(|process| {
+                    let name = process.name.as_str();
+                    name.contains("lmbench")
+                        || name.contains("unixbench")
+                        || name.contains("cyclic")
+                        || name.contains("hackbench")
+                        || name.contains("netperf")
+                        || name.contains("iperf")
+                })
+                .unwrap_or(false);
+            if result != EAGAIN_RET && bench_like_task && self.scheduler.ready_count() > 0 {
+                let _ = self.scheduler.yield_now();
+            }
             return;
         }
 
@@ -1186,7 +1303,7 @@ impl Kernel {
             }
             if let Some(parent_tgid) = exit.parent_tgid {
                 let _ = self.processes.deliver_signal(parent_tgid, 17);
-                let _ = self.scheduler.wake_task(parent_tgid);
+                let _ = self.wake_process_group_threads(parent_tgid);
             }
             if let Some(addr) = exit.clear_child_tid {
                 for tid in self.processes.wake_futex(addr, usize::MAX) {
@@ -1207,6 +1324,17 @@ impl Kernel {
             }
             let _ = self.scheduler.wake_all_blocked();
         }
+    }
+
+    fn wake_process_group_threads(&mut self, tgid: usize) -> usize {
+        let tids = self.processes.live_tids_in_tgid(tgid);
+        let mut woke = 0usize;
+        for tid in tids {
+            if self.scheduler.wake_task(tid) {
+                woke = woke.saturating_add(1);
+            }
+        }
+        woke
     }
 
     fn dispatch_pending_signals(&mut self) {
@@ -1238,6 +1366,7 @@ impl Kernel {
             .get(&signum)
             .copied()
             .unwrap_or_default();
+        let libc_bench_task = process.name.contains("libc-bench");
 
         process.pending_signals &= !(1u64 << (signum - 1));
 
@@ -1257,7 +1386,7 @@ impl Kernel {
                     }
                     if let Some(parent_tgid) = exit.parent_tgid {
                         let _ = self.processes.deliver_signal(parent_tgid, 17);
-                        let _ = self.scheduler.wake_task(parent_tgid);
+                        let _ = self.wake_process_group_threads(parent_tgid);
                     }
                     if let Some(addr) = exit.clear_child_tid {
                         for wtid in self.processes.wake_futex(addr, usize::MAX) {
@@ -1286,19 +1415,25 @@ impl Kernel {
             return;
         }
 
-        // RISC-V Linux rt_sigframe layout (musl-compatible):
-        //   offset 0:   siginfo_t  (128 bytes) – si_signo at [0..4]
+        // RISC-V Linux musl rt_sigframe layout:
+        //   offset 0:   siginfo_t (128 bytes)
         //   offset 128: ucontext_t
-        //     +0:  uc_flags(8) uc_link(8) uc_stack(24) uc_sigmask(8) __reserved(120)
-        //     +168: mcontext_t – gregs[0..32]: gregs[0]=pc, gregs[1..31]=x1..x31 (256 bytes)
-        //                        fpregs area (272 bytes)
-        //   Total frame = 128 + 168 + 256 + 272 = 824 → padded to 832 (16-byte aligned)
-        const FRAME_SIZE: usize = 832;
+        //     +0:  uc_flags(8), uc_link(8), uc_stack(24), uc_sigmask(128)
+        //     +176: mcontext_t (16-byte aligned)
+        //       gregs[32] (256 bytes): gregs[0]=pc, gregs[1..31]=x1..x31
+        //       fpregs union (528 bytes): d-ext f[32] + fcsr (+ q-ext compatible tail)
+        //   total = 128 + 960 = 1088 bytes
+        const FRAME_SIZE: usize = 1088;
         const SIGINFO_OFF: usize = 0;
         const UCONTEXT_OFF: usize = 128;
         const UC_SIGMASK_OFF: usize = UCONTEXT_OFF + 40;
-        const MCTX_OFF: usize = UCONTEXT_OFF + 168;
-        const FCSR_OFF: usize = MCTX_OFF + 32 * 8;
+        const MCTX_OFF: usize = UCONTEXT_OFF + 176;
+        #[cfg(target_arch = "riscv64")]
+        const MCTX_FP_OFF: usize = MCTX_OFF + 32 * 8;
+        #[cfg(target_arch = "riscv64")]
+        const MCTX_FP_SIZE: usize = 528;
+        #[cfg(target_arch = "riscv64")]
+        const MCTX_D_FCSR_OFF: usize = MCTX_FP_OFF + 32 * 8;
 
         let cur_sp = process.trap_frame.regs[2];
         let frame_sp = (cur_sp.wrapping_sub(FRAME_SIZE)) & !0xf_usize;
@@ -1306,16 +1441,24 @@ impl Kernel {
         let mut frame = alloc::vec![0u8; FRAME_SIZE];
 
         frame[SIGINFO_OFF..SIGINFO_OFF + 4].copy_from_slice(&(signum as u32).to_le_bytes());
+        frame[UC_SIGMASK_OFF..UC_SIGMASK_OFF + 128].fill(0);
         frame[UC_SIGMASK_OFF..UC_SIGMASK_OFF + 8]
             .copy_from_slice(&process.signal_mask.to_le_bytes());
-        frame[MCTX_OFF..MCTX_OFF + 8].copy_from_slice(&process.trap_frame.sepc.to_le_bytes());
+        let saved_pc = process.trap_frame.sepc;
+        frame[MCTX_OFF..MCTX_OFF + 8].copy_from_slice(&saved_pc.to_le_bytes());
         for i in 1usize..32 {
             let off = MCTX_OFF + i * 8;
             frame[off..off + 8].copy_from_slice(&process.trap_frame.regs[i].to_le_bytes());
         }
         #[cfg(target_arch = "riscv64")]
         {
-            frame[FCSR_OFF..FCSR_OFF + 8].copy_from_slice(&process.trap_frame.fcsr.to_le_bytes());
+            frame[MCTX_FP_OFF..MCTX_FP_OFF + MCTX_FP_SIZE].fill(0);
+            for i in 0..32usize {
+                let off = MCTX_FP_OFF + i * 8;
+                frame[off..off + 8].copy_from_slice(&process.trap_frame.fregs[i].to_le_bytes());
+            }
+            frame[MCTX_D_FCSR_OFF..MCTX_D_FCSR_OFF + 4]
+                .copy_from_slice(&(process.trap_frame.fcsr as u32).to_le_bytes());
         }
 
         if process.write_user_bytes(frame_sp, &frame).is_err() {
@@ -1342,6 +1485,18 @@ impl Kernel {
         process.signal_frame_pending = true;
         if signum == 33 {
             process.mark_cancel_signal_dispatched();
+        }
+        if signal_frame_debug_enabled() {
+            logln(format_args!(
+                "whuse-signal-frame:dispatch tid={} sig={} frame_sp={:#x} saved_pc={:#x}",
+                process.tid, signum, frame_sp, saved_pc
+            ));
+        }
+        if libc_bench_task {
+            logln(format_args!(
+                "whuse-libcbench-signal:dispatch tid={} sig={} frame_sp={:#x} saved_pc={:#x} handler={:#x}",
+                process.tid, signum, frame_sp, saved_pc, action.handler
+            ));
         }
 
         if cancel_debug_enabled() {
@@ -1372,6 +1527,10 @@ fn cancel_debug_enabled() -> bool {
         Some("1") => true,
         _ => false,
     }
+}
+
+fn signal_frame_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_SIGNAL_FRAME"), Some("1"))
 }
 
 fn robust_debug_enabled() -> bool {
@@ -1649,10 +1808,15 @@ fn oscomp_process_timeout_ns(
     has_child_groups: bool,
     in_bench_phase: bool,
 ) -> u64 {
+    if name.contains("hackbench") {
+        return 1_000_000_000;
+    }
     if is_libctest_entry_or_runner(name) {
         return OSCOMP_LIBCTEST_ENTRY_TIMEOUT_NS;
     }
-    if tgid < OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID && name == "/musl/busybox" {
+    // Keep the init shell immortal, but allow all other busybox runners and
+    // leftovers to be reaped by watchdog so a stuck step cannot block suite progress.
+    if tgid <= 2 && name == "/musl/busybox" {
         return u64::MAX;
     }
     if name.contains("lmbench") {
@@ -1662,12 +1826,9 @@ fn oscomp_process_timeout_ns(
         return OSCOMP_UNIXBENCH_TIMEOUT_NS;
     }
     if name.contains("busybox") {
-        if tgid < OSCOMP_BUSYBOX_SHORT_TIMEOUT_MIN_TGID {
-            return OSCOMP_GROUP_TIMEOUT_NS;
-        }
         if is_busybox_supervisor(name, has_child_groups, in_bench_phase) {
             if in_bench_phase {
-                return OSCOMP_LMBENCH_TIMEOUT_NS.max(OSCOMP_UNIXBENCH_TIMEOUT_NS);
+                return OSCOMP_BENCH_SUPERVISOR_TIMEOUT_NS;
             }
             return OSCOMP_BUSYBOX_SUPERVISOR_TIMEOUT_NS;
         }

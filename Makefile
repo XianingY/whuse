@@ -3,7 +3,7 @@
 	oscomp-riscv-host oscomp-loongarch-host oscomp-images parallel-setup \
 	stage1-riscv stage1-loongarch stage1-both stage2-riscv stage2-riscv-3x \
 	stage2-loongarch-chain stage2-loongarch-gate-smoke-120 stage2-loongarch-gate-300 \
-	stage2-loongarch-full-3600 qemu-clean-loongarch package-kernels
+	stage2-loongarch-full-3600 qemu-clean-loongarch package-kernels contest-selfcheck
 
 all: build-riscv build-loongarch package-kernels
 
@@ -36,10 +36,10 @@ qemu-loongarch:
 	cargo xtask qemu-loongarch
 
 oscomp-riscv:
-	cargo xtask oscomp-riscv
+	WHUSE_QEMU_MODE=contest cargo xtask oscomp-riscv
 
 oscomp-loongarch:
-	cargo xtask oscomp-loongarch
+	WHUSE_QEMU_MODE=contest cargo xtask oscomp-loongarch
 
 oscomp-riscv-contest:
 	WHUSE_QEMU_MODE=contest cargo xtask oscomp-riscv
@@ -55,6 +55,9 @@ oscomp-loongarch-host:
 
 oscomp-images:
 	cargo xtask oscomp-images
+
+contest-selfcheck:
+	cargo xtask contest-selfcheck
 
 parallel-setup:
 	tools/dev/setup_parallel_worktrees.sh

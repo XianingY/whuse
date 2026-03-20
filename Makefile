@@ -29,8 +29,8 @@ build-loongarch:
 	$(XTASK) build-loongarch
 
 package-kernels:
-	cp target/riscv64gc-unknown-none-elf/debug/whuse-riscv64-virt kernel-rv
-	cp target/loongarch64-unknown-none-softfloat/debug/whuse-loongarch64-virt kernel-la
+	@test -f kernel-rv
+	@test -f kernel-la
 
 qemu-riscv:
 	$(XTASK) qemu-riscv

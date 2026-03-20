@@ -16,11 +16,7 @@ fn main() {
         _ => "real",
     };
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let default_real_phase = if target_arch == "loongarch64" {
-        "gate"
-    } else {
-        "full"
-    };
+    let default_real_phase = "full";
     let real_phase = match env::var("WHUSE_STAGE2_REAL_PHASE")
         .unwrap_or_else(|_| default_real_phase.to_string())
         .as_str()

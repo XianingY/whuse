@@ -44,8 +44,8 @@ impl QemuMode {
 fn main() -> ExitCode {
     let command = env::args().nth(1).unwrap_or_else(|| "build".to_string());
     match command.as_str() {
-        "build" | "build-riscv" => build_kernel(RISCV_PACKAGE, RISCV_TARGET),
-        "build-loongarch" => build_kernel(LOONGARCH_PACKAGE, LOONGARCH_TARGET),
+        "build" | "build-riscv" => build_riscv_artifact(),
+        "build-loongarch" => build_loongarch_artifact(),
         "image-riscv" => build_rootfs_image("riscv64"),
         "image-loongarch" => build_rootfs_image("loongarch64"),
         "check" => cargo(&["check", "--workspace"]),
@@ -66,6 +66,48 @@ fn main() -> ExitCode {
 
 fn build_kernel(package: &str, target: &str) -> ExitCode {
     cargo(&["build", "-p", package, "--target", target])
+}
+
+fn build_riscv_artifact() -> ExitCode {
+    let status = build_kernel(RISCV_PACKAGE, RISCV_TARGET);
+    if status != ExitCode::SUCCESS {
+        return status;
+    }
+    let built_kernel = PathBuf::from("target")
+        .join(RISCV_TARGET)
+        .join("debug")
+        .join(RISCV_PACKAGE);
+    match package_riscv_kernel_artifact(&built_kernel, "kernel-rv") {
+        Ok(path) => {
+            println!("packaged RISC-V contest kernel {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn build_loongarch_artifact() -> ExitCode {
+    let status = build_kernel(LOONGARCH_PACKAGE, LOONGARCH_TARGET);
+    if status != ExitCode::SUCCESS {
+        return status;
+    }
+    let built_kernel = PathBuf::from("target")
+        .join(LOONGARCH_TARGET)
+        .join("debug")
+        .join(LOONGARCH_PACKAGE);
+    match package_kernel_artifact(&built_kernel, "kernel-la") {
+        Ok(path) => {
+            println!("packaged LoongArch contest kernel {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn objcopy_to_binary(input: &PathBuf, output: &PathBuf) -> ExitCode {
@@ -118,6 +160,27 @@ fn bundled_rust_objcopy() -> Option<PathBuf> {
 fn bundled_rustc_lib_dir() -> Option<PathBuf> {
     let lib_dir = rustc_sysroot()?.join("lib");
     lib_dir.exists().then_some(lib_dir)
+}
+
+fn rustc_binary() -> OsString {
+    env::var_os("RUSTC")
+        .or_else(|| {
+            rustc_sysroot().map(|sysroot| sysroot.join("bin").join("rustc").into_os_string())
+        })
+        .unwrap_or_else(|| "rustc".into())
+}
+
+fn bundled_rust_lld() -> Option<PathBuf> {
+    let sysroot = rustc_sysroot()?;
+    let rustlib = sysroot.join("lib").join("rustlib");
+    for entry in fs::read_dir(rustlib).ok()? {
+        let entry = entry.ok()?;
+        let lld = entry.path().join("bin").join("rust-lld");
+        if lld.exists() {
+            return Some(lld);
+        }
+    }
+    None
 }
 
 fn rustc_sysroot() -> Option<PathBuf> {
@@ -210,6 +273,121 @@ fn package_kernel_artifact(source: &Path, output_name: &str) -> Result<PathBuf, 
                 output.display()
             )
         })
+}
+
+fn package_riscv_kernel_artifact(source: &Path, output_name: &str) -> Result<PathBuf, String> {
+    let target_dir = repo_root().join("target").join("xtask").join("riscv-elf-wrap");
+    fs::create_dir_all(&target_dir)
+        .map_err(|err| format!("failed to create {}: {err}", target_dir.display()))?;
+
+    let raw_payload = target_dir.join(format!("{output_name}.raw"));
+    let raw_status = objcopy_to_binary(&source.to_path_buf(), &raw_payload);
+    if raw_status != ExitCode::SUCCESS {
+        return Err(format!(
+            "failed to extract raw riscv kernel payload {} -> {}",
+            source.display(),
+            raw_payload.display()
+        ));
+    }
+
+    let payload_path = fs::canonicalize(&raw_payload).map_err(|err| {
+        format!(
+            "failed to canonicalize RISC-V raw payload {}: {err}",
+            raw_payload.display()
+        )
+    })?;
+    let wrapper_rs = target_dir.join("payload.rs");
+    let wrapper_ld = target_dir.join("payload.ld");
+    let wrapper_obj = target_dir.join("payload.o");
+    let output = repo_root().join(output_name);
+
+    let escaped_payload = payload_path.to_string_lossy().replace('\\', "\\\\");
+    fs::write(
+        &wrapper_rs,
+        format!(
+            r##"#![no_std]
+#![no_main]
+
+use core::arch::global_asm;
+
+global_asm!(r#"
+    .section .payload, "ax"
+    .globl payload_start
+payload_start:
+    .incbin "{escaped_payload}"
+"#);
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {{
+    loop {{}}
+}}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn whuse_riscv_wrapper_anchor() {{}}
+"##
+        ),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", wrapper_rs.display()))?;
+    fs::write(
+        &wrapper_ld,
+        r#"OUTPUT_ARCH(riscv)
+ENTRY(payload_start)
+
+MEMORY {
+  RAM : ORIGIN = 0x80200000, LENGTH = 256M
+}
+
+SECTIONS {
+  . = ORIGIN(RAM);
+  .payload : ALIGN(4K) {
+    KEEP(*(.payload))
+  } > RAM
+}
+"#,
+    )
+    .map_err(|err| format!("failed to write {}: {err}", wrapper_ld.display()))?;
+
+    let rustc = rustc_binary();
+    let rustc_status = Command::new(rustc)
+        .args([
+            "--target",
+            RISCV_TARGET,
+            "--edition=2024",
+            "-C",
+            "panic=abort",
+            "--emit=obj",
+            "-o",
+        ])
+        .arg(&wrapper_obj)
+        .arg(&wrapper_rs)
+        .status()
+        .map_err(|err| format!("failed to execute rustc for riscv elf wrapper: {err}"))?;
+    if !rustc_status.success() {
+        return Err(format!(
+            "rustc failed while building riscv elf wrapper object (exit {:?})",
+            rustc_status.code()
+        ));
+    }
+
+    let Some(rust_lld) = bundled_rust_lld() else {
+        return Err("failed to locate bundled rust-lld".to_string());
+    };
+    let link_status = Command::new(rust_lld)
+        .args(["-flavor", "gnu", "-m", "elf64lriscv", "-T"])
+        .arg(&wrapper_ld)
+        .arg(&wrapper_obj)
+        .args(["-o"])
+        .arg(&output)
+        .status()
+        .map_err(|err| format!("failed to execute rust-lld for riscv elf wrapper: {err}"))?;
+    if !link_status.success() {
+        return Err(format!(
+            "rust-lld failed while linking riscv contest ELF wrapper (exit {:?})",
+            link_status.code()
+        ));
+    }
+
+    Ok(output)
 }
 
 fn build_rootfs_image(arch: &str) -> ExitCode {
@@ -363,18 +541,14 @@ fn qemu_riscv_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> ExitC
         .join(RISCV_TARGET)
         .join("debug")
         .join(RISCV_PACKAGE);
-    let packaged_kernel = match package_kernel_artifact(&built_kernel, "kernel-rv") {
+    let packaged_kernel = match package_riscv_kernel_artifact(&built_kernel, "kernel-rv") {
         Ok(path) => path,
         Err(err) => {
             eprintln!("{err}");
             return ExitCode::from(1);
         }
     };
-    let kernel = if mode == QemuMode::Contest {
-        packaged_kernel
-    } else {
-        built_kernel
-    };
+    let kernel = packaged_kernel;
     let args = build_qemu_riscv_args(&kernel, disk.as_ref(), extra_disk.as_ref());
     let used_paths = collect_used_paths(&[Some(kernel.clone()), disk.clone(), extra_disk.clone()]);
     run_qemu("qemu-system-riscv64", &args, &used_paths, mode)
@@ -824,6 +998,17 @@ fn contest_selfcheck() -> ExitCode {
         let path = root.join(artifact);
         if path.exists() {
             println!("contest-selfcheck: found artifact {}", path.display());
+            if artifact == "kernel-rv" {
+                if is_elf_artifact(&path, 0xf3) {
+                    println!("contest-selfcheck: kernel-rv-format=elf");
+                } else {
+                    eprintln!(
+                        "contest-selfcheck: kernel-rv must be an ELF RISC-V artifact, got {}",
+                        path.display()
+                    );
+                    ok = false;
+                }
+            }
         } else {
             eprintln!(
                 "contest-selfcheck: missing artifact {} (run `make all` first)",
@@ -861,8 +1046,8 @@ fn contest_selfcheck() -> ExitCode {
     match docker_qemu_version(&contest_image, "qemu-system-riscv64") {
         Ok(version) => {
             println!("contest-selfcheck: riscv-qemu={}", version);
-            if !version.contains("10.0.2") {
-                eprintln!("contest-selfcheck: expected qemu 10.0.2 in contest image");
+            if !contest_qemu_version_supported(&version) {
+                eprintln!("contest-selfcheck: expected qemu 9.2.1 or 10.0.2 in contest image");
                 ok = false;
             }
         }
@@ -874,8 +1059,8 @@ fn contest_selfcheck() -> ExitCode {
     match docker_qemu_version(&contest_image, "qemu-system-loongarch64") {
         Ok(version) => {
             println!("contest-selfcheck: loongarch-qemu={}", version);
-            if !version.contains("10.0.2") {
-                eprintln!("contest-selfcheck: expected qemu 10.0.2 in contest image");
+            if !contest_qemu_version_supported(&version) {
+                eprintln!("contest-selfcheck: expected qemu 9.2.1 or 10.0.2 in contest image");
                 ok = false;
             }
         }
@@ -932,6 +1117,37 @@ fn contest_selfcheck() -> ExitCode {
         ok = false;
     }
 
+    for (tag, arch) in [("rv", "riscv64"), ("la", "loongarch64")] {
+        let image = oscomp_image_path(tag);
+        if image.exists() {
+            if !validate_oscomp_full_image(&image, arch) {
+                ok = false;
+            }
+        } else {
+            eprintln!(
+                "contest-selfcheck: oscomp image missing {} (run `cargo run --manifest-path tools/xtask/Cargo.toml -- oscomp-images` first)",
+                image.display()
+            );
+        }
+    }
+
+    let rv_kernel = root.join("kernel-rv");
+    if rv_kernel.exists() {
+        match contest_riscv_boot_smoke(&contest_image, &rv_kernel) {
+            Ok(true) => println!("contest-selfcheck: kernel-rv-boot-smoke=ok"),
+            Ok(false) => {
+                eprintln!(
+                    "contest-selfcheck: kernel-rv boot smoke did not reach `whuse: booting on riscv64-virt`"
+                );
+                ok = false;
+            }
+            Err(err) => {
+                eprintln!("contest-selfcheck: kernel-rv boot smoke failed: {err}");
+                ok = false;
+            }
+        }
+    }
+
     if ok {
         println!("contest-selfcheck: PASS");
         ExitCode::SUCCESS
@@ -975,6 +1191,50 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<String, String> {
 
 fn line_contains_all(line: &str, tokens: &[&str]) -> bool {
     tokens.iter().all(|token| line.contains(token))
+}
+
+fn contest_qemu_version_supported(version: &str) -> bool {
+    version.contains("9.2.1") || version.contains("10.0.2")
+}
+
+fn is_elf_artifact(path: &Path, expected_machine: u16) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if bytes.len() < 20 || &bytes[..4] != b"\x7fELF" {
+        return false;
+    }
+    let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+    machine == expected_machine
+}
+
+fn contest_riscv_boot_smoke(image: &str, kernel: &Path) -> Result<bool, String> {
+    let repo = repo_root();
+    let kernel_name = kernel
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid kernel artifact path {}", kernel.display()))?;
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            &format!("{}:/work", repo.display()),
+            "-w",
+            "/work",
+            image,
+            "bash",
+            "-lc",
+            &format!(
+                "timeout 20s qemu-system-riscv64 -machine virt -kernel {kernel_name} -m 1G -nographic -smp 1 -bios default -no-reboot"
+            ),
+        ])
+        .output()
+        .map_err(|err| format!("failed to execute docker riscv boot smoke: {err}"))?;
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(text.contains("whuse: booting on riscv64-virt"))
 }
 
 fn refresh_oscomp_image(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
@@ -1179,19 +1439,59 @@ fn validate_oscomp_full_image(image: &PathBuf, arch: &str) -> bool {
             return false;
         }
     };
+    let glibc_listing = match debugfs_list(image, "/glibc") {
+        Ok(listing) => listing,
+        Err(err) => {
+            eprintln!(
+                "failed to read /glibc via debugfs for {} ({}): {err}",
+                arch,
+                image.display()
+            );
+            return false;
+        }
+    };
+    let glibc_basic_listing = match debugfs_list(image, "/glibc/basic") {
+        Ok(listing) => listing,
+        Err(err) => {
+            eprintln!(
+                "failed to read /glibc/basic via debugfs for {} ({}): {err}",
+                arch,
+                image.display()
+            );
+            return false;
+        }
+    };
 
     let required_musl = [
         "busybox",
+        "basic_testcode.sh",
         "busybox_testcode.sh",
         "busybox_cmd.txt",
         "iozone_testcode.sh",
         "libctest_testcode.sh",
+        "libcbench_testcode.sh",
         "libc-bench",
         "lmbench_testcode.sh",
         "lua_testcode.sh",
         "unixbench_testcode.sh",
         "netperf_testcode.sh",
         "iperf_testcode.sh",
+        "ltp_testcode.sh",
+        "cyclictest_testcode.sh",
+    ];
+    let required_glibc = [
+        "busybox",
+        "basic_testcode.sh",
+        "busybox_testcode.sh",
+        "iozone_testcode.sh",
+        "libcbench_testcode.sh",
+        "libc-bench",
+        "lmbench_testcode.sh",
+        "lua_testcode.sh",
+        "unixbench_testcode.sh",
+        "netperf_testcode.sh",
+        "iperf_testcode.sh",
+        "ltp_testcode.sh",
         "cyclictest_testcode.sh",
     ];
     let mut missing = Vec::new();
@@ -1200,8 +1500,16 @@ fn validate_oscomp_full_image(image: &PathBuf, arch: &str) -> bool {
             missing.push(format!("/musl/{entry}"));
         }
     }
+    for entry in required_glibc {
+        if !glibc_listing.contains(entry) {
+            missing.push(format!("/glibc/{entry}"));
+        }
+    }
     if !musl_listing.contains("test_all.sh") && !basic_listing.contains("run-all.sh") {
         missing.push("/musl/test_all.sh(or /musl/basic/run-all.sh)".to_string());
+    }
+    if !glibc_listing.contains("test_all.sh") && !glibc_basic_listing.contains("run-all.sh") {
+        missing.push("/glibc/test_all.sh(or /glibc/basic/run-all.sh)".to_string());
     }
     if !missing.is_empty() {
         eprintln!(

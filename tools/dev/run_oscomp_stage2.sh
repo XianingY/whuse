@@ -16,7 +16,11 @@ export WHUSE_STAGE2_USE_IMAGE_COPY="${WHUSE_STAGE2_USE_IMAGE_COPY:-0}"
 export WHUSE_STAGE2_STOP_ON_SUITE_DONE="${WHUSE_STAGE2_STOP_ON_SUITE_DONE:-1}"
 export WHUSE_STAGE2_ONLY_STEP="${WHUSE_STAGE2_ONLY_STEP:-}"
 export WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE:-score}"
+export WHUSE_LTP_WHITELIST="${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}"
+export WHUSE_LTP_BLACKLIST="${WHUSE_LTP_BLACKLIST:-/musl/ltp_score_blacklist.txt}"
 export WHUSE_LTP_STEP_TIMEOUT="${WHUSE_LTP_STEP_TIMEOUT:-1800}"
+export WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT:-45}"
+export WHUSE_LTP_APPLY_CANDIDATES="${WHUSE_LTP_APPLY_CANDIDATES:-0}"
 WHUSE_STAGE2_IMAGE_POLICY="${WHUSE_STAGE2_IMAGE_POLICY:-auto}"
 
 RV_IMG="${REPO_ROOT}/target/oscomp/sdcard-rv.img"
@@ -188,19 +192,121 @@ write_runtime_image_config() {
     rm -f "${tmp}"
 }
 
+write_runtime_image_file() {
+    local image="$1"
+    local target="$2"
+    local src="$3"
+    debugfs -w -R "rm ${target}" "${image}" >/dev/null 2>&1 || true
+    if ! debugfs -w -R "write ${src} ${target}" "${image}" >/dev/null 2>&1; then
+        echo "failed to write runtime file ${target} from ${src} into ${image}" >&2
+        return 1
+    fi
+}
+
 inject_ltp_runtime_config() {
     local image="$1"
+    local ltp_whitelist_path="${WHUSE_LTP_WHITELIST:-}"
+    local ltp_blacklist_path="${WHUSE_LTP_BLACKLIST:-}"
     write_runtime_image_config "${image}" "/musl/.whuse_oscomp_only_step" "ltp_testcode.sh"
     write_runtime_image_config "${image}" "/musl/.whuse_ltp_profile" "${WHUSE_LTP_PROFILE}"
+    if [[ -n "${ltp_whitelist_path}" && -f "${ltp_whitelist_path}" ]]; then
+        write_runtime_image_file "${image}" "/musl/ltp_score_whitelist.host.txt" "${ltp_whitelist_path}"
+        ltp_whitelist_path="/musl/ltp_score_whitelist.host.txt"
+    fi
+    if [[ -n "${ltp_blacklist_path}" && -f "${ltp_blacklist_path}" ]]; then
+        write_runtime_image_file "${image}" "/musl/ltp_score_blacklist.host.txt" "${ltp_blacklist_path}"
+        ltp_blacklist_path="/musl/ltp_score_blacklist.host.txt"
+    fi
     if [[ -n "${WHUSE_LTP_WHITELIST:-}" ]]; then
-        write_runtime_image_config "${image}" "/musl/.whuse_ltp_whitelist" "${WHUSE_LTP_WHITELIST}"
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_whitelist" "${ltp_whitelist_path}"
     fi
     if [[ -n "${WHUSE_LTP_BLACKLIST:-}" ]]; then
-        write_runtime_image_config "${image}" "/musl/.whuse_ltp_blacklist" "${WHUSE_LTP_BLACKLIST}"
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_blacklist" "${ltp_blacklist_path}"
     fi
     if [[ -n "${WHUSE_LTP_STEP_TIMEOUT:-}" ]]; then
         write_runtime_image_config "${image}" "/musl/.whuse_ltp_step_timeout" "${WHUSE_LTP_STEP_TIMEOUT}"
     fi
+    if [[ -n "${WHUSE_LTP_CASE_TIMEOUT:-}" ]]; then
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_case_timeout" "${WHUSE_LTP_CASE_TIMEOUT}"
+    fi
+}
+
+generate_ltp_candidate_lists() {
+    local text_log="$1"
+    local pass_out="$2"
+    local bad_out="$3"
+    local pass_tmp bad_tmp summary_tmp
+    pass_tmp="$(mktemp)"
+    bad_tmp="$(mktemp)"
+    summary_tmp="$(mktemp)"
+    awk -F: -v pass_file="${pass_tmp}" -v bad_file="${bad_tmp}" -v summary_file="${summary_tmp}" '
+        /^RUN LTP CASE / {
+            current_case = $0
+            sub(/^RUN LTP CASE /, "", current_case)
+            next
+        }
+        {
+            if (current_case != "") {
+                if ($0 ~ /TPASS/) {
+                    stream_tpass[current_case]++
+                }
+                if ($0 ~ /TFAIL/) {
+                    stream_tfail[current_case]++
+                }
+                if ($0 ~ /TBROK/) {
+                    stream_tbrok[current_case]++
+                }
+                if ($0 ~ /TCONF/) {
+                    stream_tconf[current_case]++
+                }
+            }
+        }
+        /^whuse-ltp-case-result:/ {
+            case_name=$2
+            delete kvs
+            for (i = 3; i <= NF; i++) {
+                n = split($i, kv, "=")
+                if (n == 2) {
+                    kvs[kv[1]] = kv[2]
+                }
+            }
+            rc = kvs["rc"] + 0
+            tpass = kvs["tpass"] + 0
+            tfail = kvs["tfail"] + 0
+            tbrok = kvs["tbrok"] + 0
+            class = kvs["class"]
+            if (tpass == 0 && (case_name in stream_tpass)) {
+                tpass = stream_tpass[case_name]
+            }
+            if (tfail == 0 && (case_name in stream_tfail)) {
+                tfail = stream_tfail[case_name]
+            }
+            if (tbrok == 0 && (case_name in stream_tbrok)) {
+                tbrok = stream_tbrok[case_name]
+            }
+            class_count[class]++
+            if (rc == 0 && tpass > 0 && tfail == 0 && tbrok == 0) {
+                print case_name >> pass_file
+            } else if (class == "rc255" || class == "timeout" || class == "missing" || class == "tbrok" || class == "tfail" || class == "nonzero") {
+                print case_name >> bad_file
+            }
+            current_case = ""
+        }
+        END {
+            for (k in class_count) {
+                printf("%s=%d\n", k, class_count[k]) >> summary_file
+            }
+        }
+    ' "${text_log}"
+    sort -u "${pass_tmp}" > "${pass_out}"
+    sort -u "${bad_tmp}" > "${bad_out}"
+    echo "[rv-ltp] class summary:"
+    if [[ -s "${summary_tmp}" ]]; then
+        sort "${summary_tmp}" | sed 's/^/[rv-ltp] class-count /'
+    else
+        echo "[rv-ltp] class-count none"
+    fi
+    rm -f "${pass_tmp}" "${bad_tmp}" "${summary_tmp}"
 }
 
 run_arch() {
@@ -297,10 +403,7 @@ run_ltp_riscv() {
     local runtime_image
     local suite_done_seen=0
     local terminated_by_suite_done=0
-    local saved_use_copy="${WHUSE_STAGE2_USE_IMAGE_COPY}"
-    WHUSE_STAGE2_USE_IMAGE_COPY=1
     runtime_image="$(prepare_runtime_image "rv" "${RV_IMG}")"
-    WHUSE_STAGE2_USE_IMAGE_COPY="${saved_use_copy}"
     inject_ltp_runtime_config "${runtime_image}"
 
     echo "[rv-ltp] running ltp-only, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, profile=${WHUSE_LTP_PROFILE}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"
@@ -309,6 +412,7 @@ run_ltp_riscv() {
         setsid timeout "${TIMEOUT_SECS}s" env \
             WHUSE_DISK_IMAGE="${runtime_image}" \
             WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE}" \
+            WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT}" \
             "${XTASK_CMD[@]}" qemu-riscv >"${log}" 2>&1 &
         runner_pid=$!
         while kill -0 "${runner_pid}" 2>/dev/null; do
@@ -332,6 +436,7 @@ run_ltp_riscv() {
         timeout "${TIMEOUT_SECS}s" env \
             WHUSE_DISK_IMAGE="${runtime_image}" \
             WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE}" \
+            WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT}" \
             "${XTASK_CMD[@]}" qemu-riscv >"${log}" 2>&1 || true
     fi
 
@@ -359,16 +464,27 @@ run_ltp_riscv() {
     fi
 
     local tpass tfail tbrok tconf timeout_count
+    local pass_candidates bad_candidates
     tpass="$(count_matches "TPASS" "${text_log}")"
     tfail="$(count_matches "TFAIL" "${text_log}")"
     tbrok="$(count_matches "TBROK" "${text_log}")"
     tconf="$(count_matches "TCONF" "${text_log}")"
     timeout_count="$(count_matches "whuse-oscomp-step-timeout:ltp_testcode.sh" "${text_log}")"
+    pass_candidates="/tmp/rv-ltp-pass-candidates-${TS}.txt"
+    bad_candidates="/tmp/rv-ltp-bad-candidates-${TS}.txt"
+    generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}"
+    echo "[rv-ltp] pass-candidates: ${pass_candidates} ($(wc -l < "${pass_candidates}"))"
+    echo "[rv-ltp] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
+    if [[ "${WHUSE_LTP_APPLY_CANDIDATES}" == "1" ]]; then
+        cp "${pass_candidates}" "${REPO_ROOT}/tools/oscomp/ltp/score_whitelist.txt"
+        cp "${bad_candidates}" "${REPO_ROOT}/tools/oscomp/ltp/score_blacklist.txt"
+        echo "[rv-ltp] applied candidate lists to tools/oscomp/ltp/score_whitelist.txt and score_blacklist.txt"
+    fi
     if [[ "${suite_done_seen}" == "0" ]] && rg -q "whuse-oscomp-suite-done" "${text_log}"; then
         suite_done_seen=1
     fi
     echo "[rv-ltp] summary: TPASS=${tpass} TFAIL=${tfail} TBROK=${tbrok} TCONF=${tconf} step-timeout=${timeout_count} suite_done_seen=${suite_done_seen} terminated_by_suite_done=${terminated_by_suite_done}"
-    rg "whuse-oscomp-step-(begin|end|timeout|skip):ltp_testcode.sh|whuse-oscomp-suite-done|whuse-ltp-skip-case:" "${text_log}" || true
+    rg "whuse-oscomp-step-(begin|end|timeout|skip):ltp_testcode.sh|whuse-oscomp-suite-done|whuse-ltp-(skip-case|case-result):" "${text_log}" || true
     return "${ok}"
 }
 

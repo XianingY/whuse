@@ -20,17 +20,17 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use hal_api::{hal, Timespec};
-use mm::{BinaryLoader, ElfBinaryLoader};
-use proc::{ProcessTable, SigAction, WaitSelector};
+use proc::{Process, ProcessTable, SigAction, WaitSelector};
 use spin::Mutex;
 use task::Scheduler;
 use user_init::builtin_program;
 use vfs::{
-    FileStat, KernelVfs, HANDLE_FLAG_CLOEXEC, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_TRUNC,
-    O_WRONLY,
+    FileHandle, FileStat, KernelVfs, HANDLE_FLAG_CLOEXEC, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR,
+    O_TRUNC, O_WRONLY,
 };
 
 const EAFNOSUPPORT: i32 = 97;
+const EACCES: i32 = 13;
 const EAGAIN: i32 = 11;
 const EBADF: i32 = 9;
 const EFAULT: i32 = 14;
@@ -232,6 +232,15 @@ const CLONE_NAMESPACE_MASK: usize =
     0x0002_0000 | 0x0200_0000 | 0x0400_0000 | 0x0800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000;
 const PAGE_SIZE: usize = 4096;
 const O_CLOEXEC: usize = 0x0008_0000;
+const SEEK_SET: i16 = 0;
+const SEEK_CUR: i16 = 1;
+const SEEK_END: i16 = 2;
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
+const F_GETLK: usize = 5;
+const F_SETLK: usize = 6;
+const F_SETLKW: usize = 7;
 const MAP_SHARED: usize = 0x01;
 const MAP_PRIVATE: usize = 0x02;
 const MAP_TYPE_MASK: usize = 0x0f;
@@ -415,6 +424,30 @@ static SHM_STATE: Mutex<SharedMemoryState> = Mutex::new(SharedMemoryState {
 });
 static BUSYBOX_IMAGE_CACHE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 static BUSYBOX_APPLETS: Mutex<BTreeMap<usize, String>> = Mutex::new(BTreeMap::new());
+static FCNTL_LOCK_STATE: Mutex<FcntlLockState> = Mutex::new(FcntlLockState { locks: Vec::new() });
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FlockRequest {
+    l_type: i16,
+    l_whence: i16,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+}
+
+#[derive(Clone, Debug)]
+struct FcntlRecordLock {
+    path: String,
+    owner_tgid: usize,
+    lock_type: i16,
+    start: u64,
+    end: Option<u64>,
+}
+
+#[derive(Default)]
+struct FcntlLockState {
+    locks: Vec<FcntlRecordLock>,
+}
 pub fn cache_busybox_image(image: &[u8]) {
     *BUSYBOX_IMAGE_CACHE.lock() = Some(image.to_vec());
 }
@@ -428,6 +461,237 @@ fn with_cloexec_flag(flags: u32, cloexec: bool) -> u32 {
         flags | HANDLE_FLAG_CLOEXEC
     } else {
         flags & !HANDLE_FLAG_CLOEXEC
+    }
+}
+
+fn read_flock_request(process: &Process, addr: usize) -> Result<FlockRequest, i32> {
+    if addr == 0 {
+        return Err(EFAULT);
+    }
+    let bytes = process.read_user_bytes(addr, 32).map_err(|_| EFAULT)?;
+    if bytes.len() < 32 {
+        return Err(EFAULT);
+    }
+    Ok(FlockRequest {
+        l_type: i16::from_le_bytes([bytes[0], bytes[1]]),
+        l_whence: i16::from_le_bytes([bytes[2], bytes[3]]),
+        l_start: i64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]),
+        l_len: i64::from_le_bytes([
+            bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22],
+            bytes[23],
+        ]),
+        l_pid: i32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+    })
+}
+
+fn write_flock_request(process: &mut Process, addr: usize, flock: FlockRequest) -> Result<(), i32> {
+    if addr == 0 {
+        return Err(EFAULT);
+    }
+    let mut bytes = [0u8; 32];
+    bytes[0..2].copy_from_slice(&flock.l_type.to_le_bytes());
+    bytes[2..4].copy_from_slice(&flock.l_whence.to_le_bytes());
+    bytes[8..16].copy_from_slice(&flock.l_start.to_le_bytes());
+    bytes[16..24].copy_from_slice(&flock.l_len.to_le_bytes());
+    bytes[24..28].copy_from_slice(&flock.l_pid.to_le_bytes());
+    process.write_user_bytes(addr, &bytes).map_err(|_| EFAULT)
+}
+
+fn range_end_u128(end: Option<u64>) -> u128 {
+    end.map_or(u128::MAX, |value| value as u128)
+}
+
+fn range_overlaps(start_a: u64, end_a: Option<u64>, start_b: u64, end_b: Option<u64>) -> bool {
+    let a_start = start_a as u128;
+    let a_end = range_end_u128(end_a);
+    let b_start = start_b as u128;
+    let b_end = range_end_u128(end_b);
+    a_start < b_end && b_start < a_end
+}
+
+fn lock_modes_conflict(left: i16, right: i16) -> bool {
+    left == F_WRLCK || right == F_WRLCK
+}
+
+fn lock_range_len(start: u64, end: Option<u64>) -> i64 {
+    match end {
+        Some(limit) => limit.saturating_sub(start) as i64,
+        None => 0,
+    }
+}
+
+fn normalize_lock_range(
+    flock: &FlockRequest,
+    handle: &FileHandle,
+    vfs: &KernelVfs,
+) -> Result<(u64, Option<u64>), i32> {
+    let base = match flock.l_whence {
+        SEEK_SET => 0i64,
+        SEEK_CUR => handle.offset as i64,
+        SEEK_END => vfs
+            .stat_handle(handle)
+            .map_err(|_| EINVAL)?
+            .size
+            .try_into()
+            .unwrap_or(i64::MAX),
+        _ => return Err(EINVAL),
+    };
+    let start = base.checked_add(flock.l_start).ok_or(EINVAL)?;
+    if start < 0 {
+        return Err(EINVAL);
+    }
+    if flock.l_len < 0 {
+        return Err(EINVAL);
+    }
+    let start = start as u64;
+    if flock.l_len == 0 {
+        return Ok((start, None));
+    }
+    let end = start.checked_add(flock.l_len as u64).ok_or(EINVAL)?;
+    Ok((start, Some(end)))
+}
+
+impl FcntlLockState {
+    fn clear_for_owner(&mut self, owner_tgid: usize) -> bool {
+        let before = self.locks.len();
+        self.locks.retain(|lock| lock.owner_tgid != owner_tgid);
+        before != self.locks.len()
+    }
+
+    fn clear_for_owner_path(&mut self, owner_tgid: usize, path: &str) -> bool {
+        let before = self.locks.len();
+        self.locks
+            .retain(|lock| !(lock.owner_tgid == owner_tgid && lock.path == path));
+        before != self.locks.len()
+    }
+
+    fn first_conflict(
+        &self,
+        path: &str,
+        owner_tgid: usize,
+        lock_type: i16,
+        start: u64,
+        end: Option<u64>,
+    ) -> Option<FcntlRecordLock> {
+        self.locks
+            .iter()
+            .filter(|lock| lock.path == path)
+            .filter(|lock| lock.owner_tgid != owner_tgid)
+            .filter(|lock| lock_modes_conflict(lock.lock_type, lock_type))
+            .filter(|lock| range_overlaps(lock.start, lock.end, start, end))
+            .min_by_key(|lock| lock.start)
+            .cloned()
+    }
+
+    fn apply_lock(
+        &mut self,
+        path: &str,
+        owner_tgid: usize,
+        lock_type: i16,
+        start: u64,
+        end: Option<u64>,
+    ) -> bool {
+        let cut_start = start as u128;
+        let cut_end = range_end_u128(end);
+        let mut changed = false;
+        let mut next = Vec::with_capacity(self.locks.len() + 1);
+
+        for lock in self.locks.drain(..) {
+            if lock.path != path || lock.owner_tgid != owner_tgid {
+                next.push(lock);
+                continue;
+            }
+            if !range_overlaps(lock.start, lock.end, start, end) {
+                next.push(lock);
+                continue;
+            }
+            changed = true;
+            let lock_start = lock.start as u128;
+            let lock_end = range_end_u128(lock.end);
+            if lock_start < cut_start {
+                next.push(FcntlRecordLock {
+                    path: lock.path.clone(),
+                    owner_tgid: lock.owner_tgid,
+                    lock_type: lock.lock_type,
+                    start: lock_start as u64,
+                    end: if cut_start == u128::MAX {
+                        None
+                    } else {
+                        Some(cut_start as u64)
+                    },
+                });
+            }
+            if cut_end < lock_end {
+                next.push(FcntlRecordLock {
+                    path: lock.path,
+                    owner_tgid: lock.owner_tgid,
+                    lock_type: lock.lock_type,
+                    start: cut_end as u64,
+                    end: if lock_end == u128::MAX {
+                        None
+                    } else {
+                        Some(lock_end as u64)
+                    },
+                });
+            }
+        }
+
+        if lock_type != F_UNLCK {
+            changed = true;
+            next.push(FcntlRecordLock {
+                path: path.to_string(),
+                owner_tgid,
+                lock_type,
+                start,
+                end,
+            });
+        }
+
+        next.sort_by(|left, right| {
+            (
+                left.path.as_str(),
+                left.owner_tgid,
+                left.start,
+                range_end_u128(left.end),
+                left.lock_type,
+            )
+                .cmp(&(
+                    right.path.as_str(),
+                    right.owner_tgid,
+                    right.start,
+                    range_end_u128(right.end),
+                    right.lock_type,
+                ))
+        });
+
+        let mut merged: Vec<FcntlRecordLock> = Vec::with_capacity(next.len());
+        for lock in next {
+            if let Some(last) = merged.last_mut() {
+                let same_stream = last.path == lock.path
+                    && last.owner_tgid == lock.owner_tgid
+                    && last.lock_type == lock.lock_type;
+                if same_stream {
+                    let last_end = range_end_u128(last.end);
+                    let this_start = lock.start as u128;
+                    if this_start <= last_end {
+                        let this_end = range_end_u128(lock.end);
+                        let merged_end = core::cmp::max(last_end, this_end);
+                        last.end = if merged_end == u128::MAX {
+                            None
+                        } else {
+                            Some(merged_end as u64)
+                        };
+                        continue;
+                    }
+                }
+            }
+            merged.push(lock);
+        }
+
+        self.locks = merged;
+        changed
     }
 }
 
@@ -685,11 +949,15 @@ impl SyscallDispatcher {
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
         let fd = args.0[0] as i32;
+        let owner_tgid = procs.current_tgid()?;
         let handle = procs.current()?.fd(fd)?.clone();
         procs.current_mut()?.close_fd(fd)?;
         let wake_blocked = vfs.is_pipe(&handle);
+        let released_locks = FCNTL_LOCK_STATE
+            .lock()
+            .clear_for_owner_path(owner_tgid, &handle.path);
         drop(handle);
-        if wake_blocked {
+        if wake_blocked || released_locks {
             let _ = scheduler.wake_all_blocked();
         }
         Ok(0)
@@ -991,6 +1259,11 @@ impl SyscallDispatcher {
         } else {
             procs.exit_current_thread(args.0[0] as i32)?
         };
+        let released_locks = if exit_group || exit.group_exited {
+            FCNTL_LOCK_STATE.lock().clear_for_owner(exit.tgid)
+        } else {
+            false
+        };
         if exit_group {
             scheduler.exit_group(exit.tgid);
             if let Some(parent_tgid) = exit.parent_tgid {
@@ -1039,6 +1312,9 @@ impl SyscallDispatcher {
                 "whuse: busybox exit tgid={} applet={} code={}",
                 exit.tgid, applet, args.0[0] as i32
             ));
+        }
+        if released_locks {
+            trace_line(&format!("whuse: released fcntl locks for tgid={}", exit.tgid));
         }
         let _ = scheduler.wake_all_blocked();
         Ok(0)
@@ -1276,18 +1552,44 @@ impl SyscallDispatcher {
             .current()?
             .read_user_cstr(args.0[0])
             .map_err(|_| EFAULT)?;
-        let display_path = path.clone();
         trace_line(&format!(
             "whuse: execve enter tgid={} path={}",
             procs.current_tgid().unwrap_or(0),
             path
         ));
         let cwd = procs.current()?.cwd.clone();
+        let mut display_path = vfs.absolute_path(&cwd, &path);
         let mut argv = read_string_vector(procs.current()?, args.0[1])?;
         if argv.is_empty() {
-            argv.push(path.clone());
+            argv.push(display_path.clone());
         }
         let envp = read_string_vector(procs.current()?, args.0[2])?;
+        if path.contains("busybox") && argv.len() > 1 {
+            let applet = argv[1].as_str();
+            let redirect = match applet {
+                "wait" => Some("/musl/wait"),
+                "locale" => Some("/musl/locale"),
+                "useradd" => Some("/musl/useradd"),
+                "userdel" => Some("/musl/userdel"),
+                _ => None,
+            };
+            if let Some(redirect_path) = redirect {
+                trace_line(&format!(
+                    "whuse: execve busybox applet redirect tgid={} applet={} -> {}",
+                    procs.current_tgid().unwrap_or(0),
+                    applet,
+                    redirect_path
+                ));
+                path = redirect_path.to_string();
+                display_path = path.clone();
+                let mut redirected_argv = Vec::new();
+                redirected_argv.push(display_path.clone());
+                if argv.len() > 2 {
+                    redirected_argv.extend_from_slice(&argv[2..]);
+                }
+                argv = redirected_argv;
+            }
+        }
         if display_path.contains("busybox") && argv.len() > 1 {
             let applet = argv[1].as_str();
             BUSYBOX_APPLETS
@@ -1309,37 +1611,7 @@ impl SyscallDispatcher {
                     .lock()
                     .insert(procs.current_tgid().unwrap_or(0), argv[1].clone());
             }
-            let mut file_data = if path.contains("busybox") {
-                busybox_image_cache().unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            if file_data.is_empty() {
-                let mut handle = vfs.open(&cwd, &path, O_RDONLY, 0).map_err(|_| ENOENT)?;
-                const EXEC_READ_CHUNK: usize = 256 * 1024;
-                const EXEC_READ_LIMIT: usize = 32 * 1024 * 1024;
-                loop {
-                    let remaining = EXEC_READ_LIMIT.saturating_sub(file_data.len());
-                    if remaining == 0 {
-                        return Err(EFAULT);
-                    }
-                    let read_len = EXEC_READ_CHUNK.min(remaining);
-                    let chunk = match vfs.read(&mut handle, read_len) {
-                        Ok(chunk) => chunk,
-                        Err(_) => return Err(EFAULT),
-                    };
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    file_data.extend_from_slice(&chunk);
-                }
-                trace_line(&format!(
-                    "whuse: execve read image tgid={} path={} bytes={}",
-                    procs.current_tgid().unwrap_or(0),
-                    path,
-                    file_data.len()
-                ));
-            }
+            let file_data = read_exec_file_image(vfs, &cwd, &path)?;
             if file_data.is_empty() {
                 return Err(EFAULT);
             }
@@ -1361,7 +1633,7 @@ impl SyscallDispatcher {
                 if let Some(arg) = interp_arg {
                     next_argv.push(arg);
                 }
-                next_argv.push(path.clone());
+                next_argv.push(display_path.clone());
                 if argv.len() > 1 {
                     next_argv.extend_from_slice(&argv[1..]);
                 }
@@ -1379,7 +1651,7 @@ impl SyscallDispatcher {
                     let mut next_argv = Vec::new();
                     next_argv.push(shell.to_string());
                     next_argv.push("sh".to_string());
-                    next_argv.push(path.clone());
+                    next_argv.push(display_path.clone());
                     if argv.len() > 1 {
                         next_argv.extend_from_slice(&argv[1..]);
                     }
@@ -1388,29 +1660,6 @@ impl SyscallDispatcher {
                     shebang_hops += 1;
                     continue;
                 }
-            }
-            if let Some(mut interp_path) = parse_elf_interp(&file_data) {
-                if shebang_hops >= 4 {
-                    return Err(ENOEXEC);
-                }
-                if vfs.access("/", &interp_path).is_err() {
-                    let fallback = "/musl/lib/libc.so";
-                    if vfs.access("/", fallback).is_ok() {
-                        interp_path = fallback.to_string();
-                    } else {
-                        return Err(ENOENT);
-                    }
-                }
-                let mut next_argv = Vec::new();
-                next_argv.push(interp_path.clone());
-                next_argv.push(path.clone());
-                if argv.len() > 1 {
-                    next_argv.extend_from_slice(&argv[1..]);
-                }
-                path = interp_path;
-                argv = next_argv;
-                shebang_hops += 1;
-                continue;
             }
             if let Some(program) =
                 resolve_exec_payload(&file_data).or_else(|| builtin_program(&path))
@@ -1441,11 +1690,38 @@ impl SyscallDispatcher {
                 ));
                 return Ok(0);
             }
+            let interp = if let Some(mut interp_path) = parse_elf_interp(&file_data) {
+                if vfs.access("/", &interp_path).is_err() {
+                    let fallback = "/lib/ld-linux-riscv64-lp64d.so.1";
+                    if vfs.access("/", fallback).is_ok() {
+                        interp_path = fallback.to_string();
+                    } else {
+                        let musl_fallback = "/musl/lib/libc.so";
+                        if vfs.access("/", musl_fallback).is_ok() {
+                            interp_path = musl_fallback.to_string();
+                        } else {
+                            return Err(ENOENT);
+                        }
+                    }
+                }
+                let interp_image = read_exec_file_image(vfs, "/", &interp_path)?;
+                if interp_image.is_empty() {
+                    return Err(ENOEXEC);
+                }
+                Some((interp_path, interp_image))
+            } else {
+                None
+            };
             procs.execve_current_image(0, None)?;
             let loaded = {
                 let process = procs.current_mut()?;
-                match ElfBinaryLoader::new().load(&process.address_space, &file_data, &argv, &envp)
-                {
+                match process.address_space.load_elf_images(
+                    &file_data,
+                    interp.as_ref().map(|(_, image)| image.as_slice()),
+                    &argv,
+                    &envp,
+                    Some(display_path.as_str()),
+                ) {
                     Ok(loaded) => loaded,
                     Err(err) => return Err(if err == ENOEXEC { ENOEXEC } else { EFAULT }),
                 }
@@ -1468,8 +1744,14 @@ impl SyscallDispatcher {
                 core::arch::asm!("fence.i");
             }
             trace_line(&format!(
-                "whuse: execve elf tgid={} path={} entry={:#x}",
-                tgid, proc_name, entry
+                "whuse: execve elf tgid={} path={} entry={:#x} program_entry={:#x} at_base={:#x} phdr={:#x} dyn={}",
+                tgid,
+                proc_name,
+                entry,
+                loaded.program_entry,
+                loaded.interp_base,
+                loaded.phdr_addr,
+                loaded.is_dyn
             ));
             return Ok(0);
         }
@@ -1706,7 +1988,13 @@ impl SyscallDispatcher {
         Ok(newfd as usize)
     }
 
-    fn sys_fcntl(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
+    fn sys_fcntl(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        scheduler: &mut Scheduler,
+        vfs: &mut KernelVfs,
+    ) -> Result<usize, i32> {
         const F_DUPFD: usize = 0;
         const F_GETFD: usize = 1;
         const F_SETFD: usize = 2;
@@ -1716,7 +2004,8 @@ impl SyscallDispatcher {
 
         let fd = args.0[0] as i32;
         let cmd = args.0[1];
-        let arg = args.0[2] as i32;
+        let arg_raw = args.0[2];
+        let arg = arg_raw as i32;
         match cmd {
             F_DUPFD | F_DUPFD_CLOEXEC => {
                 let mut handle = procs.current()?.fd(fd)?.clone();
@@ -1741,8 +2030,72 @@ impl SyscallDispatcher {
             }
             F_GETFL => Ok((procs.current()?.fd(fd)?.flags & !HANDLE_FLAG_CLOEXEC) as usize),
             F_SETFL => Ok(0),
+            F_GETLK | F_SETLK | F_SETLKW => {
+                self.sys_fcntl_lock(fd, cmd, arg_raw, procs, scheduler, vfs)
+            }
             _ => Err(EINVAL),
         }
+    }
+
+    fn sys_fcntl_lock(
+        &self,
+        fd: i32,
+        cmd: usize,
+        arg_ptr: usize,
+        procs: &mut ProcessTable,
+        scheduler: &mut Scheduler,
+        vfs: &mut KernelVfs,
+    ) -> Result<usize, i32> {
+        let owner_tgid = procs.current_tgid()?;
+        let handle = procs.current()?.fd(fd)?.clone();
+        let mut request = read_flock_request(procs.current()?, arg_ptr)?;
+        if !matches!(request.l_type, F_RDLCK | F_WRLCK | F_UNLCK) {
+            return Err(EINVAL);
+        }
+        let (start, end) = normalize_lock_range(&request, &handle, vfs)?;
+        if cmd == F_GETLK {
+            if request.l_type == F_UNLCK {
+                request.l_pid = 0;
+                write_flock_request(procs.current_mut()?, arg_ptr, request)?;
+                return Ok(0);
+            }
+            let conflict = FCNTL_LOCK_STATE
+                .lock()
+                .first_conflict(&handle.path, owner_tgid, request.l_type, start, end);
+            if let Some(lock) = conflict {
+                request.l_type = lock.lock_type;
+                request.l_whence = SEEK_SET;
+                request.l_start = lock.start as i64;
+                request.l_len = lock_range_len(lock.start, lock.end);
+                request.l_pid = lock.owner_tgid as i32;
+            } else {
+                request.l_type = F_UNLCK;
+                request.l_pid = 0;
+            }
+            write_flock_request(procs.current_mut()?, arg_ptr, request)?;
+            return Ok(0);
+        }
+
+        if request.l_type != F_UNLCK {
+            let conflict = FCNTL_LOCK_STATE
+                .lock()
+                .first_conflict(&handle.path, owner_tgid, request.l_type, start, end);
+            if conflict.is_some() {
+                if cmd == F_SETLKW {
+                    let _ = scheduler.block_current();
+                    return Err(EAGAIN);
+                }
+                return Err(EACCES);
+            }
+        }
+
+        let changed = FCNTL_LOCK_STATE
+            .lock()
+            .apply_lock(&handle.path, owner_tgid, request.l_type, start, end);
+        if changed {
+            let _ = scheduler.wake_all_blocked();
+        }
+        Ok(0)
     }
 
     fn sys_ioctl(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
@@ -3362,15 +3715,22 @@ impl SyscallDispatcher {
         let last = args.0[1] as i32;
         let _flags = args.0[2];
         let mut wake_blocked = false;
-        {
-            let process = procs.current_mut()?;
-            for fd in first..=last {
-                if let Some(handle) = process.fds.remove(&fd) {
-                    wake_blocked |= vfs.is_pipe(&handle);
-                }
+        let owner_tgid = procs.current_tgid()?;
+        let mut released_any_lock = false;
+        for fd in first..=last {
+            let handle = match procs.current()?.fd(fd) {
+                Ok(handle) => handle.clone(),
+                Err(_) => continue,
+            };
+            if procs.current_mut()?.close_fd(fd).is_err() {
+                continue;
             }
+            wake_blocked |= vfs.is_pipe(&handle);
+            released_any_lock |= FCNTL_LOCK_STATE
+                .lock()
+                .clear_for_owner_path(owner_tgid, &handle.path);
         }
-        if wake_blocked {
+        if wake_blocked || released_any_lock {
             let _ = scheduler.wake_all_blocked();
         }
         Ok(0)
@@ -4736,6 +5096,36 @@ fn parse_elf_interp(data: &[u8]) -> Option<String> {
         return Some(interp.to_string());
     }
     None
+}
+
+fn read_exec_file_image(vfs: &mut KernelVfs, cwd: &str, path: &str) -> Result<Vec<u8>, i32> {
+    if path.contains("busybox") {
+        if let Some(bytes) = busybox_image_cache() {
+            return Ok(bytes);
+        }
+    }
+
+    let mut handle = vfs.open(cwd, path, O_RDONLY, 0).map_err(|_| ENOENT)?;
+    let mut file_data = Vec::new();
+    const EXEC_READ_CHUNK: usize = 256 * 1024;
+    const EXEC_READ_LIMIT: usize = 32 * 1024 * 1024;
+    loop {
+        let remaining = EXEC_READ_LIMIT.saturating_sub(file_data.len());
+        if remaining == 0 {
+            return Err(EFAULT);
+        }
+        let read_len = EXEC_READ_CHUNK.min(remaining);
+        let chunk = vfs.read(&mut handle, read_len).map_err(|_| EFAULT)?;
+        if chunk.is_empty() {
+            break;
+        }
+        file_data.extend_from_slice(&chunk);
+    }
+    trace_line(&format!(
+        "whuse: execve read image path={} bytes={}",
+        path, file_data.len()
+    ));
+    Ok(file_data)
 }
 
 fn read_u32(process: &proc::Process, addr: usize) -> Result<u32, i32> {
@@ -6107,5 +6497,41 @@ mod tests {
                 sysno
             );
         }
+    }
+
+    #[test]
+    fn fcntl_lock_state_splits_overlaps_for_same_owner() {
+        let mut state = super::FcntlLockState::default();
+        assert!(state.apply_lock("/tmp/fcntl21", 100, super::F_RDLCK, 10, Some(15)));
+        assert!(state.apply_lock("/tmp/fcntl21", 100, super::F_WRLCK, 5, Some(13)));
+
+        let lock_a = state
+            .first_conflict("/tmp/fcntl21", 200, super::F_WRLCK, 0, None)
+            .expect("conflict lock A");
+        assert_eq!(lock_a.lock_type, super::F_WRLCK);
+        assert_eq!(lock_a.start, 5);
+        assert_eq!(lock_a.end, Some(13));
+
+        let lock_b = state
+            .first_conflict("/tmp/fcntl21", 200, super::F_WRLCK, 13, None)
+            .expect("conflict lock B");
+        assert_eq!(lock_b.lock_type, super::F_RDLCK);
+        assert_eq!(lock_b.start, 13);
+        assert_eq!(lock_b.end, Some(15));
+    }
+
+    #[test]
+    fn fcntl_lock_state_unlock_and_owner_clear() {
+        let mut state = super::FcntlLockState::default();
+        state.apply_lock("/tmp/a", 10, super::F_WRLCK, 0, None);
+        state.apply_lock("/tmp/b", 10, super::F_RDLCK, 5, Some(12));
+        state.apply_lock("/tmp/a", 11, super::F_RDLCK, 0, Some(3));
+
+        assert!(state.clear_for_owner_path(10, "/tmp/b"));
+        assert!(state.first_conflict("/tmp/b", 20, super::F_WRLCK, 0, None).is_none());
+
+        assert!(state.clear_for_owner(10));
+        assert!(state.first_conflict("/tmp/a", 20, super::F_WRLCK, 0, None).is_some());
+        assert!(state.first_conflict("/tmp/a", 11, super::F_WRLCK, 0, None).is_none());
     }
 }

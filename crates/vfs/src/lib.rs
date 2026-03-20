@@ -609,6 +609,10 @@ impl KernelVfs {
         normalize_path("/", cwd)
     }
 
+    pub fn absolute_path(&self, cwd: &str, path: &str) -> String {
+        normalize_path(cwd, path)
+    }
+
     pub fn access(&self, cwd: &str, path: &str) -> KernelResult<()> {
         let absolute = normalize_path(cwd, path);
         self.path_exists(&absolute)

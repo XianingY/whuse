@@ -148,6 +148,14 @@ pub struct AddressSpace {
 pub struct LoadedImage {
     pub entry: usize,
     pub stack_pointer: usize,
+    pub load_bias: usize,
+    pub phdr_addr: usize,
+    pub phnum: usize,
+    pub phent: usize,
+    pub interp_base: usize,
+    pub interp_entry: usize,
+    pub program_entry: usize,
+    pub is_dyn: bool,
 }
 
 pub trait BinaryLoader {
@@ -556,8 +564,71 @@ impl AddressSpace {
         args: &[String],
         envs: &[String],
     ) -> KernelResult<LoadedImage> {
+        self.load_elf_images(image, None, args, envs, args.first().map(|arg| arg.as_str()))
+    }
+
+    pub fn load_elf_images(
+        &self,
+        program_image: &[u8],
+        interp_image: Option<&[u8]>,
+        args: &[String],
+        envs: &[String],
+        execfn: Option<&str>,
+    ) -> KernelResult<LoadedImage> {
+        self.clear();
+        let program = self.map_elf_segments(program_image)?;
+        let interp = if let Some(image) = interp_image {
+            Some(self.map_elf_segments(image)?)
+        } else {
+            None
+        };
+
+        {
+            let mut inner = self.inner.lock();
+            inner.program_break = program.highest_end.max(USER_HEAP_BASE);
+        }
+        let stack_top = USER_STACK_TOP;
+        let stack_base = stack_top - USER_STACK_SIZE;
+        self.map_fixed_bytes(stack_base, &[], USER_STACK_SIZE, DEFAULT_PROT)?;
+        let auxv = [
+            (3usize, program.phdr_addr),                        // AT_PHDR
+            (4usize, program.phent),                            // AT_PHENT
+            (5usize, program.phnum),                            // AT_PHNUM
+            (6usize, PAGE_SIZE),                                // AT_PAGESZ
+            (7usize, interp.map(|image| image.load_bias).unwrap_or(0)), // AT_BASE
+            (8usize, 0usize),                                   // AT_FLAGS
+            (9usize, program.entry),                            // AT_ENTRY
+            (11usize, 0usize),                                  // AT_UID
+            (12usize, 0usize),                                  // AT_EUID
+            (13usize, 0usize),                                  // AT_GID
+            (14usize, 0usize),                                  // AT_EGID
+            (16usize, 0usize),                                  // AT_HWCAP
+            (17usize, 100usize),                                // AT_CLKTCK
+            (23usize, 0usize),                                  // AT_SECURE
+        ];
+        let stack_image = build_initial_stack(args, envs, stack_top, &auxv, execfn)?;
+        let used = stack_image.len();
+        self.write_bytes(stack_top - used, &stack_image)?;
+        Ok(LoadedImage {
+            entry: interp.map(|image| image.entry).unwrap_or(program.entry),
+            stack_pointer: stack_top - used,
+            load_bias: program.load_bias,
+            phdr_addr: program.phdr_addr,
+            phnum: program.phnum,
+            phent: program.phent,
+            interp_base: interp.map(|image| image.load_bias).unwrap_or(0),
+            interp_entry: interp.map(|image| image.entry).unwrap_or(0),
+            program_entry: program.entry,
+            is_dyn: program.is_dyn,
+        })
+    }
+
+    fn map_elf_segments(&self, image: &[u8]) -> KernelResult<MappedElfImage> {
+        const PT_LOAD: u32 = 1;
+        const ET_EXEC: u16 = 2;
+        const ET_DYN: u16 = 3;
+
         let header = ElfHeader::parse(image)?;
-        let phdr_addr = find_phdr_vaddr(&header, image)?;
         if header.program_header_size != 56 || header.class != 2 || header.endianness != 1 {
             return Err(ENOEXEC);
         }
@@ -565,13 +636,36 @@ impl AddressSpace {
             return Err(ENOEXEC);
         }
 
-        self.clear();
-        let mut highest_end = USER_HEAP_BASE;
+        let mut min_vaddr = usize::MAX;
+        let mut max_vaddr_end = 0usize;
         let mut load_segments = 0usize;
         for index in 0..header.program_header_num {
             let offset = header.program_header_offset + index * header.program_header_size;
             let ph = ProgramHeader::parse(image, offset)?;
-            if ph.segment_type != 1 {
+            if ph.segment_type != PT_LOAD {
+                continue;
+            }
+            if ph.file_size > ph.mem_size {
+                return Err(ENOEXEC);
+            }
+            min_vaddr = min_vaddr.min(ph.vaddr);
+            max_vaddr_end = max_vaddr_end.max(ph.vaddr.checked_add(ph.mem_size).ok_or(ENOEXEC)?);
+            load_segments += 1;
+        }
+        if load_segments == 0 {
+            return Err(ENOEXEC);
+        }
+
+        let load_bias = match header.elf_type {
+            ET_EXEC => 0usize,
+            ET_DYN => self.reserve_dynamic_load_bias(min_vaddr, max_vaddr_end)?,
+            _ => return Err(ENOEXEC),
+        };
+
+        for index in 0..header.program_header_num {
+            let offset = header.program_header_offset + index * header.program_header_size;
+            let ph = ProgramHeader::parse(image, offset)?;
+            if ph.segment_type != PT_LOAD {
                 continue;
             }
             if ph.file_size > ph.mem_size {
@@ -581,8 +675,9 @@ impl AddressSpace {
             if data_end > image.len() {
                 return Err(ENOEXEC);
             }
-            let seg_start = align_down(ph.vaddr, PAGE_SIZE);
-            let page_offset = ph.vaddr - seg_start;
+            let mapped_vaddr = ph.vaddr.checked_add(load_bias).ok_or(ENOEXEC)?;
+            let seg_start = align_down(mapped_vaddr, PAGE_SIZE);
+            let page_offset = mapped_vaddr - seg_start;
             let seg_mem_len = page_offset.checked_add(ph.mem_size).ok_or(ENOEXEC)?;
             let mut seg_bytes = Vec::new();
             seg_bytes
@@ -596,42 +691,40 @@ impl AddressSpace {
                 seg_mem_len,
                 elf_flags_to_prot(ph.flags),
             )?;
-            let seg_end = ph.vaddr.checked_add(ph.mem_size).ok_or(ENOEXEC)?;
-            highest_end = highest_end.max(align_up(seg_end, PAGE_SIZE));
-            load_segments += 1;
-        }
-        if load_segments == 0 {
-            return Err(ENOEXEC);
         }
 
-        {
-            let mut inner = self.inner.lock();
-            inner.program_break = highest_end.max(USER_HEAP_BASE);
-        }
-        let stack_top = USER_STACK_TOP;
-        let stack_base = stack_top - USER_STACK_SIZE;
-        self.map_fixed_bytes(stack_base, &[], USER_STACK_SIZE, DEFAULT_PROT)?;
-        let auxv = [
-            (3usize, phdr_addr),                  // AT_PHDR
-            (4usize, header.program_header_size), // AT_PHENT
-            (5usize, header.program_header_num),  // AT_PHNUM
-            (6usize, PAGE_SIZE),                  // AT_PAGESZ
-            (7usize, 0usize),                     // AT_BASE
-            (8usize, 0usize),                     // AT_FLAGS
-            (9usize, header.entry),               // AT_ENTRY
-            (11usize, 0usize),                    // AT_UID
-            (12usize, 0usize),                    // AT_EUID
-            (13usize, 0usize),                    // AT_GID
-            (14usize, 0usize),                    // AT_EGID
-            (23usize, 0usize),                    // AT_SECURE
-        ];
-        let stack_image = build_initial_stack(args, envs, stack_top, &auxv)?;
-        let used = stack_image.len();
-        self.write_bytes(stack_top - used, &stack_image)?;
-        Ok(LoadedImage {
-            entry: header.entry,
-            stack_pointer: stack_top - used,
+        let phdr_addr = find_phdr_vaddr(&header, image)?
+            .checked_add(load_bias)
+            .ok_or(ENOEXEC)?;
+        let entry = header.entry.checked_add(load_bias).ok_or(ENOEXEC)?;
+        Ok(MappedElfImage {
+            entry,
+            load_bias,
+            phdr_addr,
+            phnum: header.program_header_num,
+            phent: header.program_header_size,
+            highest_end: align_up(max_vaddr_end.checked_add(load_bias).ok_or(ENOEXEC)?, PAGE_SIZE),
+            is_dyn: header.elf_type == ET_DYN,
         })
+    }
+
+    fn reserve_dynamic_load_bias(
+        &self,
+        min_vaddr: usize,
+        max_vaddr_end: usize,
+    ) -> KernelResult<usize> {
+        let load_floor = align_down(min_vaddr, PAGE_SIZE);
+        let span = align_up(max_vaddr_end.saturating_sub(load_floor).max(PAGE_SIZE), PAGE_SIZE);
+        let mut inner = self.inner.lock();
+        let mut base = align_up(inner.next_mapping_base, PAGE_SIZE);
+        loop {
+            if let Some(overlap_end) = first_overlap_end(&inner.mappings, base, span) {
+                base = align_up(overlap_end, PAGE_SIZE);
+                continue;
+            }
+            inner.next_mapping_base = base.checked_add(span).ok_or(ENOMEM)?;
+            return base.checked_sub(load_floor).ok_or(ENOMEM);
+        }
     }
 
     fn map_owned(&self, addr: usize, bytes: Vec<u8>, prot: usize) -> KernelResult<()> {
@@ -1086,6 +1179,7 @@ impl MemoryManager {
 struct ElfHeader {
     class: u8,
     endianness: u8,
+    elf_type: u16,
     entry: usize,
     program_header_offset: usize,
     program_header_size: usize,
@@ -1100,12 +1194,24 @@ impl ElfHeader {
         Ok(Self {
             class: image[4],
             endianness: image[5],
+            elf_type: read_u16(image, 16)?,
             entry: read_u64(image, 24)? as usize,
             program_header_offset: read_u64(image, 32)? as usize,
             program_header_size: read_u16(image, 54)? as usize,
             program_header_num: read_u16(image, 56)? as usize,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MappedElfImage {
+    entry: usize,
+    load_bias: usize,
+    phdr_addr: usize,
+    phnum: usize,
+    phent: usize,
+    highest_end: usize,
+    is_dyn: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1289,41 +1395,92 @@ fn build_initial_stack(
     envs: &[String],
     stack_top: usize,
     auxv: &[(usize, usize)],
+    execfn: Option<&str>,
 ) -> KernelResult<Vec<u8>> {
+    const AT_RANDOM: usize = 25;
+    const AT_EXECFN: usize = 31;
+    const AUX_RANDOM_BYTES: [u8; 16] = [
+        0x57, 0x68, 0x75, 0x73, 0x65, 0x2d, 0x72, 0x76, 0x2d, 0x61, 0x75, 0x78, 0x76, 0x2d,
+        0x31, 0x36,
+    ];
+
     let pointer_size = size_of::<usize>();
-    let strings = args.iter().chain(envs.iter()).collect::<Vec<_>>();
-    let total_strings_len = strings.iter().map(|entry| entry.len() + 1).sum::<usize>();
-    let pointer_count = 1 + args.len() + 1 + envs.len() + 1 + (auxv.len() + 1) * 2;
+    let total_strings_len = args
+        .iter()
+        .chain(envs.iter())
+        .map(|entry| entry.len() + 1)
+        .sum::<usize>()
+        + execfn.map(|value| value.len() + 1).unwrap_or(0)
+        + AUX_RANDOM_BYTES.len();
+    let auxv_len = auxv.len() + usize::from(execfn.is_some()) + 1;
+    let pointer_count = 1 + args.len() + 1 + envs.len() + 1 + (auxv_len + 1) * 2;
     let mut stack = vec![0u8; align_up(total_strings_len + pointer_count * pointer_size, 16)];
 
     let mut string_cursor = stack.len();
-    let mut pointers = Vec::with_capacity(pointer_count);
+    let mut arg_ptrs = Vec::with_capacity(args.len());
+    let mut env_ptrs = Vec::with_capacity(envs.len());
+    let mut push_blob = |blob: &[u8]| -> usize {
+        string_cursor -= blob.len();
+        stack[string_cursor..string_cursor + blob.len()].copy_from_slice(blob);
+        stack_top - (stack.len() - string_cursor)
+    };
+
     for entry in args {
-        string_cursor -= entry.len() + 1;
-        stack[string_cursor..string_cursor + entry.len()].copy_from_slice(entry.as_bytes());
-        pointers.push(stack_top - (stack.len() - string_cursor));
+        let mut bytes = Vec::with_capacity(entry.len() + 1);
+        bytes.extend_from_slice(entry.as_bytes());
+        bytes.push(0);
+        arg_ptrs.push(push_blob(&bytes));
     }
-    pointers.push(0);
     for entry in envs {
-        string_cursor -= entry.len() + 1;
-        stack[string_cursor..string_cursor + entry.len()].copy_from_slice(entry.as_bytes());
-        pointers.push(stack_top - (stack.len() - string_cursor));
+        let mut bytes = Vec::with_capacity(entry.len() + 1);
+        bytes.extend_from_slice(entry.as_bytes());
+        bytes.push(0);
+        env_ptrs.push(push_blob(&bytes));
     }
-    pointers.push(0);
+    let execfn_addr = execfn.map(|value| {
+        let mut bytes = Vec::with_capacity(value.len() + 1);
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+        push_blob(&bytes)
+    });
+    let random_addr = push_blob(&AUX_RANDOM_BYTES);
 
     let mut head = vec![0u8; pointer_size * pointer_count];
     let argc = args.len();
     let mut cursor = 0usize;
     head[..pointer_size].copy_from_slice(&argc.to_le_bytes()[..pointer_size]);
     cursor += pointer_size;
-    for value in &pointers {
+    for value in &arg_ptrs {
         head[cursor..cursor + pointer_size].copy_from_slice(&value.to_le_bytes()[..pointer_size]);
         cursor += pointer_size;
     }
+    head[cursor..cursor + pointer_size].copy_from_slice(&0usize.to_le_bytes()[..pointer_size]);
+    cursor += pointer_size;
+    for value in &env_ptrs {
+        head[cursor..cursor + pointer_size].copy_from_slice(&value.to_le_bytes()[..pointer_size]);
+        cursor += pointer_size;
+    }
+    head[cursor..cursor + pointer_size].copy_from_slice(&0usize.to_le_bytes()[..pointer_size]);
+    cursor += pointer_size;
+
     for &(key, value) in auxv {
         head[cursor..cursor + pointer_size].copy_from_slice(&key.to_le_bytes()[..pointer_size]);
         cursor += pointer_size;
         head[cursor..cursor + pointer_size].copy_from_slice(&value.to_le_bytes()[..pointer_size]);
+        cursor += pointer_size;
+    }
+    head[cursor..cursor + pointer_size]
+        .copy_from_slice(&AT_RANDOM.to_le_bytes()[..pointer_size]);
+    cursor += pointer_size;
+    head[cursor..cursor + pointer_size]
+        .copy_from_slice(&random_addr.to_le_bytes()[..pointer_size]);
+    cursor += pointer_size;
+    if let Some(execfn_addr) = execfn_addr {
+        head[cursor..cursor + pointer_size]
+            .copy_from_slice(&AT_EXECFN.to_le_bytes()[..pointer_size]);
+        cursor += pointer_size;
+        head[cursor..cursor + pointer_size]
+            .copy_from_slice(&execfn_addr.to_le_bytes()[..pointer_size]);
         cursor += pointer_size;
     }
     head[cursor..cursor + pointer_size].copy_from_slice(&0usize.to_le_bytes()[..pointer_size]);

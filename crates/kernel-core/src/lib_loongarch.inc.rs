@@ -60,12 +60,13 @@ const OSCOMP_LMBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
 const OSCOMP_UNIXBENCH_TIMEOUT_NS: u64 = 600 * 1_000_000_000;
 const OSCOMP_IOZONE_BUSYBOX_WINDOW_NS: u64 = 0;
 const OSCOMP_IOZONE_BUSYBOX_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
-const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
+const OSCOMP_REQUIRED_TEST_FILES: [&str; 27] = [
     "/musl/busybox",
-    "/musl/basic/run-all.sh",
+    "/musl/basic_testcode.sh",
     "/musl/busybox_testcode.sh",
     "/musl/iozone_testcode.sh",
     "/musl/libctest_testcode.sh",
+    "/musl/libcbench_testcode.sh",
     "/musl/libc-bench",
     "/musl/lmbench_testcode.sh",
     "/musl/lua_testcode.sh",
@@ -73,8 +74,27 @@ const OSCOMP_REQUIRED_TEST_FILES: [&str; 12] = [
     "/musl/netperf_testcode.sh",
     "/musl/iperf_testcode.sh",
     "/musl/cyclictest_testcode.sh",
+    "/musl/ltp_testcode.sh",
+    "/glibc/busybox",
+    "/glibc/basic_testcode.sh",
+    "/glibc/busybox_testcode.sh",
+    "/glibc/iozone_testcode.sh",
+    "/glibc/libcbench_testcode.sh",
+    "/glibc/libc-bench",
+    "/glibc/lmbench_testcode.sh",
+    "/glibc/lua_testcode.sh",
+    "/glibc/unixbench_testcode.sh",
+    "/glibc/netperf_testcode.sh",
+    "/glibc/iperf_testcode.sh",
+    "/glibc/cyclictest_testcode.sh",
+    "/glibc/ltp_testcode.sh",
 ];
-const OSCOMP_OPTIONAL_TEST_FILES: [&str; 1] = ["/musl/time-test"];
+const OSCOMP_OPTIONAL_TEST_FILES: [&str; 3] = [
+    "/musl/time-test",
+    "/musl/basic/run-all.sh",
+    "/glibc/basic/run-all.sh",
+];
+const OSCOMP_CFG_RUNNER_MODE_PATH: &str = "/musl/.whuse_oscomp_runner";
 const OSCOMP_LIBCTEST_PRELOAD_FILES: [(&str, u32); 6] = [
     ("/musl/libctest_testcode.sh", 0o100755),
     ("/musl/run-static.sh", 0o100755),
@@ -682,6 +702,68 @@ fn oscomp_suite_script() -> String {
         oscomp_iozone_full_scope(),
     )
 }
+const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
+    "set +e\n",
+    "export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
+    "WHUSE_OSCOMP_ONLY_STEP=${WHUSE_OSCOMP_ONLY_STEP:-}\n",
+    "if [ -z \"$WHUSE_OSCOMP_ONLY_STEP\" ] && [ -f /musl/.whuse_oscomp_only_step ]; then\n",
+    "    IFS= read -r WHUSE_OSCOMP_ONLY_STEP < /musl/.whuse_oscomp_only_step\n",
+    "fi\n",
+    "export WHUSE_OSCOMP_ONLY_STEP\n",
+    "run_script_entry() {\n",
+    "    runtime=\"$1\"\n",
+    "    script=\"$2\"\n",
+    "    if [ ! -f \"./$script\" ]; then\n",
+    "        echo whuse-oscomp-step-skip:${runtime}/$script:missing\n",
+    "        return 0\n",
+    "    fi\n",
+    "    echo whuse-oscomp-step-begin:${runtime}/$script\n",
+    "    ./busybox sh \"./$script\"\n",
+    "    rc=$?\n",
+    "    echo whuse-oscomp-step-end:${runtime}/$script:$rc\n",
+    "    return 0\n",
+    "}\n",
+    "run_runtime_suite() {\n",
+    "    runtime=\"$1\"\n",
+    "    root=\"/$runtime\"\n",
+    "    if [ ! -d \"$root\" ]; then\n",
+    "        echo whuse-oscomp-runtime-skip:$runtime:missing-dir\n",
+    "        return 0\n",
+    "    fi\n",
+    "    if [ ! -x \"$root/busybox\" ]; then\n",
+    "        echo whuse-oscomp-runtime-skip:$runtime:missing-busybox\n",
+    "        return 0\n",
+    "    fi\n",
+    "    echo whuse-oscomp-runtime-begin:$runtime\n",
+    "    cd \"$root\" || return 1\n",
+    "    for script in \\\n",
+    "        basic_testcode.sh \\\n",
+    "        busybox_testcode.sh \\\n",
+    "        iozone_testcode.sh \\\n",
+    "        libctest_testcode.sh \\\n",
+    "        libcbench_testcode.sh \\\n",
+    "        lmbench_testcode.sh \\\n",
+    "        lua_testcode.sh \\\n",
+    "        unixbench_testcode.sh \\\n",
+    "        netperf_testcode.sh \\\n",
+    "        iperf_testcode.sh \\\n",
+    "        ltp_testcode.sh \\\n",
+    "        cyclictest_testcode.sh \\\n",
+    "        cyclic_testcode.sh\n",
+    "    do\n",
+    "        if [ -n \"$WHUSE_OSCOMP_ONLY_STEP\" ] && [ \"$WHUSE_OSCOMP_ONLY_STEP\" != \"$script\" ]; then\n",
+    "            continue\n",
+    "        fi\n",
+    "        run_script_entry \"$runtime\" \"$script\"\n",
+    "    done\n",
+    "    echo whuse-oscomp-runtime-end:$runtime\n",
+    "    return 0\n",
+    "}\n",
+    "echo whuse-oscomp-script-start\n",
+    "run_runtime_suite musl\n",
+    "run_runtime_suite glibc\n",
+    "echo whuse-oscomp-suite-done\n",
+);
 const OSCOMP_SUITE_CMD: &str = concat!(
     "echo whuse-oscomp-shell-entered; ",
     "cd /musl; ",
@@ -1818,28 +1900,76 @@ fn try_switch_init_to_rootfs(processes: &mut ProcessTable, vfs: &mut KernelVfs) 
 }
 
 fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
-    for dir in ["/var", "/var/tmp", "/usr", "/usr/bin", "/lib"] {
+    for dir in ["/var", "/var/tmp", "/usr", "/usr/bin", "/usr/sbin", "/lib", "/sbin"] {
         let _ = vfs.mkdir("/", dir, 0o755);
     }
     install_busybox_exec_alias(vfs, "/musl/ls", "ls");
     install_busybox_exec_alias(vfs, "/musl/which", "which");
+    install_busybox_exec_alias(vfs, "/musl/sleep", "sleep");
+    install_busybox_exec_alias(vfs, "/musl/basename", "basename");
+    install_busybox_exec_alias(vfs, "/musl/dirname", "dirname");
+    install_busybox_exec_alias(vfs, "/musl/awk", "awk");
+    install_busybox_exec_alias(vfs, "/musl/sed", "sed");
+    install_busybox_exec_alias(vfs, "/musl/grep", "grep");
+    install_busybox_exec_alias(vfs, "/musl/cut", "cut");
+    install_busybox_exec_alias(vfs, "/musl/head", "head");
+    install_busybox_exec_alias(vfs, "/musl/tail", "tail");
+    install_busybox_exec_alias(vfs, "/musl/tr", "tr");
+    install_busybox_exec_alias(vfs, "/musl/xargs", "xargs");
+    install_busybox_exec_alias(vfs, "/musl/readlink", "readlink");
     for (path, target) in [
         ("/bin/busybox", "/musl/busybox"),
         ("/bin/sh", "/musl/busybox"),
         ("/bin/bash", "/musl/busybox"),
         ("/bin/ls", "/musl/ls"),
         ("/bin/which", "/musl/which"),
+        ("/bin/sleep", "/musl/sleep"),
+        ("/bin/basename", "/musl/basename"),
+        ("/bin/dirname", "/musl/dirname"),
+        ("/bin/awk", "/musl/awk"),
+        ("/bin/sed", "/musl/sed"),
+        ("/bin/grep", "/musl/grep"),
+        ("/bin/cut", "/musl/cut"),
+        ("/bin/head", "/musl/head"),
+        ("/bin/tail", "/musl/tail"),
+        ("/bin/tr", "/musl/tr"),
+        ("/bin/xargs", "/musl/xargs"),
+        ("/bin/readlink", "/musl/readlink"),
         ("/busybox", "/musl/busybox"),
         ("/usr/bin/ls", "/musl/ls"),
         ("/usr/bin/which", "/musl/which"),
+        ("/usr/bin/sleep", "/musl/sleep"),
+        ("/usr/bin/basename", "/musl/basename"),
+        ("/usr/bin/dirname", "/musl/dirname"),
+        ("/usr/bin/awk", "/musl/awk"),
+        ("/usr/bin/sed", "/musl/sed"),
+        ("/usr/bin/grep", "/musl/grep"),
+        ("/usr/bin/cut", "/musl/cut"),
+        ("/usr/bin/head", "/musl/head"),
+        ("/usr/bin/tail", "/musl/tail"),
+        ("/usr/bin/tr", "/musl/tr"),
+        ("/usr/bin/xargs", "/musl/xargs"),
+        ("/usr/bin/readlink", "/musl/readlink"),
         ("/usr/bin/env", "/musl/busybox"),
         ("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so"),
         ("/lib/ld-musl-loongarch64.so.1", "/musl/lib/libc.so"),
+        (
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+        ),
+        (
+            "/lib/ld-linux-loongarch-lp64d.so.1",
+            "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+        ),
+        ("/lib/libc.so.6", "/glibc/lib/libc.so.6"),
+        ("/lib/libm.so.6", "/glibc/lib/libm.so.6"),
+        ("/lib/libc.so", "/glibc/lib/libc.so"),
+        ("/lib/libm.so", "/glibc/lib/libm.so"),
     ] {
         install_fallback_symlink(vfs, path, target);
     }
     install_oscomp_root_aliases(vfs);
-    let suite_script = oscomp_suite_script();
+    let suite_script = select_oscomp_suite_script(vfs);
     match vfs.create_file(
         "/",
         OSCOMP_SUITE_SCRIPT_PATH,
@@ -1965,6 +2095,13 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
         }
     }
     ok
+}
+
+fn select_oscomp_suite_script(vfs: &mut KernelVfs) -> String {
+    match vfs.read_file_all("/", OSCOMP_CFG_RUNNER_MODE_PATH) {
+        Ok(bytes) if String::from_utf8_lossy(&bytes).trim() == "debug" => oscomp_suite_script(),
+        _ => OSCOMP_OFFICIAL_SUITE_SCRIPT.to_string(),
+    }
 }
 
 fn oscomp_process_timeout_ns(

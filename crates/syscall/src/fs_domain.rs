@@ -19,7 +19,9 @@ pub(crate) fn dispatch(
         SYS_GETCWD => ctx.dispatcher.sys_getcwd(args, ctx.procs),
         SYS_DUP => ctx.dispatcher.sys_dup(args, ctx.procs),
         SYS_DUP2 => ctx.dispatcher.sys_dup3(args, ctx.procs),
-        SYS_FCNTL => ctx.dispatcher.sys_fcntl(args, ctx.procs),
+        SYS_FCNTL => ctx
+            .dispatcher
+            .sys_fcntl(args, ctx.procs, ctx.scheduler, ctx.vfs),
         SYS_IOCTL => ctx.dispatcher.sys_ioctl(args, ctx.procs),
         SYS_FLOCK => ctx.dispatcher.sys_flock(args, ctx.procs),
         SYS_MKDIR => ctx.dispatcher.sys_mkdir(args, ctx.procs, ctx.vfs),

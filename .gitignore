@@ -16,3 +16,7 @@
 # OS-generated noise
 .DS_Store
 Thumbs.db
+
+# Kernel binaries
+kernel-la
+kernel-rv

@@ -31,6 +31,8 @@ SECTIONS
     _bss_end = .;
   } > RAM
 
+  PROVIDE(end = .);
+
   /DISCARD/ : {
     *(.eh_frame)
     *(.eh_frame_hdr)

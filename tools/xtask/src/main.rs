@@ -77,7 +77,7 @@ fn build_riscv_artifact() -> ExitCode {
         .join(RISCV_TARGET)
         .join("debug")
         .join(RISCV_PACKAGE);
-    match package_riscv_kernel_artifact(&built_kernel, "kernel-rv") {
+    match package_kernel_artifact(&built_kernel, "kernel-rv") {
         Ok(path) => {
             println!("packaged RISC-V contest kernel {}", path.display());
             ExitCode::SUCCESS
@@ -447,7 +447,7 @@ fn qemu_riscv_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> ExitC
         .join(RISCV_TARGET)
         .join("debug")
         .join(RISCV_PACKAGE);
-    let packaged_kernel = match package_riscv_kernel_artifact(&built_kernel, "kernel-rv") {
+    let packaged_kernel = match package_kernel_artifact(&built_kernel, "kernel-rv") {
         Ok(path) => path,
         Err(err) => {
             eprintln!("{err}");
@@ -652,7 +652,7 @@ fn build_qemu_loongarch_host_args(
     args.push("-device".to_string());
     args.push("virtio-net-pci,netdev=net0".to_string());
     args.push("-netdev".to_string());
-    args.push("user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555".to_string());
+    args.push("user,id=net0,hostfwd=tcp::15555-:15555,hostfwd=udp::15555-:15555".to_string());
     args
 }
 
@@ -685,7 +685,7 @@ fn build_qemu_loongarch_contest_args(
     args.push("-device".to_string());
     args.push("virtio-net-pci,netdev=net0".to_string());
     args.push("-netdev".to_string());
-    args.push("user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555".to_string());
+    args.push("user,id=net0,hostfwd=tcp::15555-:15555,hostfwd=udp::15555-:15555".to_string());
     if let Some(extra) = extra_disk {
         args.push("-drive".to_string());
         args.push(format!("file={},if=none,format=raw,id=x1", extra.display()));
@@ -1011,7 +1011,7 @@ fn contest_selfcheck() -> ExitCode {
             "-rtc base=utc",
             "virtio-blk-pci,drive=x0",
             "virtio-net-pci,netdev=net0",
-            "user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555",
+            "user,id=net0,hostfwd=tcp::15555-:15555,hostfwd=udp::15555-:15555",
             "virtio-blk-pci,drive=x1",
         ],
     ) {
@@ -1205,7 +1205,7 @@ fn contest_loongarch_boot_smoke(image: &str, kernel: &Path, disk: &Path) -> Resu
             "bash",
             "-lc",
             &format!(
-                "timeout 60s qemu-system-loongarch64 -machine virt -kernel {kernel_name} -m 1G -nographic -smp 1 -drive file={disk_name},if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0 -netdev user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555 -rtc base=utc"
+                "timeout 60s qemu-system-loongarch64 -machine virt -kernel {kernel_name} -m 1G -nographic -smp 1 -drive file={disk_name},if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0 -netdev user,id=net0,hostfwd=tcp::15555-:15555,hostfwd=udp::15555-:15555 -rtc base=utc"
             ),
         ])
         .output()
@@ -1599,7 +1599,7 @@ mod tests {
             "-rtc base=utc",
             "virtio-blk-pci,drive=x0",
             "virtio-net-pci,netdev=net0",
-            "user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555",
+            "user,id=net0,hostfwd=tcp::15555-:15555,hostfwd=udp::15555-:15555",
             "virtio-blk-pci,drive=x1",
         ] {
             assert!(args.contains(token), "missing token: {token}");

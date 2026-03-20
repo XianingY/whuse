@@ -705,63 +705,50 @@ fn oscomp_suite_script() -> String {
 const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "set +e\n",
     "export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
-    "WHUSE_OSCOMP_ONLY_STEP=${WHUSE_OSCOMP_ONLY_STEP:-}\n",
-    "export WHUSE_OSCOMP_ONLY_STEP\n",
     "echo whuse-oscomp-script-start\n",
-    "for runtime in musl glibc\n",
-    "do\n",
-    "    root=\"/$runtime\"\n",
-    "    if [ ! -d \"$root\" ]; then\n",
-    "        echo whuse-oscomp-runtime-skip:$runtime:missing-dir\n",
-    "        continue\n",
-    "    fi\n",
-    "    if [ ! -x \"$root/busybox\" ]; then\n",
-    "        echo whuse-oscomp-runtime-skip:$runtime:missing-busybox\n",
-    "        continue\n",
-    "    fi\n",
-    "    echo whuse-oscomp-runtime-begin:$runtime\n",
-    "    cd \"$root\" || exit 1\n",
-    "    for script in \\\n",
-    "        basic_testcode.sh \\\n",
-    "        busybox_testcode.sh \\\n",
-    "        iozone_testcode.sh \\\n",
-    "        libctest_testcode.sh \\\n",
-    "        libcbench_testcode.sh \\\n",
-    "        lmbench_testcode.sh \\\n",
-    "        lua_testcode.sh \\\n",
-    "        unixbench_testcode.sh \\\n",
-    "        netperf_testcode.sh \\\n",
-    "        iperf_testcode.sh \\\n",
-    "        ltp_testcode.sh \\\n",
-    "        cyclictest_testcode.sh \\\n",
-    "        cyclic_testcode.sh\n",
-    "    do\n",
-    "        if [ -n \"$WHUSE_OSCOMP_ONLY_STEP\" ] && [ \"$WHUSE_OSCOMP_ONLY_STEP\" != \"$script\" ]; then\n",
-    "            continue\n",
-    "        fi\n",
-    "        if [ ! -f \"./$script\" ]; then\n",
-    "            echo whuse-oscomp-step-begin:${runtime}/$script\n",
-    "            echo whuse-oscomp-step-skip:${runtime}/$script:missing\n",
-    "            echo whuse-oscomp-step-end:${runtime}/$script:0\n",
-    "            continue\n",
-    "        fi\n",
-    "        echo whuse-oscomp-step-begin:${runtime}/$script\n",
-    "        ./busybox sh \"./$script\"\n",
-    "        rc=$?\n",
-    "        echo whuse-oscomp-step-end:${runtime}/$script:$rc\n",
-    "    done\n",
-    "    echo whuse-oscomp-runtime-end:$runtime\n",
-    "done\n",
+    "cd /musl || exit 1\n",
+    "echo whuse-oscomp-step-begin:musl/basic_testcode.sh\n",
+    "echo \"#### OS COMP TEST GROUP START basic-musl ####\"\n",
+    "cd ./basic || exit 1\n",
+    ". ./run-all.sh\n",
+    "cd .. || exit 1\n",
+    "rc=$?\n",
+    "echo \"#### OS COMP TEST GROUP END basic-musl ####\"\n",
+    "echo whuse-oscomp-step-end:musl/basic_testcode.sh:$rc\n",
+    "echo whuse-oscomp-step-begin:musl/busybox_testcode.sh\n",
+    "echo \"#### OS COMP TEST GROUP START busybox-musl ####\"\n",
+    "./busybox sh ./busybox_testcode.sh\n",
+    "rc=$?\n",
+    "echo \"#### OS COMP TEST GROUP END busybox-musl ####\"\n",
+    "echo whuse-oscomp-step-end:musl/busybox_testcode.sh:$rc\n",
+    "cd /glibc || exit 1\n",
+    "echo whuse-oscomp-step-begin:glibc/basic_testcode.sh\n",
+    "echo \"#### OS COMP TEST GROUP START basic-glibc ####\"\n",
+    "cd ./basic || exit 1\n",
+    ". ./run-all.sh\n",
+    "cd .. || exit 1\n",
+    "rc=$?\n",
+    "echo \"#### OS COMP TEST GROUP END basic-glibc ####\"\n",
+    "echo whuse-oscomp-step-end:glibc/basic_testcode.sh:$rc\n",
+    "echo whuse-oscomp-step-begin:glibc/busybox_testcode.sh\n",
+    "echo \"#### OS COMP TEST GROUP START busybox-glibc ####\"\n",
+    "/musl/busybox sh ./busybox_testcode.sh\n",
+    "rc=$?\n",
+    "echo \"#### OS COMP TEST GROUP END busybox-glibc ####\"\n",
+    "echo whuse-oscomp-step-end:glibc/busybox_testcode.sh:$rc\n",
     "echo whuse-oscomp-suite-done\n",
 );
 const OSCOMP_SUITE_ENTRY_PATH: &str = "/tmp/whuse-oscomp-entry.sh";
 const OSCOMP_SUITE_ENTRY_SCRIPT: &str = concat!(
     "#!/musl/busybox sh\n",
     "echo whuse-oscomp-shell-entered\n",
-    ". /tmp/whuse-oscomp-suite.sh\n",
+    "echo whuse-oscomp-shell-launch-suite\n",
+    "/musl/busybox sh /tmp/whuse-oscomp-suite.sh\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-shell-suite-rc:$rc\n",
     "if [ -x /musl/basic/exit ]; then exec /musl/basic/exit; fi\n",
     "echo whuse-oscomp-exit-missing\n",
-    "exit 0\n",
+    "exit \"$rc\"\n",
 );
 
 static KERNEL_IDLE_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
@@ -956,6 +943,11 @@ impl Kernel {
                     .process_snapshots()
                     .iter()
                     .any(|process| process.tgid > 1 && !process.is_thread);
+                use hal_api::ConsoleWriter;
+                use core::fmt::Write;
+                let mut console = ConsoleWriter;
+                let _ = write!(console, "whuse-debug: idle path has_non_init={}\n", has_non_init);
+                
                 if has_non_init {
                     static mut SPIN_LOG_COUNT: usize = 0;
                     unsafe {
@@ -970,6 +962,7 @@ impl Kernel {
                         }
                     }
                     let idle_ticks = KERNEL_IDLE_TIMER_TICKS.swap(0, Ordering::Relaxed);
+                    let _ = write!(console, "whuse-debug: idle_ticks={}\n", idle_ticks);
                     if idle_ticks > 0 {
                         self.timer_irq_count = self.timer_irq_count.saturating_add(idle_ticks);
                         let now = hal().timer.monotonic_nanos();

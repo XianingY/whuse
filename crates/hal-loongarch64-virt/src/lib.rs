@@ -36,6 +36,124 @@ static mut __whuse_current_frame: usize = 0;
 #[no_mangle]
 static mut __whuse_kernel_ra: usize = 0;
 
+/// Timer callback pointer for kernel-mode timer interrupts.
+pub static KERNEL_TRAP_HANDLER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+// LoongArch CSR numbers for timer handling
+const CSR_CRMD: u32 = 0x0;    // Current mode
+const CSR_PRMD: u32 = 0x1;    // Previous mode
+const CSR_ECFG: u32 = 0x4;    // Exception config (interrupt enables)
+const CSR_ESTAT: u32 = 0x5;   // Exception status
+const CSR_ERA: u32 = 0x6;     // Exception return address
+const CSR_EENTRY: u32 = 0xc;  // Exception entry
+const CSR_TCFG: u32 = 0x41;   // Timer config
+const CSR_TVAL: u32 = 0x42;   // Timer value (countdown)
+const CSR_TICLR: u32 = 0x44;  // Timer interrupt clear
+const CSR_SAVE0: u32 = 0x30;  // Scratch register 0
+const CSR_SAVE1: u32 = 0x31;  // Scratch register 1
+
+// Timer interrupt bit in ECFG/ESTAT (bit 11)
+const ECFG_TI: usize = 1 << 11;
+
+// LoongArch timer frequency (100 MHz on QEMU virt)
+const LA_TIMER_FREQ_HZ: u64 = 100_000_000;
+
+#[cfg(target_arch = "loongarch64")]
+global_asm!(
+    r#"
+    .section .text
+    .globl __whuse_kernel_trap_entry
+    .align 4
+__whuse_kernel_trap_entry:
+    // Save caller-saved registers we'll use
+    addi.d $sp, $sp, -144
+    st.d $ra,   $sp, 0
+    st.d $t0,   $sp, 8
+    st.d $t1,   $sp, 16
+    st.d $t2,   $sp, 24
+    st.d $a0,   $sp, 32
+    st.d $a1,   $sp, 40
+    st.d $a2,   $sp, 48
+    st.d $a3,   $sp, 56
+    st.d $a4,   $sp, 64
+    st.d $a5,   $sp, 72
+    st.d $a6,   $sp, 80
+    st.d $a7,   $sp, 88
+
+    // Save CRMD and set kernel-mode CRMD (DA=0, PG=1 for DMW)
+    csrrd $t0, 0x0
+    st.d $t0, $sp, 96
+    // Set CRMD for kernel: PLV=0, IE=0, DA=0, PG=1, DATF=01, DATM=01
+    // Value: 0x53 = DA=0, PG=1, DATF=01, DATM=01 (keeps DMW active)
+    li.d $t0, 0x53
+    csrwr $t0, 0x0
+
+    // Read ESTAT (exception status) and ERA (return address) for handler
+    csrrd $a0, 0x5
+    csrrd $a1, 0x6
+    bl __whuse_kernel_trap_handler
+
+    // Restore CRMD
+    ld.d $t0, $sp, 96
+    csrwr $t0, 0x0
+
+    // Restore registers
+    ld.d $ra,   $sp, 0
+    ld.d $t0,   $sp, 8
+    ld.d $t1,   $sp, 16
+    ld.d $t2,   $sp, 24
+    ld.d $a0,   $sp, 32
+    ld.d $a1,   $sp, 40
+    ld.d $a2,   $sp, 48
+    ld.d $a3,   $sp, 56
+    ld.d $a4,   $sp, 64
+    ld.d $a5,   $sp, 72
+    ld.d $a6,   $sp, 80
+    ld.d $a7,   $sp, 88
+    addi.d $sp, $sp, 144
+    ertn
+"#
+);
+
+#[cfg(target_arch = "loongarch64")]
+extern "C" {
+    fn __whuse_kernel_trap_entry();
+}
+
+/// Kernel-mode trap handler for LoongArch.
+/// Called from __whuse_kernel_trap_entry with:
+///   a0 = ESTAT (exception status)
+///   a1 = ERA (exception return address)
+#[cfg(target_arch = "loongarch64")]
+#[no_mangle]
+unsafe extern "C" fn __whuse_kernel_trap_handler(estat: usize, _era: usize) {
+    // Check if this is a timer interrupt (bit 11 of ESTAT)
+    let is_timer = (estat & ECFG_TI) != 0;
+    if is_timer {
+        // Clear the timer interrupt by writing 1 to TICLR bit 0
+        core::arch::asm!("li.d $t0, 1", "csrwr $t0, 0x44", out("$t0") _);
+
+        let cb_ptr = KERNEL_TRAP_HANDLER.load(core::sync::atomic::Ordering::Relaxed);
+        if cb_ptr != 0 {
+            let cb: fn() = core::mem::transmute(cb_ptr);
+            cb();
+        }
+        return;
+    }
+
+    // Non-timer trap in kernel mode is fatal
+    let mut console = hal_api::ConsoleWriter;
+    let _ = core::fmt::Write::write_fmt(
+        &mut console,
+        format_args!(
+            "\nwhuse: FATAL KERNEL TRAP estat={:#x} era={:#x}\n",
+            estat, _era
+        ),
+    );
+    panic!("unhandled kernel trap");
+}
+
 #[cfg(target_arch = "loongarch64")]
 global_asm!(
     r#"
@@ -266,6 +384,16 @@ fn init_loongarch_mmu() {
 fn init_loongarch_mmu() {}
 
 pub fn bootstrap(dtb_pa: usize) {
+    extern "C" {
+        fn end();
+    }
+    let kernel_end = ((end as *const () as usize) + 4095) & !4095;
+    unsafe {
+        let map_ptr = MEMORY_MAP.as_ptr() as *mut MemoryRegion;
+        (*map_ptr.add(1)).start = kernel_end;
+        (*map_ptr.add(1)).size = (PHYS_MEM_BASE + PHYS_MEM_SIZE).saturating_sub(kernel_end);
+    }
+
     let discovery = if dtb_pa != 0 {
         parse_loongarch_virtio_discovery(dtb_pa)
     } else {
@@ -408,14 +536,40 @@ impl HalCpu for VirtCpu {
     }
 
     fn enable_interrupts(&self) {
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            let mut crmd: usize;
+            core::arch::asm!("csrrd {}, 0x0", out(reg) crmd);
+            crmd |= 1 << 2; // Set IE bit
+            core::arch::asm!("csrwr {}, 0x0", in(reg) crmd);
+            
+            use hal_api::ConsoleWriter;
+            use core::fmt::Write;
+            let mut console = ConsoleWriter;
+            let _ = write!(console, "whuse-debug: enable_interrupts CRMD={:#x}\n", crmd);
+        }
         self.interrupts_enabled.store(true, Ordering::Relaxed);
     }
 
     fn disable_interrupts(&self) {
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            let mut crmd: usize;
+            core::arch::asm!("csrrd {}, 0x0", out(reg) crmd);
+            crmd &= !(1 << 2); // Clear IE bit
+            core::arch::asm!("csrwr {}, 0x0", in(reg) crmd);
+        }
         self.interrupts_enabled.store(false, Ordering::Relaxed);
     }
 
     fn interrupts_enabled(&self) -> bool {
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            let crmd: usize;
+            core::arch::asm!("csrrd {}, 0x0", out(reg) crmd);
+            return (crmd & (1 << 2)) != 0;
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
         self.interrupts_enabled.load(Ordering::Relaxed)
     }
 
@@ -456,6 +610,10 @@ impl HalCpu for VirtCpu {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             __whuse_run_user(frame as *mut TrapFrame);
+            if KERNEL_TRAP_HANDLER.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+                let eentry = __whuse_kernel_trap_entry as *const () as usize;
+                core::arch::asm!("csrwr {}, 0xc", in(reg) eentry);
+            }
         }
         #[cfg(not(target_arch = "loongarch64"))]
         {
@@ -463,7 +621,25 @@ impl HalCpu for VirtCpu {
         }
     }
 
-    fn set_kernel_timer_callback(&self, _cb: fn()) {}
+    fn set_kernel_timer_callback(&self, cb: fn()) {
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            use hal_api::ConsoleWriter;
+            use core::fmt::Write;
+            let mut console = ConsoleWriter;
+            let _ = write!(console, "whuse-debug: set_kernel_timer_callback called\n");
+            
+            KERNEL_TRAP_HANDLER.store(cb as usize, core::sync::atomic::Ordering::Relaxed);
+            let eentry = __whuse_kernel_trap_entry as *const () as usize;
+            core::arch::asm!("csrwr {}, 0xc", in(reg) eentry);
+            
+            let _ = write!(console, "whuse-debug: EENTRY set to {:#x}\n", eentry);
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            let _ = cb;
+        }
+    }
 }
 
 impl HalMemory for VirtMemory {
@@ -498,10 +674,51 @@ impl HalTimer for VirtTimer {
     }
 
     fn monotonic_nanos(&self) -> u64 {
-        self.ticks.fetch_add(1_000_000, Ordering::Relaxed)
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let count: u64;
+            unsafe {
+                core::arch::asm!("rdtime.d {}, $r0", out(reg) count);
+            }
+            count * 10
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            self.ticks.fetch_add(1_000_000, Ordering::Relaxed)
+        }
     }
 
-    fn program_oneshot(&self, _deadline_nanos: u64) {}
+    fn program_oneshot(&self, deadline_nanos: u64) {
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            let now_ticks: u64;
+            core::arch::asm!("rdtime.d {}, $r0", out(reg) now_ticks);
+            let now_nanos = now_ticks * 10;
+
+            let delta_nanos = deadline_nanos.saturating_sub(now_nanos);
+            let delta_ticks = delta_nanos / 10;
+            let init_val = delta_ticks.max(1000);
+
+            use hal_api::ConsoleWriter;
+            use core::fmt::Write;
+            let mut console = ConsoleWriter;
+            let _ = write!(console, "whuse-debug: program_oneshot delta_ticks={} init_val={}\n", delta_ticks, init_val);
+
+            let mut ecfg: usize;
+            core::arch::asm!("csrrd {}, 0x4", out(reg) ecfg);
+            ecfg |= ECFG_TI;
+            core::arch::asm!("csrwr {}, 0x4", in(reg) ecfg);
+
+            let tcfg: usize = (init_val as usize) << 2 | 0x1;
+            core::arch::asm!("csrwr {}, 0x41", in(reg) tcfg);
+            
+            let _ = write!(console, "whuse-debug: TCFG={:#x} ECFG={:#x}\n", tcfg, ecfg);
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            let _ = deadline_nanos;
+        }
+    }
 }
 
 impl Ns16550 {

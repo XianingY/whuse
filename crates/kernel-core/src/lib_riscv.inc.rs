@@ -1106,18 +1106,14 @@ impl Kernel {
                     if idle_ticks > 0 {
                         self.timer_irq_count = self.timer_irq_count.saturating_add(idle_ticks);
                         let now = hal().timer.monotonic_nanos();
-                        for tid in self.processes.timed_wait_expired_tids(now) {
-                            let _ = self.scheduler.wake_task(tid);
+                        let expired_tids = self.processes.timed_wait_expired_tids(now);
+                        for tid in &expired_tids {
+                            let _ = self.scheduler.wake_task(*tid);
                         }
                         if self.scheduler.ready_count() == 0 && self.scheduler.blocked_count() > 0 {
                             let blocked_tids = self.scheduler.blocked_task_ids();
                             let all_futex =
                                 self.processes.all_blocked_are_futex_waiters(&blocked_tids);
-                            logln(format_args!(
-                                "whuse: idle-tick ready=0 blocked={} all_futex={}",
-                                blocked_tids.len(),
-                                all_futex
-                            ));
                             if all_futex {
                                 logln(format_args!(
                                     "whuse: idle-timer futex deadlock, force-waking {} tasks",
@@ -1131,12 +1127,6 @@ impl Kernel {
                         }
                         let signal_blocked =
                             self.processes.futex_blocked_with_pending_signal_tids();
-                        if !signal_blocked.is_empty() {
-                            logln(format_args!(
-                                "whuse: idle-tick signal-wake {:?}",
-                                signal_blocked
-                            ));
-                        }
                         for tid in signal_blocked {
                             self.processes.clear_futex_wait_state(tid);
                             let _ = self.scheduler.wake_task(tid);

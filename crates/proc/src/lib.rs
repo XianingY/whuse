@@ -1672,6 +1672,10 @@ impl ProcessTable {
             .collect()
     }
 
+    pub fn get_wait_deadlines(&self, tid: usize) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
+        self.processes.get(&tid).map(|p| (p.sleep_deadline_ns, p.futex_wait_deadline_ns, p.epoll_wait_deadline_ns))
+    }
+
     pub fn force_exit_group(&mut self, tgid: usize, code: i32) -> KernelResult<Option<GroupExit>> {
         let tids = self
             .processes

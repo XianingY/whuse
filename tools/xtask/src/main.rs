@@ -276,116 +276,22 @@ fn package_kernel_artifact(source: &Path, output_name: &str) -> Result<PathBuf, 
 }
 
 fn package_riscv_kernel_artifact(source: &Path, output_name: &str) -> Result<PathBuf, String> {
-    let target_dir = repo_root().join("target").join("xtask").join("riscv-elf-wrap");
+    let target_dir = repo_root().join("target").join("xtask").join("riscv-raw");
     fs::create_dir_all(&target_dir)
         .map_err(|err| format!("failed to create {}: {err}", target_dir.display()))?;
 
-    let raw_payload = target_dir.join(format!("{output_name}.raw"));
-    let raw_status = objcopy_to_binary(&source.to_path_buf(), &raw_payload);
+    let staged_raw = target_dir.join(format!("{output_name}.raw"));
+    let raw_status = objcopy_to_binary(&source.to_path_buf(), &staged_raw);
     if raw_status != ExitCode::SUCCESS {
         return Err(format!(
-            "failed to extract raw riscv kernel payload {} -> {}",
+            "failed to package raw riscv kernel payload {} -> {}",
             source.display(),
-            raw_payload.display()
+            staged_raw.display()
         ));
     }
-
-    let payload_path = fs::canonicalize(&raw_payload).map_err(|err| {
-        format!(
-            "failed to canonicalize RISC-V raw payload {}: {err}",
-            raw_payload.display()
-        )
-    })?;
-    let wrapper_rs = target_dir.join("payload.rs");
-    let wrapper_ld = target_dir.join("payload.ld");
-    let wrapper_obj = target_dir.join("payload.o");
     let output = repo_root().join(output_name);
-
-    let escaped_payload = payload_path.to_string_lossy().replace('\\', "\\\\");
-    fs::write(
-        &wrapper_rs,
-        format!(
-            r##"#![no_std]
-#![no_main]
-
-use core::arch::global_asm;
-
-global_asm!(r#"
-    .section .payload, "ax"
-    .globl payload_start
-payload_start:
-    .incbin "{escaped_payload}"
-"#);
-
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {{
-    loop {{}}
-}}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn whuse_riscv_wrapper_anchor() {{}}
-"##
-        ),
-    )
-    .map_err(|err| format!("failed to write {}: {err}", wrapper_rs.display()))?;
-    fs::write(
-        &wrapper_ld,
-        r#"OUTPUT_ARCH(riscv)
-ENTRY(payload_start)
-
-MEMORY {
-  RAM : ORIGIN = 0x80200000, LENGTH = 256M
-}
-
-SECTIONS {
-  . = ORIGIN(RAM);
-  .payload : ALIGN(4K) {
-    KEEP(*(.payload))
-  } > RAM
-}
-"#,
-    )
-    .map_err(|err| format!("failed to write {}: {err}", wrapper_ld.display()))?;
-
-    let rustc = rustc_binary();
-    let rustc_status = Command::new(rustc)
-        .args([
-            "--target",
-            RISCV_TARGET,
-            "--edition=2024",
-            "-C",
-            "panic=abort",
-            "--emit=obj",
-            "-o",
-        ])
-        .arg(&wrapper_obj)
-        .arg(&wrapper_rs)
-        .status()
-        .map_err(|err| format!("failed to execute rustc for riscv elf wrapper: {err}"))?;
-    if !rustc_status.success() {
-        return Err(format!(
-            "rustc failed while building riscv elf wrapper object (exit {:?})",
-            rustc_status.code()
-        ));
-    }
-
-    let Some(rust_lld) = bundled_rust_lld() else {
-        return Err("failed to locate bundled rust-lld".to_string());
-    };
-    let link_status = Command::new(rust_lld)
-        .args(["-flavor", "gnu", "-m", "elf64lriscv", "-T"])
-        .arg(&wrapper_ld)
-        .arg(&wrapper_obj)
-        .args(["-o"])
-        .arg(&output)
-        .status()
-        .map_err(|err| format!("failed to execute rust-lld for riscv elf wrapper: {err}"))?;
-    if !link_status.success() {
-        return Err(format!(
-            "rust-lld failed while linking riscv contest ELF wrapper (exit {:?})",
-            link_status.code()
-        ));
-    }
+    fs::copy(&staged_raw, &output)
+        .map_err(|err| format!("failed to copy {} -> {}: {err}", staged_raw.display(), output.display()))?;
 
     Ok(output)
 }
@@ -1002,11 +908,7 @@ fn contest_selfcheck() -> ExitCode {
                 if is_elf_artifact(&path, 0xf3) {
                     println!("contest-selfcheck: kernel-rv-format=elf");
                 } else {
-                    eprintln!(
-                        "contest-selfcheck: kernel-rv must be an ELF RISC-V artifact, got {}",
-                        path.display()
-                    );
-                    ok = false;
+                    println!("contest-selfcheck: kernel-rv-format=raw");
                 }
             }
         } else {
@@ -1132,17 +1034,39 @@ fn contest_selfcheck() -> ExitCode {
     }
 
     let rv_kernel = root.join("kernel-rv");
+    let rv_image = oscomp_image_path("rv");
     if rv_kernel.exists() {
-        match contest_riscv_boot_smoke(&contest_image, &rv_kernel) {
+        match contest_riscv_boot_smoke(
+            &contest_image,
+            &rv_kernel,
+            rv_image.exists().then_some(rv_image.as_path()),
+        ) {
             Ok(true) => println!("contest-selfcheck: kernel-rv-boot-smoke=ok"),
             Ok(false) => {
                 eprintln!(
-                    "contest-selfcheck: kernel-rv boot smoke did not reach `whuse: booting on riscv64-virt`"
+                    "contest-selfcheck: kernel-rv boot smoke did not reach contest scoring markers"
                 );
                 ok = false;
             }
             Err(err) => {
                 eprintln!("contest-selfcheck: kernel-rv boot smoke failed: {err}");
+                ok = false;
+            }
+        }
+    }
+    let la_kernel = root.join("kernel-la");
+    let la_image = oscomp_image_path("la");
+    if la_kernel.exists() && la_image.exists() {
+        match contest_loongarch_boot_smoke(&contest_image, &la_kernel, &la_image) {
+            Ok(true) => println!("contest-selfcheck: kernel-la-boot-smoke=ok"),
+            Ok(false) => {
+                eprintln!(
+                    "contest-selfcheck: kernel-la boot smoke did not reach contest scoring markers"
+                );
+                ok = false;
+            }
+            Err(err) => {
+                eprintln!("contest-selfcheck: kernel-la boot smoke failed: {err}");
                 ok = false;
             }
         }
@@ -1208,12 +1132,67 @@ fn is_elf_artifact(path: &Path, expected_machine: u16) -> bool {
     machine == expected_machine
 }
 
-fn contest_riscv_boot_smoke(image: &str, kernel: &Path) -> Result<bool, String> {
+fn contest_smoke_has_progress(text: &str) -> bool {
+    text.contains("whuse-oscomp-script-start")
+        || text.contains("#### OS COMP TEST GROUP START")
+        || text.contains("testcase ")
+}
+
+fn contest_riscv_boot_smoke(
+    image: &str,
+    kernel: &Path,
+    disk: Option<&Path>,
+) -> Result<bool, String> {
     let repo = repo_root();
     let kernel_name = kernel
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("invalid kernel artifact path {}", kernel.display()))?;
+    let mut qemu = format!(
+        "timeout 60s qemu-system-riscv64 -machine virt -kernel {kernel_name} -m 1G -nographic -smp 1 -bios default -no-reboot -rtc base=utc"
+    );
+    if let Some(disk) = disk {
+        let disk_name = disk
+            .strip_prefix(&repo)
+            .unwrap_or(disk)
+            .display()
+            .to_string();
+        qemu.push_str(&format!(
+            " -drive file={disk_name},if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -device virtio-net-device,netdev=net -netdev user,id=net"
+        ));
+    }
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            &format!("{}:/work", repo.display()),
+            "-w",
+            "/work",
+            image,
+            "bash",
+            "-lc",
+            &qemu,
+        ])
+        .output()
+        .map_err(|err| format!("failed to execute docker riscv boot smoke: {err}"))?;
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(text.contains("whuse: booting on riscv64-virt") && contest_smoke_has_progress(&text))
+}
+
+fn contest_loongarch_boot_smoke(image: &str, kernel: &Path, disk: &Path) -> Result<bool, String> {
+    let repo = repo_root();
+    let kernel_name = kernel
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid kernel artifact path {}", kernel.display()))?;
+    let disk_name = disk
+        .strip_prefix(&repo)
+        .unwrap_or(disk)
+        .display()
+        .to_string();
     let output = Command::new("docker")
         .args([
             "run",
@@ -1226,15 +1205,15 @@ fn contest_riscv_boot_smoke(image: &str, kernel: &Path) -> Result<bool, String> 
             "bash",
             "-lc",
             &format!(
-                "timeout 20s qemu-system-riscv64 -machine virt -kernel {kernel_name} -m 1G -nographic -smp 1 -bios default -no-reboot"
+                "timeout 60s qemu-system-loongarch64 -machine virt -kernel {kernel_name} -m 1G -nographic -smp 1 -drive file={disk_name},if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0 -netdev user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555 -rtc base=utc"
             ),
         ])
         .output()
-        .map_err(|err| format!("failed to execute docker riscv boot smoke: {err}"))?;
+        .map_err(|err| format!("failed to execute docker loongarch boot smoke: {err}"))?;
     let mut text = String::new();
     text.push_str(&String::from_utf8_lossy(&output.stdout));
     text.push_str(&String::from_utf8_lossy(&output.stderr));
-    Ok(text.contains("whuse: booting on riscv64-virt"))
+    Ok(text.contains("whuse: booting on loongarch64-virt") && contest_smoke_has_progress(&text))
 }
 
 fn refresh_oscomp_image(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {

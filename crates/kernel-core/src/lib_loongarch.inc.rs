@@ -706,36 +706,21 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "set +e\n",
     "export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
     "WHUSE_OSCOMP_ONLY_STEP=${WHUSE_OSCOMP_ONLY_STEP:-}\n",
-    "if [ -z \"$WHUSE_OSCOMP_ONLY_STEP\" ] && [ -f /musl/.whuse_oscomp_only_step ]; then\n",
-    "    IFS= read -r WHUSE_OSCOMP_ONLY_STEP < /musl/.whuse_oscomp_only_step\n",
-    "fi\n",
     "export WHUSE_OSCOMP_ONLY_STEP\n",
-    "run_script_entry() {\n",
-    "    runtime=\"$1\"\n",
-    "    script=\"$2\"\n",
-    "    if [ ! -f \"./$script\" ]; then\n",
-    "        echo whuse-oscomp-step-skip:${runtime}/$script:missing\n",
-    "        return 0\n",
-    "    fi\n",
-    "    echo whuse-oscomp-step-begin:${runtime}/$script\n",
-    "    ./busybox sh \"./$script\"\n",
-    "    rc=$?\n",
-    "    echo whuse-oscomp-step-end:${runtime}/$script:$rc\n",
-    "    return 0\n",
-    "}\n",
-    "run_runtime_suite() {\n",
-    "    runtime=\"$1\"\n",
+    "echo whuse-oscomp-script-start\n",
+    "for runtime in musl glibc\n",
+    "do\n",
     "    root=\"/$runtime\"\n",
     "    if [ ! -d \"$root\" ]; then\n",
     "        echo whuse-oscomp-runtime-skip:$runtime:missing-dir\n",
-    "        return 0\n",
+    "        continue\n",
     "    fi\n",
     "    if [ ! -x \"$root/busybox\" ]; then\n",
     "        echo whuse-oscomp-runtime-skip:$runtime:missing-busybox\n",
-    "        return 0\n",
+    "        continue\n",
     "    fi\n",
     "    echo whuse-oscomp-runtime-begin:$runtime\n",
-    "    cd \"$root\" || return 1\n",
+    "    cd \"$root\" || exit 1\n",
     "    for script in \\\n",
     "        basic_testcode.sh \\\n",
     "        busybox_testcode.sh \\\n",
@@ -754,22 +739,29 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        if [ -n \"$WHUSE_OSCOMP_ONLY_STEP\" ] && [ \"$WHUSE_OSCOMP_ONLY_STEP\" != \"$script\" ]; then\n",
     "            continue\n",
     "        fi\n",
-    "        run_script_entry \"$runtime\" \"$script\"\n",
+    "        if [ ! -f \"./$script\" ]; then\n",
+    "            echo whuse-oscomp-step-begin:${runtime}/$script\n",
+    "            echo whuse-oscomp-step-skip:${runtime}/$script:missing\n",
+    "            echo whuse-oscomp-step-end:${runtime}/$script:0\n",
+    "            continue\n",
+    "        fi\n",
+    "        echo whuse-oscomp-step-begin:${runtime}/$script\n",
+    "        ./busybox sh \"./$script\"\n",
+    "        rc=$?\n",
+    "        echo whuse-oscomp-step-end:${runtime}/$script:$rc\n",
     "    done\n",
     "    echo whuse-oscomp-runtime-end:$runtime\n",
-    "    return 0\n",
-    "}\n",
-    "echo whuse-oscomp-script-start\n",
-    "run_runtime_suite musl\n",
-    "run_runtime_suite glibc\n",
+    "done\n",
     "echo whuse-oscomp-suite-done\n",
 );
-const OSCOMP_SUITE_CMD: &str = concat!(
-    "echo whuse-oscomp-shell-entered; ",
-    "cd /musl; ",
-    "/musl/busybox sh /tmp/whuse-oscomp-suite.sh; ",
-    "if [ -x /musl/basic/exit ]; then exec /musl/basic/exit; fi; ",
-    "echo whuse-oscomp-exit-missing; exit 0;",
+const OSCOMP_SUITE_ENTRY_PATH: &str = "/tmp/whuse-oscomp-entry.sh";
+const OSCOMP_SUITE_ENTRY_SCRIPT: &str = concat!(
+    "#!/musl/busybox sh\n",
+    "echo whuse-oscomp-shell-entered\n",
+    ". /tmp/whuse-oscomp-suite.sh\n",
+    "if [ -x /musl/basic/exit ]; then exec /musl/basic/exit; fi\n",
+    "echo whuse-oscomp-exit-missing\n",
+    "exit 0\n",
 );
 
 static KERNEL_IDLE_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
@@ -1861,8 +1853,7 @@ fn try_switch_init_to_rootfs(processes: &mut ProcessTable, vfs: &mut KernelVfs) 
     let args = vec![
         String::from("/musl/busybox"),
         String::from("sh"),
-        String::from("-c"),
-        String::from(OSCOMP_SUITE_CMD),
+        String::from(OSCOMP_SUITE_ENTRY_PATH),
     ];
     let envs = vec![
         String::from("PATH=/musl:/bin:/sbin:/usr/bin:/usr/sbin"),
@@ -1986,6 +1977,20 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
     }
     match vfs.create_file(
         "/",
+        OSCOMP_SUITE_ENTRY_PATH,
+        OSCOMP_SUITE_ENTRY_SCRIPT.as_bytes(),
+    ) {
+        Ok(()) => logln(format_args!(
+            "whuse: installed suite entry {}",
+            OSCOMP_SUITE_ENTRY_PATH
+        )),
+        Err(err) => logln(format_args!(
+            "whuse: failed suite entry {} err={}",
+            OSCOMP_SUITE_ENTRY_PATH, err
+        )),
+    }
+    match vfs.create_file(
+        "/",
         OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH,
         OSCOMP_BUSYBOX_COMPAT_SCRIPT.as_bytes(),
     ) {
@@ -2097,11 +2102,8 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
     ok
 }
 
-fn select_oscomp_suite_script(vfs: &mut KernelVfs) -> String {
-    match vfs.read_file_all("/", OSCOMP_CFG_RUNNER_MODE_PATH) {
-        Ok(bytes) if String::from_utf8_lossy(&bytes).trim() == "debug" => oscomp_suite_script(),
-        _ => OSCOMP_OFFICIAL_SUITE_SCRIPT.to_string(),
-    }
+fn select_oscomp_suite_script(_vfs: &mut KernelVfs) -> String {
+    OSCOMP_OFFICIAL_SUITE_SCRIPT.to_string()
 }
 
 fn oscomp_process_timeout_ns(

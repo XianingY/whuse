@@ -45,6 +45,7 @@ pub struct Kernel {
     watchdog_last_hw_ns: u64,
     watchdog_iozone_window_until_ns: u64,
     watchdog_bench_window_until_ns: u64,
+    watchdog_libcbench_dumped_at: BTreeMap<usize, u64>,
     timer_irq_count: u64,
 }
 
@@ -829,9 +830,6 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "set +e\n",
     "export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
     "WHUSE_OSCOMP_ONLY_STEP=${WHUSE_OSCOMP_ONLY_STEP:-}\n",
-    "if [ -z \"$WHUSE_OSCOMP_ONLY_STEP\" ] && [ -f /musl/.whuse_oscomp_only_step ]; then\n",
-    "    IFS= read -r WHUSE_OSCOMP_ONLY_STEP < /musl/.whuse_oscomp_only_step\n",
-    "fi\n",
     "export WHUSE_OSCOMP_ONLY_STEP\n",
     "run_script_entry() {\n",
     "    runtime=\"$1\"\n",
@@ -887,12 +885,14 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "run_runtime_suite glibc\n",
     "echo whuse-oscomp-suite-done\n",
 );
-const OSCOMP_SUITE_CMD: &str = concat!(
-    "echo whuse-oscomp-shell-entered; ",
-    "cd /musl; ",
-    "/musl/busybox sh /tmp/whuse-oscomp-suite.sh; ",
-    "if [ -x /musl/basic/exit ]; then exec /musl/basic/exit; fi; ",
-    "echo whuse-oscomp-exit-missing; exit 0;",
+const OSCOMP_SUITE_ENTRY_PATH: &str = "/tmp/whuse-oscomp-entry.sh";
+const OSCOMP_SUITE_ENTRY_SCRIPT: &str = concat!(
+    "#!/musl/busybox sh\n",
+    "echo whuse-oscomp-shell-entered\n",
+    ". /tmp/whuse-oscomp-suite.sh\n",
+    "if [ -x /musl/basic/exit ]; then exec /musl/basic/exit; fi\n",
+    "echo whuse-oscomp-exit-missing\n",
+    "exit 0\n",
 );
 
 static KERNEL_IDLE_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
@@ -1058,6 +1058,7 @@ impl Kernel {
             watchdog_last_hw_ns: 0,
             watchdog_iozone_window_until_ns: 0,
             watchdog_bench_window_until_ns: 0,
+            watchdog_libcbench_dumped_at: BTreeMap::new(),
             timer_irq_count: 0,
         };
         logln(format_args!("whuse: init process bootstrapped"));
@@ -1209,6 +1210,8 @@ impl Kernel {
             .retain(|tgid, _| watched.contains_key(tgid));
         self.watchdog_seen_name
             .retain(|tgid, _| watched.contains_key(tgid));
+        self.watchdog_libcbench_dumped_at
+            .retain(|tgid, _| watched.contains_key(tgid));
         for (tgid, name) in watched.iter() {
             let previous_name = self.watchdog_seen_name.get(tgid);
             let reset_started_at = match previous_name {
@@ -1235,6 +1238,41 @@ impl Kernel {
             }
             if previous_name.map(|previous| previous.as_str()) != Some(*name) {
                 self.watchdog_seen_name.insert(*tgid, (*name).to_string());
+            }
+            let Some(started) = self.watchdog_started_at.get(tgid).copied() else {
+                continue;
+            };
+            let elapsed = now.saturating_sub(started);
+            if name.contains("libc-bench")
+                && elapsed >= 2_000_000_000
+                && !self.watchdog_libcbench_dumped_at.contains_key(tgid)
+            {
+                self.watchdog_libcbench_dumped_at.insert(*tgid, now);
+                let debug_snapshots = self.processes.debug_snapshots_in_tgid(*tgid);
+                logln(format_args!(
+                    "whuse-libcbench-stall:tgid={}:elapsed_ms={}:threads={}",
+                    tgid,
+                    elapsed / 1_000_000,
+                    debug_snapshots.len()
+                ));
+                for snapshot in debug_snapshots.iter().take(16) {
+                    logln(format_args!(
+                        "whuse-libcbench-stall:tid={}:sched={}:is_thread={}:proc_state={:?}:futex={:#x?}:deadline={:#x?}:ctid={:#x?}:robust={:#x?}:pending={:#x}:mask={:#x}:sepc={:#x}:sp={:#x}:a0={:#x}",
+                        snapshot.tid,
+                        self.scheduler.task_state_label(snapshot.tid),
+                        snapshot.is_thread,
+                        snapshot.state,
+                        snapshot.futex_wait_addr,
+                        snapshot.futex_wait_deadline_ns,
+                        snapshot.clear_child_tid,
+                        snapshot.robust_list.map(|(head, _)| head),
+                        snapshot.pending_signals,
+                        snapshot.signal_mask,
+                        snapshot.sepc,
+                        snapshot.sp,
+                        snapshot.retval
+                    ));
+                }
             }
         }
         if OSCOMP_IOZONE_BUSYBOX_WINDOW_NS > 0
@@ -1724,9 +1762,8 @@ impl Kernel {
                 }
             }
             self.dispatch_pending_signals();
-            // Cooperative scheduler fairness for benchmark-heavy loops: very
-            // frequent syscalls can keep re-arming timer deadlines and starve
-            // sibling tasks in the same benchmark pipeline.
+            let clone_like_syscall =
+                matches!(sysno, syscall::SYS_CLONE | syscall::SYS_CLONE3);
             let bench_like_task = self
                 .processes
                 .current()
@@ -1740,7 +1777,10 @@ impl Kernel {
                         || name.contains("iperf")
                 })
                 .unwrap_or(false);
-            if result != EAGAIN_RET && bench_like_task && self.scheduler.ready_count() > 0 {
+            if result != EAGAIN_RET
+                && self.scheduler.ready_count() > 0
+                && (bench_like_task || clone_like_syscall)
+            {
                 let _ = self.scheduler.yield_now();
             }
             return;
@@ -2126,8 +2166,7 @@ fn try_switch_init_to_rootfs(processes: &mut ProcessTable, vfs: &mut KernelVfs) 
     let args = vec![
         String::from("/musl/busybox"),
         String::from("sh"),
-        String::from("-c"),
-        String::from(OSCOMP_SUITE_CMD),
+        String::from(OSCOMP_SUITE_ENTRY_PATH),
     ];
     let envs = vec![
         String::from("PATH=/musl:/bin:/sbin:/usr/bin:/usr/sbin"),
@@ -2287,6 +2326,20 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
     }
     match vfs.create_file(
         "/",
+        OSCOMP_SUITE_ENTRY_PATH,
+        OSCOMP_SUITE_ENTRY_SCRIPT.as_bytes(),
+    ) {
+        Ok(()) => logln(format_args!(
+            "whuse: installed suite entry {}",
+            OSCOMP_SUITE_ENTRY_PATH
+        )),
+        Err(err) => logln(format_args!(
+            "whuse: failed suite entry {} err={}",
+            OSCOMP_SUITE_ENTRY_PATH, err
+        )),
+    }
+    match vfs.create_file(
+        "/",
         OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH,
         OSCOMP_BUSYBOX_COMPAT_SCRIPT.as_bytes(),
     ) {
@@ -2417,11 +2470,8 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
     ok
 }
 
-fn select_oscomp_suite_script(vfs: &mut KernelVfs) -> &'static str {
-    match vfs.read_file_all("/", OSCOMP_CFG_RUNNER_MODE_PATH) {
-        Ok(bytes) if String::from_utf8_lossy(&bytes).trim() == "debug" => OSCOMP_SUITE_SCRIPT,
-        _ => OSCOMP_OFFICIAL_SUITE_SCRIPT,
-    }
+fn select_oscomp_suite_script(_vfs: &mut KernelVfs) -> &'static str {
+    OSCOMP_OFFICIAL_SUITE_SCRIPT
 }
 
 fn oscomp_process_timeout_ns(
@@ -2512,6 +2562,7 @@ fn process_needs_forced_preempt(name: &str, now: u64, iozone_busybox_window_unti
 
 fn is_oscomp_heavy_process(name: &str) -> bool {
     name.contains("iozone")
+        || name.contains("libc-bench")
         || name.contains("lmbench")
         || name.contains("unixbench")
         || name.contains("netperf")

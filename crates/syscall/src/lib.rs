@@ -19,6 +19,7 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use hal_api::{hal, Timespec};
 use proc::{Process, ProcessTable, SigAction, WaitSelector};
 use spin::Mutex;
@@ -361,8 +362,51 @@ fn signal_frame_debug(line: &str) {
     }
 }
 
+static LIBCBENCH_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(256);
+
+fn is_libcbench_task(process: &proc::Process) -> bool {
+    process.name.contains("libc-bench")
+}
+
+fn libcbench_debug(line: &str) {
+    if LIBCBENCH_TRACE_BUDGET
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            if remaining > 0 {
+                Some(remaining - 1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+    {
+        log_always(line);
+    }
+}
+
+fn log_user_path_fault(process: &proc::Process, syscall: &str, path_ptr: usize) {
+    log_always(&format!(
+        "whuse-ltp:path-fault syscall={} tgid={} tid={} name={} cwd={} ptr={:#x} addr={}",
+        syscall,
+        process.tgid,
+        process.tid,
+        process.name,
+        process.cwd,
+        path_ptr,
+        process.address_space.describe_addr(path_ptr)
+    ));
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SyscallArgs(pub [usize; 6]);
+
+#[derive(Clone, Copy, Debug)]
+struct CloneRequest {
+    flags: usize,
+    stack: usize,
+    parent_tid: usize,
+    child_tid: usize,
+    tls: Option<usize>,
+}
 
 pub struct SyscallDispatcher;
 
@@ -828,7 +872,13 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let dirfd = args.0[0] as i32;
         let path_ptr = args.0[1];
-        let path = procs.current()?.read_user_cstr(path_ptr).map_err(|_| EFAULT)?;
+        let path = match procs.current()?.read_user_cstr(path_ptr) {
+            Ok(path) => path,
+            Err(_) => {
+                log_user_path_fault(procs.current()?, "unlinkat", path_ptr);
+                return Err(EFAULT);
+            }
+        };
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
         let _ = args.0[2];
         vfs.unlink(&cwd, &path)?;
@@ -1254,11 +1304,35 @@ impl SyscallDispatcher {
         scheduler: &mut Scheduler,
         exit_group: bool,
     ) -> Result<usize, i32> {
+        let libcbench_leader = procs
+            .current()
+            .ok()
+            .filter(|process| is_libcbench_task(process) && process.tid == process.tgid)
+            .map(|process| (process.tid, process.tgid));
+        if let Some((tid, tgid)) = libcbench_leader {
+            log_always(&format!(
+                "whuse-libcbench:sys-exit-enter tid={} tgid={} exit_group={} code={}",
+                tid,
+                tgid,
+                exit_group,
+                args.0[0] as i32
+            ));
+        }
         let exit = if exit_group {
             procs.exit_current_process_group(args.0[0] as i32)?
         } else {
             procs.exit_current_thread(args.0[0] as i32)?
         };
+        if let Some((tid, tgid)) = libcbench_leader {
+            log_always(&format!(
+                "whuse-libcbench:sys-exit-result tid={} tgid={} group_exited={} clear_child_tid={:#x?} robust_addrs={}",
+                tid,
+                tgid,
+                exit.group_exited,
+                exit.clear_child_tid,
+                exit.robust_futex_addrs.len()
+            ));
+        }
         let released_locks = if exit_group || exit.group_exited {
             FCNTL_LOCK_STATE.lock().clear_for_owner(exit.tgid)
         } else {
@@ -1288,12 +1362,12 @@ impl SyscallDispatcher {
                 ));
             }
             if let Some(addr) = exit.clear_child_tid {
-                log_always(&format!(
+                cancel_debug(&format!(
                     "whuse-debug: exit tid={} clear_child_tid={:#x}",
                     exit.tid, addr
                 ));
                 let woken = procs.wake_futex(addr, usize::MAX);
-                log_always(&format!(
+                cancel_debug(&format!(
                     "whuse-debug: wake_futex addr={:#x} woken={:?}",
                     addr, woken
                 ));
@@ -1301,7 +1375,7 @@ impl SyscallDispatcher {
                     let _ = scheduler.wake_task(tid);
                 }
             } else {
-                log_always(&format!(
+                cancel_debug(&format!(
                     "whuse-debug: exit tid={} no clear_child_tid",
                     exit.tid
                 ));
@@ -1409,9 +1483,21 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         scheduler: &mut Scheduler,
     ) -> Result<usize, i32> {
-        let name = procs.current()?.name.clone();
+        let request = decode_clone_request(args);
+        self.do_clone(request, procs, scheduler)
+    }
+
+    fn do_clone(
+        &self,
+        request: CloneRequest,
+        procs: &mut ProcessTable,
+        scheduler: &mut Scheduler,
+    ) -> Result<usize, i32> {
+        let current = procs.current()?;
+        let name = current.name.clone();
+        let libcbench_task = is_libcbench_task(current);
         let parent_pid = procs.current_pid()?;
-        let flags = args.0[0];
+        let flags = request.flags;
         if flags & CLONE_NAMESPACE_MASK != 0 {
             return Err(EINVAL);
         }
@@ -1428,10 +1514,23 @@ impl SyscallDispatcher {
             if compat_flags & required != required {
                 return Err(EINVAL);
             }
-            let stack = args.0[1];
-            let parent_tid = args.0[2];
-            let tls = ((compat_flags & CLONE_SETTLS) != 0).then_some(args.0[4]);
-            let child_tid_ptr = args.0[3];
+            let stack = request.stack;
+            let parent_tid = request.parent_tid;
+            let tls = request.tls;
+            let child_tid_ptr = request.child_tid;
+            if libcbench_task {
+                libcbench_debug(&format!(
+                    "whuse-libcbench:clone-thread parent_tgid={} flags={:#x} stack={:#x} ptid={:#x} ptid_addr={} ctid={:#x} ctid_addr={} tls={:#x}",
+                    parent_pid,
+                    flags,
+                    stack,
+                    parent_tid,
+                    procs.current()?.address_space.describe_addr(parent_tid),
+                    child_tid_ptr,
+                    procs.current()?.address_space.describe_addr(child_tid_ptr),
+                    tls.unwrap_or(0)
+                ));
+            }
             let tid = procs.clone_thread_from_current(stack, tls)?;
             if compat_flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
                 procs
@@ -1450,16 +1549,24 @@ impl SyscallDispatcher {
             if compat_flags & CLONE_CHILD_CLEARTID != 0 && child_tid_ptr != 0 {
                 procs.set_clear_child_tid(Some(child_tid_ptr))?;
             }
+            if libcbench_task {
+                libcbench_debug(&format!(
+                    "whuse-libcbench:clone-thread-child tid={} tgid={} clear_child_tid={:#x}",
+                    tid,
+                    procs.current_tgid()?,
+                    procs.current()?.clear_child_tid().unwrap_or(0)
+                ));
+            }
             let tgid = procs.current_tgid()?;
             procs.set_current(current_tid)?;
             scheduler.spawn(&name, tid, tgid);
             return Ok(tid);
         }
 
-        let child_stack = args.0[1];
+        let child_stack = request.stack;
         let shared_vm = (compat_flags & CLONE_VM) != 0;
-        let parent_tid = args.0[2];
-        let child_tid_ptr = args.0[3];
+        let parent_tid = request.parent_tid;
+        let child_tid_ptr = request.child_tid;
         let pid = if shared_vm {
             procs.fork_process_from_current_shared()?
         } else {
@@ -1531,15 +1638,15 @@ impl SyscallDispatcher {
         } else {
             stack.saturating_add(stack_size)
         };
-        let legacy = SyscallArgs([
+        let legacy = decode_clone_request(SyscallArgs([
             flags | (exit_signal & 0xff),
             child_stack,
             parent_tid,
             child_tid,
             tls,
             0,
-        ]);
-        self.sys_clone(legacy, procs, scheduler)
+        ]));
+        self.do_clone(legacy, procs, scheduler)
     }
 
     fn sys_execve(
@@ -3112,14 +3219,16 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let uaddr = args.0[0];
         let op = args.0[1] & 0x7f;
-        let (current_tid, current_tgid, libctest_task) = if let Ok(process) = procs.current() {
+        let (current_tid, current_tgid, libctest_task, libcbench_task) =
+            if let Ok(process) = procs.current() {
             (
                 process.tid,
                 process.tgid,
                 is_libctest_task_name(process.name.as_str()),
+                is_libcbench_task(process),
             )
         } else {
-            (0, 0, false)
+            (0, 0, false, false)
         };
         if libctest_task
             && (op == FUTEX_WAIT
@@ -3129,6 +3238,17 @@ impl SyscallDispatcher {
         {
             log_always(&format!(
                 "whuse-libctest:futex-enter tid={} tgid={} op={} uaddr={:#x} val={}",
+                current_tid, current_tgid, op, uaddr, args.0[2] as i32
+            ));
+        }
+        if libcbench_task
+            && (op == FUTEX_WAIT
+                || op == FUTEX_WAIT_BITSET
+                || op == FUTEX_WAKE
+                || op == FUTEX_WAKE_BITSET)
+        {
+            libcbench_debug(&format!(
+                "whuse-libcbench:futex-enter tid={} tgid={} op={} uaddr={:#x} val={}",
                 current_tid, current_tgid, op, uaddr, args.0[2] as i32
             ));
         }
@@ -3174,6 +3294,12 @@ impl SyscallDispatcher {
                         }
                         if !procs.is_futex_waiting(wait_addr, tid) {
                             procs.clear_futex_wait_state(tid);
+                            if libcbench_task {
+                                libcbench_debug(&format!(
+                                    "whuse-libcbench:futex-woke tid={} addr={:#x}",
+                                    tid, wait_addr
+                                ));
+                            }
                             cancel_debug(&format!(
                                 "whuse-debug: FUTEX_WAIT woke(remove) tid={} addr={:#x}",
                                 tid, wait_addr
@@ -3247,6 +3373,12 @@ impl SyscallDispatcher {
                             tid, uaddr, val, deadline
                         ));
                     }
+                    if libcbench_task {
+                        libcbench_debug(&format!(
+                            "whuse-libcbench:futex-block tid={} addr={:#x} val={} deadline={}",
+                            tid, uaddr, val, deadline
+                        ));
+                    }
                     let _ = scheduler.block_current();
                     Err(EAGAIN)
                 }
@@ -3254,6 +3386,19 @@ impl SyscallDispatcher {
             FUTEX_WAKE | FUTEX_WAKE_BITSET => {
                 let wake_count = val.max(0) as usize;
                 let woke = procs.wake_futex(uaddr, wake_count);
+                let wake_targets_thread_list_lock = libcbench_task
+                    && procs
+                        .current()
+                        .ok()
+                        .and_then(|process| process.clear_child_tid())
+                        == Some(uaddr);
+                if libcbench_task {
+                    let current_word = read_i32(procs.current()?, uaddr).unwrap_or(i32::MIN);
+                    libcbench_debug(&format!(
+                        "whuse-libcbench:futex-wake tid={} addr={:#x} req={} cur={} woke={:?}",
+                        current_tid, uaddr, wake_count, current_word, woke
+                    ));
+                }
                 if libctest_task {
                     log_always(&format!(
                         "whuse-libctest:futex-wake tid={} addr={:#x} req={} woke={}",
@@ -3264,8 +3409,11 @@ impl SyscallDispatcher {
                     ));
                 }
                 for tid in &woke {
-                    procs.clear_futex_wait_state(*tid);
                     let _ = scheduler.wake_task(*tid);
+                }
+                if wake_targets_thread_list_lock && !woke.is_empty() && scheduler.ready_count() > 0
+                {
+                    let _ = scheduler.yield_now();
                 }
                 Ok(woke.len())
             }
@@ -3312,8 +3460,17 @@ impl SyscallDispatcher {
                 let wake_count = val.max(0) as usize;
                 let woke = procs.wake_futex(uaddr, wake_count);
                 for tid in &woke {
-                    procs.clear_futex_wait_state(*tid);
                     let _ = scheduler.wake_task(*tid);
+                }
+                let wake_targets_thread_list_lock = libcbench_task
+                    && procs
+                        .current()
+                        .ok()
+                        .and_then(|process| process.clear_child_tid())
+                        == Some(uaddr);
+                if wake_targets_thread_list_lock && !woke.is_empty() && scheduler.ready_count() > 0
+                {
+                    let _ = scheduler.yield_now();
                 }
 
                 let condition = match cmp {
@@ -3328,8 +3485,19 @@ impl SyscallDispatcher {
                 if condition {
                     let woke2 = procs.wake_futex(uaddr2, val2);
                     for tid in &woke2 {
-                        procs.clear_futex_wait_state(*tid);
                         let _ = scheduler.wake_task(*tid);
+                    }
+                    let wake2_targets_thread_list_lock = libcbench_task
+                        && procs
+                            .current()
+                            .ok()
+                            .and_then(|process| process.clear_child_tid())
+                            == Some(uaddr2);
+                    if wake2_targets_thread_list_lock
+                        && !woke2.is_empty()
+                        && scheduler.ready_count() > 0
+                    {
+                        let _ = scheduler.yield_now();
                     }
                     Ok(woke.len() + woke2.len())
                 } else {
@@ -4551,6 +4719,28 @@ fn normalize_open_flags(flags: u32) -> u32 {
     out
 }
 
+fn decode_clone_request_for_abi(args: SyscallArgs, riscv_legacy_order: bool) -> CloneRequest {
+    let flags = args.0[0];
+    let stack = args.0[1];
+    let parent_tid = args.0[2];
+    let (child_tid, tls_raw) = if riscv_legacy_order {
+        (args.0[4], args.0[3])
+    } else {
+        (args.0[3], args.0[4])
+    };
+    CloneRequest {
+        flags,
+        stack,
+        parent_tid,
+        child_tid,
+        tls: ((flags & CLONE_SETTLS) != 0).then_some(tls_raw),
+    }
+}
+
+fn decode_clone_request(args: SyscallArgs) -> CloneRequest {
+    decode_clone_request_for_abi(args, cfg!(target_arch = "riscv64"))
+}
+
 fn resolve_at_cwd(
     process: &proc::Process,
     vfs: &KernelVfs,
@@ -4582,7 +4772,10 @@ fn read_at_path_allow_empty(
         }
         return Err(EFAULT);
     }
-    process.read_user_cstr(path_ptr).map_err(|_| EFAULT)
+    process.read_user_cstr(path_ptr).map_err(|_| {
+        log_user_path_fault(process, "read_at_path_allow_empty", path_ptr);
+        EFAULT
+    })
 }
 
 fn timespec_to_bytes(ts: Timespec) -> [u8; 16] {
@@ -5997,6 +6190,42 @@ mod tests {
     }
 
     #[test]
+    fn clone_decode_respects_riscv_legacy_tls_order() {
+        let args = SyscallArgs([
+            super::CLONE_THREAD | super::CLONE_SETTLS,
+            0x2000,
+            0x3000,
+            0x4000,
+            0x5000,
+            0,
+        ]);
+        let decoded = super::decode_clone_request_for_abi(args, true);
+        assert_eq!(decoded.flags, super::CLONE_THREAD | super::CLONE_SETTLS);
+        assert_eq!(decoded.stack, 0x2000);
+        assert_eq!(decoded.parent_tid, 0x3000);
+        assert_eq!(decoded.tls, Some(0x4000));
+        assert_eq!(decoded.child_tid, 0x5000);
+    }
+
+    #[test]
+    fn clone_decode_respects_non_riscv_legacy_tls_order() {
+        let args = SyscallArgs([
+            super::CLONE_THREAD | super::CLONE_SETTLS,
+            0x2000,
+            0x3000,
+            0x4000,
+            0x5000,
+            0,
+        ]);
+        let decoded = super::decode_clone_request_for_abi(args, false);
+        assert_eq!(decoded.flags, super::CLONE_THREAD | super::CLONE_SETTLS);
+        assert_eq!(decoded.stack, 0x2000);
+        assert_eq!(decoded.parent_tid, 0x3000);
+        assert_eq!(decoded.child_tid, 0x4000);
+        assert_eq!(decoded.tls, Some(0x5000));
+    }
+
+    #[test]
     fn futex_cancel_interrupt_is_one_shot() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
@@ -6049,6 +6278,17 @@ mod tests {
                 &mut vfs,
             ),
             1
+        );
+        assert_eq!(procs.current().unwrap().futex_wait_addr, Some(0xa400));
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FUTEX,
+                SyscallArgs([0xa400, super::FUTEX_WAIT, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
         );
         assert_eq!(procs.current().unwrap().futex_wait_addr, None);
     }

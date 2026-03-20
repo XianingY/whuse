@@ -3,7 +3,9 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -416,6 +418,59 @@ impl AddressSpace {
         Ok(out)
     }
 
+    pub fn describe_addr(&self, addr: usize) -> String {
+        let inner = self.inner.lock();
+        if let Some((_, segment)) = inner.mappings.range(..=addr).next_back() {
+            let start = segment.area.start;
+            let end = start.saturating_add(segment.area.len);
+            if addr < end {
+                let kind = if addr >= USER_STACK_TOP.saturating_sub(USER_STACK_SIZE * 4) {
+                    "stack"
+                } else if addr >= USER_MMAP_BASE {
+                    "mmap"
+                } else if addr >= USER_HEAP_BASE {
+                    "brk"
+                } else {
+                    "elf"
+                };
+                return format!(
+                    "mapped kind={} start={:#x} end={:#x} prot={:#x}",
+                    kind, start, end, segment.area.prot
+                );
+            }
+        }
+        let prev = inner
+            .mappings
+            .range(..addr)
+            .next_back()
+            .map(|(_, segment)| {
+                format!(
+                    "{:#x}-{:#x}/prot={:#x}",
+                    segment.area.start,
+                    segment.area.start.saturating_add(segment.area.len),
+                    segment.area.prot
+                )
+            })
+            .unwrap_or_else(|| "none".to_string());
+        let next = inner
+            .mappings
+            .range(addr..)
+            .next()
+            .map(|(_, segment)| {
+                format!(
+                    "{:#x}-{:#x}/prot={:#x}",
+                    segment.area.start,
+                    segment.area.start.saturating_add(segment.area.len),
+                    segment.area.prot
+                )
+            })
+            .unwrap_or_else(|| "none".to_string());
+        format!(
+            "unmapped prev={} next={} brk={:#x} next_mmap={:#x}",
+            prev, next, inner.program_break, inner.next_mapping_base
+        )
+    }
+
     pub fn write_bytes(&self, addr: usize, bytes: &[u8]) -> KernelResult<()> {
         if bytes.is_empty() {
             return Ok(());
@@ -678,7 +733,12 @@ impl AddressSpace {
             let mapped_vaddr = ph.vaddr.checked_add(load_bias).ok_or(ENOEXEC)?;
             let seg_start = align_down(mapped_vaddr, PAGE_SIZE);
             let page_offset = mapped_vaddr - seg_start;
-            let seg_mem_len = page_offset.checked_add(ph.mem_size).ok_or(ENOEXEC)?;
+            // PT_LOAD segments are page-granular once mapped into userspace.
+            // The bytes between the logical end of the segment and the end of
+            // its last page must remain accessible/zero-filled, otherwise PIE
+            // data/bss users that touch objects in the tail of that page will
+            // spuriously fault with EFAULT.
+            let seg_mem_len = align_up(page_offset.checked_add(ph.mem_size).ok_or(ENOEXEC)?, PAGE_SIZE);
             let mut seg_bytes = Vec::new();
             seg_bytes
                 .try_reserve_exact(page_offset + ph.file_size)

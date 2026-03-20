@@ -114,6 +114,24 @@ pub struct ProcessSnapshot {
     pub is_thread: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessDebugSnapshot {
+    pub tid: usize,
+    pub tgid: usize,
+    pub name: String,
+    pub state: ProcessState,
+    pub is_thread: bool,
+    pub clear_child_tid: Option<usize>,
+    pub futex_wait_addr: Option<usize>,
+    pub futex_wait_deadline_ns: Option<u64>,
+    pub robust_list: Option<(usize, usize)>,
+    pub pending_signals: u64,
+    pub signal_mask: u64,
+    pub sepc: usize,
+    pub sp: usize,
+    pub retval: usize,
+}
+
 pub struct Process {
     pub pid: usize,
     pub tid: usize,
@@ -1408,6 +1426,29 @@ impl ProcessTable {
             .values()
             .filter(|process| process.tgid == tgid && process.state != ProcessState::Exited)
             .map(|process| process.tid)
+            .collect()
+    }
+
+    pub fn debug_snapshots_in_tgid(&self, tgid: usize) -> Vec<ProcessDebugSnapshot> {
+        self.processes
+            .values()
+            .filter(|process| process.tgid == tgid && process.state != ProcessState::Exited)
+            .map(|process| ProcessDebugSnapshot {
+                tid: process.tid,
+                tgid: process.tgid,
+                name: clamp_process_name(&process.name),
+                state: process.state,
+                is_thread: process.is_thread,
+                clear_child_tid: process.clear_child_tid,
+                futex_wait_addr: process.futex_wait_addr,
+                futex_wait_deadline_ns: process.futex_wait_deadline_ns,
+                robust_list: process.robust_list,
+                pending_signals: process.pending_signals,
+                signal_mask: process.signal_mask,
+                sepc: process.trap_frame.sepc,
+                sp: process.trap_frame.regs[2],
+                retval: process.trap_frame.regs[10],
+            })
             .collect()
     }
 

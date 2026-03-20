@@ -206,6 +206,19 @@ impl Scheduler {
         self.blocked.len()
     }
 
+    pub fn task_state_label(&self, task_id: usize) -> &'static str {
+        if self.current.as_ref().is_some_and(|task| task.id == task_id) {
+            return "running";
+        }
+        if self.ready.iter().any(|task| task.id == task_id) {
+            return "ready";
+        }
+        if self.blocked.contains_key(&task_id) {
+            return "blocked";
+        }
+        "gone"
+    }
+
     pub fn ready_count(&self) -> usize {
         self.ready.len()
     }

@@ -24,11 +24,14 @@ pub const HANDLE_FLAG_CLOEXEC: u32 = 1 << 31;
 const ENOENT: i32 = 2;
 const EEXIST: i32 = 17;
 const EAGAIN: i32 = 11;
+const ENOTSOCK: i32 = 88;
 const ENOTDIR: i32 = 20;
+const ELOOP: i32 = 40;
 const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
 const ENOSPC: i32 = 28;
 const ENOMEM: i32 = 12;
+const EOPNOTSUPP: i32 = 95;
 const EPIPE: i32 = 32;
 const EROFS: i32 = 30;
 const ENOTEMPTY: i32 = 39;
@@ -45,6 +48,7 @@ const PROC_UPTIME: &[u8] = b"1.00 1.00\n";
 const PROC_STAT: &[u8] = b"cpu  1 0 1 1 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 1735689600\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n";
 const PROC_VERSION: &[u8] = b"Linux version 6.8.0-whuse (whuse@localdomain) #1 SMP PREEMPT\n";
 const PROC_SELF_STAT: &[u8] = b"1 (self) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 1 4096 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+const PROC_SELF_MAPS: &[u8] = b"50000000-50080000 r-xp 00000000 00:00 0 /proc/self/exe\n";
 const EXT4_DIR_STAT_CACHE_MAX_SIZE: u64 = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +77,7 @@ pub struct MountRecord {
     pub source: String,
     pub target: String,
     pub fs_type: String,
+    pub flags: u32,
 }
 
 pub struct FileHandle {
@@ -143,6 +148,8 @@ struct SocketChannel {
 struct SocketPending {
     path: Option<String>,
     listening: bool,
+    family: usize,
+    sock_type: usize,
     pending: Vec<Arc<Node>>,
 }
 
@@ -185,6 +192,8 @@ enum NodeData {
     SocketConnected {
         channel: Arc<Mutex<SocketChannel>>,
         side: usize,
+        family: usize,
+        sock_type: usize,
     },
     PidFd(usize),
 }
@@ -201,8 +210,10 @@ pub struct KernelVfs {
     external_mounts: Vec<ExternalMount>,
     external_stat_cache: BTreeMap<String, FileStat>,
     external_preloaded: BTreeMap<String, (Arc<Vec<u8>>, FileStat)>,
+    mem_modes: BTreeMap<String, u32>,
     next_pipe_id: usize,
     next_memfd_id: usize,
+    next_ephemeral_port: u16,
     socket_bindings: BTreeMap<String, Arc<Node>>,
 }
 
@@ -230,8 +241,10 @@ impl KernelVfs {
             external_mounts: Vec::new(),
             external_stat_cache: BTreeMap::new(),
             external_preloaded: BTreeMap::new(),
+            mem_modes: BTreeMap::new(),
             next_pipe_id: 0,
             next_memfd_id: 0,
+            next_ephemeral_port: 40000,
             socket_bindings: BTreeMap::new(),
         };
         for dir in ["/dev", "/proc", "/mnt", "/tmp", "/bin", "/etc"] {
@@ -250,6 +263,7 @@ impl KernelVfs {
         let _ = vfs.create_proc_file("/proc/version", PROC_VERSION);
         let _ = vfs.mkdir("/", "/proc/self", 0o755);
         let _ = vfs.create_proc_file("/proc/self/stat", PROC_SELF_STAT);
+        let _ = vfs.create_proc_file("/proc/self/maps", PROC_SELF_MAPS);
         vfs
     }
 
@@ -267,12 +281,24 @@ impl KernelVfs {
     }
 
     pub fn create_file(&mut self, cwd: &str, path: &str, contents: &[u8]) -> KernelResult<()> {
+        self.create_file_with_mode(cwd, path, contents, S_IFREG | 0o755)
+    }
+
+    pub fn create_file_with_mode(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        contents: &[u8],
+        mode: u32,
+    ) -> KernelResult<()> {
         let absolute = normalize_path(cwd, path);
         self.create_node(
             &absolute,
             NodeKind::File,
             Some(NodeData::File(contents.to_vec())),
-        )
+        )?;
+        self.mem_modes.insert(absolute, S_IFREG | (mode & 0o7777));
+        Ok(())
     }
 
     pub fn preload_external_file(
@@ -299,12 +325,16 @@ impl KernelVfs {
             &absolute,
             NodeKind::Symlink,
             Some(NodeData::Symlink(target.to_string())),
-        )
+        )?;
+        self.mem_modes.insert(absolute, S_IFLNK | 0o777);
+        Ok(())
     }
 
     pub fn mkdir(&mut self, cwd: &str, path: &str, _mode: u32) -> KernelResult<()> {
         let absolute = normalize_path(cwd, path);
-        self.create_node(&absolute, NodeKind::Directory, None)
+        self.create_node(&absolute, NodeKind::Directory, None)?;
+        self.mem_modes.insert(absolute, S_IFDIR | (_mode & 0o7777));
+        Ok(())
     }
 
     pub fn open(
@@ -312,21 +342,21 @@ impl KernelVfs {
         cwd: &str,
         path: &str,
         flags: u32,
-        _mode: u32,
+        mode: u32,
     ) -> KernelResult<FileHandle> {
         let absolute = normalize_path(cwd, path);
         if let Some(handle) = self.try_open_external(&absolute, flags)? {
             return Ok(handle);
         }
-        self.open_mem(&absolute, flags)
+        self.open_mem(&absolute, flags, mode)
     }
 
-    fn open_mem(&mut self, absolute: &str, flags: u32) -> KernelResult<FileHandle> {
+    fn open_mem(&mut self, absolute: &str, flags: u32, mode: u32) -> KernelResult<FileHandle> {
         let mut resolved = absolute.to_string();
         let node = match self.lookup_abs(&resolved) {
             Ok(node) => node,
             Err(err) if err == ENOENT && (flags & O_CREAT) != 0 => {
-                self.create_file("/", &resolved, b"")?;
+                self.create_file_with_mode("/", &resolved, b"", mode)?;
                 self.lookup_abs(&resolved)?
             }
             Err(err) => return Err(err),
@@ -462,11 +492,7 @@ impl KernelVfs {
 
     pub fn stat_path(&self, cwd: &str, path: &str) -> KernelResult<FileStat> {
         let absolute = normalize_path(cwd, path);
-        if let Some(stat) = self.external_stat_path(&absolute)? {
-            return Ok(stat);
-        }
-        let node = self.lookup_abs(&absolute)?;
-        self.stat(&node)
+        self.stat_path_follow(&absolute, 0)
     }
 
     pub fn chdir(&self, cwd: &str, path: &str) -> KernelResult<String> {
@@ -528,6 +554,7 @@ impl KernelVfs {
         }
         entries.remove(name);
         self.socket_bindings.remove(&absolute);
+        self.mem_modes.remove(&absolute);
         Ok(())
     }
 
@@ -545,16 +572,20 @@ impl KernelVfs {
             return Err(EEXIST);
         }
         entries.insert(name.to_string(), node);
+        if let Some(mode) = self.mem_modes.get(&old_absolute).copied() {
+            self.mem_modes.insert(new_absolute, mode);
+        }
         Ok(())
     }
 
-    pub fn mount(&mut self, source: &str, target: &str, fs_type: &str) -> KernelResult<()> {
+    pub fn mount(&mut self, source: &str, target: &str, fs_type: &str, flags: u32) -> KernelResult<()> {
         let absolute = normalize_path("/", target);
         let _ = self.lookup_abs(&absolute)?;
         self.mounts.push(MountRecord {
             source: source.to_string(),
             target: absolute,
             fs_type: fs_type.to_string(),
+            flags,
         });
         self.refresh_mounts_proc();
         Ok(())
@@ -582,9 +613,20 @@ impl KernelVfs {
             source: source.to_string(),
             target: absolute,
             fs_type: "ext4".to_string(),
+            flags: 0,
         });
         self.refresh_mounts_proc();
         Ok(label)
+    }
+
+    pub fn mount_flags_for_path(&self, cwd: &str, path: &str) -> u32 {
+        let absolute = normalize_path(cwd, path);
+        self.mounts
+            .iter()
+            .filter(|mount| absolute == mount.target || absolute.starts_with(&(mount.target.clone() + "/")))
+            .max_by_key(|mount| mount.target.len())
+            .map(|mount| mount.flags)
+            .unwrap_or(0)
     }
 
     pub fn umount(&mut self, target: &str) -> KernelResult<()> {
@@ -615,7 +657,7 @@ impl KernelVfs {
 
     pub fn access(&self, cwd: &str, path: &str) -> KernelResult<()> {
         let absolute = normalize_path(cwd, path);
-        self.path_exists(&absolute)
+        self.path_exists_follow(&absolute, 0)
     }
 
     pub fn read_file_all(&mut self, cwd: &str, path: &str) -> KernelResult<Vec<u8>> {
@@ -673,6 +715,23 @@ impl KernelVfs {
             return Err(EEXIST);
         }
         entries.insert(new_name.to_string(), node);
+        if let Some(mode) = self.mem_modes.remove(&old_absolute) {
+            self.mem_modes.insert(new_absolute, mode);
+        }
+        Ok(())
+    }
+
+    pub fn chmod_path(&mut self, cwd: &str, path: &str, mode: u32) -> KernelResult<()> {
+        let absolute = normalize_path(cwd, path);
+        let stat = self.stat_path("/", &absolute)?;
+        self.mem_modes.insert(absolute, (stat.mode & !0o7777) | (mode & 0o7777));
+        Ok(())
+    }
+
+    pub fn chmod_handle(&mut self, handle: &FileHandle, mode: u32) -> KernelResult<()> {
+        let stat = self.stat_handle(handle)?;
+        self.mem_modes
+            .insert(handle.path.clone(), (stat.mode & !0o7777) | (mode & 0o7777));
         Ok(())
     }
 
@@ -844,11 +903,11 @@ impl KernelVfs {
         Ok(*pid)
     }
 
-    pub fn create_socket(&mut self) -> KernelResult<FileHandle> {
+    pub fn create_socket(&mut self, family: usize, sock_type: usize) -> KernelResult<FileHandle> {
         let path = format!("socket:[{}]", self.next_pipe_id);
         self.next_pipe_id += 1;
         Ok(FileHandle {
-            node: Arc::new(Node::socket_pending(&path)),
+            node: Arc::new(Node::socket_pending(&path, family, sock_type)),
             offset: 0,
             flags: O_RDWR,
             path,
@@ -864,14 +923,14 @@ impl KernelVfs {
         }));
         Ok((
             FileHandle {
-                node: Arc::new(Node::socket_connected(&path, channel.clone(), 0)),
+                node: Arc::new(Node::socket_connected(&path, channel.clone(), 0, 1, 1)),
                 offset: 0,
                 flags: O_RDWR,
                 path: format!("{}:0", path),
                 pipe_end: PipeEnd::None,
             },
             FileHandle {
-                node: Arc::new(Node::socket_connected(&path, channel, 1)),
+                node: Arc::new(Node::socket_connected(&path, channel, 1, 1, 1)),
                 offset: 0,
                 flags: O_RDWR,
                 path: format!("{}:1", path),
@@ -886,7 +945,7 @@ impl KernelVfs {
         cwd: &str,
         path: &str,
     ) -> KernelResult<()> {
-        let absolute = normalize_path(cwd, path);
+        let absolute = assign_ephemeral_inet_path(self, &normalize_path(cwd, path));
         let NodeData::SocketPending(state) = &mut *handle.node.data.lock() else {
             return Err(EINVAL);
         };
@@ -911,34 +970,60 @@ impl KernelVfs {
         path: &str,
     ) -> KernelResult<()> {
         let absolute = normalize_path(cwd, path);
-        let listener = self.socket_bindings.get(&absolute).cloned().ok_or(ENOENT)?;
+        let listener = if let Some(listener) = self.socket_bindings.get(&absolute).cloned() {
+            listener
+        } else if let Some(any_addr) = inet_any_listener_path(&absolute) {
+            self.socket_bindings.get(&any_addr).cloned().ok_or(ENOENT)?
+        } else {
+            return Err(ENOENT);
+        };
         let channel = Arc::new(Mutex::new(SocketChannel {
             inbox: [VecDeque::new(), VecDeque::new()],
         }));
-        {
-            let mut guard = listener.data.lock();
-            let NodeData::SocketPending(state) = &mut *guard else {
-                return Err(EINVAL);
+        let (family, sock_type) = {
+            let guard = listener.data.lock();
+            let NodeData::SocketPending(state) = &*guard else {
+                return Err(ENOTSOCK);
             };
             if !state.listening {
                 return Err(EINVAL);
             }
+            (state.family, state.sock_type)
+        };
+        {
+            let mut guard = listener.data.lock();
+            let NodeData::SocketPending(state) = &mut *guard else {
+                return Err(ENOTSOCK);
+            };
             state.pending.push(Arc::new(Node::socket_connected(
                 &absolute,
                 channel.clone(),
                 1,
+                family,
+                sock_type,
             )));
         }
-        *handle.node.data.lock() = NodeData::SocketConnected { channel, side: 0 };
+        *handle.node.data.lock() = NodeData::SocketConnected {
+            channel,
+            side: 0,
+            family,
+            sock_type,
+        };
         handle.path = absolute;
         Ok(())
     }
 
     pub fn accept_socket(&mut self, handle: &mut FileHandle) -> KernelResult<FileHandle> {
         let NodeData::SocketPending(state) = &mut *handle.node.data.lock() else {
-            return Err(EINVAL);
+            return Err(ENOTSOCK);
         };
-        let node = state.pending.pop().ok_or(EINVAL)?;
+        if state.sock_type != 1 {
+            return Err(EOPNOTSUPP);
+        }
+        if !state.listening {
+            return Err(EINVAL);
+        }
+        let node = state.pending.pop().ok_or(EAGAIN)?;
         Ok(FileHandle {
             node,
             offset: 0,
@@ -957,7 +1042,7 @@ impl KernelVfs {
     }
 
     pub fn stat_handle(&self, handle: &FileHandle) -> KernelResult<FileStat> {
-        handle.stat_object()
+        self.stat(&handle.path, &handle.node)
     }
 
     pub fn is_pipe(&self, handle: &FileHandle) -> bool {
@@ -965,7 +1050,23 @@ impl KernelVfs {
     }
 
     fn path_exists(&self, absolute: &str) -> KernelResult<()> {
-        if self.lookup_abs(absolute).is_ok() {
+        self.path_exists_follow(absolute, 0)
+    }
+
+    fn path_exists_follow(&self, absolute: &str, depth: usize) -> KernelResult<()> {
+        if depth >= 16 {
+            return Err(ELOOP);
+        }
+        if let Ok(node) = self.lookup_abs(absolute) {
+            if node.kind == NodeKind::Symlink {
+                let target = match &*node.data.lock() {
+                    NodeData::Symlink(target) => target.clone(),
+                    _ => return Err(EINVAL),
+                };
+                let parent = split_parent(absolute)?.0;
+                let resolved = normalize_path(&parent, &target);
+                return self.path_exists_follow(&resolved, depth + 1);
+            }
             return Ok(());
         }
         if self.external_preloaded.contains_key(absolute) {
@@ -994,10 +1095,46 @@ impl KernelVfs {
             {
                 return Ok(());
             }
-            // Avoid blocking ext4 metadata operations for existence probes.
             return Ok(());
         }
         Err(ENOENT)
+    }
+
+    fn stat_path_follow(&self, absolute: &str, depth: usize) -> KernelResult<FileStat> {
+        if depth >= 16 {
+            return Err(ELOOP);
+        }
+        if let Some(stat) = self.external_stat_path(absolute)? {
+            return Ok(stat);
+        }
+        let node = self.lookup_abs(absolute)?;
+        if node.kind == NodeKind::Symlink {
+            let target = match &*node.data.lock() {
+                NodeData::Symlink(target) => target.clone(),
+                _ => return Err(EINVAL),
+            };
+            let parent = split_parent(absolute)?.0;
+            let resolved = normalize_path(&parent, &target);
+            return self.stat_path_follow(&resolved, depth + 1);
+        }
+        self.stat(absolute, &node)
+    }
+
+    fn resolve_mem_path(&self, absolute: &str) -> KernelResult<(String, Arc<Node>)> {
+        let mut path = absolute.to_string();
+        for _ in 0..16 {
+            let node = self.lookup_abs(&path)?;
+            if node.kind != NodeKind::Symlink {
+                return Ok((path, node));
+            }
+            let target = match &*node.data.lock() {
+                NodeData::Symlink(target) => target.clone(),
+                _ => return Err(EINVAL),
+            };
+            let parent = split_parent(&path)?.0;
+            path = normalize_path(&parent, &target);
+        }
+        Err(ELOOP)
     }
 
     fn external_stat_path(&self, absolute: &str) -> KernelResult<Option<FileStat>> {
@@ -1303,14 +1440,14 @@ impl KernelVfs {
             ),
             NodeKind::Event => Node::eventfd(name, 0),
             NodeKind::Epoll => Node::epoll(name),
-            NodeKind::Socket => Node::socket_pending(name),
+            NodeKind::Socket => Node::socket_pending(name, 1, 1),
             NodeKind::PidFd => Node::pidfd(name, 0),
         });
         entries.insert(name.to_string(), node);
         Ok(())
     }
 
-    fn stat(&self, node: &Arc<Node>) -> KernelResult<FileStat> {
+    fn stat(&self, path: &str, node: &Arc<Node>) -> KernelResult<FileStat> {
         let guard = node.data.lock();
         let size = match &*guard {
             NodeData::Directory(entries) => entries.len() as u64,
@@ -1322,14 +1459,14 @@ impl KernelVfs {
             NodeData::Event(_) => 8,
             NodeData::Epoll(watches) => watches.len() as u64,
             NodeData::SocketPending(state) => state.pending.len() as u64,
-            NodeData::SocketConnected { channel, side } => channel.lock().inbox[*side].len() as u64,
+            NodeData::SocketConnected { channel, side, .. } => channel.lock().inbox[*side].len() as u64,
             NodeData::PidFd(_) => 0,
             NodeData::CharDevice => 0,
         };
         let mode = match &*guard {
             NodeData::Ext4File(state) => state.mode,
             NodeData::Ext4Dir(state) => state.mode,
-            _ => match node.kind {
+            _ => self.mem_modes.get(path).copied().unwrap_or(match node.kind {
                 NodeKind::Directory => S_IFDIR | 0o755,
                 NodeKind::File | NodeKind::Proc => S_IFREG | 0o644,
                 NodeKind::CharDevice => S_IFCHR | 0o600,
@@ -1337,7 +1474,7 @@ impl KernelVfs {
                 NodeKind::Symlink => S_IFLNK | 0o777,
                 NodeKind::Event | NodeKind::Epoll | NodeKind::Socket => S_IFSOCK | 0o644,
                 NodeKind::PidFd => S_IFREG | 0o444,
-            },
+            }),
         };
         Ok(FileStat {
             mode,
@@ -1380,7 +1517,7 @@ impl FileHandle {
             NodeData::Event(_) => 8,
             NodeData::Epoll(watches) => watches.len() as u64,
             NodeData::SocketPending(state) => state.pending.len() as u64,
-            NodeData::SocketConnected { channel, side } => channel.lock().inbox[*side].len() as u64,
+            NodeData::SocketConnected { channel, side, .. } => channel.lock().inbox[*side].len() as u64,
             NodeData::PidFd(_) => 0,
             NodeData::CharDevice => 0,
         };
@@ -1524,7 +1661,7 @@ impl KernelObject for FileHandle {
                 Ok(value.to_le_bytes().to_vec())
             }
             NodeData::Epoll(_) | NodeData::SocketPending(_) | NodeData::PidFd(_) => Err(EINVAL),
-            NodeData::SocketConnected { channel, side } => {
+            NodeData::SocketConnected { channel, side, .. } => {
                 let mut guard = channel.lock();
                 let inbox = &mut guard.inbox[*side];
                 let end = len.min(inbox.len());
@@ -1584,7 +1721,7 @@ impl KernelObject for FileHandle {
                 *counter = counter.saturating_add(u64::from_le_bytes(bytes));
                 Ok(8)
             }
-            NodeData::SocketConnected { channel, side } => {
+            NodeData::SocketConnected { channel, side, .. } => {
                 let mut guard = channel.lock();
                 let peer = 1 - *side;
                 guard.inbox[peer].extend(data.iter().copied());
@@ -1641,7 +1778,7 @@ impl KernelObject for FileHandle {
             NodeData::Event(counter) => *counter != 0,
             NodeData::Epoll(_) => true,
             NodeData::SocketPending(state) => !state.pending.is_empty(),
-            NodeData::SocketConnected { channel, side } => !channel.lock().inbox[*side].is_empty(),
+            NodeData::SocketConnected { channel, side, .. } => !channel.lock().inbox[*side].is_empty(),
             NodeData::PidFd(_) => true,
         }
     }
@@ -1739,23 +1876,36 @@ impl Node {
         }
     }
 
-    fn socket_pending(name: &str) -> Self {
+    fn socket_pending(name: &str, family: usize, sock_type: usize) -> Self {
         Self {
             _name: name.to_string(),
             kind: NodeKind::Socket,
             data: Mutex::new(NodeData::SocketPending(SocketPending {
                 path: None,
                 listening: false,
+                family,
+                sock_type,
                 pending: Vec::new(),
             })),
         }
     }
 
-    fn socket_connected(name: &str, channel: Arc<Mutex<SocketChannel>>, side: usize) -> Self {
+    fn socket_connected(
+        name: &str,
+        channel: Arc<Mutex<SocketChannel>>,
+        side: usize,
+        family: usize,
+        sock_type: usize,
+    ) -> Self {
         Self {
             _name: name.to_string(),
             kind: NodeKind::Socket,
-            data: Mutex::new(NodeData::SocketConnected { channel, side }),
+            data: Mutex::new(NodeData::SocketConnected {
+                channel,
+                side,
+                family,
+                sock_type,
+            }),
         }
     }
 
@@ -1819,6 +1969,34 @@ fn split_parent(path: &str) -> KernelResult<(String, &str)> {
         return Err(EINVAL);
     }
     Ok((parent, name))
+}
+
+fn inet_any_listener_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/inet/")?;
+    let (_, port) = rest.rsplit_once(':')?;
+    Some(format!("/inet/000.000.000.000:{port}"))
+}
+
+fn assign_ephemeral_inet_path(vfs: &mut KernelVfs, path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("/inet/") {
+        if let Some((ip, port)) = rest.rsplit_once(':') {
+            if port == "0" {
+                let assigned = vfs.next_ephemeral_port;
+                vfs.next_ephemeral_port = vfs.next_ephemeral_port.saturating_add(1);
+                return format!("/inet/{ip}:{assigned}");
+            }
+        }
+    }
+    if let Some(rest) = path.strip_prefix("/inet6/") {
+        if let Some((ip, port)) = rest.rsplit_once(':') {
+            if port == "0" {
+                let assigned = vfs.next_ephemeral_port;
+                vfs.next_ephemeral_port = vfs.next_ephemeral_port.saturating_add(1);
+                return format!("/inet6/{ip}:{assigned}");
+            }
+        }
+    }
+    path.to_string()
 }
 
 fn external_mount_path(target: &str, absolute: &str) -> Option<String> {

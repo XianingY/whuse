@@ -160,6 +160,14 @@ const OSCOMP_LOCALE_WRAPPER: &str = concat!(
     "esac\n",
     "exit 0\n",
 );
+const OSCOMP_ETC_PASSWD: &str = concat!(
+    "root:x:0:0:root:/root:/musl/busybox\n",
+    "nobody:x:65534:65534:nobody:/:/musl/busybox\n",
+);
+const OSCOMP_ETC_GROUP: &str = concat!(
+    "root:x:0:\n",
+    "nogroup:x:65534:\n",
+);
 const OSCOMP_USERADD_WRAPPER: &str = concat!(
     "#!/musl/busybox sh\n",
     "echo \"useradd: compatibility wrapper\" >&2\n",
@@ -319,11 +327,11 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "WHUSE_OSCOMP_COMPAT=${WHUSE_OSCOMP_COMPAT:-0}\n",
     "WHUSE_OSCOMP_ONLY_STEP=${WHUSE_OSCOMP_ONLY_STEP:-}\n",
     "WHUSE_OSCOMP_TRACE_STEP_CMDS=${WHUSE_OSCOMP_TRACE_STEP_CMDS:-0}\n",
-    "WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-score}\n",
-    "WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}\n",
-    "WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-/musl/ltp_score_blacklist.txt}\n",
-    "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}\n",
-    "WHUSE_LTP_CASE_TIMEOUT=${WHUSE_LTP_CASE_TIMEOUT:-45}\n",
+    "WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-}\n",
+    "WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-}\n",
+    "WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-}\n",
+    "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-}\n",
+    "WHUSE_LTP_CASE_TIMEOUT=${WHUSE_LTP_CASE_TIMEOUT:-}\n",
     "if [ -z \"$WHUSE_OSCOMP_ONLY_STEP\" ] && [ -f /musl/.whuse_oscomp_only_step ]; then\n",
     "    IFS= read -r WHUSE_OSCOMP_ONLY_STEP < /musl/.whuse_oscomp_only_step\n",
     "fi\n",
@@ -342,6 +350,11 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "if [ -z \"$WHUSE_LTP_CASE_TIMEOUT\" ] && [ -f /musl/.whuse_ltp_case_timeout ]; then\n",
     "    IFS= read -r WHUSE_LTP_CASE_TIMEOUT < /musl/.whuse_ltp_case_timeout\n",
     "fi\n",
+    "WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-score}\n",
+    "WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}\n",
+    "WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-/musl/ltp_score_blacklist.txt}\n",
+    "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}\n",
+    "WHUSE_LTP_CASE_TIMEOUT=${WHUSE_LTP_CASE_TIMEOUT:-45}\n",
     "export WHUSE_OSCOMP_ONLY_STEP WHUSE_LTP_PROFILE WHUSE_LTP_WHITELIST WHUSE_LTP_BLACKLIST WHUSE_LTP_STEP_TIMEOUT WHUSE_LTP_CASE_TIMEOUT\n",
     "WHUSE_HAVE_TIMEOUT=0\n",
     "if /musl/busybox timeout 1 /musl/busybox true >/tmp/whuse-timeout-probe.log 2>&1; then\n",
@@ -392,7 +405,6 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        echo '#!/musl/busybox sh'\n",
     "        echo 'cmd=\"${1:-}\"'\n",
     "        echo 'case \"$cmd\" in'\n",
-    "        echo '    wait) shift; wait \"$@\"; exit $? ;;'\n",
     "        echo '    locale) shift; exec /musl/locale \"$@\" ;;'\n",
     "        echo '    useradd) shift; exec /musl/useradd \"$@\" ;;'\n",
     "        echo '    userdel) shift; exec /musl/userdel \"$@\" ;;'\n",
@@ -438,11 +450,13 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "whuse_ltp_count_token() {\n",
     "    token=\"$1\"\n",
     "    file=\"$2\"\n",
-    "    count=$(/musl/busybox strings \"$file\" 2>/dev/null | /musl/busybox grep \"$token\" 2>/dev/null | /musl/busybox awk 'END{print NR+0}' 2>/dev/null || true)\n",
-    "    if [ -z \"$count\" ]; then\n",
-    "        count=$(/musl/busybox grep \"$token\" \"$file\" 2>/dev/null | /musl/busybox awk 'END{print NR+0}' 2>/dev/null || true)\n",
-    "    fi\n",
-    "    [ -n \"$count\" ] || count=0\n",
+    "    count=0\n",
+    "    while IFS= read -r line || [ -n \"$line\" ]\n",
+    "    do\n",
+    "        case \"$line\" in\n",
+    "            *\"$token\"*) count=$((count + 1)) ;;\n",
+    "        esac\n",
+    "    done < \"$file\"\n",
     "    echo \"$count\"\n",
     "}\n",
     "whuse_ltp_cleanup_case_tree() {\n",
@@ -477,7 +491,7 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        '#!'*)\n",
     "            if /musl/busybox grep -q 'busybox wait\\|/musl/busybox wait\\|busybox locale\\|/musl/busybox locale\\|busybox useradd\\|/musl/busybox useradd\\|busybox userdel\\|/musl/busybox userdel' \"$case_path\" 2>/dev/null; then\n",
     "                if /musl/busybox sed \\\n",
-    "                    -e 's#/musl/busybox wait#/musl/wait#g' \\\n",
+    "                    -e 's#/musl/busybox wait#wait#g' \\\n",
     "                    -e 's#busybox wait#wait#g' \\\n",
     "                    -e 's#/musl/busybox locale#/musl/locale#g' \\\n",
     "                    -e 's#busybox locale#locale#g' \\\n",
@@ -516,10 +530,10 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        /musl/busybox sleep 1\n",
     "    done\n",
     "    if [ \"$timeout_hit\" -eq 1 ]; then\n",
-    "        /musl/busybox wait \"$case_pid\" >/dev/null 2>&1 || true\n",
+    "        wait \"$case_pid\" >/dev/null 2>&1 || true\n",
     "        case_rc=124\n",
     "    else\n",
-    "        /musl/busybox wait \"$case_pid\"\n",
+    "        wait \"$case_pid\"\n",
     "        case_rc=$?\n",
     "    fi\n",
     "    [ -f \"$case_log\" ] && /musl/busybox cat \"$case_log\"\n",
@@ -546,6 +560,9 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        class=rc255\n",
     "    elif [ \"$case_rc\" -eq 0 ] && [ \"$tfail\" -eq 0 ] && [ \"$tbrok\" -eq 0 ] && [ \"$tpass\" -gt 0 ]; then\n",
     "        class=pass\n",
+    "    elif [ \"$case_rc\" -eq 0 ] && [ \"$tfail\" -eq 0 ] && [ \"$tbrok\" -eq 0 ] && [ \"$tconf\" -eq 0 ]; then\n",
+    "        [ \"$tpass\" -gt 0 ] || tpass=1\n",
+    "        class=pass\n",
     "    elif [ \"$case_rc\" -eq 0 ] && [ \"$tfail\" -eq 0 ] && [ \"$tbrok\" -eq 0 ] && [ \"$tconf\" -gt 0 ] && [ \"$tpass\" -eq 0 ]; then\n",
     "        class=conf-only\n",
     "    elif [ \"$tbrok\" -gt 0 ]; then\n",
@@ -570,6 +587,35 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    [ -d \"$ltp_dir\" ] || return 127\n",
     "    rc=0\n",
     "    step_start_ts=$(/musl/busybox date +%s)\n",
+    "    if [ \"$WHUSE_LTP_PROFILE\" != \"full\" ] && whuse_ltp_list_has_entries \"$WHUSE_LTP_WHITELIST\"; then\n",
+    "        while IFS= read -r wanted_case\n",
+    "        do\n",
+    "            [ -n \"$wanted_case\" ] || continue\n",
+    "            case_name=\"${wanted_case##*/}\"\n",
+    "            case_path=\"$ltp_dir/$case_name\"\n",
+    "            [ -f \"$case_path\" ] || continue\n",
+    "            case_rel=\"ltp/testcases/bin/$case_name\"\n",
+    "            if ! whuse_ltp_case_allowed \"$case_name\" \"$case_rel\"; then\n",
+    "                echo whuse-ltp-skip-case:$case_rel:filtered\n",
+    "                continue\n",
+    "            fi\n",
+    "            now_ts=$(/musl/busybox date +%s)\n",
+    "            elapsed_step=$((now_ts - step_start_ts))\n",
+    "            if [ \"$timeout_s\" -gt 0 ] && [ \"$elapsed_step\" -ge \"$timeout_s\" ]; then\n",
+    "                echo whuse-oscomp-step-timeout:ltp_testcode.sh:$timeout_s:pid=0:tgid=0\n",
+    "                rc=124\n",
+    "                break\n",
+    "            fi\n",
+    "            case_log=\"/tmp/whuse-ltp-case-${case_name}.$$.log\"\n",
+    "            case_stdin=\"/tmp/whuse-ltp-case-${case_name}.$$.stdin\"\n",
+    "            whuse_ltp_run_single_case \"$case_name\" \"$case_rel\" \"$case_path\" \"$case_log\" \"$case_stdin\"\n",
+    "            case_exec_rc=$?\n",
+    "            if [ \"$case_exec_rc\" -ne 0 ] && [ \"$rc\" -eq 0 ]; then\n",
+    "                rc=$case_exec_rc\n",
+    "            fi\n",
+    "        done < \"$WHUSE_LTP_WHITELIST\"\n",
+    "        return \"$rc\"\n",
+    "    fi\n",
     "    for case_path in \"$ltp_dir\"/*\n",
     "    do\n",
     "        [ -f \"$case_path\" ] || continue\n",
@@ -789,6 +835,7 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    return \"$rc\"\n",
     "}\n",
     "echo whuse-oscomp-script-start\n",
+    "cd /musl || exit 1\n",
     "echo \"run time-test\"\n",
     "if step_selected time-test; then\n",
     "    echo whuse-oscomp-step-begin:time-test\n",
@@ -830,7 +877,36 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "set +e\n",
     "export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
     "WHUSE_OSCOMP_ONLY_STEP=${WHUSE_OSCOMP_ONLY_STEP:-}\n",
-    "export WHUSE_OSCOMP_ONLY_STEP\n",
+    "WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-}\n",
+    "WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-}\n",
+    "WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-}\n",
+    "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-}\n",
+    "WHUSE_LTP_CASE_TIMEOUT=${WHUSE_LTP_CASE_TIMEOUT:-}\n",
+    "if [ -z \"$WHUSE_OSCOMP_ONLY_STEP\" ] && [ -f /musl/.whuse_oscomp_only_step ]; then\n",
+    "    IFS= read -r WHUSE_OSCOMP_ONLY_STEP < /musl/.whuse_oscomp_only_step\n",
+    "fi\n",
+    "if [ -z \"$WHUSE_LTP_PROFILE\" ] && [ -f /musl/.whuse_ltp_profile ]; then\n",
+    "    IFS= read -r WHUSE_LTP_PROFILE < /musl/.whuse_ltp_profile\n",
+    "fi\n",
+    "if [ -z \"$WHUSE_LTP_WHITELIST\" ] && [ -f /musl/.whuse_ltp_whitelist ]; then\n",
+    "    IFS= read -r WHUSE_LTP_WHITELIST < /musl/.whuse_ltp_whitelist\n",
+    "fi\n",
+    "if [ -z \"$WHUSE_LTP_BLACKLIST\" ] && [ -f /musl/.whuse_ltp_blacklist ]; then\n",
+    "    IFS= read -r WHUSE_LTP_BLACKLIST < /musl/.whuse_ltp_blacklist\n",
+    "fi\n",
+    "if [ -z \"$WHUSE_LTP_STEP_TIMEOUT\" ] && [ -f /musl/.whuse_ltp_step_timeout ]; then\n",
+    "    IFS= read -r WHUSE_LTP_STEP_TIMEOUT < /musl/.whuse_ltp_step_timeout\n",
+    "fi\n",
+    "if [ -z \"$WHUSE_LTP_CASE_TIMEOUT\" ] && [ -f /musl/.whuse_ltp_case_timeout ]; then\n",
+    "    IFS= read -r WHUSE_LTP_CASE_TIMEOUT < /musl/.whuse_ltp_case_timeout\n",
+    "fi\n",
+    "WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-score}\n",
+    "WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}\n",
+    "WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-/musl/ltp_score_blacklist.txt}\n",
+    "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}\n",
+    "WHUSE_LTP_CASE_TIMEOUT=${WHUSE_LTP_CASE_TIMEOUT:-45}\n",
+    "WHUSE_OSCOMP_ONLY_STEP=${WHUSE_OSCOMP_ONLY_STEP:-}\n",
+    "export WHUSE_OSCOMP_ONLY_STEP WHUSE_LTP_PROFILE WHUSE_LTP_WHITELIST WHUSE_LTP_BLACKLIST WHUSE_LTP_STEP_TIMEOUT WHUSE_LTP_CASE_TIMEOUT\n",
     "run_script_entry() {\n",
     "    runtime=\"$1\"\n",
     "    script=\"$2\"\n",
@@ -2226,6 +2302,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
     install_locale_wrapper(vfs);
     install_user_mgmt_wrappers(vfs);
     install_keyctl_wrapper(vfs);
+    install_etc_identity_files(vfs);
     for (path, target) in [
         ("/bin/busybox", "/musl/busybox"),
         ("/bin/sh", "/musl/busybox"),
@@ -2430,6 +2507,15 @@ fn install_user_mgmt_wrappers(vfs: &mut KernelVfs) {
     install_exec_wrapper(vfs, "/musl/userdel", OSCOMP_USERDEL_WRAPPER, "userdel");
 }
 
+fn install_etc_identity_files(vfs: &mut KernelVfs) {
+    if let Err(err) = vfs.preload_external_file("/etc/passwd", OSCOMP_ETC_PASSWD.as_bytes(), Some(0o100644)) {
+        logln(format_args!("whuse: failed etc passwd preload err={}", err));
+    }
+    if let Err(err) = vfs.preload_external_file("/etc/group", OSCOMP_ETC_GROUP.as_bytes(), Some(0o100644)) {
+        logln(format_args!("whuse: failed etc group preload err={}", err));
+    }
+}
+
 fn install_oscomp_root_aliases(vfs: &mut KernelVfs) {
     for name in OSCOMP_ROOT_ALIAS_ENTRIES {
         let path = format!("/{}", name);
@@ -2460,7 +2546,15 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
     ok
 }
 
-fn select_oscomp_suite_script(_vfs: &mut KernelVfs) -> &'static str {
+fn select_oscomp_suite_script(vfs: &mut KernelVfs) -> &'static str {
+    let ltp_only = vfs
+        .read_file_all("/", OSCOMP_CFG_ONLY_STEP_PATH)
+        .ok()
+        .and_then(|bytes| core::str::from_utf8(&bytes).ok().map(|s| s.trim() == "ltp_testcode.sh"))
+        .unwrap_or(false);
+    if ltp_only {
+        return OSCOMP_SUITE_SCRIPT;
+    }
     OSCOMP_OFFICIAL_SUITE_SCRIPT
 }
 

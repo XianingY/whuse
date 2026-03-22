@@ -1,5 +1,3 @@
 [toolchain]
-channel = "1.94.0"
+channel = "nightly-2025-01-18"
 profile = "minimal"
-components = ["rust-src"]
-targets = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none-softfloat"]

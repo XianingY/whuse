@@ -5,18 +5,26 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const RISCV_TARGET: &str = "riscv64gc-unknown-none-elf";
 const RISCV_PACKAGE: &str = "whuse-riscv64-virt";
-const LOONGARCH_TARGET: &str = "loongarch64-unknown-none-softfloat";
+const LOONGARCH_TARGET: &str = "loongarch64-unknown-none";
 const LOONGARCH_PACKAGE: &str = "whuse-loongarch64-virt";
 const LOONGARCH_BOOTROM_PACKAGE: &str = "whuse-loongarch64-bootrom";
 const CONTEST_DOCKER_IMAGE: &str = "docker.educg.net/cg/os-contest:20260104";
+const CONTEST_TOOLCHAIN: &str = "nightly-2025-01-18";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QemuMode {
     Host,
     Contest,
+}
+
+#[derive(Clone, Debug)]
+enum ContestRuntime {
+    Docker(String),
+    Local,
 }
 
 impl QemuMode {
@@ -37,6 +45,25 @@ impl QemuMode {
                 eprintln!("unknown WHUSE_QEMU_MODE={other}, fallback to {:?}", default);
                 default
             }
+        }
+    }
+}
+
+impl ContestRuntime {
+    fn detect() -> ContestRuntime {
+        let contest_image =
+            env::var("WHUSE_OSCOMP_DOCKER_IMAGE").unwrap_or_else(|_| CONTEST_DOCKER_IMAGE.to_string());
+        if command_available("docker", &["version"]) {
+            ContestRuntime::Docker(contest_image)
+        } else {
+            ContestRuntime::Local
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            ContestRuntime::Docker(_) => "docker",
+            ContestRuntime::Local => "local",
         }
     }
 }
@@ -235,7 +262,16 @@ fn cargo(args: &[&str]) -> ExitCode {
     }
 }
 
+fn command_available(binary: &str, args: &[&str]) -> bool {
+    Command::new(binary).args(args).output().is_ok()
+}
+
 fn repo_root() -> PathBuf {
+    if let Ok(cwd) = env::current_dir() {
+        if cwd.join("Cargo.toml").exists() && cwd.join("tools").join("xtask").join("Cargo.toml").exists() {
+            return cwd;
+        }
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask lives under tools/")
@@ -652,7 +688,7 @@ fn build_qemu_loongarch_host_args(
     args.push("-device".to_string());
     args.push("virtio-net-pci,netdev=net0".to_string());
     args.push("-netdev".to_string());
-    args.push("user,id=net0,hostfwd=tcp::15555-:15555,hostfwd=udp::15555-:15555".to_string());
+    args.push("user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555".to_string());
     args
 }
 
@@ -685,7 +721,7 @@ fn build_qemu_loongarch_contest_args(
     args.push("-device".to_string());
     args.push("virtio-net-pci,netdev=net0".to_string());
     args.push("-netdev".to_string());
-    args.push("user,id=net0,hostfwd=tcp::15555-:15555,hostfwd=udp::15555-:15555".to_string());
+    args.push("user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555".to_string());
     if let Some(extra) = extra_disk {
         args.push("-drive".to_string());
         args.push(format!("file={},if=none,format=raw,id=x1", extra.display()));
@@ -881,6 +917,14 @@ fn prepare_oscomp_images() -> ExitCode {
         eprintln!("{err}");
         return ExitCode::from(1);
     }
+    if let Err(err) = purge_runtime_oscomp_overrides(&dst_rv) {
+        eprintln!("{err}");
+        return ExitCode::from(1);
+    }
+    if let Err(err) = purge_runtime_oscomp_overrides(&dst_la) {
+        eprintln!("{err}");
+        return ExitCode::from(1);
+    }
 
     let rv_ok = validate_oscomp_full_image(&dst_rv, "riscv64");
     let la_ok = validate_oscomp_full_image(&dst_la, "loongarch64");
@@ -898,6 +942,32 @@ fn prepare_oscomp_images() -> ExitCode {
 fn contest_selfcheck() -> ExitCode {
     let mut ok = true;
     let root = repo_root();
+    let runtime = ContestRuntime::detect();
+
+    let cargo_config = root.join("cargo_config.toml");
+    if cargo_config.exists() {
+        println!(
+            "contest-selfcheck: cargo-config={}",
+            cargo_config.display()
+        );
+    } else {
+        eprintln!(
+            "contest-selfcheck: missing {} (contest clone filters .cargo; keep non-hidden cargo config in repo root)",
+            cargo_config.display()
+        );
+        ok = false;
+    }
+
+    let vendor_dir = root.join("vendor");
+    if vendor_dir.exists() {
+        println!("contest-selfcheck: vendor-dir={}", vendor_dir.display());
+    } else {
+        eprintln!(
+            "contest-selfcheck: missing {} (contest builds must not depend on online registry downloads)",
+            vendor_dir.display()
+        );
+        ok = false;
+    }
 
     let expected_artifacts = ["kernel-rv", "kernel-la"];
     for artifact in expected_artifacts {
@@ -943,9 +1013,41 @@ fn contest_selfcheck() -> ExitCode {
         ok = false;
     }
 
-    let contest_image =
-        env::var("WHUSE_OSCOMP_DOCKER_IMAGE").unwrap_or_else(|_| CONTEST_DOCKER_IMAGE.to_string());
-    match docker_qemu_version(&contest_image, "qemu-system-riscv64") {
+    println!("contest-selfcheck: runtime={}", runtime.label());
+    match contest_toolchain_version(&runtime, CONTEST_TOOLCHAIN) {
+        Ok(version) => {
+            println!("contest-selfcheck: rust-toolchain={version}");
+        }
+        Err(err) => {
+            eprintln!(
+                "contest-selfcheck: contest image missing preinstalled toolchain {}: {err}",
+                CONTEST_TOOLCHAIN
+            );
+            ok = false;
+        }
+    }
+    match contest_installed_targets(&runtime, CONTEST_TOOLCHAIN) {
+        Ok(installed) => {
+            println!("contest-selfcheck: rust-targets={}", installed.join(","));
+            for target in [RISCV_TARGET, LOONGARCH_TARGET] {
+                if !installed.iter().any(|installed_target| installed_target == target) {
+                    eprintln!(
+                        "contest-selfcheck: contest image toolchain {} is missing target {}",
+                        CONTEST_TOOLCHAIN, target
+                    );
+                    ok = false;
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "contest-selfcheck: failed to inspect targets for {}: {err}",
+                CONTEST_TOOLCHAIN
+            );
+            ok = false;
+        }
+    }
+    match contest_qemu_version(&runtime, "qemu-system-riscv64") {
         Ok(version) => {
             println!("contest-selfcheck: riscv-qemu={}", version);
             if !contest_qemu_version_supported(&version) {
@@ -958,7 +1060,7 @@ fn contest_selfcheck() -> ExitCode {
             ok = false;
         }
     }
-    match docker_qemu_version(&contest_image, "qemu-system-loongarch64") {
+    match contest_qemu_version(&runtime, "qemu-system-loongarch64") {
         Ok(version) => {
             println!("contest-selfcheck: loongarch-qemu={}", version);
             if !contest_qemu_version_supported(&version) {
@@ -1011,7 +1113,7 @@ fn contest_selfcheck() -> ExitCode {
             "-rtc base=utc",
             "virtio-blk-pci,drive=x0",
             "virtio-net-pci,netdev=net0",
-            "user,id=net0,hostfwd=tcp::15555-:15555,hostfwd=udp::15555-:15555",
+            "user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555",
             "virtio-blk-pci,drive=x1",
         ],
     ) {
@@ -1036,11 +1138,7 @@ fn contest_selfcheck() -> ExitCode {
     let rv_kernel = root.join("kernel-rv");
     let rv_image = oscomp_image_path("rv");
     if rv_kernel.exists() {
-        match contest_riscv_boot_smoke(
-            &contest_image,
-            &rv_kernel,
-            rv_image.exists().then_some(rv_image.as_path()),
-        ) {
+        match contest_riscv_boot_smoke(&runtime, &rv_kernel, rv_image.exists().then_some(rv_image.as_path())) {
             Ok(true) => println!("contest-selfcheck: kernel-rv-boot-smoke=ok"),
             Ok(false) => {
                 eprintln!(
@@ -1057,7 +1155,7 @@ fn contest_selfcheck() -> ExitCode {
     let la_kernel = root.join("kernel-la");
     let la_image = oscomp_image_path("la");
     if la_kernel.exists() && la_image.exists() {
-        match contest_loongarch_boot_smoke(&contest_image, &la_kernel, &la_image) {
+        match contest_loongarch_boot_smoke(&runtime, &la_kernel, &la_image) {
             Ok(true) => println!("contest-selfcheck: kernel-la-boot-smoke=ok"),
             Ok(false) => {
                 eprintln!(
@@ -1095,6 +1193,139 @@ fn docker_qemu_version(image: &str, binary: &str) -> Result<String, String> {
         return Err("empty version output".to_string());
     }
     Ok(line)
+}
+
+fn docker_bash_output(image: &str, script: &str) -> Result<String, String> {
+    let output = Command::new("docker")
+        .args(["run", "--rm", image, "bash", "-lc", script])
+        .output()
+        .map_err(|err| format!("failed to execute docker bash: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "docker bash exit code {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn docker_toolchain_version(image: &str, toolchain: &str) -> Result<String, String> {
+    let text = docker_bash_output(
+        image,
+        &format!("rustup run {toolchain} cargo --version && rustup run {toolchain} rustc --version"),
+    )?;
+    let line = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if line.is_empty() {
+        return Err("empty cargo version output".to_string());
+    }
+    Ok(line)
+}
+
+fn docker_installed_targets(image: &str, toolchain: &str) -> Result<Vec<String>, String> {
+    let target_toolchain = format!("{toolchain}-x86_64-unknown-linux-gnu");
+    let text = docker_bash_output(
+        image,
+        &format!("rustup target list --toolchain {target_toolchain} --installed"),
+    )?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn local_bash_output(script: &str) -> Result<String, String> {
+    let output = Command::new("bash")
+        .args(["-lc", script])
+        .output()
+        .map_err(|err| format!("failed to execute local bash: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "local bash exit code {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn local_toolchain_version(toolchain: &str) -> Result<String, String> {
+    let text = local_bash_output(
+        &format!("rustup run {toolchain} cargo --version && rustup run {toolchain} rustc --version"),
+    )?;
+    let line = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if line.is_empty() {
+        return Err("empty cargo version output".to_string());
+    }
+    Ok(line)
+}
+
+fn local_installed_targets(toolchain: &str) -> Result<Vec<String>, String> {
+    let target_toolchain = format!("{toolchain}-x86_64-unknown-linux-gnu");
+    let text = local_bash_output(&format!(
+        "rustup target list --toolchain {target_toolchain} --installed"
+    ))?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn local_qemu_version(binary: &str) -> Result<String, String> {
+    let output = Command::new(binary)
+        .arg("--version")
+        .output()
+        .map_err(|err| format!("failed to execute local {binary}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "local {binary} exit code {:?}",
+            output.status.code()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let line = text.lines().next().unwrap_or_default().trim().to_string();
+    if line.is_empty() {
+        return Err("empty version output".to_string());
+    }
+    Ok(line)
+}
+
+fn contest_toolchain_version(runtime: &ContestRuntime, toolchain: &str) -> Result<String, String> {
+    match runtime {
+        ContestRuntime::Docker(image) => docker_toolchain_version(image, toolchain),
+        ContestRuntime::Local => local_toolchain_version(toolchain),
+    }
+}
+
+fn contest_installed_targets(
+    runtime: &ContestRuntime,
+    toolchain: &str,
+) -> Result<Vec<String>, String> {
+    match runtime {
+        ContestRuntime::Docker(image) => docker_installed_targets(image, toolchain),
+        ContestRuntime::Local => local_installed_targets(toolchain),
+    }
+}
+
+fn contest_qemu_version(runtime: &ContestRuntime, binary: &str) -> Result<String, String> {
+    match runtime {
+        ContestRuntime::Docker(image) => docker_qemu_version(image, binary),
+        ContestRuntime::Local => local_qemu_version(binary),
+    }
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<String, String> {
@@ -1138,81 +1369,141 @@ fn contest_smoke_has_progress(text: &str) -> bool {
         || text.contains("testcase ")
 }
 
+fn collect_command_output(command: &mut Command, desc: &str) -> Result<String, String> {
+    let output = command
+        .output()
+        .map_err(|err| format!("failed to execute {desc}: {err}"))?;
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(text)
+}
+
+fn make_temp_disk_copy(prefix: &str, source: &Path) -> Result<PathBuf, String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("failed to read clock for temp image: {err}"))?
+        .as_nanos();
+    let temp = env::temp_dir().join(format!("{prefix}-{}-{nanos}.img", std::process::id()));
+    fs::copy(source, &temp).map_err(|err| {
+        format!(
+            "failed to copy {} -> {} for selfcheck smoke: {err}",
+            source.display(),
+            temp.display()
+        )
+    })?;
+    Ok(temp)
+}
+
 fn contest_riscv_boot_smoke(
-    image: &str,
+    runtime: &ContestRuntime,
     kernel: &Path,
     disk: Option<&Path>,
 ) -> Result<bool, String> {
     let repo = repo_root();
-    let kernel_name = kernel
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("invalid kernel artifact path {}", kernel.display()))?;
-    let mut qemu = format!(
-        "timeout 60s qemu-system-riscv64 -machine virt -kernel {kernel_name} -m 1G -nographic -smp 1 -bios default -no-reboot -rtc base=utc"
-    );
-    if let Some(disk) = disk {
-        let disk_name = disk
-            .strip_prefix(&repo)
-            .unwrap_or(disk)
-            .display()
-            .to_string();
-        qemu.push_str(&format!(
-            " -drive file={disk_name},if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -device virtio-net-device,netdev=net -netdev user,id=net"
-        ));
+    let kernel_rel = kernel.strip_prefix(&repo).unwrap_or(kernel);
+    let temp_disk = disk.map(|path| make_temp_disk_copy("whuse-selfcheck-rv", path)).transpose()?;
+    let docker_disk = PathBuf::from("/tmp/whuse-selfcheck-rv.img");
+    let disk_buf = temp_disk
+        .as_deref()
+        .or(disk)
+        .map(|path| path.strip_prefix(&repo).unwrap_or(path).to_path_buf());
+    let args = match runtime {
+        ContestRuntime::Docker(_) => build_qemu_riscv_args(
+            kernel_rel,
+            temp_disk.as_ref().map(|_| &docker_disk),
+            None,
+        ),
+        ContestRuntime::Local => build_qemu_riscv_args(kernel_rel, disk_buf.as_ref(), None),
+    };
+    let text = match runtime {
+        ContestRuntime::Docker(image) => {
+            let joined = args.join(" ");
+            collect_command_output(
+                Command::new("docker").args([
+                    "run",
+                    "--rm",
+                    "-v",
+                    &format!("{}:/work", repo.display()),
+                    "-v",
+                    &format!(
+                        "{}:/tmp/whuse-selfcheck-rv.img",
+                        temp_disk
+                            .as_ref()
+                            .ok_or_else(|| "missing temp rv disk for docker smoke".to_string())?
+                            .display()
+                    ),
+                    "-w",
+                    "/work",
+                    image,
+                    "bash",
+                    "-lc",
+                    &format!("timeout 60s qemu-system-riscv64 {joined}"),
+                ]),
+                "docker riscv boot smoke",
+            )?
+        }
+        ContestRuntime::Local => collect_command_output(
+            Command::new("timeout")
+                .arg("60s")
+                .arg("qemu-system-riscv64")
+                .args(&args),
+            "local riscv boot smoke",
+        )?,
+    };
+    if let Some(temp_disk) = temp_disk {
+        let _ = fs::remove_file(temp_disk);
     }
-    let output = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-v",
-            &format!("{}:/work", repo.display()),
-            "-w",
-            "/work",
-            image,
-            "bash",
-            "-lc",
-            &qemu,
-        ])
-        .output()
-        .map_err(|err| format!("failed to execute docker riscv boot smoke: {err}"))?;
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
     Ok(text.contains("whuse: booting on riscv64-virt") && contest_smoke_has_progress(&text))
 }
 
-fn contest_loongarch_boot_smoke(image: &str, kernel: &Path, disk: &Path) -> Result<bool, String> {
+fn contest_loongarch_boot_smoke(
+    runtime: &ContestRuntime,
+    kernel: &Path,
+    disk: &Path,
+) -> Result<bool, String> {
     let repo = repo_root();
-    let kernel_name = kernel
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("invalid kernel artifact path {}", kernel.display()))?;
-    let disk_name = disk
-        .strip_prefix(&repo)
-        .unwrap_or(disk)
-        .display()
-        .to_string();
-    let output = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-v",
-            &format!("{}:/work", repo.display()),
-            "-w",
-            "/work",
-            image,
-            "bash",
-            "-lc",
-            &format!(
-                "timeout 60s qemu-system-loongarch64 -machine virt -kernel {kernel_name} -m 1G -nographic -smp 1 -drive file={disk_name},if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0 -netdev user,id=net0,hostfwd=tcp::15555-:15555,hostfwd=udp::15555-:15555 -rtc base=utc"
-            ),
-        ])
-        .output()
-        .map_err(|err| format!("failed to execute docker loongarch boot smoke: {err}"))?;
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let kernel_rel = kernel.strip_prefix(&repo).unwrap_or(kernel);
+    let temp_disk = make_temp_disk_copy("whuse-selfcheck-la", disk)?;
+    let docker_disk = PathBuf::from("/tmp/whuse-selfcheck-la.img");
+    let args = match runtime {
+        ContestRuntime::Docker(_) => build_qemu_loongarch_contest_args(
+            kernel_rel,
+            Some(&docker_disk),
+            None,
+        ),
+        ContestRuntime::Local => build_qemu_loongarch_contest_args(kernel_rel, Some(&temp_disk), None),
+    };
+    let text = match runtime {
+        ContestRuntime::Docker(image) => {
+            let joined = args.join(" ");
+            collect_command_output(
+                Command::new("docker").args([
+                    "run",
+                    "--rm",
+                    "-v",
+                    &format!("{}:/work", repo.display()),
+                    "-v",
+                    &format!("{}:/tmp/whuse-selfcheck-la.img", temp_disk.display()),
+                    "-w",
+                    "/work",
+                    image,
+                    "bash",
+                    "-lc",
+                    &format!("timeout 60s qemu-system-loongarch64 {joined}"),
+                ]),
+                "docker loongarch boot smoke",
+            )?
+        }
+        ContestRuntime::Local => collect_command_output(
+            Command::new("timeout")
+                .arg("60s")
+                .arg("qemu-system-loongarch64")
+                .args(&args),
+            "local loongarch boot smoke",
+        )?,
+    };
+    let _ = fs::remove_file(temp_disk);
     Ok(text.contains("whuse: booting on loongarch64-virt") && contest_smoke_has_progress(&text))
 }
 
@@ -1441,6 +1732,31 @@ fn validate_oscomp_full_image(image: &PathBuf, arch: &str) -> bool {
         }
     };
 
+    let leaked_runtime_configs = [
+        ".whuse_oscomp_only_step",
+        ".whuse_ltp_profile",
+        ".whuse_ltp_whitelist",
+        ".whuse_ltp_blacklist",
+        ".whuse_ltp_step_timeout",
+        ".whuse_ltp_case_timeout",
+        "ltp_score_whitelist.host.txt",
+        "ltp_score_blacklist.host.txt",
+    ];
+    let leaked: Vec<_> = leaked_runtime_configs
+        .iter()
+        .copied()
+        .filter(|entry| debugfs_exists(image, &format!("/musl/{entry}")))
+        .collect();
+    if !leaked.is_empty() {
+        eprintln!(
+            "oscomp image {} ({}) still contains runtime-only config files under /musl: {:?}",
+            arch,
+            image.display(),
+            leaked
+        );
+        return false;
+    }
+
     let required_musl = [
         "busybox",
         "basic_testcode.sh",
@@ -1502,6 +1818,38 @@ fn validate_oscomp_full_image(image: &PathBuf, arch: &str) -> bool {
     true
 }
 
+fn purge_runtime_oscomp_overrides(image: &PathBuf) -> Result<(), String> {
+    for path in [
+        "/musl/.whuse_oscomp_only_step",
+        "/musl/.whuse_ltp_profile",
+        "/musl/.whuse_ltp_whitelist",
+        "/musl/.whuse_ltp_blacklist",
+        "/musl/.whuse_ltp_step_timeout",
+        "/musl/.whuse_ltp_case_timeout",
+        "/musl/ltp_score_whitelist.host.txt",
+        "/musl/ltp_score_blacklist.host.txt",
+    ] {
+        debugfs_remove(image, path)?;
+    }
+    Ok(())
+}
+
+fn debugfs_remove(image: &PathBuf, path: &str) -> Result<(), String> {
+    let status = Command::new("debugfs")
+        .args([
+            "-w",
+            "-R",
+            &format!("rm {path}"),
+            image.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .map_err(|err| format!("failed to execute debugfs for rm {path}: {err}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    Ok(())
+}
+
 fn debugfs_list(image: &PathBuf, path: &str) -> Result<String, String> {
     let output = Command::new("debugfs")
         .args([
@@ -1515,6 +1863,27 @@ fn debugfs_list(image: &PathBuf, path: &str) -> Result<String, String> {
         return Err(format!("debugfs exit code {:?}", output.status.code()));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn debugfs_exists(image: &PathBuf, path: &str) -> bool {
+    let Ok(output) = Command::new("debugfs")
+        .args([
+            "-R",
+            &format!("stat {path}"),
+            image.to_string_lossy().as_ref(),
+        ])
+        .output()
+    else {
+        return false;
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.status.success()
+        && !text.contains("File not found")
+        && !text.contains("not found by ext2_lookup")
 }
 
 fn detect_qemu_disk_holder(disk: &PathBuf) -> Option<(u32, String)> {
@@ -1599,7 +1968,7 @@ mod tests {
             "-rtc base=utc",
             "virtio-blk-pci,drive=x0",
             "virtio-net-pci,netdev=net0",
-            "user,id=net0,hostfwd=tcp::15555-:15555,hostfwd=udp::15555-:15555",
+            "user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555",
             "virtio-blk-pci,drive=x1",
         ] {
             assert!(args.contains(token), "missing token: {token}");

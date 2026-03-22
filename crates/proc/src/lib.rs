@@ -1018,6 +1018,39 @@ impl ProcessTable {
         Ok(())
     }
 
+    pub fn setresuid_current(
+        &mut self,
+        ruid: Option<u32>,
+        euid: Option<u32>,
+    ) -> KernelResult<()> {
+        let current = self.current()?.clone();
+        let target_ruid = ruid.unwrap_or(current.uid);
+        let target_euid = euid.unwrap_or(current.euid);
+        let privileged = current.uid == 0 || current.euid == 0;
+        if !privileged
+            && target_ruid != current.uid
+            && target_ruid != current.euid
+            && target_euid != current.uid
+            && target_euid != current.euid
+        {
+            return Err(1);
+        }
+        let tgid = self.current_tgid()?;
+        for process in self
+            .processes
+            .values_mut()
+            .filter(|process| process.tgid == tgid)
+        {
+            if let Some(uid) = ruid {
+                process.uid = uid;
+            }
+            if let Some(euid) = euid {
+                process.euid = euid;
+            }
+        }
+        Ok(())
+    }
+
     pub fn setgid_current(&mut self, gid: u32) -> KernelResult<()> {
         let tgid = self.current_tgid()?;
         for process in self

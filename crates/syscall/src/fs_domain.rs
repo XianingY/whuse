@@ -75,7 +75,7 @@ pub(crate) fn dispatch(
         SYS_CHDIR => ctx.dispatcher.sys_chdir(args, ctx.procs, ctx.vfs),
         SYS_FCHDIR => ctx.dispatcher.sys_fchdir(args, ctx.procs, ctx.vfs),
         SYS_CHROOT => ctx.dispatcher.sys_chroot(args, ctx.procs, ctx.vfs),
-        SYS_FCHMOD => ctx.dispatcher.sys_fchmod(args, ctx.procs),
+        SYS_FCHMOD => ctx.dispatcher.sys_fchmod(args, ctx.procs, ctx.vfs),
         SYS_FCHMODAT | SYS_FCHMODAT2 => ctx.dispatcher.sys_fchmodat(args, ctx.procs, ctx.vfs),
         SYS_FCHOWNAT => ctx.dispatcher.sys_fchownat(args, ctx.procs, ctx.vfs),
         SYS_FCHOWN => ctx.dispatcher.sys_fchown(args, ctx.procs),

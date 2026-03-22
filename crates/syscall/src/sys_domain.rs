@@ -2,7 +2,7 @@ use crate::{
     DispatchContext, SyscallArgs, SYS_GETEGID, SYS_GETEUID, SYS_GETGID, SYS_GETGROUPS,
     SYS_GETRANDOM, SYS_GETUID, SYS_MEMBARRIER, SYS_MEMFD_CREATE, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN,
     SYS_PIDFD_SEND_SIGNAL, SYS_PRCTL, SYS_RISCV_FLUSH_ICACHE, SYS_SECCOMP, SYS_SETGID,
-    SYS_SETGROUPS, SYS_SETUID, SYS_SYSINFO, SYS_UMASK, SYS_UNAME,
+    SYS_SETGROUPS, SYS_SETRESUID, SYS_SETREUID, SYS_SETUID, SYS_SYSINFO, SYS_UMASK, SYS_UNAME,
 };
 
 pub(crate) fn dispatch(
@@ -18,6 +18,8 @@ pub(crate) fn dispatch(
         SYS_GETGROUPS => ctx.dispatcher.sys_getgroups(args, ctx.procs),
         SYS_SETGROUPS => ctx.dispatcher.sys_setgroups(args, ctx.procs),
         SYS_SETUID => ctx.dispatcher.sys_setuid(args, ctx.procs),
+        SYS_SETREUID => ctx.dispatcher.sys_setreuid(args, ctx.procs),
+        SYS_SETRESUID => ctx.dispatcher.sys_setresuid(args, ctx.procs),
         SYS_SETGID => ctx.dispatcher.sys_setgid(args, ctx.procs),
         SYS_UNAME => ctx.dispatcher.sys_uname(args, ctx.procs),
         SYS_SYSINFO => ctx.dispatcher.sys_sysinfo(args, ctx.procs, ctx.scheduler),

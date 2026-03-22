@@ -20,14 +20,19 @@ Current measured QEMU in the contest image is `10.0.2` for both
 
 ## Rust Toolchain Policy
 
-To avoid rustup rolling updates during contest compile, this repository pins
-Rust to `1.94.0` with `profile = "minimal"` in
-`rust-toolchain.toml` instead of using floating `stable`.
+To avoid contest-time rustup installs, this repository pins Rust to the contest
+image's preinstalled toolchain `nightly-2025-01-18` with `profile = "minimal"`
+in `rust-toolchain.toml` instead of using a floating channel or a newer
+unavailable version.
 
 ## Xtask Invocation Policy (Contest-Safe)
 
-Contest builds must not depend on Cargo alias loading from `.cargo/config.toml`.
-This repository's build scripts call xtask explicitly via:
+Contest builds must not depend on Cargo alias loading from `.cargo/config.toml`,
+because hidden directories are filtered during submission. The repository keeps
+the real config in root-level `cargo_config.toml`, vendors registry crates under
+`vendor/`, and `make` recreates `.cargo/config.toml` before any Cargo command.
+
+Build scripts still call xtask explicitly via:
 
 ```bash
 cargo run --manifest-path tools/xtask/Cargo.toml -- <command>

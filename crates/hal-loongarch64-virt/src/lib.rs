@@ -41,17 +41,17 @@ pub static KERNEL_TRAP_HANDLER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 // LoongArch CSR numbers for timer handling
-const CSR_CRMD: u32 = 0x0;    // Current mode
-const CSR_PRMD: u32 = 0x1;    // Previous mode
-const CSR_ECFG: u32 = 0x4;    // Exception config (interrupt enables)
-const CSR_ESTAT: u32 = 0x5;   // Exception status
-const CSR_ERA: u32 = 0x6;     // Exception return address
-const CSR_EENTRY: u32 = 0xc;  // Exception entry
-const CSR_TCFG: u32 = 0x41;   // Timer config
-const CSR_TVAL: u32 = 0x42;   // Timer value (countdown)
-const CSR_TICLR: u32 = 0x44;  // Timer interrupt clear
-const CSR_SAVE0: u32 = 0x30;  // Scratch register 0
-const CSR_SAVE1: u32 = 0x31;  // Scratch register 1
+const CSR_CRMD: u32 = 0x0; // Current mode
+const CSR_PRMD: u32 = 0x1; // Previous mode
+const CSR_ECFG: u32 = 0x4; // Exception config (interrupt enables)
+const CSR_ESTAT: u32 = 0x5; // Exception status
+const CSR_ERA: u32 = 0x6; // Exception return address
+const CSR_EENTRY: u32 = 0xc; // Exception entry
+const CSR_TCFG: u32 = 0x41; // Timer config
+const CSR_TVAL: u32 = 0x42; // Timer value (countdown)
+const CSR_TICLR: u32 = 0x44; // Timer interrupt clear
+const CSR_SAVE0: u32 = 0x30; // Scratch register 0
+const CSR_SAVE1: u32 = 0x31; // Scratch register 1
 
 // Timer interrupt bit in ECFG/ESTAT (bit 11)
 const ECFG_TI: usize = 1 << 11;
@@ -542,9 +542,9 @@ impl HalCpu for VirtCpu {
             core::arch::asm!("csrrd {}, 0x0", out(reg) crmd);
             crmd |= 1 << 2; // Set IE bit
             core::arch::asm!("csrwr {}, 0x0", in(reg) crmd);
-            
-            use hal_api::ConsoleWriter;
+
             use core::fmt::Write;
+            use hal_api::ConsoleWriter;
             let mut console = ConsoleWriter;
             let _ = write!(console, "whuse-debug: enable_interrupts CRMD={:#x}\n", crmd);
         }
@@ -624,15 +624,15 @@ impl HalCpu for VirtCpu {
     fn set_kernel_timer_callback(&self, cb: fn()) {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
-            use hal_api::ConsoleWriter;
             use core::fmt::Write;
+            use hal_api::ConsoleWriter;
             let mut console = ConsoleWriter;
             let _ = write!(console, "whuse-debug: set_kernel_timer_callback called\n");
-            
+
             KERNEL_TRAP_HANDLER.store(cb as usize, core::sync::atomic::Ordering::Relaxed);
             let eentry = __whuse_kernel_trap_entry as *const () as usize;
             core::arch::asm!("csrwr {}, 0xc", in(reg) eentry);
-            
+
             let _ = write!(console, "whuse-debug: EENTRY set to {:#x}\n", eentry);
         }
         #[cfg(not(target_arch = "loongarch64"))]
@@ -699,10 +699,14 @@ impl HalTimer for VirtTimer {
             let delta_ticks = delta_nanos / 10;
             let init_val = delta_ticks.max(1000);
 
-            use hal_api::ConsoleWriter;
             use core::fmt::Write;
+            use hal_api::ConsoleWriter;
             let mut console = ConsoleWriter;
-            let _ = write!(console, "whuse-debug: program_oneshot delta_ticks={} init_val={}\n", delta_ticks, init_val);
+            let _ = write!(
+                console,
+                "whuse-debug: program_oneshot delta_ticks={} init_val={}\n",
+                delta_ticks, init_val
+            );
 
             let mut ecfg: usize;
             core::arch::asm!("csrrd {}, 0x4", out(reg) ecfg);
@@ -711,7 +715,7 @@ impl HalTimer for VirtTimer {
 
             let tcfg: usize = (init_val as usize) << 2 | 0x1;
             core::arch::asm!("csrwr {}, 0x41", in(reg) tcfg);
-            
+
             let _ = write!(console, "whuse-debug: TCFG={:#x} ECFG={:#x}\n", tcfg, ecfg);
         }
         #[cfg(not(target_arch = "loongarch64"))]

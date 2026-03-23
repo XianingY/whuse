@@ -105,8 +105,18 @@ impl FrameAllocator {
 
 #[derive(Clone, Debug)]
 enum SegmentStorage {
-    Owned { bytes: Vec<u8>, ptr: usize },
-    Host { ptr: usize, len: usize },
+    Owned {
+        bytes: Vec<u8>,
+        ptr: usize,
+    },
+    Shared {
+        bytes: alloc::sync::Arc<Mutex<Vec<u8>>>,
+        ptr: usize,
+    },
+    Host {
+        ptr: usize,
+        len: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -240,12 +250,51 @@ impl AddressSpace {
         Ok(start)
     }
 
+    pub fn map_anonymous_shared(&self, len: usize, prot: usize) -> KernelResult<usize> {
+        if len == 0 {
+            return Err(EINVAL);
+        }
+        let aligned = align_up(len, PAGE_SIZE);
+        let start = {
+            let mut inner = self.inner.lock();
+            let mut start = align_up(inner.next_mapping_base, PAGE_SIZE);
+            loop {
+                if let Some(overlap_end) = first_overlap_end(&inner.mappings, start, aligned) {
+                    start = align_up(overlap_end, PAGE_SIZE);
+                    continue;
+                }
+                let next = start.checked_add(aligned).ok_or(ENOMEM)?;
+                inner.next_mapping_base = next;
+                break start;
+            }
+        };
+        let mut zeros = Vec::new();
+        zeros.try_reserve_exact(aligned).map_err(|_| ENOMEM)?;
+        zeros.resize(aligned, 0);
+        self.map_shared(start, zeros, prot)?;
+        Ok(start)
+    }
+
     pub fn map_anonymous_at(&self, addr: usize, len: usize, prot: usize) -> KernelResult<usize> {
         if len == 0 || addr & (PAGE_SIZE - 1) != 0 {
             return Err(EINVAL);
         }
         let aligned = align_up(len, PAGE_SIZE);
         self.map_fixed_bytes(addr, &[], aligned, prot)?;
+        Ok(addr)
+    }
+
+    pub fn map_anonymous_shared_at(
+        &self,
+        addr: usize,
+        len: usize,
+        prot: usize,
+    ) -> KernelResult<usize> {
+        if len == 0 || addr & (PAGE_SIZE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let aligned = align_up(len, PAGE_SIZE);
+        self.map_fixed_shared_bytes(addr, &[], aligned, prot)?;
         Ok(addr)
     }
 
@@ -273,6 +322,23 @@ impl AddressSpace {
         buffer.resize(mem_len, 0);
         buffer[..bytes.len()].copy_from_slice(bytes);
         self.map_owned(addr, buffer, prot)
+    }
+
+    pub fn map_fixed_shared_bytes(
+        &self,
+        addr: usize,
+        bytes: &[u8],
+        mem_len: usize,
+        prot: usize,
+    ) -> KernelResult<()> {
+        if mem_len == 0 || bytes.len() > mem_len {
+            return Err(EINVAL);
+        }
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(mem_len).map_err(|_| ENOMEM)?;
+        buffer.resize(mem_len, 0);
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        self.map_shared(addr, buffer, prot)
     }
 
     pub fn install_bytes(&self, addr: usize, bytes: &[u8]) {
@@ -405,6 +471,12 @@ impl AddressSpace {
                         take,
                     ));
                 },
+                SegmentStorage::Shared { ptr, .. } => unsafe {
+                    out.extend_from_slice(core::slice::from_raw_parts(
+                        (ptr + offset) as *const u8,
+                        take,
+                    ));
+                },
                 SegmentStorage::Host { ptr, .. } => unsafe {
                     out.extend_from_slice(core::slice::from_raw_parts(
                         (ptr + offset) as *const u8,
@@ -490,6 +562,13 @@ impl AddressSpace {
                         take,
                     );
                 },
+                SegmentStorage::Shared { ptr, .. } => unsafe {
+                    ptr::copy_nonoverlapping(
+                        bytes[written..written + take].as_ptr(),
+                        (*ptr + offset) as *mut u8,
+                        take,
+                    );
+                },
                 SegmentStorage::Host { ptr, len } => {
                     if offset + take > *len {
                         return Err(EFAULT);
@@ -563,6 +642,10 @@ impl AddressSpace {
                     };
                     create_owned_storage(*start, bytes)
                 }
+                SegmentStorage::Shared { bytes, ptr } => SegmentStorage::Shared {
+                    bytes: bytes.clone(),
+                    ptr: *ptr,
+                },
                 SegmentStorage::Host { ptr, len } => unsafe {
                     create_owned_storage(
                         *start,
@@ -619,7 +702,13 @@ impl AddressSpace {
         args: &[String],
         envs: &[String],
     ) -> KernelResult<LoadedImage> {
-        self.load_elf_images(image, None, args, envs, args.first().map(|arg| arg.as_str()))
+        self.load_elf_images(
+            image,
+            None,
+            args,
+            envs,
+            args.first().map(|arg| arg.as_str()),
+        )
     }
 
     pub fn load_elf_images(
@@ -646,20 +735,20 @@ impl AddressSpace {
         let stack_base = stack_top - USER_STACK_SIZE;
         self.map_fixed_bytes(stack_base, &[], USER_STACK_SIZE, DEFAULT_PROT)?;
         let auxv = [
-            (3usize, program.phdr_addr),                        // AT_PHDR
-            (4usize, program.phent),                            // AT_PHENT
-            (5usize, program.phnum),                            // AT_PHNUM
-            (6usize, PAGE_SIZE),                                // AT_PAGESZ
+            (3usize, program.phdr_addr),                                // AT_PHDR
+            (4usize, program.phent),                                    // AT_PHENT
+            (5usize, program.phnum),                                    // AT_PHNUM
+            (6usize, PAGE_SIZE),                                        // AT_PAGESZ
             (7usize, interp.map(|image| image.load_bias).unwrap_or(0)), // AT_BASE
-            (8usize, 0usize),                                   // AT_FLAGS
-            (9usize, program.entry),                            // AT_ENTRY
-            (11usize, 0usize),                                  // AT_UID
-            (12usize, 0usize),                                  // AT_EUID
-            (13usize, 0usize),                                  // AT_GID
-            (14usize, 0usize),                                  // AT_EGID
-            (16usize, 0usize),                                  // AT_HWCAP
-            (17usize, 100usize),                                // AT_CLKTCK
-            (23usize, 0usize),                                  // AT_SECURE
+            (8usize, 0usize),                                           // AT_FLAGS
+            (9usize, program.entry),                                    // AT_ENTRY
+            (11usize, 0usize),                                          // AT_UID
+            (12usize, 0usize),                                          // AT_EUID
+            (13usize, 0usize),                                          // AT_GID
+            (14usize, 0usize),                                          // AT_EGID
+            (16usize, 0usize),                                          // AT_HWCAP
+            (17usize, 100usize),                                        // AT_CLKTCK
+            (23usize, 0usize),                                          // AT_SECURE
         ];
         let stack_image = build_initial_stack(args, envs, stack_top, &auxv, execfn)?;
         let used = stack_image.len();
@@ -738,7 +827,10 @@ impl AddressSpace {
             // its last page must remain accessible/zero-filled, otherwise PIE
             // data/bss users that touch objects in the tail of that page will
             // spuriously fault with EFAULT.
-            let seg_mem_len = align_up(page_offset.checked_add(ph.mem_size).ok_or(ENOEXEC)?, PAGE_SIZE);
+            let seg_mem_len = align_up(
+                page_offset.checked_add(ph.mem_size).ok_or(ENOEXEC)?,
+                PAGE_SIZE,
+            );
             let mut seg_bytes = Vec::new();
             seg_bytes
                 .try_reserve_exact(page_offset + ph.file_size)
@@ -763,7 +855,10 @@ impl AddressSpace {
             phdr_addr,
             phnum: header.program_header_num,
             phent: header.program_header_size,
-            highest_end: align_up(max_vaddr_end.checked_add(load_bias).ok_or(ENOEXEC)?, PAGE_SIZE),
+            highest_end: align_up(
+                max_vaddr_end.checked_add(load_bias).ok_or(ENOEXEC)?,
+                PAGE_SIZE,
+            ),
             is_dyn: header.elf_type == ET_DYN,
         })
     }
@@ -774,7 +869,10 @@ impl AddressSpace {
         max_vaddr_end: usize,
     ) -> KernelResult<usize> {
         let load_floor = align_down(min_vaddr, PAGE_SIZE);
-        let span = align_up(max_vaddr_end.saturating_sub(load_floor).max(PAGE_SIZE), PAGE_SIZE);
+        let span = align_up(
+            max_vaddr_end.saturating_sub(load_floor).max(PAGE_SIZE),
+            PAGE_SIZE,
+        );
         let mut inner = self.inner.lock();
         let mut base = align_up(inner.next_mapping_base, PAGE_SIZE);
         loop {
@@ -796,6 +894,18 @@ impl AddressSpace {
                 prot,
             },
             storage: create_owned_storage(addr, bytes),
+        })
+    }
+
+    fn map_shared(&self, addr: usize, bytes: Vec<u8>, prot: usize) -> KernelResult<()> {
+        let len = bytes.len().max(1);
+        self.insert_segment(Segment {
+            area: MappingArea {
+                start: addr,
+                len,
+                prot,
+            },
+            storage: create_shared_storage(addr, bytes),
         })
     }
 
@@ -1162,6 +1272,7 @@ fn segment_phys_base(segment: &Segment) -> Option<usize> {
     let page_offset = segment.area.start & (PAGE_SIZE - 1);
     match segment.storage {
         SegmentStorage::Owned { ptr, .. } => Some(ptr.saturating_sub(page_offset)),
+        SegmentStorage::Shared { ptr, .. } => Some(ptr.saturating_sub(page_offset)),
         SegmentStorage::Host { ptr, .. } => {
             ((ptr & (PAGE_SIZE - 1)) == page_offset).then_some(ptr.saturating_sub(page_offset))
         }
@@ -1194,6 +1305,27 @@ fn create_owned_storage(addr: usize, mut data: Vec<u8>) -> SegmentStorage {
         ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, len);
     }
     SegmentStorage::Owned { bytes, ptr }
+}
+
+fn create_shared_storage(addr: usize, mut data: Vec<u8>) -> SegmentStorage {
+    if data.is_empty() {
+        data.push(0);
+    }
+    let len = data.len();
+    let page_offset = addr & (PAGE_SIZE - 1);
+    let map_len = align_up(page_offset + len, PAGE_SIZE);
+    let total = map_len + PAGE_SIZE;
+    let mut bytes = vec![0u8; total];
+    let raw_ptr = bytes.as_mut_ptr() as usize;
+    let aligned_base = align_up(raw_ptr, PAGE_SIZE);
+    let ptr = aligned_base + page_offset;
+    unsafe {
+        ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, len);
+    }
+    SegmentStorage::Shared {
+        bytes: alloc::sync::Arc::new(Mutex::new(bytes)),
+        ptr,
+    }
 }
 
 fn elf_flags_to_prot(flags: u32) -> usize {
@@ -1405,6 +1537,10 @@ fn slice_segment_storage(segment: &Segment, start: usize, len: usize) -> Segment
                 unsafe { core::slice::from_raw_parts((*ptr + offset) as *const u8, len).to_vec() };
             create_owned_storage(start, bytes)
         }
+        SegmentStorage::Shared { bytes, ptr } => SegmentStorage::Shared {
+            bytes: bytes.clone(),
+            ptr: ptr.saturating_add(offset),
+        },
         SegmentStorage::Host { ptr, .. } => SegmentStorage::Host {
             ptr: ptr.saturating_add(offset),
             len,
@@ -1460,8 +1596,8 @@ fn build_initial_stack(
     const AT_RANDOM: usize = 25;
     const AT_EXECFN: usize = 31;
     const AUX_RANDOM_BYTES: [u8; 16] = [
-        0x57, 0x68, 0x75, 0x73, 0x65, 0x2d, 0x72, 0x76, 0x2d, 0x61, 0x75, 0x78, 0x76, 0x2d,
-        0x31, 0x36,
+        0x57, 0x68, 0x75, 0x73, 0x65, 0x2d, 0x72, 0x76, 0x2d, 0x61, 0x75, 0x78, 0x76, 0x2d, 0x31,
+        0x36,
     ];
 
     let pointer_size = size_of::<usize>();
@@ -1529,11 +1665,9 @@ fn build_initial_stack(
         head[cursor..cursor + pointer_size].copy_from_slice(&value.to_le_bytes()[..pointer_size]);
         cursor += pointer_size;
     }
-    head[cursor..cursor + pointer_size]
-        .copy_from_slice(&AT_RANDOM.to_le_bytes()[..pointer_size]);
+    head[cursor..cursor + pointer_size].copy_from_slice(&AT_RANDOM.to_le_bytes()[..pointer_size]);
     cursor += pointer_size;
-    head[cursor..cursor + pointer_size]
-        .copy_from_slice(&random_addr.to_le_bytes()[..pointer_size]);
+    head[cursor..cursor + pointer_size].copy_from_slice(&random_addr.to_le_bytes()[..pointer_size]);
     cursor += pointer_size;
     if let Some(execfn_addr) = execfn_addr {
         head[cursor..cursor + pointer_size]

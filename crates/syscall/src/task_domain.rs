@@ -14,15 +14,17 @@ pub(crate) fn dispatch(
         SYS_SCHED_YIELD => ctx.dispatcher.sys_sched_yield(ctx.scheduler),
         SYS_EXIT => ctx
             .dispatcher
-            .sys_exit(args, ctx.procs, ctx.scheduler, false),
+            .sys_exit(args, ctx.procs, ctx.scheduler, ctx.vfs, false),
         SYS_EXIT_GROUP => ctx
             .dispatcher
-            .sys_exit(args, ctx.procs, ctx.scheduler, true),
+            .sys_exit(args, ctx.procs, ctx.scheduler, ctx.vfs, true),
         SYS_GETPID => ctx.dispatcher.sys_getpid(ctx.procs),
         SYS_GETPPID => ctx.dispatcher.sys_getppid(ctx.procs),
         SYS_GETTID => ctx.dispatcher.sys_gettid(ctx.procs),
         SYS_CLONE => ctx.dispatcher.sys_clone(args, ctx.procs, ctx.scheduler),
-        SYS_EXECVE => ctx.dispatcher.sys_execve(args, ctx.procs, ctx.vfs),
+        SYS_EXECVE => ctx
+            .dispatcher
+            .sys_execve(args, ctx.procs, ctx.scheduler, ctx.vfs),
         SYS_WAIT => ctx.dispatcher.sys_wait(args, ctx.procs, ctx.scheduler),
         SYS_SETPGID => ctx.dispatcher.sys_setpgid(args, ctx.procs),
         SYS_GETPGID => ctx.dispatcher.sys_getpgid(args, ctx.procs),

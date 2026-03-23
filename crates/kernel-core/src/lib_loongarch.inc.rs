@@ -1478,6 +1478,7 @@ impl Kernel {
                 }
             }
 
+            self.dispatch_pending_signals();
             let _ = self.scheduler.yield_now();
             return;
         }
@@ -1551,7 +1552,11 @@ impl Kernel {
                 let _ = self.processes.deliver_signal(parent_tgid, 17);
                 let _ = self.scheduler.wake_task(parent_tgid);
             }
-            if let Some(addr) = exit.clear_child_tid {
+            let mut wake_addrs = [exit.clear_child_tid, exit.tid_address];
+            if wake_addrs[0] == wake_addrs[1] {
+                wake_addrs[1] = None;
+            }
+            for addr in wake_addrs.into_iter().flatten() {
                 for tid in self.processes.wake_futex(addr, usize::MAX) {
                     let _ = self.scheduler.wake_task(tid);
                 }
@@ -1627,7 +1632,11 @@ impl Kernel {
                         let _ = self.processes.deliver_signal(parent_tgid, 17);
                         let _ = self.scheduler.wake_task(parent_tgid);
                     }
-                    if let Some(addr) = exit.clear_child_tid {
+                    let mut wake_addrs = [exit.clear_child_tid, exit.tid_address];
+                    if wake_addrs[0] == wake_addrs[1] {
+                        wake_addrs[1] = None;
+                    }
+                    for addr in wake_addrs.into_iter().flatten() {
                         for wtid in self.processes.wake_futex(addr, usize::MAX) {
                             let _ = self.scheduler.wake_task(wtid);
                         }
@@ -1884,7 +1893,16 @@ fn try_switch_init_to_rootfs(processes: &mut ProcessTable, vfs: &mut KernelVfs) 
 }
 
 fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
-    for dir in ["/var", "/var/tmp", "/usr", "/usr/bin", "/usr/sbin", "/lib", "/sbin"] {
+    for dir in [
+        "/var",
+        "/var/tmp",
+        "/usr",
+        "/usr/bin",
+        "/usr/sbin",
+        "/lib",
+        "/lib64",
+        "/sbin",
+    ] {
         let _ = vfs.mkdir("/", dir, 0o755);
     }
     install_busybox_exec_alias(vfs, "/musl/ls", "ls");
@@ -1937,6 +1955,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         ("/usr/bin/env", "/musl/busybox"),
         ("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so"),
         ("/lib/ld-musl-loongarch64.so.1", "/musl/lib/libc.so"),
+        ("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so"),
         (
             "/lib/ld-linux-riscv64-lp64d.so.1",
             "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
@@ -1947,7 +1966,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         ),
         ("/lib/libc.so.6", "/glibc/lib/libc.so.6"),
         ("/lib/libm.so.6", "/glibc/lib/libm.so.6"),
-        ("/lib/libc.so", "/glibc/lib/libc.so"),
+        ("/lib/libc.so", "/musl/lib/libc.so"),
         ("/lib/libm.so", "/glibc/lib/libm.so"),
     ] {
         install_fallback_symlink(vfs, path, target);

@@ -51,8 +51,8 @@ impl QemuMode {
 
 impl ContestRuntime {
     fn detect() -> ContestRuntime {
-        let contest_image =
-            env::var("WHUSE_OSCOMP_DOCKER_IMAGE").unwrap_or_else(|_| CONTEST_DOCKER_IMAGE.to_string());
+        let contest_image = env::var("WHUSE_OSCOMP_DOCKER_IMAGE")
+            .unwrap_or_else(|_| CONTEST_DOCKER_IMAGE.to_string());
         if command_available("docker", &["version"]) {
             ContestRuntime::Docker(contest_image)
         } else {
@@ -268,7 +268,9 @@ fn command_available(binary: &str, args: &[&str]) -> bool {
 
 fn repo_root() -> PathBuf {
     if let Ok(cwd) = env::current_dir() {
-        if cwd.join("Cargo.toml").exists() && cwd.join("tools").join("xtask").join("Cargo.toml").exists() {
+        if cwd.join("Cargo.toml").exists()
+            && cwd.join("tools").join("xtask").join("Cargo.toml").exists()
+        {
             return cwd;
         }
     }
@@ -326,8 +328,13 @@ fn package_riscv_kernel_artifact(source: &Path, output_name: &str) -> Result<Pat
         ));
     }
     let output = repo_root().join(output_name);
-    fs::copy(&staged_raw, &output)
-        .map_err(|err| format!("failed to copy {} -> {}: {err}", staged_raw.display(), output.display()))?;
+    fs::copy(&staged_raw, &output).map_err(|err| {
+        format!(
+            "failed to copy {} -> {}: {err}",
+            staged_raw.display(),
+            output.display()
+        )
+    })?;
 
     Ok(output)
 }
@@ -550,11 +557,8 @@ fn qemu_loongarch_with_disk_and_mode(disk: Option<PathBuf>, mode: QemuMode) -> E
         }
     };
     if mode == QemuMode::Contest {
-        let args = build_qemu_loongarch_contest_args(
-            &packaged_kernel,
-            disk.as_ref(),
-            extra_disk.as_ref(),
-        );
+        let args =
+            build_qemu_loongarch_contest_args(&packaged_kernel, disk.as_ref(), extra_disk.as_ref());
         let used_paths =
             collect_used_paths(&[Some(packaged_kernel), disk.clone(), extra_disk.clone()]);
         return run_qemu("qemu-system-loongarch64", &args, &used_paths, mode);
@@ -946,10 +950,7 @@ fn contest_selfcheck() -> ExitCode {
 
     let cargo_config = root.join("cargo_config.toml");
     if cargo_config.exists() {
-        println!(
-            "contest-selfcheck: cargo-config={}",
-            cargo_config.display()
-        );
+        println!("contest-selfcheck: cargo-config={}", cargo_config.display());
     } else {
         eprintln!(
             "contest-selfcheck: missing {} (contest clone filters .cargo; keep non-hidden cargo config in repo root)",
@@ -1030,7 +1031,10 @@ fn contest_selfcheck() -> ExitCode {
         Ok(installed) => {
             println!("contest-selfcheck: rust-targets={}", installed.join(","));
             for target in [RISCV_TARGET, LOONGARCH_TARGET] {
-                if !installed.iter().any(|installed_target| installed_target == target) {
+                if !installed
+                    .iter()
+                    .any(|installed_target| installed_target == target)
+                {
                     eprintln!(
                         "contest-selfcheck: contest image toolchain {} is missing target {}",
                         CONTEST_TOOLCHAIN, target
@@ -1138,7 +1142,11 @@ fn contest_selfcheck() -> ExitCode {
     let rv_kernel = root.join("kernel-rv");
     let rv_image = oscomp_image_path("rv");
     if rv_kernel.exists() {
-        match contest_riscv_boot_smoke(&runtime, &rv_kernel, rv_image.exists().then_some(rv_image.as_path())) {
+        match contest_riscv_boot_smoke(
+            &runtime,
+            &rv_kernel,
+            rv_image.exists().then_some(rv_image.as_path()),
+        ) {
             Ok(true) => println!("contest-selfcheck: kernel-rv-boot-smoke=ok"),
             Ok(false) => {
                 eprintln!(
@@ -1213,14 +1221,11 @@ fn docker_bash_output(image: &str, script: &str) -> Result<String, String> {
 fn docker_toolchain_version(image: &str, toolchain: &str) -> Result<String, String> {
     let text = docker_bash_output(
         image,
-        &format!("rustup run {toolchain} cargo --version && rustup run {toolchain} rustc --version"),
+        &format!(
+            "rustup run {toolchain} cargo --version && rustup run {toolchain} rustc --version"
+        ),
     )?;
-    let line = text
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let line = text.lines().next().unwrap_or_default().trim().to_string();
     if line.is_empty() {
         return Err("empty cargo version output".to_string());
     }
@@ -1257,15 +1262,10 @@ fn local_bash_output(script: &str) -> Result<String, String> {
 }
 
 fn local_toolchain_version(toolchain: &str) -> Result<String, String> {
-    let text = local_bash_output(
-        &format!("rustup run {toolchain} cargo --version && rustup run {toolchain} rustc --version"),
-    )?;
-    let line = text
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let text = local_bash_output(&format!(
+        "rustup run {toolchain} cargo --version && rustup run {toolchain} rustc --version"
+    ))?;
+    let line = text.lines().next().unwrap_or_default().trim().to_string();
     if line.is_empty() {
         return Err("empty cargo version output".to_string());
     }
@@ -1385,13 +1385,29 @@ fn make_temp_disk_copy(prefix: &str, source: &Path) -> Result<PathBuf, String> {
         .map_err(|err| format!("failed to read clock for temp image: {err}"))?
         .as_nanos();
     let temp = env::temp_dir().join(format!("{prefix}-{}-{nanos}.img", std::process::id()));
-    fs::copy(source, &temp).map_err(|err| {
-        format!(
-            "failed to copy {} -> {} for selfcheck smoke: {err}",
+    let status = Command::new("cp")
+        .args([
+            "--reflink=auto",
+            "--sparse=always",
+            source.to_string_lossy().as_ref(),
+            temp.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .map_err(|err| {
+            format!(
+                "failed to execute cp for selfcheck smoke {} -> {}: {err}",
+                source.display(),
+                temp.display()
+            )
+        })?;
+    if !status.success() {
+        return Err(format!(
+            "cp failed while creating selfcheck smoke image {} -> {} (exit code {:?})",
             source.display(),
-            temp.display()
-        )
-    })?;
+            temp.display(),
+            status.code()
+        ));
+    }
     Ok(temp)
 }
 
@@ -1402,18 +1418,18 @@ fn contest_riscv_boot_smoke(
 ) -> Result<bool, String> {
     let repo = repo_root();
     let kernel_rel = kernel.strip_prefix(&repo).unwrap_or(kernel);
-    let temp_disk = disk.map(|path| make_temp_disk_copy("whuse-selfcheck-rv", path)).transpose()?;
+    let temp_disk = disk
+        .map(|path| make_temp_disk_copy("whuse-selfcheck-rv", path))
+        .transpose()?;
     let docker_disk = PathBuf::from("/tmp/whuse-selfcheck-rv.img");
     let disk_buf = temp_disk
         .as_deref()
         .or(disk)
         .map(|path| path.strip_prefix(&repo).unwrap_or(path).to_path_buf());
     let args = match runtime {
-        ContestRuntime::Docker(_) => build_qemu_riscv_args(
-            kernel_rel,
-            temp_disk.as_ref().map(|_| &docker_disk),
-            None,
-        ),
+        ContestRuntime::Docker(_) => {
+            build_qemu_riscv_args(kernel_rel, temp_disk.as_ref().map(|_| &docker_disk), None)
+        }
         ContestRuntime::Local => build_qemu_riscv_args(kernel_rel, disk_buf.as_ref(), None),
     };
     let text = match runtime {
@@ -1467,12 +1483,12 @@ fn contest_loongarch_boot_smoke(
     let temp_disk = make_temp_disk_copy("whuse-selfcheck-la", disk)?;
     let docker_disk = PathBuf::from("/tmp/whuse-selfcheck-la.img");
     let args = match runtime {
-        ContestRuntime::Docker(_) => build_qemu_loongarch_contest_args(
-            kernel_rel,
-            Some(&docker_disk),
-            None,
-        ),
-        ContestRuntime::Local => build_qemu_loongarch_contest_args(kernel_rel, Some(&temp_disk), None),
+        ContestRuntime::Docker(_) => {
+            build_qemu_loongarch_contest_args(kernel_rel, Some(&docker_disk), None)
+        }
+        ContestRuntime::Local => {
+            build_qemu_loongarch_contest_args(kernel_rel, Some(&temp_disk), None)
+        }
     };
     let text = match runtime {
         ContestRuntime::Docker(image) => {

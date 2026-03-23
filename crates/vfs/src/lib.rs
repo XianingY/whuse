@@ -6,6 +6,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use fs_ext4::{Ext4Mount, Ext4NodeKind};
 use hal_api::hal;
@@ -35,6 +36,9 @@ const EOPNOTSUPP: i32 = 95;
 const EPIPE: i32 = 32;
 const EROFS: i32 = 30;
 const ENOTEMPTY: i32 = 39;
+const EADDRINUSE: i32 = 98;
+const EADDRNOTAVAIL: i32 = 99;
+const UNIX_ABSTRACT_PREFIX: &str = "/__unix_abstract__/";
 const INMEM_FILE_SIZE_LIMIT: usize = 64 * 1024 * 1024;
 
 const S_IFREG: u32 = 0o100000;
@@ -143,6 +147,7 @@ struct Node {
 
 struct SocketChannel {
     inbox: [VecDeque<u8>; 2],
+    open_sides: [usize; 2],
 }
 
 struct SocketPending {
@@ -150,6 +155,7 @@ struct SocketPending {
     listening: bool,
     family: usize,
     sock_type: usize,
+    multicast_joined: bool,
     pending: Vec<Arc<Node>>,
 }
 
@@ -177,6 +183,16 @@ struct PipeState {
     writers: usize,
 }
 
+struct RawSocketState {
+    family: usize,
+    protocol: usize,
+    bound_path: Option<String>,
+    checksum_offset: Option<usize>,
+    icmp6_filter: [u32; 8],
+    ipv6_recv_opts: BTreeMap<usize, i32>,
+    inbox: VecDeque<Vec<u8>>,
+}
+
 enum NodeData {
     Directory(BTreeMap<String, Arc<Node>>),
     File(Vec<u8>),
@@ -194,7 +210,9 @@ enum NodeData {
         side: usize,
         family: usize,
         sock_type: usize,
+        multicast_joined: bool,
     },
+    SocketRaw(RawSocketState),
     PidFd(usize),
 }
 
@@ -215,6 +233,7 @@ pub struct KernelVfs {
     next_memfd_id: usize,
     next_ephemeral_port: u16,
     socket_bindings: BTreeMap<String, Arc<Node>>,
+    raw_sockets: Vec<Arc<Node>>,
 }
 
 #[inline]
@@ -246,8 +265,23 @@ impl KernelVfs {
             next_memfd_id: 0,
             next_ephemeral_port: 40000,
             socket_bindings: BTreeMap::new(),
+            raw_sockets: Vec::new(),
         };
         for dir in ["/dev", "/proc", "/mnt", "/tmp", "/bin", "/etc"] {
+            let _ = vfs.mkdir("/", dir, 0o755);
+        }
+        for dir in [
+            "/proc/net",
+            "/proc/sys",
+            "/proc/sys/net",
+            "/proc/sys/user",
+            "/proc/sys/net/ipv6",
+            "/proc/sys/net/ipv6/conf",
+            "/proc/sys/net/ipv6/conf/all",
+            "/proc/sys/net/ipv6/conf/lo",
+            "/proc/sys/net/ipv6/conf/ltp_ns_veth1",
+            "/proc/sys/net/ipv6/conf/ltp_ns_veth2",
+        ] {
             let _ = vfs.mkdir("/", dir, 0o755);
         }
         let _ = vfs.create_char_device("/dev/console", "console");
@@ -257,6 +291,21 @@ impl KernelVfs {
         let _ = vfs.create_char_device("/dev/urandom", "urandom");
         let _ = vfs.create_char_device("/dev/rtc0", "rtc0");
         let _ = vfs.create_proc_file("/proc/mounts", b"");
+        let _ = vfs.create_proc_file("/proc/net/if_inet6", b"00000000000000000000000000000001 01 80 10 80 lo\nfd000001000100010000000000000002 02 40 00 80 ltp_ns_veth2\nfd000001000100010000000000000001 03 40 00 80 ltp_ns_veth1\n");
+        let _ = vfs.create_proc_file("/proc/sys/net/ipv6/conf/all/disable_ipv6", b"0\n");
+        let _ = vfs.create_proc_file("/proc/sys/net/ipv6/conf/lo/disable_ipv6", b"0\n");
+        let _ = vfs.create_proc_file("/proc/sys/net/ipv6/conf/ltp_ns_veth1/disable_ipv6", b"0\n");
+        let _ = vfs.create_proc_file("/proc/sys/net/ipv6/conf/ltp_ns_veth2/disable_ipv6", b"0\n");
+        let _ = vfs.mkdir("/", "/proc/sys", 0o755);
+        let _ = vfs.mkdir("/", "/proc/sys/user", 0o755);
+        let _ = vfs.mkdir("/", "/proc/sys/kernel", 0o755);
+        let _ = vfs.mkdir("/", "/proc/sys/kernel/keys", 0o755);
+        let _ = vfs.create_proc_file("/proc/sys/user/max_user_namespaces", b"1024\n");
+        let _ = vfs.create_proc_file("/proc/sys/kernel/tainted", b"0\n");
+        let _ = vfs.create_proc_file("/proc/key-users", b"");
+        let _ = vfs.create_proc_file("/proc/sys/kernel/keys/gc_delay", b"1\n");
+        let _ = vfs.create_proc_file("/proc/sys/kernel/keys/maxkeys", b"200\n");
+        let _ = vfs.create_proc_file("/proc/sys/kernel/keys/maxbytes", b"20000\n");
         let _ = vfs.create_proc_file("/proc/meminfo", PROC_MEMINFO);
         let _ = vfs.create_proc_file("/proc/uptime", PROC_UPTIME);
         let _ = vfs.create_proc_file("/proc/stat", PROC_STAT);
@@ -406,6 +455,55 @@ impl KernelVfs {
     }
 
     pub fn write(&mut self, handle: &mut FileHandle, data: &[u8]) -> KernelResult<usize> {
+        let raw_meta = {
+            let guard = handle.node.data.lock();
+            match &*guard {
+                NodeData::SocketRaw(state) => {
+                    Some((state.family, state.protocol, state.bound_path.clone()))
+                }
+                _ => None,
+            }
+        };
+        if let Some((family, protocol, bound_path)) = raw_meta {
+            let mut packet = data.to_vec();
+            if let NodeData::SocketRaw(state) = &*handle.node.data.lock() {
+                if let Some(offset) = state.checksum_offset {
+                    if offset + 1 >= packet.len() {
+                        return Err(EINVAL);
+                    }
+                    packet[offset] = 0;
+                    packet[offset + 1] = 0;
+                    let checksum = ipv6_raw_checksum(protocol as u8, &packet);
+                    packet[offset..offset + 2].copy_from_slice(&checksum.to_be_bytes());
+                }
+            }
+            let send_type = packet.first().copied().unwrap_or(0);
+            for node in &self.raw_sockets {
+                let mut guard = node.data.lock();
+                let NodeData::SocketRaw(peer) = &mut *guard else {
+                    continue;
+                };
+                if peer.family != family || peer.protocol != protocol {
+                    continue;
+                }
+                if let (Some(src), Some(dst)) = (bound_path.as_ref(), peer.bound_path.as_ref()) {
+                    if src != dst {
+                        continue;
+                    }
+                }
+                if protocol == 58 {
+                    let word = (send_type / 32) as usize;
+                    let bit = send_type % 32;
+                    if word < peer.icmp6_filter.len()
+                        && (peer.icmp6_filter[word] & (1u32 << bit)) != 0
+                    {
+                        continue;
+                    }
+                }
+                peer.inbox.push_back(packet.clone());
+            }
+            return Ok(data.len());
+        }
         handle.write_object(data)
     }
 
@@ -578,9 +676,17 @@ impl KernelVfs {
         Ok(())
     }
 
-    pub fn mount(&mut self, source: &str, target: &str, fs_type: &str, flags: u32) -> KernelResult<()> {
+    pub fn mount(
+        &mut self,
+        source: &str,
+        target: &str,
+        fs_type: &str,
+        flags: u32,
+    ) -> KernelResult<()> {
         let absolute = normalize_path("/", target);
-        let _ = self.lookup_abs(&absolute)?;
+        if self.lookup_abs(&absolute).is_err() {
+            self.mkdir("/", &absolute, 0o755)?;
+        }
         self.mounts.push(MountRecord {
             source: source.to_string(),
             target: absolute,
@@ -623,7 +729,9 @@ impl KernelVfs {
         let absolute = normalize_path(cwd, path);
         self.mounts
             .iter()
-            .filter(|mount| absolute == mount.target || absolute.starts_with(&(mount.target.clone() + "/")))
+            .filter(|mount| {
+                absolute == mount.target || absolute.starts_with(&(mount.target.clone() + "/"))
+            })
             .max_by_key(|mount| mount.target.len())
             .map(|mount| mount.flags)
             .unwrap_or(0)
@@ -724,7 +832,8 @@ impl KernelVfs {
     pub fn chmod_path(&mut self, cwd: &str, path: &str, mode: u32) -> KernelResult<()> {
         let absolute = normalize_path(cwd, path);
         let stat = self.stat_path("/", &absolute)?;
-        self.mem_modes.insert(absolute, (stat.mode & !0o7777) | (mode & 0o7777));
+        self.mem_modes
+            .insert(absolute, (stat.mode & !0o7777) | (mode & 0o7777));
         Ok(())
     }
 
@@ -751,6 +860,7 @@ impl KernelVfs {
             | NodeData::Epoll(_)
             | NodeData::SocketPending(_)
             | NodeData::SocketConnected { .. }
+            | NodeData::SocketRaw(_)
             | NodeData::PidFd(_) => Err(EINVAL),
         }
     }
@@ -903,11 +1013,32 @@ impl KernelVfs {
         Ok(*pid)
     }
 
-    pub fn create_socket(&mut self, family: usize, sock_type: usize) -> KernelResult<FileHandle> {
+    pub fn socket_family(&self, handle: &FileHandle) -> KernelResult<usize> {
+        match &*handle.node.data.lock() {
+            NodeData::SocketPending(state) => Ok(state.family),
+            NodeData::SocketConnected { family, .. } => Ok(*family),
+            NodeData::SocketRaw(state) => Ok(state.family),
+            _ => Err(ENOTSOCK),
+        }
+    }
+
+    pub fn create_socket(
+        &mut self,
+        family: usize,
+        sock_type: usize,
+        protocol: usize,
+    ) -> KernelResult<FileHandle> {
         let path = format!("socket:[{}]", self.next_pipe_id);
         self.next_pipe_id += 1;
+        let node = if sock_type == 3 {
+            let node = Arc::new(Node::socket_raw(&path, family, protocol));
+            self.raw_sockets.push(node.clone());
+            node
+        } else {
+            Arc::new(Node::socket_pending(&path, family, sock_type))
+        };
         Ok(FileHandle {
-            node: Arc::new(Node::socket_pending(&path, family, sock_type)),
+            node,
             offset: 0,
             flags: O_RDWR,
             path,
@@ -920,17 +1051,25 @@ impl KernelVfs {
         self.next_pipe_id += 1;
         let channel = Arc::new(Mutex::new(SocketChannel {
             inbox: [VecDeque::new(), VecDeque::new()],
+            open_sides: [1, 1],
         }));
         Ok((
             FileHandle {
-                node: Arc::new(Node::socket_connected(&path, channel.clone(), 0, 1, 1)),
+                node: Arc::new(Node::socket_connected(
+                    &path,
+                    channel.clone(),
+                    0,
+                    1,
+                    1,
+                    false,
+                )),
                 offset: 0,
                 flags: O_RDWR,
                 path: format!("{}:0", path),
                 pipe_end: PipeEnd::None,
             },
             FileHandle {
-                node: Arc::new(Node::socket_connected(&path, channel, 1, 1, 1)),
+                node: Arc::new(Node::socket_connected(&path, channel, 1, 1, 1, false)),
                 offset: 0,
                 flags: O_RDWR,
                 path: format!("{}:1", path),
@@ -946,13 +1085,84 @@ impl KernelVfs {
         path: &str,
     ) -> KernelResult<()> {
         let absolute = assign_ephemeral_inet_path(self, &normalize_path(cwd, path));
-        let NodeData::SocketPending(state) = &mut *handle.node.data.lock() else {
-            return Err(EINVAL);
-        };
-        state.path = Some(absolute.clone());
-        handle.path = absolute.clone();
-        self.socket_bindings.insert(absolute, handle.node.clone());
-        Ok(())
+        match &mut *handle.node.data.lock() {
+            NodeData::SocketPending(state) => {
+                if state.path.is_some() {
+                    return Err(EINVAL);
+                }
+                if state.family == 2 {
+                    if let Some(rest) = absolute.strip_prefix("/inet/") {
+                        let (ip, _) = rest.rsplit_once(':').ok_or(EINVAL)?;
+                        if ip != "000.000.000.000" && ip != "127.000.000.001" {
+                            return Err(EADDRNOTAVAIL);
+                        }
+                    }
+                }
+                if state.family == 1 {
+                    if !absolute.starts_with(UNIX_ABSTRACT_PREFIX) {
+                        if self.socket_bindings.contains_key(&absolute) {
+                            return Err(EADDRINUSE);
+                        }
+                        let (parent_path, name) = split_parent(&absolute)?;
+                        let parent = self.lookup_abs(&parent_path)?;
+                        if parent.kind != NodeKind::Directory {
+                            return Err(ENOTDIR);
+                        }
+                        let mut guard = parent.data.lock();
+                        let NodeData::Directory(entries) = &mut *guard else {
+                            return Err(ENOTDIR);
+                        };
+                        if entries.contains_key(name) {
+                            return Err(EADDRINUSE);
+                        }
+                        entries.insert(name.to_string(), handle.node.clone());
+                        self.mem_modes.insert(absolute.clone(), S_IFSOCK | 0o777);
+                    }
+                }
+                state.path = Some(absolute.clone());
+                handle.path = absolute.clone();
+                self.socket_bindings.insert(absolute, handle.node.clone());
+                Ok(())
+            }
+            NodeData::SocketRaw(state) => {
+                if state.bound_path.is_some() {
+                    return Err(EINVAL);
+                }
+                if state.family == 2 {
+                    if let Some(rest) = absolute.strip_prefix("/inet/") {
+                        let (ip, _) = rest.rsplit_once(':').ok_or(EINVAL)?;
+                        if ip != "000.000.000.000" && ip != "127.000.000.001" {
+                            return Err(EADDRNOTAVAIL);
+                        }
+                    }
+                }
+                if state.family == 1 {
+                    if !absolute.starts_with(UNIX_ABSTRACT_PREFIX) {
+                        if self.socket_bindings.contains_key(&absolute) {
+                            return Err(EADDRINUSE);
+                        }
+                        let (parent_path, name) = split_parent(&absolute)?;
+                        let parent = self.lookup_abs(&parent_path)?;
+                        if parent.kind != NodeKind::Directory {
+                            return Err(ENOTDIR);
+                        }
+                        let mut guard = parent.data.lock();
+                        let NodeData::Directory(entries) = &mut *guard else {
+                            return Err(ENOTDIR);
+                        };
+                        if entries.contains_key(name) {
+                            return Err(EADDRINUSE);
+                        }
+                        entries.insert(name.to_string(), handle.node.clone());
+                        self.mem_modes.insert(absolute.clone(), S_IFSOCK | 0o777);
+                    }
+                }
+                state.bound_path = Some(absolute.clone());
+                handle.path = absolute;
+                Ok(())
+            }
+            _ => Err(ENOTSOCK),
+        }
     }
 
     pub fn listen_socket(&mut self, handle: &mut FileHandle, _backlog: i32) -> KernelResult<()> {
@@ -979,18 +1189,19 @@ impl KernelVfs {
         };
         let channel = Arc::new(Mutex::new(SocketChannel {
             inbox: [VecDeque::new(), VecDeque::new()],
+            open_sides: [1, 1],
         }));
-        let (family, sock_type) = {
+        let (family, sock_type, listening) = {
             let guard = listener.data.lock();
             let NodeData::SocketPending(state) = &*guard else {
                 return Err(ENOTSOCK);
             };
-            if !state.listening {
+            (state.family, state.sock_type, state.listening)
+        };
+        if sock_type == 1 || sock_type == 5 {
+            if !listening {
                 return Err(EINVAL);
             }
-            (state.family, state.sock_type)
-        };
-        {
             let mut guard = listener.data.lock();
             let NodeData::SocketPending(state) = &mut *guard else {
                 return Err(ENOTSOCK);
@@ -1001,13 +1212,27 @@ impl KernelVfs {
                 1,
                 family,
                 sock_type,
+                false,
             )));
+        } else {
+            let mut guard = listener.data.lock();
+            let NodeData::SocketPending(_) = &*guard else {
+                return Err(ENOTSOCK);
+            };
+            *guard = NodeData::SocketConnected {
+                channel: channel.clone(),
+                side: 1,
+                family,
+                sock_type,
+                multicast_joined: false,
+            };
         }
         *handle.node.data.lock() = NodeData::SocketConnected {
             channel,
             side: 0,
             family,
             sock_type,
+            multicast_joined: false,
         };
         handle.path = absolute;
         Ok(())
@@ -1017,7 +1242,7 @@ impl KernelVfs {
         let NodeData::SocketPending(state) = &mut *handle.node.data.lock() else {
             return Err(ENOTSOCK);
         };
-        if state.sock_type != 1 {
+        if state.sock_type != 1 && state.sock_type != 5 {
             return Err(EOPNOTSUPP);
         }
         if !state.listening {
@@ -1037,6 +1262,128 @@ impl KernelVfs {
         handle.poll_read_ready()
     }
 
+    pub fn socket_ip_multicast_action(
+        &mut self,
+        handle: &mut FileHandle,
+        join: bool,
+    ) -> KernelResult<()> {
+        match &mut *handle.node.data.lock() {
+            NodeData::SocketPending(state) => {
+                if join {
+                    state.multicast_joined = true;
+                    Ok(())
+                } else if state.multicast_joined {
+                    state.multicast_joined = false;
+                    Ok(())
+                } else {
+                    Err(99)
+                }
+            }
+            NodeData::SocketConnected {
+                multicast_joined, ..
+            } => {
+                if join {
+                    *multicast_joined = true;
+                    Ok(())
+                } else if *multicast_joined {
+                    *multicast_joined = false;
+                    Ok(())
+                } else {
+                    Err(99)
+                }
+            }
+            _ => Err(ENOTSOCK),
+        }
+    }
+
+    pub fn socket_set_icmp6_filter(
+        &mut self,
+        handle: &mut FileHandle,
+        filter: [u32; 8],
+    ) -> KernelResult<()> {
+        match &mut *handle.node.data.lock() {
+            NodeData::SocketRaw(state) if state.family == 10 && state.protocol == 58 => {
+                state.icmp6_filter = filter;
+                Ok(())
+            }
+            NodeData::SocketRaw(_) => Err(EINVAL),
+            _ => Err(ENOTSOCK),
+        }
+    }
+
+    pub fn socket_set_ipv6_checksum_offset(
+        &mut self,
+        handle: &mut FileHandle,
+        offset: Option<usize>,
+    ) -> KernelResult<()> {
+        match &mut *handle.node.data.lock() {
+            NodeData::SocketRaw(state) if state.family == 10 => {
+                state.checksum_offset = offset;
+                Ok(())
+            }
+            NodeData::SocketRaw(_) => Err(EINVAL),
+            _ => Err(ENOTSOCK),
+        }
+    }
+
+    pub fn socket_icmp6_filter(&self, handle: &FileHandle) -> KernelResult<[u32; 8]> {
+        match &*handle.node.data.lock() {
+            NodeData::SocketRaw(state) if state.family == 10 && state.protocol == 58 => {
+                Ok(state.icmp6_filter)
+            }
+            NodeData::SocketRaw(_) => Err(EINVAL),
+            _ => Err(ENOTSOCK),
+        }
+    }
+
+    pub fn socket_set_ipv6_recv_opt(
+        &mut self,
+        handle: &mut FileHandle,
+        opt: usize,
+        value: i32,
+    ) -> KernelResult<()> {
+        match &mut *handle.node.data.lock() {
+            NodeData::SocketRaw(state) if state.family == 10 => {
+                state.ipv6_recv_opts.insert(opt, value);
+                Ok(())
+            }
+            NodeData::SocketRaw(_) => Err(EINVAL),
+            _ => Err(ENOTSOCK),
+        }
+    }
+
+    pub fn socket_get_ipv6_recv_opt(&self, handle: &FileHandle, opt: usize) -> KernelResult<i32> {
+        match &*handle.node.data.lock() {
+            NodeData::SocketRaw(state) if state.family == 10 => {
+                Ok(*state.ipv6_recv_opts.get(&opt).unwrap_or(&0))
+            }
+            NodeData::SocketRaw(_) => Err(EINVAL),
+            _ => Err(ENOTSOCK),
+        }
+    }
+
+    pub fn socket_ipv6_recv_cmsgs(
+        &self,
+        handle: &FileHandle,
+    ) -> KernelResult<Vec<(usize, Vec<u8>)>> {
+        match &*handle.node.data.lock() {
+            NodeData::SocketRaw(state) if state.family == 10 => {
+                let mut out = Vec::new();
+                for (opt, value) in &state.ipv6_recv_opts {
+                    if *value == 0 {
+                        continue;
+                    }
+                    if let Some((cmsg_type, payload_len)) = ipv6_recv_opt_cmsg(*opt) {
+                        out.push((cmsg_type, vec![0u8; payload_len]));
+                    }
+                }
+                Ok(out)
+            }
+            NodeData::SocketRaw(_) => Err(EINVAL),
+            _ => Err(ENOTSOCK),
+        }
+    }
+
     pub fn is_write_ready(&self, handle: &FileHandle) -> bool {
         handle.poll_write_ready()
     }
@@ -1047,6 +1394,10 @@ impl KernelVfs {
 
     pub fn is_pipe(&self, handle: &FileHandle) -> bool {
         handle.node.kind == NodeKind::Pipe
+    }
+
+    pub fn is_socket(&self, handle: &FileHandle) -> bool {
+        handle.node.kind == NodeKind::Socket
     }
 
     fn path_exists(&self, absolute: &str) -> KernelResult<()> {
@@ -1371,6 +1722,12 @@ impl KernelVfs {
         }
     }
 
+    pub fn replace_proc_file(&mut self, path: &str, contents: &[u8]) -> KernelResult<()> {
+        let node = self.lookup_abs(path)?;
+        *node.data.lock() = NodeData::ProcFile(contents.to_vec());
+        Ok(())
+    }
+
     fn lookup_abs(&self, path: &str) -> KernelResult<Arc<Node>> {
         if path == "/" {
             return Ok(self.root.clone());
@@ -1459,22 +1816,29 @@ impl KernelVfs {
             NodeData::Event(_) => 8,
             NodeData::Epoll(watches) => watches.len() as u64,
             NodeData::SocketPending(state) => state.pending.len() as u64,
-            NodeData::SocketConnected { channel, side, .. } => channel.lock().inbox[*side].len() as u64,
+            NodeData::SocketConnected { channel, side, .. } => {
+                channel.lock().inbox[*side].len() as u64
+            }
+            NodeData::SocketRaw(state) => state.inbox.len() as u64,
             NodeData::PidFd(_) => 0,
             NodeData::CharDevice => 0,
         };
         let mode = match &*guard {
             NodeData::Ext4File(state) => state.mode,
             NodeData::Ext4Dir(state) => state.mode,
-            _ => self.mem_modes.get(path).copied().unwrap_or(match node.kind {
-                NodeKind::Directory => S_IFDIR | 0o755,
-                NodeKind::File | NodeKind::Proc => S_IFREG | 0o644,
-                NodeKind::CharDevice => S_IFCHR | 0o600,
-                NodeKind::Pipe => S_IFIFO | 0o644,
-                NodeKind::Symlink => S_IFLNK | 0o777,
-                NodeKind::Event | NodeKind::Epoll | NodeKind::Socket => S_IFSOCK | 0o644,
-                NodeKind::PidFd => S_IFREG | 0o444,
-            }),
+            _ => self
+                .mem_modes
+                .get(path)
+                .copied()
+                .unwrap_or(match node.kind {
+                    NodeKind::Directory => S_IFDIR | 0o755,
+                    NodeKind::File | NodeKind::Proc => S_IFREG | 0o644,
+                    NodeKind::CharDevice => S_IFCHR | 0o600,
+                    NodeKind::Pipe => S_IFIFO | 0o644,
+                    NodeKind::Symlink => S_IFLNK | 0o777,
+                    NodeKind::Event | NodeKind::Epoll | NodeKind::Socket => S_IFSOCK | 0o644,
+                    NodeKind::PidFd => S_IFREG | 0o444,
+                }),
         };
         Ok(FileStat {
             mode,
@@ -1486,22 +1850,33 @@ impl KernelVfs {
 
 impl FileHandle {
     fn adjust_pipe_refcount(&self, delta: isize) {
-        if self.node.kind != NodeKind::Pipe || self.pipe_end == PipeEnd::None {
-            return;
-        }
         let mut guard = self.node.data.lock();
-        let NodeData::Pipe(state) = &mut *guard else {
-            return;
-        };
-        let target = match self.pipe_end {
-            PipeEnd::Read => &mut state.readers,
-            PipeEnd::Write => &mut state.writers,
-            PipeEnd::None => return,
-        };
-        if delta > 0 {
-            *target = target.saturating_add(delta as usize);
-        } else {
-            *target = target.saturating_sub((-delta) as usize);
+        match &mut *guard {
+            NodeData::Pipe(state) => {
+                if self.pipe_end == PipeEnd::None {
+                    return;
+                }
+                let target = match self.pipe_end {
+                    PipeEnd::Read => &mut state.readers,
+                    PipeEnd::Write => &mut state.writers,
+                    PipeEnd::None => return,
+                };
+                if delta > 0 {
+                    *target = target.saturating_add(delta as usize);
+                } else {
+                    *target = target.saturating_sub((-delta) as usize);
+                }
+            }
+            NodeData::SocketConnected { channel, side, .. } => {
+                let mut socket = channel.lock();
+                let target = &mut socket.open_sides[*side];
+                if delta > 0 {
+                    *target = target.saturating_add(delta as usize);
+                } else {
+                    *target = target.saturating_sub((-delta) as usize);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1517,7 +1892,10 @@ impl FileHandle {
             NodeData::Event(_) => 8,
             NodeData::Epoll(watches) => watches.len() as u64,
             NodeData::SocketPending(state) => state.pending.len() as u64,
-            NodeData::SocketConnected { channel, side, .. } => channel.lock().inbox[*side].len() as u64,
+            NodeData::SocketConnected { channel, side, .. } => {
+                channel.lock().inbox[*side].len() as u64
+            }
+            NodeData::SocketRaw(state) => state.inbox.len() as u64,
             NodeData::PidFd(_) => 0,
             NodeData::CharDevice => 0,
         };
@@ -1664,8 +2042,23 @@ impl KernelObject for FileHandle {
             NodeData::SocketConnected { channel, side, .. } => {
                 let mut guard = channel.lock();
                 let inbox = &mut guard.inbox[*side];
+                if inbox.is_empty() {
+                    let peer = 1 - *side;
+                    if guard.open_sides[peer] == 0 {
+                        return Ok(Vec::new());
+                    }
+                    return Err(EAGAIN);
+                }
                 let end = len.min(inbox.len());
                 Ok(inbox.drain(..end).collect())
+            }
+            NodeData::SocketRaw(state) => {
+                let mut packet = state.inbox.pop_front().ok_or(EAGAIN)?;
+                if packet.len() > len {
+                    let rest = packet.split_off(len);
+                    state.inbox.push_front(rest);
+                }
+                Ok(packet)
             }
             NodeData::CharDevice => {
                 if self.path == "/dev/zero" {
@@ -1711,6 +2104,7 @@ impl KernelObject for FileHandle {
             NodeData::Symlink(_)
             | NodeData::Epoll(_)
             | NodeData::SocketPending(_)
+            | NodeData::SocketRaw(_)
             | NodeData::PidFd(_) => Err(EINVAL),
             NodeData::Event(counter) => {
                 if data.len() < 8 {
@@ -1724,6 +2118,9 @@ impl KernelObject for FileHandle {
             NodeData::SocketConnected { channel, side, .. } => {
                 let mut guard = channel.lock();
                 let peer = 1 - *side;
+                if guard.open_sides[peer] == 0 {
+                    return Err(EPIPE);
+                }
                 guard.inbox[peer].extend(data.iter().copied());
                 Ok(data.len())
             }
@@ -1778,7 +2175,12 @@ impl KernelObject for FileHandle {
             NodeData::Event(counter) => *counter != 0,
             NodeData::Epoll(_) => true,
             NodeData::SocketPending(state) => !state.pending.is_empty(),
-            NodeData::SocketConnected { channel, side, .. } => !channel.lock().inbox[*side].is_empty(),
+            NodeData::SocketConnected { channel, side, .. } => {
+                let guard = channel.lock();
+                let peer = 1 - *side;
+                !guard.inbox[*side].is_empty() || guard.open_sides[peer] == 0
+            }
+            NodeData::SocketRaw(state) => !state.inbox.is_empty(),
             NodeData::PidFd(_) => true,
         }
     }
@@ -1885,7 +2287,24 @@ impl Node {
                 listening: false,
                 family,
                 sock_type,
+                multicast_joined: false,
                 pending: Vec::new(),
+            })),
+        }
+    }
+
+    fn socket_raw(name: &str, family: usize, protocol: usize) -> Self {
+        Self {
+            _name: name.to_string(),
+            kind: NodeKind::Socket,
+            data: Mutex::new(NodeData::SocketRaw(RawSocketState {
+                family,
+                protocol,
+                bound_path: None,
+                checksum_offset: None,
+                icmp6_filter: [0; 8],
+                ipv6_recv_opts: BTreeMap::new(),
+                inbox: VecDeque::new(),
             })),
         }
     }
@@ -1896,6 +2315,7 @@ impl Node {
         side: usize,
         family: usize,
         sock_type: usize,
+        multicast_joined: bool,
     ) -> Self {
         Self {
             _name: name.to_string(),
@@ -1905,6 +2325,7 @@ impl Node {
                 side,
                 family,
                 sock_type,
+                multicast_joined,
             }),
         }
     }
@@ -1972,9 +2393,56 @@ fn split_parent(path: &str) -> KernelResult<(String, &str)> {
 }
 
 fn inet_any_listener_path(path: &str) -> Option<String> {
-    let rest = path.strip_prefix("/inet/")?;
-    let (_, port) = rest.rsplit_once(':')?;
-    Some(format!("/inet/000.000.000.000:{port}"))
+    if let Some(rest) = path.strip_prefix("/inet/") {
+        let (_, port) = rest.rsplit_once(':')?;
+        return Some(format!("/inet/000.000.000.000:{port}"));
+    }
+    if let Some(rest) = path.strip_prefix("/inet6/") {
+        let (_, port) = rest.rsplit_once(':')?;
+        return Some(format!("/inet6/0:0:0:0:0:0:0:0:{port}"));
+    }
+    None
+}
+
+fn ipv6_recv_opt_cmsg(opt: usize) -> Option<(usize, usize)> {
+    match opt {
+        49 => Some((50, 20)),
+        51 => Some((52, 4)),
+        66 => Some((67, 4)),
+        2 => Some((2, 20)),
+        8 => Some((8, 4)),
+        _ => None,
+    }
+}
+
+fn ipv6_raw_checksum(next_header: u8, packet: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut pseudo = [0u8; 40];
+    pseudo[15] = 1;
+    pseudo[31] = 1;
+    pseudo[32..36].copy_from_slice(&(packet.len() as u32).to_be_bytes());
+    pseudo[39] = next_header;
+    sum = checksum_add(sum, &pseudo);
+    sum = checksum_add(sum, packet);
+    checksum_finish(sum)
+}
+
+fn checksum_add(mut sum: u32, bytes: &[u8]) -> u32 {
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+    }
+    if let Some(&byte) = chunks.remainder().first() {
+        sum = sum.wrapping_add(((byte as u16) << 8) as u32);
+    }
+    sum
+}
+
+fn checksum_finish(mut sum: u32) -> u16 {
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 fn assign_ephemeral_inet_path(vfs: &mut KernelVfs, path: &str) -> String {
@@ -2261,7 +2729,7 @@ mod tests {
             .unwrap();
         assert_eq!(vfs.read(&mut before, 16).unwrap(), b"wait-ok");
 
-        vfs.mount("dev:/dev/vda2", "/mnt", "vfat").unwrap();
+        vfs.mount("dev:/dev/vda2", "/mnt", "vfat", 0).unwrap();
         vfs.umount("/mnt").unwrap();
 
         let mut after = vfs

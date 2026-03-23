@@ -89,6 +89,7 @@ pub struct ThreadExit {
     pub tid: usize,
     pub tgid: usize,
     pub clear_child_tid: Option<usize>,
+    pub tid_address: Option<usize>,
     pub robust_futex_addrs: Vec<usize>,
     pub group_exited: bool,
     pub parent_tgid: Option<usize>,
@@ -165,6 +166,8 @@ pub struct Process {
     pub sleep_requested_ns: u64,
     pub sleep_remain_ptr: Option<usize>,
     pub sleep_absolute: bool,
+    pub itimer_real_deadline_ns: Option<u64>,
+    pub itimer_real_interval_ns: u64,
     pub futex_wait_addr: Option<usize>,
     pub futex_wait_deadline_ns: Option<u64>,
     pub epoll_wait_deadline_ns: Option<u64>,
@@ -247,6 +250,8 @@ impl Process {
             sleep_requested_ns: 0,
             sleep_remain_ptr: None,
             sleep_absolute: false,
+            itimer_real_deadline_ns: None,
+            itimer_real_interval_ns: 0,
             futex_wait_addr: None,
             futex_wait_deadline_ns: None,
             epoll_wait_deadline_ns: None,
@@ -460,6 +465,8 @@ impl Process {
         self.sleep_requested_ns = 0;
         self.sleep_remain_ptr = None;
         self.sleep_absolute = false;
+        self.itimer_real_deadline_ns = None;
+        self.itimer_real_interval_ns = 0;
         self.futex_wait_addr = None;
         self.futex_wait_deadline_ns = None;
         self.epoll_wait_deadline_ns = None;
@@ -514,6 +521,8 @@ impl Process {
             sleep_requested_ns: 0,
             sleep_remain_ptr: None,
             sleep_absolute: false,
+            itimer_real_deadline_ns: None,
+            itimer_real_interval_ns: 0,
             futex_wait_addr: None,
             futex_wait_deadline_ns: None,
             epoll_wait_deadline_ns: None,
@@ -570,6 +579,8 @@ impl Process {
             sleep_requested_ns: 0,
             sleep_remain_ptr: None,
             sleep_absolute: false,
+            itimer_real_deadline_ns: None,
+            itimer_real_interval_ns: 0,
             futex_wait_addr: None,
             futex_wait_deadline_ns: None,
             epoll_wait_deadline_ns: None,
@@ -637,6 +648,8 @@ impl Process {
             sleep_requested_ns: 0,
             sleep_remain_ptr: None,
             sleep_absolute: false,
+            itimer_real_deadline_ns: None,
+            itimer_real_interval_ns: 0,
             futex_wait_addr: None,
             futex_wait_deadline_ns: None,
             epoll_wait_deadline_ns: None,
@@ -841,12 +854,16 @@ impl ProcessTable {
             return Err(ECHILD);
         };
 
-        let status = self
+        let exit_code = self
             .processes
             .get(&child_tid)
             .and_then(|process| process.exit_code)
-            .unwrap_or_default()
-            << 8;
+            .unwrap_or_default();
+        let status = if exit_code < 0 {
+            wait_status_from_signal((-exit_code) as usize)
+        } else {
+            exit_code << 8
+        };
         self.reap_thread_group(child_tid);
         Ok((child_tid, status))
     }
@@ -958,6 +975,23 @@ impl ProcessTable {
         Ok(())
     }
 
+    pub fn set_itimer_real_current(
+        &mut self,
+        deadline_ns: Option<u64>,
+        interval_ns: u64,
+    ) -> KernelResult<()> {
+        let tgid = self.current_tgid()?;
+        for process in self
+            .processes
+            .values_mut()
+            .filter(|process| process.tgid == tgid)
+        {
+            process.itimer_real_deadline_ns = deadline_ns;
+            process.itimer_real_interval_ns = interval_ns;
+        }
+        Ok(())
+    }
+
     pub fn get_robust_list(&self, pid: usize) -> KernelResult<(usize, usize)> {
         let process = if pid == 0 {
             self.current()?
@@ -1018,12 +1052,8 @@ impl ProcessTable {
         Ok(())
     }
 
-    pub fn setresuid_current(
-        &mut self,
-        ruid: Option<u32>,
-        euid: Option<u32>,
-    ) -> KernelResult<()> {
-        let current = self.current()?.clone();
+    pub fn setresuid_current(&mut self, ruid: Option<u32>, euid: Option<u32>) -> KernelResult<()> {
+        let current = self.current()?;
         let target_ruid = ruid.unwrap_or(current.uid);
         let target_euid = euid.unwrap_or(current.euid);
         let privileged = current.uid == 0 || current.euid == 0;
@@ -1060,6 +1090,38 @@ impl ProcessTable {
         {
             process.gid = gid;
             process.egid = gid;
+        }
+        Ok(())
+    }
+
+    pub fn setresgid_current(&mut self, rgid: Option<u32>, egid: Option<u32>) -> KernelResult<()> {
+        let (current_gid, current_egid) = {
+            let current = self.current()?;
+            (current.gid, current.egid)
+        };
+        let target_rgid = rgid.unwrap_or(current_gid);
+        let target_egid = egid.unwrap_or(current_egid);
+        let privileged = current_gid == 0 || current_egid == 0;
+        if !privileged
+            && target_rgid != current_gid
+            && target_rgid != current_egid
+            && target_egid != current_gid
+            && target_egid != current_egid
+        {
+            return Err(1);
+        }
+        let tgid = self.current_tgid()?;
+        for process in self
+            .processes
+            .values_mut()
+            .filter(|process| process.tgid == tgid)
+        {
+            if let Some(gid) = rgid {
+                process.gid = gid;
+            }
+            if let Some(egid) = egid {
+                process.egid = egid;
+            }
         }
         Ok(())
     }
@@ -1132,6 +1194,10 @@ impl ProcessTable {
             return Err(ESRCH);
         }
         process.pending_signals |= 1u64 << (signal - 1);
+        if signal == 33 {
+            process.mark_cancel_signal_dispatched();
+            process.arm_cancel_interrupt_once();
+        }
         Ok(target_tid)
     }
 
@@ -1147,6 +1213,10 @@ impl ProcessTable {
             return Ok(tid);
         }
         process.pending_signals |= 1u64 << (signal - 1);
+        if signal == 33 {
+            process.mark_cancel_signal_dispatched();
+            process.arm_cancel_interrupt_once();
+        }
         Ok(tid)
     }
 
@@ -1339,6 +1409,7 @@ impl ProcessTable {
         let vfork_parent_tid = self.current()?.vfork_parent_tid;
         let robust_futex_addrs = self.current_mut()?.collect_robust_futex_addrs_for_exit();
         let clear_child_tid = self.current()?.clear_child_tid;
+        let tid_address = self.current()?.tid_address;
         if let Some(addr) = clear_child_tid {
             let _ = self
                 .current_mut()?
@@ -1376,6 +1447,7 @@ impl ProcessTable {
             tid: current_tid,
             tgid: current_tgid,
             clear_child_tid,
+            tid_address,
             robust_futex_addrs,
             group_exited: !group_alive,
             parent_tgid,
@@ -1390,6 +1462,7 @@ impl ProcessTable {
         let vfork_parent_tid = self.current()?.vfork_parent_tid;
         let mut robust_futex_addrs = Vec::new();
         let clear_child_tid = self.current()?.clear_child_tid;
+        let tid_address = self.current()?.tid_address;
         let tids = self
             .processes
             .iter()
@@ -1417,6 +1490,7 @@ impl ProcessTable {
             tid: current_tid,
             tgid: current_tgid,
             clear_child_tid,
+            tid_address,
             robust_futex_addrs,
             group_exited: true,
             parent_tgid,
@@ -1481,6 +1555,21 @@ impl ProcessTable {
                 sepc: process.trap_frame.sepc,
                 sp: process.trap_frame.regs[2],
                 retval: process.trap_frame.regs[10],
+            })
+            .collect()
+    }
+
+    pub fn itimer_real_debug(&self) -> Vec<(usize, usize, bool, Option<u64>)> {
+        self.processes
+            .values()
+            .filter(|process| process.state != ProcessState::Exited)
+            .map(|process| {
+                (
+                    process.tid,
+                    process.tgid,
+                    process.is_thread,
+                    process.itimer_real_deadline_ns,
+                )
             })
             .collect()
     }
@@ -1705,8 +1794,50 @@ impl ProcessTable {
             .collect()
     }
 
-    pub fn get_wait_deadlines(&self, tid: usize) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
-        self.processes.get(&tid).map(|p| (p.sleep_deadline_ns, p.futex_wait_deadline_ns, p.epoll_wait_deadline_ns))
+    pub fn expired_itimer_real_tgids(&self, now_ns: u64) -> Vec<usize> {
+        let mut expired = Vec::new();
+        for process in self.processes.values() {
+            if process
+                .itimer_real_deadline_ns
+                .is_some_and(|deadline| deadline != u64::MAX && now_ns >= deadline)
+                && !expired.contains(&process.tgid)
+            {
+                expired.push(process.tgid);
+            }
+        }
+        expired
+    }
+
+    pub fn consume_itimer_real_expiry(&mut self, tgid: usize, now_ns: u64) {
+        for process in self
+            .processes
+            .values_mut()
+            .filter(|process| process.tgid == tgid)
+        {
+            if let Some(deadline) = process.itimer_real_deadline_ns {
+                if deadline != u64::MAX && now_ns >= deadline {
+                    if process.itimer_real_interval_ns != 0 {
+                        process.itimer_real_deadline_ns =
+                            Some(now_ns.saturating_add(process.itimer_real_interval_ns));
+                    } else {
+                        process.itimer_real_deadline_ns = None;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn get_wait_deadlines(
+        &self,
+        tid: usize,
+    ) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
+        self.processes.get(&tid).map(|p| {
+            (
+                p.sleep_deadline_ns,
+                p.futex_wait_deadline_ns,
+                p.epoll_wait_deadline_ns,
+            )
+        })
     }
 
     pub fn force_exit_group(&mut self, tgid: usize, code: i32) -> KernelResult<Option<GroupExit>> {
@@ -1836,6 +1967,11 @@ fn selector_from_wait_pid(pid: i32, current_pgid: usize) -> WaitSelector {
     } else {
         WaitSelector::Pgid((-pid) as usize)
     }
+}
+
+fn wait_status_from_signal(signum: usize) -> i32 {
+    let core = matches!(signum, 3 | 4 | 6 | 7 | 8 | 11 | 24 | 25 | 31);
+    (signum as i32 & 0x7f) | if core { 0x80 } else { 0 }
 }
 
 fn selector_matches(selector: WaitSelector, process: &Process) -> bool {

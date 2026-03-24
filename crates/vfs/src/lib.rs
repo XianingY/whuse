@@ -241,6 +241,11 @@ fn stage2_openat_debug_enabled() -> bool {
     matches!(option_env!("WHUSE_DEBUG_STAGE2_OPENAT"), Some("1"))
 }
 
+#[inline]
+fn is_shell_token_path(absolute: &str) -> bool {
+    matches!(absolute, "/[" | "/]")
+}
+
 fn stage2_openat_debug(line: &str) {
     if !stage2_openat_debug_enabled() {
         return;
@@ -1489,6 +1494,9 @@ impl KernelVfs {
     }
 
     fn external_stat_path(&self, absolute: &str) -> KernelResult<Option<FileStat>> {
+        if is_shell_token_path(absolute) {
+            return Ok(None);
+        }
         if self.is_memory_preferred_path(absolute) && self.lookup_abs(absolute).is_ok() {
             return Ok(None);
         }
@@ -1503,6 +1511,28 @@ impl KernelVfs {
         let Some((mount, fs_path)) = self.resolve_external_path(absolute) else {
             return Ok(None);
         };
+
+        let dir_prefix = if absolute == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", absolute)
+        };
+        if self
+            .external_preloaded
+            .keys()
+            .any(|entry| entry.starts_with(&dir_prefix))
+            || self
+                .external_stat_cache
+                .keys()
+                .any(|entry| entry.starts_with(&dir_prefix))
+        {
+            return Ok(Some(FileStat {
+                mode: S_IFDIR | 0o755,
+                size: 0,
+                nlink: 1,
+            }));
+        }
+
         match mount.ext4.stat(&fs_path) {
             Ok(stat) => Ok(Some(FileStat {
                 mode: stat.mode,
@@ -1519,7 +1549,10 @@ impl KernelVfs {
         absolute: &str,
         flags: u32,
     ) -> KernelResult<Option<FileHandle>> {
-        if self.is_memory_preferred_path(absolute) && self.lookup_abs(absolute).is_ok() {
+        if is_shell_token_path(absolute) {
+            return Ok(None);
+        }
+        if self.lookup_abs(absolute).is_ok() {
             return Ok(None);
         }
         let (mount, fs_path) = {
@@ -1528,7 +1561,11 @@ impl KernelVfs {
             };
             (mount.ext4.clone(), fs_path)
         };
-        let trace_path = stage2_openat_debug_enabled() && absolute.starts_with("/musl/");
+        let trace_path = stage2_openat_debug_enabled()
+            && (absolute.starts_with("/musl/")
+                || absolute.starts_with("/lib/")
+                || absolute.starts_with("/lib64/")
+                || absolute.starts_with("/glibc/"));
         if flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC) != 0 {
             return Ok(None);
         }
@@ -2517,7 +2554,22 @@ fn should_use_statless_external_open(absolute: &str, flags: u32) -> bool {
     if (flags & O_DIRECTORY) != 0 {
         return false;
     }
-    is_libctest_probe_path(absolute)
+    if is_libctest_probe_path(absolute) {
+        return true;
+    }
+
+    if !(absolute.starts_with("/lib/")
+        || absolute.starts_with("/lib64/")
+        || absolute.starts_with("/glibc/lib/")
+        || absolute.starts_with("/musl/lib/"))
+    {
+        return false;
+    }
+
+    absolute.contains("ld-linux")
+        || absolute.contains("ld-musl")
+        || absolute.ends_with(".so")
+        || absolute.contains(".so.")
 }
 
 fn is_libctest_probe_path(path: &str) -> bool {

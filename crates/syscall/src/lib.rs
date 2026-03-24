@@ -397,6 +397,12 @@ fn stage2_openat_debug_enabled() -> bool {
     matches!(option_env!("WHUSE_DEBUG_STAGE2_OPENAT"), Some("1"))
 }
 
+fn stage2_openat_debug(line: &str) {
+    if stage2_openat_debug_enabled() {
+        log_always(line);
+    }
+}
+
 fn cancel_debug_enabled() -> bool {
     match option_env!("WHUSE_DEBUG_CANCEL") {
         Some("1") => true,
@@ -415,7 +421,8 @@ fn is_libctest_task_name(name: &str) -> bool {
 }
 
 fn is_libctest_openat_probe_task(name: &str, tgid: usize, cwd: &str) -> bool {
-    is_libctest_task_name(name) || (name == "/musl/busybox" && tgid > 2 && cwd == "/musl")
+    is_libctest_task_name(name)
+        || (name == "/musl/busybox" && tgid >= 2 && cwd.starts_with("/musl"))
 }
 
 fn is_libctest_probe_path(path: &str) -> bool {
@@ -1013,7 +1020,20 @@ impl SyscallDispatcher {
             .read_user_cstr(path_arg)
             .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
+        trace_line(&format!(
+            "whuse: mkdir path-check tgid={} name={} cwd={} path={} mode={:#o}",
+            procs.current_tgid().unwrap_or(0),
+            procs.current()?.name,
+            cwd,
+            path,
+            mode
+        ));
         vfs.mkdir(&cwd, &path, mode)?;
+        trace_line(&format!(
+            "whuse: mkdir done tgid={} path={}",
+            procs.current_tgid().unwrap_or(0),
+            path
+        ));
         Ok(0)
     }
 
@@ -1935,6 +1955,12 @@ impl SyscallDispatcher {
         }
         let mut shebang_hops = 0usize;
         loop {
+            trace_line(&format!(
+                "whuse: execve stage loop path={} hops={} argv0={}",
+                path,
+                shebang_hops,
+                argv.first().map(|s| s.as_str()).unwrap_or("")
+            ));
             if path.contains("busybox") && argv.len() > 1 {
                 BUSYBOX_APPLETS
                     .lock()
@@ -1942,9 +1968,21 @@ impl SyscallDispatcher {
             }
             let file_data = read_exec_file_image(vfs, &cwd, &path)?;
             if file_data.is_empty() {
+                trace_line(&format!("whuse: execve stage empty-image path={}", path));
                 return Err(EFAULT);
             }
+            trace_line(&format!(
+                "whuse: execve stage image-loaded path={} bytes={}",
+                path,
+                file_data.len()
+            ));
             if let Some((mut interp_path, mut interp_arg)) = parse_shebang_line(&file_data) {
+                trace_line(&format!(
+                    "whuse: execve stage shebang path={} interp={} arg={}",
+                    path,
+                    interp_path,
+                    interp_arg.as_deref().unwrap_or("")
+                ));
                 let script_body_empty = file_data
                     .iter()
                     .position(|&b| b == b'\n')
@@ -2011,7 +2049,17 @@ impl SyscallDispatcher {
                 resolve_exec_payload(&file_data).or_else(|| builtin_program(&path))
             {
                 let entry = BUILTIN_EXEC_BASE + program.entry;
+                trace_line(&format!(
+                    "whuse: execve stage builtin-reset-begin tgid={} path={} entry={:#x}",
+                    procs.current_tgid().unwrap_or(0),
+                    path,
+                    entry
+                ));
                 procs.execve_current_image(entry, None)?;
+                trace_line(&format!(
+                    "whuse: execve stage builtin-reset-done tgid={}",
+                    procs.current_tgid().unwrap_or(0)
+                ));
                 let process = procs.current_mut()?;
                 process.name = display_path.clone();
                 process
@@ -2036,29 +2084,72 @@ impl SyscallDispatcher {
                 ));
                 return Ok(0);
             }
-            let interp = if let Some(mut interp_path) = parse_elf_interp(&file_data) {
-                if vfs.access("/", &interp_path).is_err() {
-                    let fallback = "/lib/ld-linux-riscv64-lp64d.so.1";
-                    if vfs.access("/", fallback).is_ok() {
-                        interp_path = fallback.to_string();
-                    } else {
-                        let musl_fallback = "/musl/lib/libc.so";
-                        if vfs.access("/", musl_fallback).is_ok() {
-                            interp_path = musl_fallback.to_string();
-                        } else {
-                            return Err(ENOENT);
+            let interp = if let Some(interp_path) = parse_elf_interp(&file_data) {
+                trace_line(&format!(
+                    "whuse: execve stage interp-detected path={} interp={}",
+                    path, interp_path
+                ));
+                let mut interp_loaded: Option<(String, Vec<u8>)> = None;
+                for candidate in [
+                    interp_path.as_str(),
+                    "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+                    "/lib/ld-linux-riscv64-lp64d.so.1",
+                    "/musl/lib/libc.so",
+                ] {
+                    trace_line(&format!(
+                        "whuse: execve stage interp-candidate-try path={} candidate={}",
+                        path, candidate
+                    ));
+                    match read_exec_file_image(vfs, "/", candidate) {
+                        Ok(image) => {
+                            trace_line(&format!(
+                                "whuse: execve stage interp-candidate-ok path={} candidate={} bytes={}",
+                                path,
+                                candidate,
+                                image.len()
+                            ));
+                            interp_loaded = Some((candidate.to_string(), image));
+                            break;
+                        }
+                        Err(err) => {
+                            trace_line(&format!(
+                                "whuse: execve stage interp-candidate-err path={} candidate={} err={}",
+                                path, candidate, err
+                            ));
                         }
                     }
                 }
-                let interp_image = read_exec_file_image(vfs, "/", &interp_path)?;
+                let (interp_path, interp_image) = interp_loaded.ok_or(ENOENT)?;
                 if interp_image.is_empty() {
                     return Err(ENOEXEC);
                 }
+                trace_line(&format!(
+                    "whuse: execve stage interp-image interp={} bytes={}",
+                    interp_path,
+                    interp_image.len()
+                ));
                 Some((interp_path, interp_image))
             } else {
+                trace_line(&format!("whuse: execve stage interp-none path={}", path));
                 None
             };
+            trace_line(&format!(
+                "whuse: execve stage elf-reset-begin tgid={} path={}",
+                procs.current_tgid().unwrap_or(0),
+                path
+            ));
             procs.execve_current_image(0, None)?;
+            trace_line(&format!(
+                "whuse: execve stage elf-reset-done tgid={}",
+                procs.current_tgid().unwrap_or(0)
+            ));
+            trace_line(&format!(
+                "whuse: execve stage load-elf-begin tgid={} path={} argv={} env={}",
+                procs.current_tgid().unwrap_or(0),
+                path,
+                argv.len(),
+                envp.len()
+            ));
             let loaded = {
                 let process = procs.current_mut()?;
                 match process.address_space.load_elf_images(
@@ -2069,9 +2160,23 @@ impl SyscallDispatcher {
                     Some(display_path.as_str()),
                 ) {
                     Ok(loaded) => loaded,
-                    Err(err) => return Err(if err == ENOEXEC { ENOEXEC } else { EFAULT }),
+                    Err(err) => {
+                        trace_line(&format!(
+                            "whuse: execve stage load-elf-err tgid={} path={} err={}",
+                            process.tgid, process.name, err
+                        ));
+                        return Err(if err == ENOEXEC { ENOEXEC } else { EFAULT });
+                    }
                 }
             };
+            trace_line(&format!(
+                "whuse: execve stage load-elf-done tgid={} entry={:#x} sp={:#x} dyn={} interp_base={:#x}",
+                procs.current_tgid().unwrap_or(0),
+                loaded.entry,
+                loaded.stack_pointer,
+                loaded.is_dyn,
+                loaded.interp_base
+            ));
             let process = procs.current_mut()?;
             process.trap_frame.sepc = loaded.entry;
             process.trap_frame.regs[2] = loaded.stack_pointer;
@@ -2997,6 +3102,15 @@ impl SyscallDispatcher {
         let flags = args.0[3];
         let path = read_at_path_allow_empty(procs.current()?, args.0[1], flags)?;
         let mode = args.0[2];
+        trace_line(&format!(
+            "whuse: faccessat path-check tgid={} name={} dirfd={} path={} mode={:#x} flags={:#x}",
+            procs.current_tgid().unwrap_or(0),
+            procs.current()?.name,
+            dirfd,
+            path,
+            mode,
+            flags
+        ));
         let allowed_mode_bits = F_OK | X_OK | W_OK | R_OK;
         if (mode & !allowed_mode_bits) != 0 {
             return Err(EINVAL);
@@ -3564,7 +3678,24 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let dirfd = args.0[0] as i32;
         let flags = args.0[2];
+        let statx_probe = stage2_openat_debug_enabled()
+            && procs
+                .current()
+                .map(|p| p.name.as_str() == "/musl/busybox")
+                .unwrap_or(false);
+        if statx_probe {
+            stage2_openat_debug(&format!(
+                "whuse-libctest:statx-enter dirfd={} path_ptr={:#x} flags={:#x} mask={:#x} out_ptr={:#x}",
+                dirfd, args.0[1], flags, args.0[3], args.0[4]
+            ));
+        }
         let path = read_at_path_allow_empty(procs.current()?, args.0[1], flags)?;
+        if statx_probe {
+            stage2_openat_debug(&format!(
+                "whuse-libctest:statx-path dirfd={} path={} flags={:#x} mask={:#x}",
+                dirfd, path, flags, args.0[3]
+            ));
+        }
         if let Some(applet) = BUSYBOX_APPLETS.lock().get(&procs.current_tgid()?).cloned() {
             if applet == "du" {
                 trace_enosys(&format!(
@@ -3576,15 +3707,39 @@ impl SyscallDispatcher {
         let stat = if path.is_empty() && (flags & AT_EMPTY_PATH_FLAG) != 0 {
             if dirfd == AT_FDCWD {
                 let cwd = procs.current()?.cwd.clone();
+                if statx_probe {
+                    stage2_openat_debug(&format!(
+                        "whuse-libctest:statx-vfs-begin cwd={} path={} mode=empty-at-cwd",
+                        cwd, path
+                    ));
+                }
                 vfs.stat_path(&cwd, &cwd)?
             } else {
                 let handle = procs.current()?.fd(dirfd)?;
+                if statx_probe {
+                    stage2_openat_debug(&format!(
+                        "whuse-libctest:statx-fd dirfd={} handle_path={}",
+                        dirfd, handle.path
+                    ));
+                }
                 vfs.stat_handle(handle)?
             }
         } else {
             let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
+            if statx_probe {
+                stage2_openat_debug(&format!(
+                    "whuse-libctest:statx-vfs-begin cwd={} path={} mode=path",
+                    cwd, path
+                ));
+            }
             vfs.stat_path(&cwd, &path)?
         };
+        if statx_probe {
+            stage2_openat_debug(&format!(
+                "whuse-libctest:statx-vfs-ok path={} mode={:#o} size={}",
+                path, stat.mode, stat.size
+            ));
+        }
         let bytes = statx_bytes(stat);
         procs
             .current_mut()?
@@ -3813,12 +3968,6 @@ impl SyscallDispatcher {
             FUTEX_WAKE | FUTEX_WAKE_BITSET => {
                 let wake_count = val.max(0) as usize;
                 let woke = procs.wake_futex(uaddr, wake_count);
-                let wake_targets_thread_list_lock = libcbench_task
-                    && procs
-                        .current()
-                        .ok()
-                        .and_then(|process| process.clear_child_tid())
-                        == Some(uaddr);
                 if libcbench_task {
                     let current_word = read_i32(procs.current()?, uaddr).unwrap_or(i32::MIN);
                     libcbench_debug(&format!(
@@ -3838,8 +3987,7 @@ impl SyscallDispatcher {
                 for tid in &woke {
                     let _ = scheduler.wake_task(*tid);
                 }
-                if wake_targets_thread_list_lock && !woke.is_empty() && scheduler.ready_count() > 0
-                {
+                if libcbench_task && !woke.is_empty() && scheduler.ready_count() > 0 {
                     let _ = scheduler.yield_now();
                 }
                 Ok(woke.len())
@@ -3889,14 +4037,7 @@ impl SyscallDispatcher {
                 for tid in &woke {
                     let _ = scheduler.wake_task(*tid);
                 }
-                let wake_targets_thread_list_lock = libcbench_task
-                    && procs
-                        .current()
-                        .ok()
-                        .and_then(|process| process.clear_child_tid())
-                        == Some(uaddr);
-                if wake_targets_thread_list_lock && !woke.is_empty() && scheduler.ready_count() > 0
-                {
+                if libcbench_task && !woke.is_empty() && scheduler.ready_count() > 0 {
                     let _ = scheduler.yield_now();
                 }
 
@@ -3914,16 +4055,7 @@ impl SyscallDispatcher {
                     for tid in &woke2 {
                         let _ = scheduler.wake_task(*tid);
                     }
-                    let wake2_targets_thread_list_lock = libcbench_task
-                        && procs
-                            .current()
-                            .ok()
-                            .and_then(|process| process.clear_child_tid())
-                            == Some(uaddr2);
-                    if wake2_targets_thread_list_lock
-                        && !woke2.is_empty()
-                        && scheduler.ready_count() > 0
-                    {
+                    if libcbench_task && !woke2.is_empty() && scheduler.ready_count() > 0 {
                         let _ = scheduler.yield_now();
                     }
                     Ok(woke.len() + woke2.len())
@@ -6205,9 +6337,17 @@ fn read_exec_file_image(vfs: &mut KernelVfs, cwd: &str, path: &str) -> Result<Ve
         }
     }
 
+    trace_line(&format!(
+        "whuse: execve open image cwd={} path={}",
+        cwd, path
+    ));
     let mut handle = vfs.open(cwd, path, O_RDONLY, 0).map_err(|_| ENOENT)?;
+    trace_line(&format!(
+        "whuse: execve open ok resolved={} off={}",
+        handle.path, handle.offset
+    ));
     let mut file_data = Vec::new();
-    const EXEC_READ_CHUNK: usize = 256 * 1024;
+    const EXEC_READ_CHUNK: usize = 4 * 1024 * 1024;
     const EXEC_READ_LIMIT: usize = 32 * 1024 * 1024;
     loop {
         let remaining = EXEC_READ_LIMIT.saturating_sub(file_data.len());
@@ -6216,10 +6356,19 @@ fn read_exec_file_image(vfs: &mut KernelVfs, cwd: &str, path: &str) -> Result<Ve
         }
         let read_len = EXEC_READ_CHUNK.min(remaining);
         let chunk = vfs.read(&mut handle, read_len).map_err(|_| EFAULT)?;
+        trace_line(&format!(
+            "whuse: execve read chunk path={} bytes={} off={}",
+            handle.path,
+            chunk.len(),
+            handle.offset
+        ));
         if chunk.is_empty() {
             break;
         }
         file_data.extend_from_slice(&chunk);
+        if chunk.len() < read_len {
+            break;
+        }
     }
     trace_line(&format!(
         "whuse: execve read image path={} bytes={}",

@@ -1209,13 +1209,21 @@ fn riscv_make_table_pte(paddr: usize) -> u64 {
 
 fn riscv_segment_pte_flags(prot: usize) -> u64 {
     let mut flags = RISCV_PTE_U | RISCV_PTE_A | RISCV_PTE_D;
-    if prot & 0b001 != 0 {
+    let mut read = prot & 0b001 != 0;
+    let write = prot & 0b010 != 0;
+    let exec = prot & 0b100 != 0;
+    // RISC-V leaf PTEs do not allow execute-only encodings (R=0,W=0,X=1).
+    // Align with Linux-style mappings: executable pages are at least readable.
+    if exec {
+        read = true;
+    }
+    if read {
         flags |= RISCV_PTE_R;
     }
-    if prot & 0b010 != 0 {
+    if write {
         flags |= RISCV_PTE_W;
     }
-    if prot & 0b100 != 0 {
+    if exec {
         flags |= RISCV_PTE_X;
     }
     if flags & (RISCV_PTE_R | RISCV_PTE_W | RISCV_PTE_X) == 0 {
@@ -1240,6 +1248,11 @@ fn loong_segment_pte_flags(prot: usize) -> u64 {
     let mut read = prot & 0b001 != 0;
     let write = prot & 0b010 != 0;
     let exec = prot & 0b100 != 0;
+    // Keep user mappings permissive enough for toolchains that request
+    // write-only or execute-only pages during loader transitions.
+    if write || exec {
+        read = true;
+    }
     if !read && !write && !exec {
         read = true;
     }

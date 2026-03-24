@@ -628,7 +628,10 @@ fn build_qemu_riscv_args(
     ];
     if let Some(disk) = disk {
         args.push("-drive".to_string());
-        args.push(format!("file={},if=none,format=raw,id=x0", disk.display()));
+        args.push(format!(
+            "file={},if=none,format=raw,id=x0,file.locking=off",
+            disk.display()
+        ));
         args.push("-device".to_string());
         args.push("virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0".to_string());
         args.push("-device".to_string());
@@ -638,7 +641,10 @@ fn build_qemu_riscv_args(
     }
     if let Some(extra) = extra_disk {
         args.push("-drive".to_string());
-        args.push(format!("file={},if=none,format=raw,id=x1", extra.display()));
+        args.push(format!(
+            "file={},if=none,format=raw,id=x1,file.locking=off",
+            extra.display()
+        ));
         args.push("-device".to_string());
         args.push("virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1".to_string());
     }
@@ -679,20 +685,26 @@ fn build_qemu_loongarch_host_args(
     ];
     if let Some(disk) = disk {
         args.push("-drive".to_string());
-        args.push(format!("file={},if=none,format=raw,id=x0", disk.display()));
+        args.push(format!(
+            "file={},if=none,format=raw,id=x0,file.locking=off",
+            disk.display()
+        ));
         args.push("-device".to_string());
         args.push("virtio-blk-pci,drive=x0".to_string());
     }
     if let Some(extra) = extra_disk {
         args.push("-drive".to_string());
-        args.push(format!("file={},if=none,format=raw,id=x1", extra.display()));
+        args.push(format!(
+            "file={},if=none,format=raw,id=x1,file.locking=off",
+            extra.display()
+        ));
         args.push("-device".to_string());
         args.push("virtio-blk-pci,drive=x1".to_string());
     }
     args.push("-device".to_string());
     args.push("virtio-net-pci,netdev=net0".to_string());
     args.push("-netdev".to_string());
-    args.push("user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555".to_string());
+    args.push("user,id=net0".to_string());
     args
 }
 
@@ -718,17 +730,23 @@ fn build_qemu_loongarch_contest_args(
     ];
     if let Some(disk) = disk {
         args.push("-drive".to_string());
-        args.push(format!("file={},if=none,format=raw,id=x0", disk.display()));
+        args.push(format!(
+            "file={},if=none,format=raw,id=x0,file.locking=off",
+            disk.display()
+        ));
         args.push("-device".to_string());
         args.push("virtio-blk-pci,drive=x0".to_string());
     }
     args.push("-device".to_string());
     args.push("virtio-net-pci,netdev=net0".to_string());
     args.push("-netdev".to_string());
-    args.push("user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555".to_string());
+    args.push("user,id=net0".to_string());
     if let Some(extra) = extra_disk {
         args.push("-drive".to_string());
-        args.push(format!("file={},if=none,format=raw,id=x1", extra.display()));
+        args.push(format!(
+            "file={},if=none,format=raw,id=x1,file.locking=off",
+            extra.display()
+        ));
         args.push("-device".to_string());
         args.push("virtio-blk-pci,drive=x1".to_string());
     }
@@ -1117,7 +1135,7 @@ fn contest_selfcheck() -> ExitCode {
             "-rtc base=utc",
             "virtio-blk-pci,drive=x0",
             "virtio-net-pci,netdev=net0",
-            "user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555",
+            "user,id=net0",
             "virtio-blk-pci,drive=x1",
         ],
     ) {
@@ -1777,33 +1795,32 @@ fn validate_oscomp_full_image(image: &PathBuf, arch: &str) -> bool {
         "busybox",
         "basic_testcode.sh",
         "busybox_testcode.sh",
-        "busybox_cmd.txt",
-        "iozone_testcode.sh",
-        "libctest_testcode.sh",
         "libcbench_testcode.sh",
         "libc-bench",
-        "lmbench_testcode.sh",
+        "iozone_testcode.sh",
+        "iozone",
         "lua_testcode.sh",
-        "unixbench_testcode.sh",
-        "netperf_testcode.sh",
-        "iperf_testcode.sh",
+        "lua",
+        "lmbench_testcode.sh",
+        "libctest_testcode.sh",
+        "runtest.exe",
+        "entry-static.exe",
+        "entry-dynamic.exe",
         "ltp_testcode.sh",
-        "cyclictest_testcode.sh",
     ];
     let required_glibc = [
         "busybox",
         "basic_testcode.sh",
         "busybox_testcode.sh",
-        "iozone_testcode.sh",
         "libcbench_testcode.sh",
         "libc-bench",
-        "lmbench_testcode.sh",
+        "iozone_testcode.sh",
+        "iozone",
         "lua_testcode.sh",
-        "unixbench_testcode.sh",
-        "netperf_testcode.sh",
-        "iperf_testcode.sh",
+        "lua",
+        "lmbench_testcode.sh",
+        "libctest_testcode.sh",
         "ltp_testcode.sh",
-        "cyclictest_testcode.sh",
     ];
     let mut missing = Vec::new();
     for entry in required_musl {
@@ -1984,7 +2001,7 @@ mod tests {
             "-rtc base=utc",
             "virtio-blk-pci,drive=x0",
             "virtio-net-pci,netdev=net0",
-            "user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555",
+            "user,id=net0",
             "virtio-blk-pci,drive=x1",
         ] {
             assert!(args.contains(token), "missing token: {token}");

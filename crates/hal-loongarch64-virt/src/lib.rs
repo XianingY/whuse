@@ -43,6 +43,7 @@ pub static KERNEL_TRAP_HANDLER: core::sync::atomic::AtomicUsize =
 // LoongArch CSR numbers for timer handling
 const CSR_CRMD: u32 = 0x0; // Current mode
 const CSR_PRMD: u32 = 0x1; // Previous mode
+const CSR_EUEN: u32 = 0x2; // Extension unit enable (FPU/SX/ASX)
 const CSR_ECFG: u32 = 0x4; // Exception config (interrupt enables)
 const CSR_ESTAT: u32 = 0x5; // Exception status
 const CSR_ERA: u32 = 0x6; // Exception return address
@@ -212,6 +213,9 @@ __whuse_run_user:
     csrwr $t0, 0x1
     ld.d $t0, $a0, 80
     csrwr $t0, 0x30
+    // Enable user extension units (FPU/SX/ASX) before entering userspace.
+    li.d $t2, 0x7
+    csrwr $t2, 0x2
     csrwr $a0, 0x30
     ertn
 
@@ -402,6 +406,12 @@ pub fn bootstrap(dtb_pa: usize) {
     if let Some(discovery) = discovery {
         INTERRUPT.configure(&discovery);
         VIRTIO_BLK.bootstrap(&discovery);
+    }
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        // Keep extension units enabled globally; __whuse_run_user also
+        // reasserts this right before ERTN into userspace.
+        core::arch::asm!("li.d $t0, 0x7", "csrwr $t0, 0x2", out("$t0") _);
     }
     init_loongarch_mmu();
     register_hal(HalBundle {
@@ -699,15 +709,6 @@ impl HalTimer for VirtTimer {
             let delta_ticks = delta_nanos / 10;
             let init_val = delta_ticks.max(1000);
 
-            use core::fmt::Write;
-            use hal_api::ConsoleWriter;
-            let mut console = ConsoleWriter;
-            let _ = write!(
-                console,
-                "whuse-debug: program_oneshot delta_ticks={} init_val={}\n",
-                delta_ticks, init_val
-            );
-
             let mut ecfg: usize;
             core::arch::asm!("csrrd {}, 0x4", out(reg) ecfg);
             ecfg |= ECFG_TI;
@@ -716,7 +717,7 @@ impl HalTimer for VirtTimer {
             let tcfg: usize = (init_val as usize) << 2 | 0x1;
             core::arch::asm!("csrwr {}, 0x41", in(reg) tcfg);
 
-            let _ = write!(console, "whuse-debug: TCFG={:#x} ECFG={:#x}\n", tcfg, ecfg);
+            let _ = (tcfg, ecfg);
         }
         #[cfg(not(target_arch = "loongarch64"))]
         {

@@ -449,7 +449,7 @@ fn signal_frame_debug(line: &str) {
     }
 }
 
-static LIBCBENCH_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(256);
+static LIBCBENCH_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(4096);
 
 fn is_libcbench_task(process: &proc::Process) -> bool {
     process.name.contains("libc-bench")
@@ -1586,9 +1586,14 @@ impl SyscallDispatcher {
                     parent_tgid, woke
                 ));
             }
-            if let Some(addr) = exit.clear_child_tid {
+            let mut wake_addrs = [exit.clear_child_tid, exit.tid_address].to_vec();
+            wake_addrs.sort_unstable();
+            wake_addrs.dedup();
+            let mut any_wake_addr = false;
+            for addr in wake_addrs.into_iter().flatten() {
+                any_wake_addr = true;
                 cancel_debug(&format!(
-                    "whuse-debug: exit tid={} clear_child_tid={:#x}",
+                    "whuse-debug: exit tid={} wake_addr={:#x}",
                     exit.tid, addr
                 ));
                 let woken = procs.wake_futex(addr, usize::MAX);
@@ -1599,9 +1604,10 @@ impl SyscallDispatcher {
                 for tid in woken {
                     let _ = scheduler.wake_task(tid);
                 }
-            } else {
+            }
+            if !any_wake_addr {
                 cancel_debug(&format!(
-                    "whuse-debug: exit tid={} no clear_child_tid",
+                    "whuse-debug: exit tid={} no wake address",
                     exit.tid
                 ));
             }
@@ -1618,7 +1624,6 @@ impl SyscallDispatcher {
                 exit.tgid
             ));
         }
-        let _ = scheduler.wake_all_blocked();
         Ok(0)
     }
 
@@ -1726,13 +1731,36 @@ impl SyscallDispatcher {
         let libcbench_task = is_libcbench_task(current);
         let parent_pid = procs.current_pid()?;
         let flags = request.flags;
+        if libcbench_task {
+            libcbench_debug(&format!(
+                "whuse-libcbench:clone-enter parent_tgid={} flags={:#x} stack={:#x} parent_tid={:#x} child_tid={:#x} tls={:#x}",
+                parent_pid,
+                flags,
+                request.stack,
+                request.parent_tid,
+                request.child_tid,
+                request.tls.unwrap_or(0)
+            ));
+        }
         if flags & CLONE_NAMESPACE_MASK != 0 {
+            if libcbench_task {
+                libcbench_debug(&format!(
+                    "whuse-libcbench:clone-reject namespace-flags flags={:#x} mask={:#x}",
+                    flags, CLONE_NAMESPACE_MASK
+                ));
+            }
             return Err(EINVAL);
         }
         let compat_flags = flags;
         if (compat_flags & CLONE_THREAD) != 0 {
             let required = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
             if compat_flags & required != required {
+                if libcbench_task {
+                    libcbench_debug(&format!(
+                        "whuse-libcbench:clone-reject missing-required flags={:#x} required={:#x}",
+                        compat_flags, required
+                    ));
+                }
                 return Err(EINVAL);
             }
             let stack = request.stack;

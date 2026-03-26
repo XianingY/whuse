@@ -890,6 +890,7 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        busybox_testcode.sh) echo 180 ;;\n",
     "        iozone_testcode.sh) echo 300 ;;\n",
     "        libctest_testcode.sh) echo 300 ;;\n",
+    "        libcbench_testcode.sh) echo 1800 ;;\n",
     "        lmbench_testcode.sh) echo 1800 ;;\n",
     "        lua_testcode.sh) echo 300 ;;\n",
     "        unixbench_testcode.sh) echo 1800 ;;\n",
@@ -1103,41 +1104,47 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:${runtime}/$script:$rc\n",
     "    return 0\n",
     "}\n",
-    "run_runtime_suite() {\n",
+    "run_runtime_step() {\n",
     "    runtime=\"$1\"\n",
+    "    script=\"$2\"\n",
+    "    timeout_s=\"$3\"\n",
     "    root=\"/$runtime\"\n",
     "    if [ ! -d \"$root\" ]; then\n",
     "        echo whuse-oscomp-runtime-skip:$runtime:missing-dir\n",
+    "        echo whuse-oscomp-step-begin:${runtime}/$script\n",
+    "        echo whuse-oscomp-step-skip:${runtime}/$script:missing-dir\n",
+    "        echo whuse-oscomp-step-end:${runtime}/$script:0\n",
     "        return 0\n",
     "    fi\n",
     "    if [ ! -x \"$root/busybox\" ]; then\n",
     "        echo whuse-oscomp-runtime-skip:$runtime:missing-busybox\n",
+    "        echo whuse-oscomp-step-begin:${runtime}/$script\n",
+    "        echo whuse-oscomp-step-skip:${runtime}/$script:missing-busybox\n",
+    "        echo whuse-oscomp-step-end:${runtime}/$script:0\n",
     "        return 0\n",
     "    fi\n",
     "    echo whuse-oscomp-runtime-begin:$runtime\n",
     "    cd \"$root\" || return 1\n",
-    "    for script in \\\n",
-    "        basic_testcode.sh \\\n",
-    "        busybox_testcode.sh \\\n",
-    "        libcbench_testcode.sh \\\n",
-    "        iozone_testcode.sh \\\n",
-    "        lua_testcode.sh \\\n",
-    "        lmbench_testcode.sh \\\n",
-    "        libctest_testcode.sh \\\n",
-    "        ltp_testcode.sh\n",
-    "    do\n",
-    "        timeout_s=\"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "        if [ \"$script\" = \"ltp_testcode.sh\" ]; then\n",
-    "            timeout_s=\"$WHUSE_LTP_STEP_TIMEOUT\"\n",
-    "        fi\n",
-    "        run_script_entry \"$runtime\" \"$script\" \"$timeout_s\"\n",
-    "    done\n",
+    "    run_script_entry \"$runtime\" \"$script\" \"$timeout_s\"\n",
+    "    cd / || return 1\n",
     "    echo whuse-oscomp-runtime-end:$runtime\n",
     "    return 0\n",
     "}\n",
+    "run_both_runtimes_for_step() {\n",
+    "    script=\"$1\"\n",
+    "    timeout_s=\"$2\"\n",
+    "    run_runtime_step musl \"$script\" \"$timeout_s\"\n",
+    "    run_runtime_step glibc \"$script\" \"$timeout_s\"\n",
+    "}\n",
     "echo whuse-oscomp-script-start\n",
-    "run_runtime_suite musl\n",
-    "run_runtime_suite glibc\n",
+    "run_both_runtimes_for_step basic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "run_both_runtimes_for_step busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "run_both_runtimes_for_step iozone_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "run_both_runtimes_for_step lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "run_both_runtimes_for_step lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "run_both_runtimes_for_step libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "run_both_runtimes_for_step libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "run_both_runtimes_for_step ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"\n",
     "echo whuse-oscomp-suite-done\n",
 );
 const OSCOMP_SUITE_ENTRY_PATH: &str = "/tmp/whuse-oscomp-entry.sh";
@@ -1928,20 +1935,6 @@ impl Kernel {
                     "whuse-sched-tick: tick={} blocked={} ready={}",
                     self.timer_irq_count, bc, rc
                 ));
-                if bc > 0 {
-                    logln(format_args!(
-                        "whuse-coop: tick={} blocked={} waking_all",
-                        self.timer_irq_count, bc
-                    ));
-                    let all_blocked = self.scheduler.blocked_task_ids();
-                    for tid in all_blocked {
-                        if tid == 125 || tid == 126 {
-                            logln(format_args!("whuse-sched: spurious_wake tid={}", tid));
-                        }
-                        self.processes.clear_futex_wait_state(tid);
-                        let _ = self.scheduler.wake_task(tid);
-                    }
-                }
             }
 
             self.dispatch_pending_signals();
@@ -2459,11 +2452,18 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
     for dir in [
         "/var",
         "/var/tmp",
+        "/var/tmp/lmbench",
         "/usr",
         "/usr/bin",
         "/usr/sbin",
         "/lib",
+        "/lib/riscv64-linux-gnu",
+        "/lib/riscv64-linux-gnu/tls",
+        "/lib/loongarch64-linux-gnu",
+        "/lib/loongarch64-linux-gnu/tls",
         "/lib64",
+        "/lib64/loongarch64-linux-gnu",
+        "/lib64/loongarch64-linux-gnu/tls",
         "/sbin",
         "/lib/modules",
         "/lib/modules/6.8.0-whuse",
@@ -2574,17 +2574,77 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
             "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
         ),
         (
+            "/lib/riscv64-linux-gnu/ld-linux-riscv64-lp64d.so.1",
+            "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+        ),
+        (
             "/lib/ld-linux-loongarch-lp64d.so.1",
+            "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+        ),
+        (
+            "/lib/loongarch64-linux-gnu/ld-linux-loongarch-lp64d.so.1",
             "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
         ),
         (
             "/lib64/ld-linux-loongarch-lp64d.so.1",
             "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
         ),
+        (
+            "/lib64/loongarch64-linux-gnu/ld-linux-loongarch-lp64d.so.1",
+            "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+        ),
         ("/lib/libc.so.6", "/glibc/lib/libc.so.6"),
         ("/lib/libm.so.6", "/glibc/lib/libm.so.6"),
+        ("/lib/riscv64-linux-gnu/libc.so.6", "/glibc/lib/libc.so.6"),
+        ("/lib/riscv64-linux-gnu/libm.so.6", "/glibc/lib/libm.so.6"),
+        ("/lib/riscv64-linux-gnu/libc.so", "/glibc/lib/libc.so.6"),
+        ("/lib/riscv64-linux-gnu/libm.so", "/glibc/lib/libm.so.6"),
+        ("/lib/riscv64-linux-gnu/tls/libc.so", "/glibc/lib/libc.so.6"),
+        ("/lib/riscv64-linux-gnu/tls/libm.so", "/glibc/lib/libm.so.6"),
+        (
+            "/lib/loongarch64-linux-gnu/libc.so.6",
+            "/glibc/lib/libc.so.6",
+        ),
+        (
+            "/lib/loongarch64-linux-gnu/libm.so.6",
+            "/glibc/lib/libm.so.6",
+        ),
+        ("/lib/loongarch64-linux-gnu/libc.so", "/glibc/lib/libc.so.6"),
+        ("/lib/loongarch64-linux-gnu/libm.so", "/glibc/lib/libm.so.6"),
+        (
+            "/lib/loongarch64-linux-gnu/tls/libc.so",
+            "/glibc/lib/libc.so.6",
+        ),
+        (
+            "/lib/loongarch64-linux-gnu/tls/libm.so",
+            "/glibc/lib/libm.so.6",
+        ),
         ("/lib64/libc.so.6", "/glibc/lib/libc.so.6"),
         ("/lib64/libm.so.6", "/glibc/lib/libm.so.6"),
+        (
+            "/lib64/loongarch64-linux-gnu/libc.so.6",
+            "/glibc/lib/libc.so.6",
+        ),
+        (
+            "/lib64/loongarch64-linux-gnu/libm.so.6",
+            "/glibc/lib/libm.so.6",
+        ),
+        (
+            "/lib64/loongarch64-linux-gnu/libc.so",
+            "/glibc/lib/libc.so.6",
+        ),
+        (
+            "/lib64/loongarch64-linux-gnu/libm.so",
+            "/glibc/lib/libm.so.6",
+        ),
+        (
+            "/lib64/loongarch64-linux-gnu/tls/libc.so",
+            "/glibc/lib/libc.so.6",
+        ),
+        (
+            "/lib64/loongarch64-linux-gnu/tls/libm.so",
+            "/glibc/lib/libm.so.6",
+        ),
         ("/lib/libc.so", "/musl/lib/libc.so"),
         ("/lib/libm.so", "/glibc/lib/libm.so"),
         ("/lib64/libm.so", "/glibc/lib/libm.so"),

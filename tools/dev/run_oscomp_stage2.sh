@@ -14,6 +14,7 @@ export WHUSE_OSCOMP_COMPAT="${WHUSE_OSCOMP_COMPAT:-0}"
 export WHUSE_QEMU_MODE="${WHUSE_QEMU_MODE:-contest}"
 export WHUSE_STAGE2_USE_IMAGE_COPY="${WHUSE_STAGE2_USE_IMAGE_COPY:-0}"
 export WHUSE_STAGE2_STOP_ON_SUITE_DONE="${WHUSE_STAGE2_STOP_ON_SUITE_DONE:-1}"
+export WHUSE_STAGE2_CLEAN_QEMU="${WHUSE_STAGE2_CLEAN_QEMU:-1}"
 export WHUSE_STAGE2_ONLY_STEP="${WHUSE_STAGE2_ONLY_STEP:-}"
 export WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE:-score}"
 export WHUSE_LTP_WHITELIST="${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}"
@@ -62,6 +63,8 @@ required_musl_entries=(
 )
 
 runtime_images=()
+cleanup_target_images=()
+cleanup_done=0
 
 cleanup_runtime_images() {
     for img in "${runtime_images[@]}"; do
@@ -69,7 +72,50 @@ cleanup_runtime_images() {
     done
 }
 
-trap cleanup_runtime_images EXIT
+cleanup_stale_qemu() {
+    if [[ "${WHUSE_STAGE2_CLEAN_QEMU}" != "1" ]]; then
+        return
+    fi
+    local cleanup_script="${REPO_ROOT}/tools/dev/cleanup_stale_qemu.sh"
+    if [[ ! -f "${cleanup_script}" ]]; then
+        return
+    fi
+    local -a cleanup_args=()
+    local image
+    for image in "${cleanup_target_images[@]}"; do
+        cleanup_args+=(--image "${image}")
+    done
+    if [[ ${#cleanup_args[@]} -eq 0 ]]; then
+        cleanup_args+=(--all-oscomp-containers)
+    fi
+    echo "[cleanup] scanning stale qemu/docker instances"
+    bash "${cleanup_script}" "${cleanup_args[@]}" || true
+}
+
+cleanup_all() {
+    local rc=$?
+    if [[ "${cleanup_done}" -eq 1 ]]; then
+        return "${rc}"
+    fi
+    cleanup_done=1
+    cleanup_stale_qemu
+    cleanup_runtime_images
+    return "${rc}"
+}
+
+on_interrupt() {
+    cleanup_all
+    exit 130
+}
+
+on_term() {
+    cleanup_all
+    exit 143
+}
+
+trap cleanup_all EXIT
+trap on_interrupt INT
+trap on_term TERM
 
 check_image_complete() {
     local arch="$1"
@@ -167,12 +213,14 @@ prepare_runtime_image() {
     local arch="$1"
     local src="$2"
     if [[ "${WHUSE_STAGE2_USE_IMAGE_COPY}" != "1" ]]; then
+        cleanup_target_images+=("${src}")
         echo "${src}"
         return
     fi
     local dst="/tmp/whuse-${arch}-stage2-${TS}.img"
     cp --reflink=auto "${src}" "${dst}"
     runtime_images+=("${dst}")
+    cleanup_target_images+=("${dst}")
     echo "${dst}"
 }
 

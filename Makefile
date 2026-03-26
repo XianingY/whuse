@@ -4,7 +4,7 @@
 	stage1-riscv stage1-loongarch stage1-both stage2-riscv stage2-riscv-3x \
 	stage2-riscv-ltp \
 	stage2-loongarch-chain stage2-loongarch-gate-smoke-120 stage2-loongarch-gate-300 \
-	stage2-loongarch-full-3600 qemu-clean-loongarch package-kernels contest-selfcheck \
+	stage2-loongarch-full-3600 qemu-clean qemu-clean-loongarch package-kernels contest-selfcheck \
 	prepare-cargo-config
 
 XTASK := cargo run --manifest-path tools/xtask/Cargo.toml --
@@ -100,5 +100,8 @@ stage2-riscv-ltp: prepare-cargo-config
 stage2-riscv-3x: prepare-cargo-config
 	RUNS=$${RUNS:-3} TIMEOUT_SECS=$${TIMEOUT_SECS:-3600} WHUSE_STAGE2_IMAGE_POLICY=$${WHUSE_STAGE2_IMAGE_POLICY:-auto} WHUSE_OSCOMP_COMPAT=$${WHUSE_OSCOMP_COMPAT:-0} WHUSE_STAGE2_STOP_ON_SUITE_DONE=$${WHUSE_STAGE2_STOP_ON_SUITE_DONE:-1} tools/dev/run_oscomp_stage2_3x.sh
 
+qemu-clean:
+	tools/dev/cleanup_stale_qemu.sh --all-oscomp-containers
+
 qemu-clean-loongarch:
-	tools/dev/cleanup_stale_qemu.sh
+	tools/dev/cleanup_stale_qemu.sh --all-oscomp-containers

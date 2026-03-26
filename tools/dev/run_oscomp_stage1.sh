@@ -13,6 +13,7 @@ export WHUSE_OSCOMP_DOCKER_IMAGE="${WHUSE_OSCOMP_DOCKER_IMAGE:-docker.educg.net/
 export WHUSE_OSCOMP_COMPAT="${WHUSE_OSCOMP_COMPAT:-0}"
 export WHUSE_STAGE1_USE_IMAGE_COPY="${WHUSE_STAGE1_USE_IMAGE_COPY:-0}"
 export WHUSE_STAGE1_CLEAN_LOONGARCH="${WHUSE_STAGE1_CLEAN_LOONGARCH:-1}"
+export WHUSE_STAGE1_CLEAN_QEMU="${WHUSE_STAGE1_CLEAN_QEMU:-${WHUSE_STAGE1_CLEAN_LOONGARCH}}"
 export WHUSE_OSCOMP_SKIP_BUILD="${WHUSE_OSCOMP_SKIP_BUILD:-0}"
 export WHUSE_STAGE2_TIMEOUT_PROFILE="${WHUSE_STAGE2_TIMEOUT_PROFILE:-real}"
 export WHUSE_STAGE2_REAL_PHASE="${WHUSE_STAGE2_REAL_PHASE:-full}"
@@ -131,6 +132,7 @@ resolve_full_step_groups() {
 }
 
 runtime_images=()
+cleanup_target_images=()
 active_run_pid=""
 active_run_pgid=""
 active_run_label=""
@@ -143,16 +145,24 @@ cleanup_runtime_images() {
 }
 
 cleanup_loongarch_stale_qemu() {
-	if [[ "${WHUSE_STAGE1_CLEAN_LOONGARCH}" != "1" ]]; then
+	if [[ "${WHUSE_STAGE1_CLEAN_QEMU}" != "1" ]]; then
 		return
 	fi
 	local cleanup_script="${REPO_ROOT}/tools/dev/cleanup_stale_qemu.sh"
 	if [[ ! -f "${cleanup_script}" ]]; then
 		return
 	fi
+	local -a cleanup_args=()
+	local image
+	for image in "${cleanup_target_images[@]}"; do
+		cleanup_args+=(--image "${image}")
+	done
+	if [[ ${#cleanup_args[@]} -eq 0 ]]; then
+		cleanup_args+=(--all-oscomp-containers)
+	fi
 	echo "[cleanup] scanning stale loongarch qemu instances"
-	bash "${cleanup_script}" --dry-run || true
-	bash "${cleanup_script}" || true
+	bash "${cleanup_script}" --dry-run "${cleanup_args[@]}" || true
+	bash "${cleanup_script}" "${cleanup_args[@]}" || true
 }
 
 terminate_process_group() {
@@ -212,12 +222,14 @@ prepare_runtime_image() {
 	local arch="$1"
 	local src="$2"
 	if [[ "${WHUSE_STAGE1_USE_IMAGE_COPY}" != "1" ]]; then
+		cleanup_target_images+=("${src}")
 		echo "${src}"
 		return
 	fi
 	local dst="/tmp/whuse-${arch}-stage1-${TS}.img"
 	cp --reflink=auto "${src}" "${dst}"
 	runtime_images+=("${dst}")
+	cleanup_target_images+=("${dst}")
 	echo "${dst}"
 }
 

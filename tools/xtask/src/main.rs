@@ -14,6 +14,23 @@ const LOONGARCH_PACKAGE: &str = "whuse-loongarch64-virt";
 const LOONGARCH_BOOTROM_PACKAGE: &str = "whuse-loongarch64-bootrom";
 const CONTEST_DOCKER_IMAGE: &str = "docker.educg.net/cg/os-contest:20260104";
 const CONTEST_TOOLCHAIN: &str = "nightly-2025-01-18";
+const OSCOMP_PROFILE_REPO_PATH: &str = "tools/oscomp/profile/default.txt";
+const OSCOMP_PROFILE_IMAGE_PATH: &str = "/whuse-oscomp-profile";
+const OSCOMP_ALLOWED_PROFILES: &[&str] = &[
+    "full",
+    "basic",
+    "busybox",
+    "iozone",
+    "libctest",
+    "libc-bench",
+    "lmbench",
+    "lua",
+    "ltp",
+    "unixbench",
+    "netperf",
+    "iperf",
+    "cyclic",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QemuMode {
@@ -947,6 +964,21 @@ fn prepare_oscomp_images() -> ExitCode {
         eprintln!("{err}");
         return ExitCode::from(1);
     }
+    let repo_profile = match load_repo_oscomp_profile() {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(err) = debugfs_write_text(&dst_rv, OSCOMP_PROFILE_IMAGE_PATH, &repo_profile) {
+        eprintln!("{err}");
+        return ExitCode::from(1);
+    }
+    if let Err(err) = debugfs_write_text(&dst_la, OSCOMP_PROFILE_IMAGE_PATH, &repo_profile) {
+        eprintln!("{err}");
+        return ExitCode::from(1);
+    }
 
     let rv_ok = validate_oscomp_full_image(&dst_rv, "riscv64");
     let la_ok = validate_oscomp_full_image(&dst_la, "loongarch64");
@@ -1586,6 +1618,28 @@ fn same_file_metadata(src: &PathBuf, dst: &PathBuf) -> Result<bool, String> {
     Ok(dst_modified >= src_modified)
 }
 
+fn validate_oscomp_profile_value(value: &str) -> Result<&'static str, String> {
+    let trimmed = value.trim();
+    OSCOMP_ALLOWED_PROFILES
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == trimmed)
+        .ok_or_else(|| {
+            format!(
+                "invalid oscomp profile {:?}; expected one of: {}",
+                trimmed,
+                OSCOMP_ALLOWED_PROFILES.join(", ")
+            )
+        })
+}
+
+fn load_repo_oscomp_profile() -> Result<String, String> {
+    let path = repo_root().join(OSCOMP_PROFILE_REPO_PATH);
+    let contents = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    validate_oscomp_profile_value(&contents).map(|profile| profile.to_string())
+}
+
 fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
     let docker_image = env::var("WHUSE_OSCOMP_DOCKER_IMAGE")
         .unwrap_or_else(|_| "docker.educg.net/cg/os-contest:20260104".to_string());
@@ -1790,6 +1844,28 @@ fn validate_oscomp_full_image(image: &PathBuf, arch: &str) -> bool {
         );
         return false;
     }
+    let profile = match debugfs_read_to_string(image, OSCOMP_PROFILE_IMAGE_PATH) {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!(
+                "oscomp image {} ({}) is missing stable profile {} ({err})",
+                arch,
+                image.display(),
+                OSCOMP_PROFILE_IMAGE_PATH
+            );
+            return false;
+        }
+    };
+    if let Err(err) = validate_oscomp_profile_value(&profile) {
+        eprintln!(
+            "oscomp image {} ({}) has invalid {}: {}",
+            arch,
+            image.display(),
+            OSCOMP_PROFILE_IMAGE_PATH,
+            err
+        );
+        return false;
+    }
 
     let required_musl = [
         "busybox",
@@ -1883,6 +1959,40 @@ fn debugfs_remove(image: &PathBuf, path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn debugfs_write_text(image: &PathBuf, path: &str, value: &str) -> Result<(), String> {
+    let temp_path = env::temp_dir().join(format!(
+        "whuse-oscomp-profile-{}-{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| format!("failed to read system clock: {err}"))?
+            .as_nanos()
+    ));
+    fs::write(&temp_path, format!("{value}\n"))
+        .map_err(|err| format!("failed to write temporary profile {}: {err}", temp_path.display()))?;
+    debugfs_remove(image, path)?;
+    let status = Command::new("debugfs")
+        .args([
+            "-w",
+            "-R",
+            &format!("write {} {path}", temp_path.to_string_lossy()),
+            image.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .map_err(|err| format!("failed to execute debugfs for write {path}: {err}"))?;
+    let _ = fs::remove_file(&temp_path);
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to write {} into {} (exit code {:?})",
+            path,
+            image.display(),
+            status.code()
+        ))
+    }
+}
+
 fn debugfs_list(image: &PathBuf, path: &str) -> Result<String, String> {
     let output = Command::new("debugfs")
         .args([
@@ -1892,6 +2002,21 @@ fn debugfs_list(image: &PathBuf, path: &str) -> Result<String, String> {
         ])
         .output()
         .map_err(|err| format!("failed to execute debugfs: {err}"))?;
+    if !output.status.success() {
+        return Err(format!("debugfs exit code {:?}", output.status.code()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn debugfs_read_to_string(image: &PathBuf, path: &str) -> Result<String, String> {
+    let output = Command::new("debugfs")
+        .args([
+            "-R",
+            &format!("cat {path}"),
+            image.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .map_err(|err| format!("failed to execute debugfs cat {path}: {err}"))?;
     if !output.status.success() {
         return Err(format!("debugfs exit code {:?}", output.status.code()));
     }
@@ -1961,7 +2086,9 @@ fn detect_qemu_disk_holder(disk: &PathBuf) -> Option<(u32, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_qemu_loongarch_contest_args, build_qemu_riscv_args};
+    use super::{
+        build_qemu_loongarch_contest_args, build_qemu_riscv_args, validate_oscomp_profile_value,
+    };
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -2006,5 +2133,23 @@ mod tests {
         ] {
             assert!(args.contains(token), "missing token: {token}");
         }
+    }
+
+    #[test]
+    fn validates_known_oscomp_subset_profiles() {
+        for profile in ["full", "basic", "busybox", "ltp", "cyclic"] {
+            assert_eq!(validate_oscomp_profile_value(profile).unwrap(), profile);
+            assert_eq!(
+                validate_oscomp_profile_value(&format!("  {profile}\n")).unwrap(),
+                profile
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_oscomp_subset_profiles() {
+        assert!(validate_oscomp_profile_value("").is_err());
+        assert!(validate_oscomp_profile_value("nope").is_err());
+        assert!(validate_oscomp_profile_value("basic_testcode.sh").is_err());
     }
 }

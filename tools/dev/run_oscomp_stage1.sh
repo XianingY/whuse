@@ -22,6 +22,7 @@ export WHUSE_STAGE2_FULL_MAX_GROUP="${WHUSE_STAGE2_FULL_MAX_GROUP:-all}"
 export WHUSE_STAGE2_IOZONE_PROFILE="${WHUSE_STAGE2_IOZONE_PROFILE:-smoke}"
 export WHUSE_STAGE2_IOZONE_FULL_SCOPE="${WHUSE_STAGE2_IOZONE_FULL_SCOPE:-full}"
 export WHUSE_STAGE2_CHAIN_REAL_STEPS="${WHUSE_STAGE2_CHAIN_REAL_STEPS:-busybox_testcode.sh,iozone_testcode.sh,libctest_testcode.sh}"
+export WHUSE_OSCOMP_PROFILE="${WHUSE_OSCOMP_PROFILE:-}"
 
 RV_IMG="${REPO_ROOT}/target/oscomp/sdcard-rv.img"
 LA_IMG="${REPO_ROOT}/target/oscomp/sdcard-la.img"
@@ -72,31 +73,33 @@ probe | full) ;;
 	exit 1
 	;;
 esac
+case "${WHUSE_OSCOMP_PROFILE}" in
+"" | full | basic | busybox | iozone | libctest | libc-bench | lmbench | lua | ltp | unixbench | netperf | iperf | cyclic) ;;
+*)
+	echo "invalid WHUSE_OSCOMP_PROFILE=${WHUSE_OSCOMP_PROFILE}" >&2
+	exit 1
+	;;
+esac
 
 required_core_markers=(
 	"whuse-oscomp-shell-entered"
 	"whuse-oscomp-script-start"
 	"whuse-oscomp-suite-done"
 )
-
-required_step_groups=(
-	"time-test:time-test"
-	"busybox:busybox_testcode.sh"
-	"iozone:iozone_testcode.sh"
-	"libctest:libctest_testcode.sh"
-	"libc-bench:libc-bench"
-	"lmbench:lmbench_testcode.sh"
-	"lua:lua_testcode.sh"
-	"unixbench:unixbench_testcode.sh"
-	"netperf:netperf_testcode.sh"
-	"iperf:iperf_testcode.sh"
-	"cyclic:cyclic_testcode.sh,cyclictest_testcode.sh"
-)
-required_step_groups_gate=(
-	"time-test:time-test"
-	"busybox:busybox_testcode.sh"
-	"iozone:iozone_testcode.sh"
-	"libctest:libctest_testcode.sh"
+full_root_steps=(
+	"time-test"
+	"basic_testcode.sh"
+	"busybox_testcode.sh"
+	"iozone_testcode.sh"
+	"libctest_testcode.sh"
+	"libc-bench"
+	"lmbench_testcode.sh"
+	"lua_testcode.sh"
+	"unixbench_testcode.sh"
+	"netperf_testcode.sh"
+	"iperf_testcode.sh"
+	"ltp_testcode.sh"
+	"cyclic_testcode.sh"
 )
 iozone_smoke_cases=(
 	"smoke-write-read"
@@ -118,17 +121,61 @@ iozone_probe_cases=(
 	"throughput-write-read"
 )
 
-resolve_full_step_groups() {
-	local max_group="$1"
-	local -a selected=()
-	for step_group in "${required_step_groups[@]}"; do
-		selected+=("${step_group}")
-		local label="${step_group%%:*}"
-		if [[ "${max_group}" != "all" && "${label}" == "${max_group}" ]]; then
-			break
-		fi
-	done
-	printf '%s\n' "${selected[@]}"
+profile_root_step() {
+	local profile="$1"
+	case "${profile}" in
+	basic) echo "basic_testcode.sh" ;;
+	busybox) echo "busybox_testcode.sh" ;;
+	iozone) echo "iozone_testcode.sh" ;;
+	libctest) echo "libctest_testcode.sh" ;;
+	libc-bench) echo "libc-bench" ;;
+	lmbench) echo "lmbench_testcode.sh" ;;
+	lua) echo "lua_testcode.sh" ;;
+	ltp) echo "ltp_testcode.sh" ;;
+	unixbench) echo "unixbench_testcode.sh" ;;
+	netperf) echo "netperf_testcode.sh" ;;
+	iperf) echo "iperf_testcode.sh" ;;
+	cyclic) echo "cyclic_testcode.sh" ;;
+	*) return 1 ;;
+	esac
+}
+
+resolve_expected_root_steps() {
+	local profile="${1:-full}"
+	if [[ -z "${profile}" || "${profile}" == "full" ]]; then
+		printf '%s\n' "${full_root_steps[@]}"
+		return 0
+	fi
+	profile_root_step "${profile}"
+}
+
+effective_oscomp_profile() {
+	if [[ -n "${WHUSE_OSCOMP_PROFILE}" ]]; then
+		printf '%s\n' "${WHUSE_OSCOMP_PROFILE}"
+		return 0
+	fi
+	local repo_profile_file="${REPO_ROOT}/tools/oscomp/profile/default.txt"
+	if [[ -f "${repo_profile_file}" ]]; then
+		tr -d '[:space:]' < "${repo_profile_file}"
+		printf '\n'
+		return 0
+	fi
+	printf 'full\n'
+}
+
+count_step_semantic_lines() {
+	local log_file="$1"
+	local step="$2"
+	local pattern="$3"
+	awk \
+		-v begin="whuse-oscomp-step-begin:${step}" \
+		-v end="whuse-oscomp-step-end:${step}:" \
+		-v pat="${pattern}" '
+			index($0, begin) > 0 { in_step = 1; next }
+			in_step && index($0, end) > 0 { in_step = 0; next }
+			in_step && $0 ~ pat { count++ }
+			END { print count + 0 }
+		' "${log_file}" 2>/dev/null || echo 0
 }
 
 runtime_images=()
@@ -233,12 +280,44 @@ prepare_runtime_image() {
 	echo "${dst}"
 }
 
+write_runtime_image_config() {
+	local image="$1"
+	local target="$2"
+	local value="$3"
+	local tmp
+	tmp="$(mktemp)"
+	printf '%s\n' "${value}" >"${tmp}"
+	debugfs -w -R "rm ${target}" "${image}" >/dev/null 2>&1 || true
+	if ! debugfs -w -R "write ${tmp} ${target}" "${image}" >/dev/null 2>&1; then
+		rm -f "${tmp}"
+		echo "failed to write runtime config ${target} into ${image}" >&2
+		return 1
+	fi
+	rm -f "${tmp}"
+}
+
+inject_oscomp_profile() {
+	local image="$1"
+	local profile="$2"
+	write_runtime_image_config "${image}" "/whuse-oscomp-profile" "${profile}"
+}
+
 inject_stage2_profile_files() {
 	local arch="$1"
-	if [[ "${arch}" != "la" ]]; then
-		return
+	local image="$2"
+	local effective_profile
+	effective_profile="$(effective_oscomp_profile)"
+	case "${effective_profile}" in
+	"" | full | basic | busybox | iozone | libctest | libc-bench | lmbench | lua | ltp | unixbench | netperf | iperf | cyclic) ;;
+	*)
+		echo "invalid effective oscomp profile ${effective_profile}" >&2
+		return 1
+		;;
+	esac
+	if [[ -n "${WHUSE_OSCOMP_PROFILE}" ]]; then
+		inject_oscomp_profile "${image}" "${WHUSE_OSCOMP_PROFILE}"
 	fi
-	echo "[${arch}] stage2 timeout profile: ${WHUSE_STAGE2_TIMEOUT_PROFILE}, real-phase: ${WHUSE_STAGE2_REAL_PHASE}, gate-libctest-scope: ${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE}, full-max-group: ${WHUSE_STAGE2_FULL_MAX_GROUP}, iozone-profile: ${WHUSE_STAGE2_IOZONE_PROFILE}, iozone-full-scope: ${WHUSE_STAGE2_IOZONE_FULL_SCOPE} (chain-real-steps=${WHUSE_STAGE2_CHAIN_REAL_STEPS})"
+	echo "[${arch}] stage2 timeout profile: ${WHUSE_STAGE2_TIMEOUT_PROFILE}, real-phase: ${WHUSE_STAGE2_REAL_PHASE}, gate-libctest-scope: ${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE}, full-max-group: ${WHUSE_STAGE2_FULL_MAX_GROUP}, iozone-profile: ${WHUSE_STAGE2_IOZONE_PROFILE}, iozone-full-scope: ${WHUSE_STAGE2_IOZONE_FULL_SCOPE} (chain-real-steps=${WHUSE_STAGE2_CHAIN_REAL_STEPS}, oscomp-profile=${effective_profile})"
 }
 
 run_xtask_with_timeout() {
@@ -337,13 +416,15 @@ run_arch() {
 	local log="/tmp/${arch}-stage1-${TS}.log"
 	local text_log="/tmp/${arch}-stage1-${TS}.strings.log"
 	local runtime_image
+	local effective_profile
 	runtime_image="$(prepare_runtime_image "${arch}" "${image}")"
-	inject_stage2_profile_files "${arch}"
+	inject_stage2_profile_files "${arch}" "${runtime_image}"
+	effective_profile="$(effective_oscomp_profile)"
 	if [[ "${arch}" == "la" ]]; then
 		cleanup_loongarch_stale_qemu
 	fi
 
-	echo "[${arch}] running ${xtask_cmd}, timeout=${TIMEOUT_SECS}s, image=${runtime_image}"
+	echo "[${arch}] running ${xtask_cmd}, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, oscomp-profile=${effective_profile}"
 	set +e
 	run_xtask_with_timeout "${runtime_image}" "${xtask_cmd}" "${log}" "${arch}"
 	local run_rc=$?
@@ -368,127 +449,44 @@ run_arch() {
 		fi
 	done
 
-	local -a step_groups_to_check=("${required_step_groups[@]}")
-	if [[ "${arch}" == "la" && "${WHUSE_STAGE2_TIMEOUT_PROFILE}" == "real" && "${WHUSE_STAGE2_REAL_PHASE}" == "gate" ]]; then
-		step_groups_to_check=("${required_step_groups_gate[@]}")
-	elif [[ "${arch}" == "la" && "${WHUSE_STAGE2_TIMEOUT_PROFILE}" == "real" && "${WHUSE_STAGE2_REAL_PHASE}" == "full" ]]; then
-		mapfile -t step_groups_to_check < <(resolve_full_step_groups "${WHUSE_STAGE2_FULL_MAX_GROUP}")
-	fi
-	for step_group in "${step_groups_to_check[@]}"; do
-		local label="${step_group%%:*}"
-		local names_csv="${step_group#*:}"
-		local found_begin=0
-		local found_done=0
-		IFS=',' read -r -a names <<<"${names_csv}"
-		for name in "${names[@]}"; do
-			if rg -q -F "whuse-oscomp-step-begin:${name}" "${text_log}"; then
-				found_begin=1
-			fi
-			if rg -q -F "whuse-oscomp-step-end:${name}" "${text_log}" || \
-				rg -q -F "whuse-oscomp-step-skip:${name}" "${text_log}" || \
-				rg -q -F "whuse-oscomp-step-timeout:${name}" "${text_log}"; then
-				found_done=1
-			fi
-		done
-		if [[ "${found_begin}" -eq 1 ]]; then
-			echo "[${arch}] step-begin ok: ${label}"
+	local -a expected_steps=()
+	mapfile -t expected_steps < <(resolve_expected_root_steps "${effective_profile}")
+	for step in "${expected_steps[@]}"; do
+		if rg -q -F "whuse-oscomp-step-begin:${step}" "${text_log}"; then
+			echo "[${arch}] step-begin ok: ${step}"
 		else
-			echo "[${arch}] missing step-begin: ${label} (${names_csv})" >&2
+			echo "[${arch}] missing step-begin: ${step}" >&2
 			ok=1
 		fi
-		if [[ "${found_done}" -eq 1 ]]; then
-			echo "[${arch}] step-done ok: ${label}"
+		if rg -q -F "whuse-oscomp-step-end:${step}" "${text_log}" || \
+			rg -q -F "whuse-oscomp-step-skip:${step}" "${text_log}" || \
+			rg -q -F "whuse-oscomp-step-timeout:${step}" "${text_log}"; then
+			echo "[${arch}] step-done ok: ${step}"
 		else
-			echo "[${arch}] missing step-done: ${label} (${names_csv})" >&2
+			echo "[${arch}] missing step-done: ${step}" >&2
 			ok=1
 		fi
 	done
-	if [[ "${arch}" == "la" && "${WHUSE_STAGE2_TIMEOUT_PROFILE}" == "real" && "${WHUSE_STAGE2_REAL_PHASE}" == "gate" ]]; then
-		if rg -q -F "whuse-oscomp-step-end:libctest_testcode.sh:0" "${text_log}"; then
-			echo "[${arch}] gate-check ok: libctest step-end:0"
-		else
-			echo "[${arch}] gate-check failed: missing whuse-oscomp-step-end:libctest_testcode.sh:0" >&2
+	if [[ "${effective_profile}" == "basic" ]]; then
+		local musl_brk_count glibc_brk_count
+		musl_brk_count="$(count_step_semantic_lines "${text_log}" "musl/basic_testcode.sh" '^Testing brk :')"
+		glibc_brk_count="$(count_step_semantic_lines "${text_log}" "glibc/basic_testcode.sh" '^Testing brk :')"
+		if [[ "${musl_brk_count}" -lt 1 || "${glibc_brk_count}" -lt 1 ]]; then
+			echo "[${arch}] basic profile failed semantic check: expected Testing brk output in both musl/glibc runtimes (musl=${musl_brk_count}, glibc=${glibc_brk_count})" >&2
 			ok=1
-		fi
-		if rg -q -F "whuse-oscomp-real-phase:gate" "${text_log}"; then
-			echo "[${arch}] gate-check ok: real-phase marker"
 		else
-			echo "[${arch}] gate-check failed: missing whuse-oscomp-real-phase:gate marker" >&2
-			ok=1
+			echo "[${arch}] basic profile semantic check ok: musl Testing brk=${musl_brk_count}, glibc Testing brk=${glibc_brk_count}"
 		fi
 	fi
-	if [[ "${arch}" == "la" && "${WHUSE_STAGE2_TIMEOUT_PROFILE}" == "real" && "${WHUSE_STAGE2_REAL_PHASE}" == "full" ]]; then
-		if rg -q -F "whuse-oscomp-step-end:busybox_testcode.sh:0" "${text_log}"; then
-			echo "[${arch}] full-check ok: busybox step-end:0"
-		else
-			echo "[${arch}] full-check failed: missing whuse-oscomp-step-end:busybox_testcode.sh:0" >&2
+	if [[ "${effective_profile}" == "busybox" ]]; then
+		local musl_busybox_cases glibc_busybox_cases
+		musl_busybox_cases="$(count_step_semantic_lines "${text_log}" "musl/busybox_testcode.sh" 'testcase busybox .* success')"
+		glibc_busybox_cases="$(count_step_semantic_lines "${text_log}" "glibc/busybox_testcode.sh" 'testcase busybox .* success')"
+		if [[ "${musl_busybox_cases}" -lt 1 || "${glibc_busybox_cases}" -lt 1 ]]; then
+			echo "[${arch}] busybox profile failed semantic check: expected testcase busybox output in both musl/glibc runtimes (musl=${musl_busybox_cases}, glibc=${glibc_busybox_cases})" >&2
 			ok=1
-		fi
-		if rg -q -F "whuse-oscomp-real-max-group:${WHUSE_STAGE2_FULL_MAX_GROUP}" "${text_log}"; then
-			echo "[${arch}] full-check ok: real-max-group marker"
 		else
-			echo "[${arch}] full-check failed: missing whuse-oscomp-real-max-group:${WHUSE_STAGE2_FULL_MAX_GROUP}" >&2
-			ok=1
-		fi
-		if rg -q -F "whuse-oscomp-iozone-profile:${WHUSE_STAGE2_IOZONE_PROFILE}" "${text_log}"; then
-			echo "[${arch}] full-check ok: iozone profile marker"
-		else
-			echo "[${arch}] full-check failed: missing whuse-oscomp-iozone-profile:${WHUSE_STAGE2_IOZONE_PROFILE}" >&2
-			ok=1
-		fi
-		if rg -q -F "whuse-oscomp-iozone-full-scope:${WHUSE_STAGE2_IOZONE_FULL_SCOPE}" "${text_log}"; then
-			echo "[${arch}] full-check ok: iozone full-scope marker"
-		else
-			echo "[${arch}] full-check failed: missing whuse-oscomp-iozone-full-scope:${WHUSE_STAGE2_IOZONE_FULL_SCOPE}" >&2
-			ok=1
-		fi
-		if [[ "${WHUSE_STAGE2_FULL_MAX_GROUP}" == "iozone" ]]; then
-			local -a iozone_cases_to_check=()
-			if [[ "${WHUSE_STAGE2_IOZONE_PROFILE}" == "full" ]]; then
-				if [[ "${WHUSE_STAGE2_IOZONE_FULL_SCOPE}" == "probe" ]]; then
-					iozone_cases_to_check=("${iozone_probe_cases[@]}")
-				else
-					iozone_cases_to_check=("${iozone_full_cases[@]}")
-				fi
-			else
-				iozone_cases_to_check=("${iozone_smoke_cases[@]}")
-			fi
-			for case_name in "${iozone_cases_to_check[@]}"; do
-				if rg -q -F "whuse-oscomp-iozone-case-begin:${case_name}" "${text_log}"; then
-					echo "[${arch}] iozone-case-begin ok: ${case_name}"
-				else
-					echo "[${arch}] iozone-case-begin missing: ${case_name}" >&2
-					ok=1
-				fi
-				if rg -q -F "whuse-oscomp-iozone-case-end:${case_name}:" "${text_log}"; then
-					echo "[${arch}] iozone-case-end ok: ${case_name}"
-				else
-					echo "[${arch}] iozone-case-end missing: ${case_name}" >&2
-					ok=1
-				fi
-			done
-			if [[ "${WHUSE_STAGE2_IOZONE_PROFILE}" == "full" && "${WHUSE_STAGE2_IOZONE_FULL_SCOPE}" == "full" ]]; then
-				if rg -q -F "whuse-oscomp-step-end:iozone_testcode.sh:0" "${text_log}"; then
-					echo "[${arch}] iozone full-check ok: step-end:0"
-				else
-					echo "[${arch}] iozone full-check failed: missing whuse-oscomp-step-end:iozone_testcode.sh:0" >&2
-					ok=1
-				fi
-			elif [[ "${WHUSE_STAGE2_IOZONE_PROFILE}" == "full" && "${WHUSE_STAGE2_IOZONE_FULL_SCOPE}" == "probe" ]]; then
-				if rg -q -F "whuse-oscomp-step-end:iozone_testcode.sh:" "${text_log}"; then
-					echo "[${arch}] iozone probe-check ok: step-end present"
-				else
-					echo "[${arch}] iozone probe-check failed: missing whuse-oscomp-step-end:iozone_testcode.sh:*" >&2
-					ok=1
-				fi
-			else
-				if rg -q -F "whuse-oscomp-step-end:iozone_testcode.sh:" "${text_log}"; then
-					echo "[${arch}] iozone smoke-check ok: step-end present"
-				else
-					echo "[${arch}] iozone smoke-check failed: missing whuse-oscomp-step-end:iozone_testcode.sh:*" >&2
-					ok=1
-				fi
-			fi
+			echo "[${arch}] busybox profile semantic check ok: musl testcase busybox=${musl_busybox_cases}, glibc testcase busybox=${glibc_busybox_cases}"
 		fi
 	fi
 

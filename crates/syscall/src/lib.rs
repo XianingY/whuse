@@ -20,7 +20,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use hal_api::{hal, Timespec};
+use hal_api::{hal, PlatformArch, Timespec};
 use proc::{Process, ProcessTable, SigAction, WaitSelector};
 use spin::Mutex;
 use task::Scheduler;
@@ -1119,10 +1119,7 @@ impl SyscallDispatcher {
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
         let dirfd = args.0[0] as i32;
-        let path = procs
-            .current()?
-            .read_user_cstr(args.0[1])
-            .map_err(|_| EFAULT)?;
+        let path_ptr = args.0[1];
         let raw_flags = args.0[2] as u32;
         let flags = normalize_open_flags(raw_flags);
         let mode = args.0[3] as u32;
@@ -1135,6 +1132,10 @@ impl SyscallDispatcher {
                 process.cwd.clone(),
             )
         };
+        let path = procs
+            .current()?
+            .read_user_cstr(path_ptr)
+            .map_err(|_| EFAULT)?;
         let openat_probe = stage2_openat_debug_enabled()
             && is_libctest_openat_probe_task(name.as_str(), tgid, proc_cwd.as_str());
         if openat_probe {
@@ -1485,8 +1486,32 @@ impl SyscallDispatcher {
         }
 
         if now < deadline {
-            let _ = scheduler.block_current();
-            return Err(EAGAIN);
+            if hal().platform.architecture() == PlatformArch::LoongArch64 {
+                let mut now_spin = now;
+                while now_spin < deadline {
+                    let pending = procs.pending_signals()?;
+                    if pending != 0 {
+                        if let Some(ptr) = remain_ptr {
+                            let remain = deadline.saturating_sub(now_spin).min(requested);
+                            procs
+                                .current_mut()?
+                                .write_user_bytes(ptr, &nanos_to_timespec_bytes(remain))
+                                .map_err(|_| EFAULT)?;
+                        }
+                        let process = procs.current_mut()?;
+                        process.sleep_deadline_ns = None;
+                        process.sleep_requested_ns = 0;
+                        process.sleep_remain_ptr = None;
+                        process.sleep_absolute = false;
+                        return Err(EINTR);
+                    }
+                    core::hint::spin_loop();
+                    now_spin = hal().timer.monotonic_nanos();
+                }
+            } else {
+                let _ = scheduler.block_current();
+                return Err(EAGAIN);
+            }
         }
 
         if let Some(ptr) = remain_ptr {
@@ -3191,12 +3216,6 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let pid_raw = args.0[0] as isize;
         let sig = args.0[1];
-        log_always(&format!(
-            "whuse-debug: kill/tkill target={} sig={} caller_tid={}",
-            pid_raw,
-            sig,
-            procs.current_tid().unwrap_or(0)
-        ));
         if sig > 64 {
             return Err(EINVAL);
         }
@@ -4712,8 +4731,34 @@ impl SyscallDispatcher {
         }
 
         if now < deadline {
-            let _ = scheduler.block_current();
-            return Err(EAGAIN);
+            if hal().platform.architecture() == PlatformArch::LoongArch64 {
+                let mut now_spin = now;
+                while now_spin < deadline {
+                    let pending = procs.pending_signals()?;
+                    if pending != 0 {
+                        if !sleep_absolute {
+                            if let Some(ptr) = remain_ptr {
+                                let remain = deadline.saturating_sub(now_spin).min(requested_ns);
+                                procs
+                                    .current_mut()?
+                                    .write_user_bytes(ptr, &nanos_to_timespec_bytes(remain))
+                                    .map_err(|_| EFAULT)?;
+                            }
+                        }
+                        let process = procs.current_mut()?;
+                        process.sleep_deadline_ns = None;
+                        process.sleep_requested_ns = 0;
+                        process.sleep_remain_ptr = None;
+                        process.sleep_absolute = false;
+                        return Err(EINTR);
+                    }
+                    core::hint::spin_loop();
+                    now_spin = hal().timer.monotonic_nanos();
+                }
+            } else {
+                let _ = scheduler.block_current();
+                return Err(EAGAIN);
+            }
         }
 
         if !sleep_absolute {

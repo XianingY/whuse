@@ -2575,6 +2575,9 @@ fn should_use_statless_external_open(absolute: &str, flags: u32) -> bool {
     if (flags & O_DIRECTORY) != 0 {
         return false;
     }
+    if absolute == "/etc/localtime" {
+        return true;
+    }
     if absolute.ends_with("/basic/test_echo") {
         return true;
     }

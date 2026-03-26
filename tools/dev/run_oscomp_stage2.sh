@@ -15,7 +15,7 @@ export WHUSE_QEMU_MODE="${WHUSE_QEMU_MODE:-contest}"
 export WHUSE_STAGE2_USE_IMAGE_COPY="${WHUSE_STAGE2_USE_IMAGE_COPY:-0}"
 export WHUSE_STAGE2_STOP_ON_SUITE_DONE="${WHUSE_STAGE2_STOP_ON_SUITE_DONE:-1}"
 export WHUSE_STAGE2_CLEAN_QEMU="${WHUSE_STAGE2_CLEAN_QEMU:-1}"
-export WHUSE_STAGE2_ONLY_STEP="${WHUSE_STAGE2_ONLY_STEP:-}"
+export WHUSE_OSCOMP_PROFILE="${WHUSE_OSCOMP_PROFILE:-}"
 export WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE:-score}"
 export WHUSE_LTP_WHITELIST="${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}"
 export WHUSE_LTP_BLACKLIST="${WHUSE_LTP_BLACKLIST:-/musl/ltp_score_blacklist.txt}"
@@ -32,8 +32,9 @@ if [[ "${WHUSE_OSCOMP_COMPAT}" != "0" ]]; then
     exit 1
 fi
 
-required_steps=(
+full_root_steps=(
     "time-test"
+    "basic_testcode.sh"
     "busybox_testcode.sh"
     "iozone_testcode.sh"
     "libctest_testcode.sh"
@@ -43,6 +44,7 @@ required_steps=(
     "unixbench_testcode.sh"
     "netperf_testcode.sh"
     "iperf_testcode.sh"
+    "ltp_testcode.sh"
     "cyclic_testcode.sh"
 )
 
@@ -61,6 +63,78 @@ required_musl_entries=(
     "cyclictest_testcode.sh"
     "ltp_testcode.sh"
 )
+
+validate_oscomp_profile() {
+    local profile="${1:-}"
+    case "${profile}" in
+    "" | full | basic | busybox | iozone | libctest | libc-bench | lmbench | lua | ltp | unixbench | netperf | iperf | cyclic)
+        return 0
+        ;;
+    *)
+        echo "invalid WHUSE_OSCOMP_PROFILE=${profile}" >&2
+        return 1
+        ;;
+    esac
+}
+
+validate_oscomp_profile "${WHUSE_OSCOMP_PROFILE}"
+
+profile_root_step() {
+    local profile="$1"
+    case "${profile}" in
+    basic) echo "basic_testcode.sh" ;;
+    busybox) echo "busybox_testcode.sh" ;;
+    iozone) echo "iozone_testcode.sh" ;;
+    libctest) echo "libctest_testcode.sh" ;;
+    libc-bench) echo "libc-bench" ;;
+    lmbench) echo "lmbench_testcode.sh" ;;
+    lua) echo "lua_testcode.sh" ;;
+    ltp) echo "ltp_testcode.sh" ;;
+    unixbench) echo "unixbench_testcode.sh" ;;
+    netperf) echo "netperf_testcode.sh" ;;
+    iperf) echo "iperf_testcode.sh" ;;
+    cyclic) echo "cyclic_testcode.sh" ;;
+    *) return 1 ;;
+    esac
+}
+
+resolve_expected_root_steps() {
+    local profile="${1:-full}"
+    if [[ -z "${profile}" || "${profile}" == "full" ]]; then
+        printf '%s\n' "${full_root_steps[@]}"
+        return 0
+    fi
+    profile_root_step "${profile}"
+}
+
+effective_oscomp_profile() {
+    if [[ -n "${WHUSE_OSCOMP_PROFILE}" ]]; then
+        printf '%s\n' "${WHUSE_OSCOMP_PROFILE}"
+        return 0
+    fi
+    local repo_profile_file="${REPO_ROOT}/tools/oscomp/profile/default.txt"
+    if [[ -f "${repo_profile_file}" ]]; then
+        tr -d '[:space:]' < "${repo_profile_file}"
+        printf '\n'
+        return 0
+    fi
+    printf 'full\n'
+}
+
+count_step_semantic_lines() {
+    local log_file="$1"
+    local step="$2"
+    local pattern="$3"
+    awk \
+        -v begin="whuse-oscomp-step-begin:${step}" \
+        -v end="whuse-oscomp-step-end:${step}:" \
+        -v pat="${pattern}" '
+            index($0, begin) > 0 { in_step = 1; next }
+            in_step && index($0, end) > 0 { in_step = 0; next }
+            in_step && $0 ~ pat { count++ }
+            END { print count + 0 }
+        ' "${log_file}" 2>/dev/null || echo 0
+}
 
 runtime_images=()
 cleanup_target_images=()
@@ -251,11 +325,17 @@ write_runtime_image_file() {
     fi
 }
 
+inject_oscomp_profile() {
+    local image="$1"
+    local profile="$2"
+    write_runtime_image_config "${image}" "/whuse-oscomp-profile" "${profile}"
+}
+
 inject_ltp_runtime_config() {
     local image="$1"
     local ltp_whitelist_path="${WHUSE_LTP_WHITELIST:-}"
     local ltp_blacklist_path="${WHUSE_LTP_BLACKLIST:-}"
-    write_runtime_image_config "${image}" "/musl/.whuse_oscomp_only_step" "ltp_testcode.sh"
+    inject_oscomp_profile "${image}" "ltp"
     write_runtime_image_config "${image}" "/musl/.whuse_ltp_profile" "${WHUSE_LTP_PROFILE}"
     if [[ -n "${ltp_whitelist_path}" && -f "${ltp_whitelist_path}" ]]; then
         write_runtime_image_file "${image}" "/musl/ltp_score_whitelist.host.txt" "${ltp_whitelist_path}"
@@ -366,9 +446,15 @@ run_arch() {
     local runtime_image
     local suite_done_seen=0
     local terminated_by_suite_done=0
+    local effective_profile
     runtime_image="$(prepare_runtime_image "${arch}" "${image}")"
+    if [[ -n "${WHUSE_OSCOMP_PROFILE}" ]]; then
+        inject_oscomp_profile "${runtime_image}" "${WHUSE_OSCOMP_PROFILE}"
+    fi
+    effective_profile="$(effective_oscomp_profile)"
+    validate_oscomp_profile "${effective_profile}"
 
-    echo "[${arch}] running ${xtask_cmd}, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"
+    echo "[${arch}] running ${xtask_cmd}, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}, oscomp-profile=${effective_profile}"
     if [[ "${WHUSE_STAGE2_STOP_ON_SUITE_DONE}" == "1" ]]; then
         local runner_pid
         setsid timeout "${TIMEOUT_SECS}s" env WHUSE_DISK_IMAGE="${runtime_image}" "${XTASK_CMD[@]}" "${xtask_cmd}" >"${log}" 2>&1 &
@@ -414,7 +500,9 @@ run_arch() {
         ok=1
     fi
 
-    for step in "${required_steps[@]}"; do
+    local -a expected_steps=()
+    mapfile -t expected_steps < <(resolve_expected_root_steps "${effective_profile}")
+    for step in "${expected_steps[@]}"; do
         if rg -q "whuse-oscomp-step-begin:${step}" "${text_log}"; then
             echo "[${arch}] step-begin ok: ${step}"
         else
@@ -428,6 +516,30 @@ run_arch() {
             ok=1
         fi
     done
+
+    if [[ "${effective_profile}" == "basic" ]]; then
+        local musl_brk_count glibc_brk_count
+        musl_brk_count="$(count_step_semantic_lines "${text_log}" "musl/basic_testcode.sh" '^Testing brk :')"
+        glibc_brk_count="$(count_step_semantic_lines "${text_log}" "glibc/basic_testcode.sh" '^Testing brk :')"
+        if [[ "${musl_brk_count}" -lt 1 || "${glibc_brk_count}" -lt 1 ]]; then
+            echo "[${arch}] basic profile failed semantic check: expected Testing brk output in both musl/glibc runtimes (musl=${musl_brk_count}, glibc=${glibc_brk_count})" >&2
+            ok=1
+        else
+            echo "[${arch}] basic profile semantic check ok: musl Testing brk=${musl_brk_count}, glibc Testing brk=${glibc_brk_count}"
+        fi
+    fi
+
+    if [[ "${effective_profile}" == "busybox" ]]; then
+        local musl_busybox_cases glibc_busybox_cases
+        musl_busybox_cases="$(count_step_semantic_lines "${text_log}" "musl/busybox_testcode.sh" 'testcase busybox .* success')"
+        glibc_busybox_cases="$(count_step_semantic_lines "${text_log}" "glibc/busybox_testcode.sh" 'testcase busybox .* success')"
+        if [[ "${musl_busybox_cases}" -lt 1 || "${glibc_busybox_cases}" -lt 1 ]]; then
+            echo "[${arch}] busybox profile failed semantic check: expected testcase busybox output in both musl/glibc runtimes (musl=${musl_busybox_cases}, glibc=${glibc_busybox_cases})" >&2
+            ok=1
+        else
+            echo "[${arch}] busybox profile semantic check ok: musl testcase busybox=${musl_busybox_cases}, glibc testcase busybox=${glibc_busybox_cases}"
+        fi
+    fi
 
     echo "[${arch}] marker summary:"
     rg "whuse-oscomp-step-(begin|end|timeout|skip)|whuse-oscomp-suite-done" "${text_log}" || true

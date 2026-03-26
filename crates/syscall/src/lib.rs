@@ -1797,6 +1797,12 @@ impl SyscallDispatcher {
             "whuse: clone parent_tgid={} flags={:#x} child_tgid={} shared_vm={}",
             parent_pid, flags, pid, shared_vm
         ));
+        if name.contains("/basic/clone") {
+            log_always(&format!(
+                "whuse-clone-debug: parent={} flags={:#x} child={} stack={:#x} ptid={:#x} ctid={:#x} shared_vm={}",
+                parent_pid, flags, pid, child_stack, parent_tid, child_tid_ptr, shared_vm
+            ));
+        }
 
         if compat_flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
             procs
@@ -1820,6 +1826,12 @@ impl SyscallDispatcher {
 
         if child_stack != 0 {
             procs.set_thread_stack_pointer(pid, child_stack)?;
+            if name.contains("/basic/clone") {
+                log_always(&format!(
+                    "whuse-clone-debug: child={} stack-set={:#x}",
+                    pid, child_stack
+                ));
+            }
         }
         if (flags & CLONE_VFORK) != 0 {
             procs.set_vfork_parent_tid(pid, parent_tid)?;
@@ -2398,7 +2410,9 @@ impl SyscallDispatcher {
         };
         let busybox_wait_debug =
             parent_name.contains("busybox") && parent_cwd == "/musl" && wait_pid > 0;
-        if busybox_wait_debug {
+        let clone_wait_debug = parent_name.contains("/basic/clone");
+        let wait_debug = busybox_wait_debug || clone_wait_debug;
+        if wait_debug {
             log_always(&format!(
                 "whuse-wait: enter tgid={} name={} wait_pid={} options={:#x}",
                 parent_pid, parent_name, wait_pid, options
@@ -2412,7 +2426,7 @@ impl SyscallDispatcher {
         let (child_pid, status) = match procs.wait_child(parent_pid, selector, options) {
             Ok(pair) => pair,
             Err(err) => {
-                if busybox_wait_debug {
+                if wait_debug {
                     log_always(&format!(
                         "whuse-wait: err tgid={} wait_pid={} err={}",
                         parent_pid, wait_pid, err
@@ -2426,7 +2440,7 @@ impl SyscallDispatcher {
             }
         };
         if child_pid == 0 {
-            if busybox_wait_debug {
+            if wait_debug {
                 log_always(&format!(
                     "whuse-wait: no-exited-child tgid={} wait_pid={} options={:#x}",
                     parent_pid, wait_pid, options
@@ -2449,7 +2463,7 @@ impl SyscallDispatcher {
                 .write_user_bytes(status_ptr, &(status as i32).to_le_bytes())
                 .map_err(|_| EFAULT)?;
         }
-        if busybox_wait_debug {
+        if wait_debug {
             log_always(&format!(
                 "whuse-wait: return tgid={} child={} status={}",
                 parent_pid, child_pid, status

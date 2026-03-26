@@ -22,3 +22,5 @@ kernel-la
 kernel-rv
 
 assist_docs/
+tmp/
+.sisyphus/

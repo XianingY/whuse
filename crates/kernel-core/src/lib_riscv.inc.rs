@@ -169,20 +169,6 @@ const OSCOMP_RSH_WRAPPER: &str = concat!(
     "[ $# -gt 0 ] || exit 0\n",
     "exec \"$@\"\n",
 );
-const OSCOMP_BASIC_MUSL_SMOKE_SCRIPT: &str = concat!(
-    "#!/musl/busybox sh\n",
-    "echo \"#### OS COMP TEST GROUP START basic-musl ####\"\n",
-    "echo \"whuse: basic-musl smoke\"\n",
-    "echo \"#### OS COMP TEST GROUP END basic-musl ####\"\n",
-    "exit 0\n",
-);
-const OSCOMP_BASIC_GLIBC_SMOKE_SCRIPT: &str = concat!(
-    "#!/musl/busybox sh\n",
-    "echo \"#### OS COMP TEST GROUP START basic-glibc ####\"\n",
-    "echo \"whuse: basic-glibc smoke\"\n",
-    "echo \"#### OS COMP TEST GROUP END basic-glibc ####\"\n",
-    "exit 0\n",
-);
 const OSCOMP_ETC_PASSWD: &str = concat!(
     "root:x:0:0:root:/root:/musl/busybox\n",
     "nobody:x:65534:65534:nobody:/:/musl/busybox\n",
@@ -1083,8 +1069,12 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}\n",
     "WHUSE_LTP_PROFILE=full\n",
     "WHUSE_LTP_CASE_TIMEOUT=${WHUSE_LTP_CASE_TIMEOUT:-45}\n",
+    "WHUSE_OSCOMP_ONLY_STEP=${WHUSE_OSCOMP_ONLY_STEP:-}\n",
     "KCONFIG_SKIP_CHECK=${KCONFIG_SKIP_CHECK:-1}\n",
-    "export WHUSE_OSCOMP_STEP_TIMEOUT WHUSE_LTP_STEP_TIMEOUT WHUSE_LTP_PROFILE WHUSE_LTP_CASE_TIMEOUT KCONFIG_SKIP_CHECK\n",
+    "if [ -z \"$WHUSE_OSCOMP_ONLY_STEP\" ] && [ -f /musl/.whuse_oscomp_only_step ]; then\n",
+    "    IFS= read -r WHUSE_OSCOMP_ONLY_STEP < /musl/.whuse_oscomp_only_step\n",
+    "fi\n",
+    "export WHUSE_OSCOMP_STEP_TIMEOUT WHUSE_LTP_STEP_TIMEOUT WHUSE_LTP_PROFILE WHUSE_LTP_CASE_TIMEOUT WHUSE_OSCOMP_ONLY_STEP KCONFIG_SKIP_CHECK\n",
     "if /musl/busybox timeout 1 /musl/busybox true >/tmp/whuse-timeout-probe.log 2>&1; then\n",
     "    WHUSE_HAS_TIMEOUT=1\n",
     "else\n",
@@ -1094,6 +1084,12 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    runtime=\"$1\"\n",
     "    script=\"$2\"\n",
     "    timeout_s=\"$3\"\n",
+    "    if [ -n \"$WHUSE_OSCOMP_ONLY_STEP\" ] && [ \"$WHUSE_OSCOMP_ONLY_STEP\" != \"$script\" ]; then\n",
+    "        echo whuse-oscomp-step-begin:${runtime}/$script\n",
+    "        echo whuse-oscomp-step-skip:${runtime}/$script:filtered\n",
+    "        echo whuse-oscomp-step-end:${runtime}/$script:0\n",
+    "        return 0\n",
+    "    fi\n",
     "    echo whuse-oscomp-step-begin:${runtime}/$script\n",
     "    if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
     "        /musl/busybox timeout \"$timeout_s\" /musl/busybox sh \"./$script\"\n",
@@ -2467,6 +2463,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         "/usr/bin",
         "/usr/sbin",
         "/lib",
+        "/lib64",
         "/sbin",
         "/lib/modules",
         "/lib/modules/6.8.0-whuse",
@@ -2727,53 +2724,6 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         }
     }
 
-    for (runtime, script, body) in [
-        ("musl", "basic_testcode.sh", OSCOMP_BASIC_MUSL_SMOKE_SCRIPT),
-        (
-            "glibc",
-            "basic_testcode.sh",
-            OSCOMP_BASIC_GLIBC_SMOKE_SCRIPT,
-        ),
-    ] {
-        let path = format!("/{}/{}", runtime, script);
-        if let Err(err) = vfs.preload_external_file(path.as_str(), body.as_bytes(), Some(0o100755))
-        {
-            logln(format_args!(
-                "whuse: score smoke override failed path={} err={}",
-                path, err
-            ));
-        }
-    }
-
-    for runtime in ["musl", "glibc"] {
-        for script in [
-            "busybox_testcode.sh",
-            "iozone_testcode.sh",
-            "libcbench_testcode.sh",
-            "libctest_testcode.sh",
-            "lmbench_testcode.sh",
-            "ltp_testcode.sh",
-            "lua_testcode.sh",
-        ] {
-            let step = script
-                .trim_end_matches("_testcode.sh")
-                .trim_end_matches(".sh");
-            let body = format!(
-                "#!/musl/busybox sh\necho \"#### OS COMP TEST GROUP START {}-{} ####\"\necho \"whuse: {} smoke\"\necho \"#### OS COMP TEST GROUP END {}-{} ####\"\nexit 0\n",
-                step, runtime, step, step, runtime
-            );
-            let path = format!("/{}/{}", runtime, script);
-            if let Err(err) =
-                vfs.preload_external_file(path.as_str(), body.as_bytes(), Some(0o100755))
-            {
-                logln(format_args!(
-                    "whuse: score smoke override failed path={} err={}",
-                    path, err
-                ));
-            }
-        }
-    }
-
     if vfs.access("/", OSCOMP_CFG_ONLY_STEP_PATH).is_ok() {
         logln(format_args!(
             "whuse: ignore {} in official full-run mode",
@@ -2783,6 +2733,9 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
 }
 
 fn install_fallback_symlink(vfs: &mut KernelVfs, path: &str, target: &str) {
+    if vfs.access("/", target).is_err() {
+        return;
+    }
     let _ = vfs.unlink("/", path);
     match vfs.create_symlink("/", path, target) {
         Ok(()) | Err(17) => {}

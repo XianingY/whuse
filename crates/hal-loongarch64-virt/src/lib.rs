@@ -173,10 +173,8 @@ __whuse_run_user:
 
     ld.d $ra, $a0, 8
     ld.d $sp, $a0, 16
+    ld.d $r15, $a0, 24
     ld.d $tp, $a0, 32
-    ld.d $t0, $a0, 40
-    ld.d $t1, $a0, 48
-    ld.d $t2, $a0, 56
     ld.d $fp, $a0, 64
     ld.d $s0, $a0, 72
     ld.d $a1, $a0, 88
@@ -194,12 +192,12 @@ __whuse_run_user:
     ld.d $s6, $a0, 184
     ld.d $s7, $a0, 192
     ld.d $s8, $a0, 200
-    ld.d $r31, $a0, 208
-    ld.d $r22, $a0, 216
-    ld.d $r12, $a0, 224
-    ld.d $r13, $a0, 232
-    ld.d $r14, $a0, 240
-    ld.d $r15, $a0, 248
+    ld.d $r16, $a0, 208
+    ld.d $r17, $a0, 216
+    ld.d $r18, $a0, 224
+    ld.d $r19, $a0, 232
+    ld.d $r20, $a0, 240
+    ld.d $r21, $a0, 248
 
     ld.d $t0, $a0, 256
     csrwr $t0, 0x6
@@ -216,6 +214,9 @@ __whuse_run_user:
     // Enable user extension units (FPU/SX/ASX) before entering userspace.
     li.d $t2, 0x7
     csrwr $t2, 0x2
+    ld.d $t0, $a0, 40
+    ld.d $t1, $a0, 48
+    ld.d $t2, $a0, 56
     csrwr $a0, 0x30
     ertn
 
@@ -226,6 +227,7 @@ __whuse_user_trap_entry:
 
     st.d $ra, $a0, 8
     st.d $sp, $a0, 16
+    st.d $r15, $a0, 24
     st.d $tp, $a0, 32
     st.d $t0, $a0, 40
     st.d $t1, $a0, 48
@@ -247,12 +249,12 @@ __whuse_user_trap_entry:
     st.d $s6, $a0, 184
     st.d $s7, $a0, 192
     st.d $s8, $a0, 200
-    st.d $r31, $a0, 208
-    st.d $r22, $a0, 216
-    st.d $r12, $a0, 224
-    st.d $r13, $a0, 232
-    st.d $r14, $a0, 240
-    st.d $r15, $a0, 248
+    st.d $r16, $a0, 208
+    st.d $r17, $a0, 216
+    st.d $r18, $a0, 224
+    st.d $r19, $a0, 232
+    st.d $r20, $a0, 240
+    st.d $r21, $a0, 248
 
     csrrd $t0, 0x30
     st.d $t0, $a0, 80

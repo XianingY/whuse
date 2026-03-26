@@ -279,8 +279,10 @@ version = "0.1.0"
 name = "whuse-loongarch64-virt"
 version = "0.1.0"
 dependencies = [
+ "hal-api",
  "hal-loongarch64-virt",
  "kernel-core",
+ "spin",
 ]
 
 [[package]]

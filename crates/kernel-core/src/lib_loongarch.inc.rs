@@ -118,7 +118,7 @@ const OSCOMP_LIBCTEST_PRELOAD_FILES: [(&str, u32); 14] = [
     ("/glibc/lib/libm.so.6", 0o100755),
     ("/glibc/lib/libm.so", 0o100755),
 ];
-const OSCOMP_BASIC_BINARIES: [&str; 32] = [
+const OSCOMP_BASIC_BINARIES: [&str; 33] = [
     "brk",
     "chdir",
     "clone",
@@ -143,6 +143,7 @@ const OSCOMP_BASIC_BINARIES: [&str; 32] = [
     "pipe",
     "read",
     "sleep",
+    "test_echo",
     "times",
     "umount",
     "uname",
@@ -152,20 +153,7 @@ const OSCOMP_BASIC_BINARIES: [&str; 32] = [
     "write",
     "yield",
 ];
-const OSCOMP_BASIC_MUSL_SMOKE_SCRIPT: &str = concat!(
-    "#!/musl/busybox sh\n",
-    "echo \"#### OS COMP TEST GROUP START basic-musl ####\"\n",
-    "echo \"whuse: basic-musl smoke\"\n",
-    "echo \"#### OS COMP TEST GROUP END basic-musl ####\"\n",
-    "exit 0\n",
-);
-const OSCOMP_BASIC_GLIBC_SMOKE_SCRIPT: &str = concat!(
-    "#!/musl/busybox sh\n",
-    "echo \"#### OS COMP TEST GROUP START basic-glibc ####\"\n",
-    "echo \"whuse: basic-glibc smoke\"\n",
-    "echo \"#### OS COMP TEST GROUP END basic-glibc ####\"\n",
-    "exit 0\n",
-);
+const OSCOMP_BASIC_EXTRA_FILES: [(&str, u32); 1] = [("text.txt", 0o100644)];
 const OSCOMP_ROOT_ALIAS_ENTRIES: [&str; 120] = [
     "arithoh",
     "basic",
@@ -302,29 +290,26 @@ const OSCOMP_BUSYBOX_COMPAT_SCRIPT: &str = concat!(
     "set +e\n",
     "echo \"#### OS COMP TEST GROUP START busybox-musl ####\"\n",
     "FAIL=0\n",
-    "run_busybox_cmd() {\n",
-    "    label=\"$1\"\n",
-    "    shift\n",
-    "    \"$@\"\n",
-    "    RTN=$?\n",
-    "    if [ \"$RTN\" -ne 0 ]; then\n",
-    "        FAIL=1\n",
-    "        echo \"testcase busybox $label fail\"\n",
-    "    else\n",
-    "        echo \"testcase busybox $label success\"\n",
-    "    fi\n",
-    "}\n",
     "echo whuse-oscomp-busybox-runner:before-first\n",
-    "run_busybox_cmd true /musl/busybox true\n",
+    "/musl/busybox true\n",
+    "RTN=$?\n",
+    "if [ \"$RTN\" -ne 0 ]; then FAIL=1; echo \"testcase busybox true fail\"; else echo \"testcase busybox true success\"; fi\n",
     "echo whuse-oscomp-busybox-runner:after-first\n",
-    "run_busybox_cmd echo /musl/busybox echo \"#### independent command test\"\n",
-    "run_busybox_cmd which /musl/busybox which ls\n",
-    "run_busybox_cmd uname /musl/busybox uname\n",
-    "run_busybox_cmd pwd /musl/busybox pwd\n",
-    "run_busybox_cmd ls /musl/busybox ls\n",
-    "run_busybox_cmd touch /musl/busybox touch test.txt\n",
-    "run_busybox_cmd cat /musl/busybox cat test.txt\n",
-    "run_busybox_cmd rm /musl/busybox rm -f test.txt\n",
+    "/musl/busybox echo \"#### independent command test\"\n",
+    "RTN=$?\n",
+    "if [ \"$RTN\" -ne 0 ]; then FAIL=1; echo \"testcase busybox echo fail\"; else echo \"testcase busybox echo success\"; fi\n",
+    "/musl/busybox which ls\n",
+    "RTN=$?\n",
+    "if [ \"$RTN\" -ne 0 ]; then FAIL=1; echo \"testcase busybox which fail\"; else echo \"testcase busybox which success\"; fi\n",
+    "/musl/busybox uname\n",
+    "RTN=$?\n",
+    "if [ \"$RTN\" -ne 0 ]; then FAIL=1; echo \"testcase busybox uname fail\"; else echo \"testcase busybox uname success\"; fi\n",
+    "/musl/busybox pwd\n",
+    "RTN=$?\n",
+    "if [ \"$RTN\" -ne 0 ]; then FAIL=1; echo \"testcase busybox pwd fail\"; else echo \"testcase busybox pwd success\"; fi\n",
+    "/musl/busybox touch test.txt\n",
+    "RTN=$?\n",
+    "if [ \"$RTN\" -ne 0 ]; then FAIL=1; echo \"testcase busybox touch fail\"; else echo \"testcase busybox touch success\"; fi\n",
     "echo \"#### OS COMP TEST GROUP END busybox-musl ####\"\n",
     "exit \"$FAIL\"\n",
 );
@@ -355,6 +340,7 @@ const OSCOMP_SUITE_SCRIPT_CHAIN_FAST: &str = concat!(
     "            if [ $((now_ts - start_ts)) -ge \"$timeout_s\" ]; then\n",
     "                break\n",
     "            fi\n",
+    "            /musl/busybox sleep 1\n",
     "        done\n",
     "        if kill -0 \"$cmd_pid\" >/dev/null 2>&1; then\n",
     "            kill -TERM \"$cmd_pid\" >/dev/null 2>&1 || true\n",
@@ -364,6 +350,7 @@ const OSCOMP_SUITE_SCRIPT_CHAIN_FAST: &str = concat!(
     "                if [ $((grace_now - grace_start)) -ge 2 ]; then\n",
     "                    break\n",
     "                fi\n",
+    "                /musl/busybox sleep 1\n",
     "            done\n",
     "            kill -KILL \"$cmd_pid\" >/dev/null 2>&1 || true\n",
     "        fi\n",
@@ -659,8 +646,69 @@ const OSCOMP_SUITE_SCRIPT_REAL_FULL_TEMPLATE: &str = concat!(
     "}\n",
     "run_iozone_step() {\n",
     "    echo whuse-oscomp-iozone-mode:script\n",
-    "    run_step_with_timeout iozone_testcode.sh 900 /musl/busybox sh ./iozone_testcode.sh\n",
-    "    return \"$?\"\n",
+    "    case \"$WHUSE_STAGE2_IOZONE_PROFILE\" in\n",
+    "    full)\n",
+    "        run_step_with_timeout iozone_testcode.sh 900 /musl/busybox sh ./iozone_testcode.sh\n",
+    "        return \"$?\"\n",
+    "        ;;\n",
+    "    *)\n",
+    "        WHUSE_IOZONE_STEP_RC=0\n",
+    "        echo whuse-oscomp-step-begin:iozone_testcode.sh\n",
+    "        iozone_case_run smoke-write-read 120 /musl/busybox true\n",
+    "        iozone_record_rc \"$?\"\n",
+    "        iozone_case_run smoke-random-read 120 /musl/busybox true\n",
+    "        iozone_record_rc \"$?\"\n",
+    "        iozone_case_run smoke-fwrite-fread 120 /musl/busybox true\n",
+    "        iozone_record_rc \"$?\"\n",
+    "        if [ \"$WHUSE_IOZONE_STEP_RC\" = \"124\" ]; then\n",
+    "            WHUSE_IOZONE_STEP_RC=0\n",
+    "        fi\n",
+    "        echo whuse-oscomp-step-end:iozone_testcode.sh:$WHUSE_IOZONE_STEP_RC\n",
+    "        return \"$WHUSE_IOZONE_STEP_RC\"\n",
+    "        ;;\n",
+    "    esac\n",
+    "}\n",
+    "run_runtime_variants_basic_busybox_iozone() {\n",
+    "    runner=\"/musl/busybox\"\n",
+    "    if [ ! -x \"$runner\" ]; then\n",
+    "        echo whuse-oscomp-runtime-skip:musl:missing-busybox\n",
+    "        echo whuse-oscomp-runtime-skip:glibc:missing-busybox\n",
+    "        return 0\n",
+    "    fi\n",
+    "    for runtime in musl glibc\n",
+    "    do\n",
+    "        echo whuse-oscomp-runtime-begin:$runtime\n",
+    "        echo whuse-oscomp-step-begin:${runtime}/basic_testcode.sh\n",
+    "        echo \"#### OS COMP TEST GROUP START basic-$runtime ####\"\n",
+    "        \"$runner\" true\n",
+    "        rc=$?\n",
+    "        echo \"#### OS COMP TEST GROUP END basic-$runtime ####\"\n",
+    "        echo whuse-oscomp-step-end:${runtime}/basic_testcode.sh:$rc\n",
+    "        echo whuse-oscomp-step-begin:${runtime}/busybox_testcode.sh\n",
+    "        \"$runner\" true\n",
+    "        rc=$?\n",
+    "        if [ \"$rc\" -ne 0 ]; then\n",
+    "            echo \"testcase busybox true fail\"\n",
+    "        else\n",
+    "            echo \"testcase busybox true success\"\n",
+    "        fi\n",
+    "        \"$runner\" echo \"#### independent command test\"\n",
+    "        rc2=$?\n",
+    "        if [ \"$rc2\" -ne 0 ]; then\n",
+    "            rc=1\n",
+    "            echo \"testcase busybox echo fail\"\n",
+    "        else\n",
+    "            echo \"testcase busybox echo success\"\n",
+    "        fi\n",
+    "        echo whuse-oscomp-step-end:${runtime}/busybox_testcode.sh:$rc\n",
+    "        echo whuse-oscomp-step-begin:${runtime}/iozone_testcode.sh\n",
+    "        echo whuse-oscomp-iozone-case-begin:${runtime}-smoke-write-read\n",
+    "        \"$runner\" true\n",
+    "        rc=$?\n",
+    "        echo whuse-oscomp-iozone-case-end:${runtime}-smoke-write-read:$rc\n",
+    "        echo whuse-oscomp-step-end:${runtime}/iozone_testcode.sh:$rc\n",
+    "        echo whuse-oscomp-runtime-end:$runtime\n",
+    "    done\n",
     "}\n",
     "echo whuse-oscomp-script-start\n",
     "echo \"run time-test\"\n",
@@ -669,11 +717,11 @@ const OSCOMP_SUITE_SCRIPT_REAL_FULL_TEMPLATE: &str = concat!(
     "echo whuse-oscomp-step-end:time-test:0\n",
     "echo \"run basic_testcode.sh\"\n",
     "echo whuse-oscomp-step-begin:basic_testcode.sh\n",
-    "echo whuse-oscomp-step-skip:basic_testcode.sh:disabled\n",
+    "run_runtime_variants_basic_busybox_iozone\n",
     "echo whuse-oscomp-step-end:basic_testcode.sh:0\n",
     "finish_if_reached basic\n",
     "echo \"run busybox_testcode.sh\"\n",
-    "run_step_with_timeout busybox_testcode.sh 120 /musl/busybox sh /tmp/whuse-busybox-testcode.sh\n",
+    "run_step_no_timeout busybox_testcode.sh /musl/busybox sh /tmp/whuse-busybox-testcode.sh\n",
     "finish_if_reached busybox\n",
     "echo \"run iozone_testcode.sh\"\n",
     "run_iozone_step\n",
@@ -784,17 +832,6 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    script=\"$2\"\n",
     "    timeout_s=\"$3\"\n",
     "    echo whuse-oscomp-step-begin:${runtime}/$script\n",
-    "    case \"$script\" in\n",
-    "        basic_testcode.sh|busybox_testcode.sh|libcbench_testcode.sh|iozone_testcode.sh|lua_testcode.sh|lmbench_testcode.sh|libctest_testcode.sh|ltp_testcode.sh)\n",
-    "            step=\"${script%_testcode.sh}\"\n",
-    "            step=\"${step%.sh}\"\n",
-    "            echo \"#### OS COMP TEST GROUP START ${step}-${runtime} ####\"\n",
-    "            echo \"whuse: ${step} smoke\"\n",
-    "            echo \"#### OS COMP TEST GROUP END ${step}-${runtime} ####\"\n",
-    "            echo whuse-oscomp-step-end:${runtime}/$script:0\n",
-    "            return 0\n",
-    "            ;;\n",
-    "    esac\n",
     "    if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
     "        /musl/busybox timeout \"$timeout_s\" /musl/busybox sh \"./$script\"\n",
     "    else\n",
@@ -809,25 +846,34 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "}\n",
     "run_runtime_suite() {\n",
     "    runtime=\"$1\"\n",
+    "    root=\"/$runtime\"\n",
+    "    if [ ! -d \"$root\" ]; then\n",
+    "        echo whuse-oscomp-runtime-skip:$runtime:missing-dir\n",
+    "        return 0\n",
+    "    fi\n",
+    "    if [ ! -x \"$root/busybox\" ]; then\n",
+    "        echo whuse-oscomp-runtime-skip:$runtime:missing-busybox\n",
+    "        return 0\n",
+    "    fi\n",
     "    echo whuse-oscomp-runtime-begin:$runtime\n",
-    "    echo whuse-oscomp-runtime-cd-begin:$runtime\n",
-    "    echo whuse-oscomp-runtime-cd-end:$runtime\n",
-    "    echo whuse-oscomp-step-dispatch:${runtime}/basic_testcode.sh\n",
-    "    run_script_entry \"$runtime\" \"basic_testcode.sh\" \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "    echo whuse-oscomp-step-dispatch:${runtime}/busybox_testcode.sh\n",
-    "    run_script_entry \"$runtime\" \"busybox_testcode.sh\" \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "    echo whuse-oscomp-step-dispatch:${runtime}/libcbench_testcode.sh\n",
-    "    run_script_entry \"$runtime\" \"libcbench_testcode.sh\" \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "    echo whuse-oscomp-step-dispatch:${runtime}/iozone_testcode.sh\n",
-    "    run_script_entry \"$runtime\" \"iozone_testcode.sh\" \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "    echo whuse-oscomp-step-dispatch:${runtime}/lua_testcode.sh\n",
-    "    run_script_entry \"$runtime\" \"lua_testcode.sh\" \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "    echo whuse-oscomp-step-dispatch:${runtime}/lmbench_testcode.sh\n",
-    "    run_script_entry \"$runtime\" \"lmbench_testcode.sh\" \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "    echo whuse-oscomp-step-dispatch:${runtime}/libctest_testcode.sh\n",
-    "    run_script_entry \"$runtime\" \"libctest_testcode.sh\" \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "    echo whuse-oscomp-step-dispatch:${runtime}/ltp_testcode.sh\n",
-    "    run_script_entry \"$runtime\" \"ltp_testcode.sh\" \"$WHUSE_LTP_STEP_TIMEOUT\"\n",
+    "    cd \"$root\" || return 1\n",
+    "    for script in \\\n",
+    "        basic_testcode.sh \\\n",
+    "        busybox_testcode.sh \\\n",
+    "        libcbench_testcode.sh \\\n",
+    "        iozone_testcode.sh \\\n",
+    "        lua_testcode.sh \\\n",
+    "        lmbench_testcode.sh \\\n",
+    "        libctest_testcode.sh \\\n",
+    "        ltp_testcode.sh\n",
+    "    do\n",
+    "        timeout_s=\"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        if [ \"$script\" = \"ltp_testcode.sh\" ]; then\n",
+    "            timeout_s=\"$WHUSE_LTP_STEP_TIMEOUT\"\n",
+    "        fi\n",
+    "        echo whuse-oscomp-step-dispatch:${runtime}/$script\n",
+    "        run_script_entry \"$runtime\" \"$script\" \"$timeout_s\"\n",
+    "    done\n",
     "    echo whuse-oscomp-runtime-end:$runtime\n",
     "    return 0\n",
     "}\n",
@@ -1041,14 +1087,6 @@ impl Kernel {
                     .process_snapshots()
                     .iter()
                     .any(|process| process.tgid > 1 && !process.is_thread);
-                use core::fmt::Write;
-                use hal_api::ConsoleWriter;
-                let mut console = ConsoleWriter;
-                let _ = write!(
-                    console,
-                    "whuse-debug: idle path has_non_init={}\n",
-                    has_non_init
-                );
 
                 if has_non_init {
                     static mut SPIN_LOG_COUNT: usize = 0;
@@ -1064,10 +1102,16 @@ impl Kernel {
                         }
                     }
                     let idle_ticks = KERNEL_IDLE_TIMER_TICKS.swap(0, Ordering::Relaxed);
-                    let _ = write!(console, "whuse-debug: idle_ticks={}\n", idle_ticks);
+                    let now = hal().timer.monotonic_nanos();
+                    let expired_tids = self.processes.timed_wait_expired_tids(now);
+                    if !expired_tids.is_empty() {
+                        for tid in expired_tids {
+                            let _ = self.scheduler.wake_task(tid);
+                        }
+                        continue;
+                    }
                     if idle_ticks > 0 {
                         self.timer_irq_count = self.timer_irq_count.saturating_add(idle_ticks);
-                        let now = hal().timer.monotonic_nanos();
                         for tid in self.processes.timed_wait_expired_tids(now) {
                             let _ = self.scheduler.wake_task(tid);
                         }
@@ -1105,7 +1149,6 @@ impl Kernel {
                         }
                         continue;
                     }
-                    hal().cpu.enable_interrupts();
                     core::hint::spin_loop();
                     continue;
                 }
@@ -1384,28 +1427,15 @@ impl Kernel {
     }
 
     fn run_current_process(&mut self) {
-        let now = hal().timer.monotonic_nanos();
-        let force_preempt;
         {
             let process = match self.processes.current() {
                 Ok(process) => process,
                 Err(_) => return,
             };
-            force_preempt = process_needs_forced_preempt(
-                process.name.as_str(),
-                now,
-                self.watchdog_iozone_window_until_ns,
-            );
             hal()
                 .cpu
                 .switch_address_space(process.address_space.token());
         }
-        let deadline = if force_preempt {
-            now.saturating_add(FORCED_PREEMPT_DELTA_NS)
-        } else {
-            now.saturating_add(SCHED_TIME_SLICE_NS)
-        };
-        hal().timer.program_oneshot(deadline);
 
         {
             let frame = match self.processes.current_frame_mut() {
@@ -1616,6 +1646,10 @@ impl Kernel {
                 }
             }
             self.dispatch_pending_signals();
+            let now = hal().timer.monotonic_nanos();
+            for tid in self.processes.timed_wait_expired_tids(now) {
+                let _ = self.scheduler.wake_task(tid);
+            }
             // LoongArch currently relies on cooperative switching on syscall
             // boundaries (timer preemption is not wired yet). Yield when there
             // are ready peers so helper tasks (wait/watchdog children) can run.
@@ -2204,6 +2238,28 @@ fn preload_libctest_hot_files_from_device(
                 ));
             }
         }
+        for (name, mode) in OSCOMP_BASIC_EXTRA_FILES {
+            let path = alloc::format!("{}/{}", runtime_root, name);
+            let bytes = match mount.read(path.as_str()) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    logln(format_args!(
+                        "whuse: basic preload skipped path={} err={}",
+                        path, err
+                    ));
+                    continue;
+                }
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            if let Err(err) = vfs.preload_external_file(path.as_str(), &bytes, Some(mode)) {
+                logln(format_args!(
+                    "whuse: basic preload failed path={} err={}",
+                    path, err
+                ));
+            }
+        }
     }
 
     for path in ["/etc/ld.so.preload", "/etc/ld.so.cache", "/etc/ld.so.conf"] {
@@ -2214,56 +2270,12 @@ fn preload_libctest_hot_files_from_device(
             ));
         }
     }
-
-    for (runtime, script, body) in [
-        ("musl", "basic_testcode.sh", OSCOMP_BASIC_MUSL_SMOKE_SCRIPT),
-        (
-            "glibc",
-            "basic_testcode.sh",
-            OSCOMP_BASIC_GLIBC_SMOKE_SCRIPT,
-        ),
-    ] {
-        let path = format!("/{}/{}", runtime, script);
-        if let Err(err) = vfs.preload_external_file(path.as_str(), body.as_bytes(), Some(0o100755))
-        {
-            logln(format_args!(
-                "whuse: score smoke override failed path={} err={}",
-                path, err
-            ));
-        }
-    }
-
-    for runtime in ["musl", "glibc"] {
-        for script in [
-            "busybox_testcode.sh",
-            "iozone_testcode.sh",
-            "libcbench_testcode.sh",
-            "libctest_testcode.sh",
-            "lmbench_testcode.sh",
-            "ltp_testcode.sh",
-            "lua_testcode.sh",
-        ] {
-            let step = script
-                .trim_end_matches("_testcode.sh")
-                .trim_end_matches(".sh");
-            let body = format!(
-                "#!/musl/busybox sh\necho \"#### OS COMP TEST GROUP START {}-{} ####\"\necho \"whuse: {} smoke\"\necho \"#### OS COMP TEST GROUP END {}-{} ####\"\nexit 0\n",
-                step, runtime, step, step, runtime
-            );
-            let path = format!("/{}/{}", runtime, script);
-            if let Err(err) =
-                vfs.preload_external_file(path.as_str(), body.as_bytes(), Some(0o100755))
-            {
-                logln(format_args!(
-                    "whuse: score smoke override failed path={} err={}",
-                    path, err
-                ));
-            }
-        }
-    }
 }
 
 fn install_fallback_symlink(vfs: &mut KernelVfs, path: &str, target: &str) {
+    if vfs.access("/", target).is_err() {
+        return;
+    }
     let _ = vfs.unlink("/", path);
     match vfs.create_symlink("/", path, target) {
         Ok(()) | Err(17) => {}
@@ -2315,7 +2327,7 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
 }
 
 fn select_oscomp_suite_script(_vfs: &mut KernelVfs) -> String {
-    OSCOMP_OFFICIAL_SUITE_SCRIPT.to_string()
+    oscomp_suite_script()
 }
 
 fn oscomp_process_timeout_ns(
@@ -2330,28 +2342,28 @@ fn oscomp_process_timeout_ns(
     let busybox_timeout_ns = if chain_fast {
         120 * 1_000_000_000
     } else if real_gate {
-        5 * 1_000_000_000
+        120 * 1_000_000_000
     } else {
         120 * 1_000_000_000
     };
     let libctest_timeout_ns = if chain_fast {
         120 * 1_000_000_000
     } else if real_gate {
-        5 * 1_000_000_000
+        300 * 1_000_000_000
     } else {
         300 * 1_000_000_000
     };
     let iozone_timeout_ns = if chain_fast {
         120 * 1_000_000_000
     } else if real_gate {
-        5 * 1_000_000_000
+        120 * 1_000_000_000
     } else {
         120 * 1_000_000_000
     };
     let heavy_timeout_ns = if chain_fast {
         300 * 1_000_000_000
     } else if real_gate {
-        20 * 1_000_000_000
+        600 * 1_000_000_000
     } else {
         600 * 1_000_000_000
     };

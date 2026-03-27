@@ -21,6 +21,10 @@ export WHUSE_STAGE2_GATE_LIBCTEST_SCOPE="${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE:-ful
 export WHUSE_STAGE2_FULL_MAX_GROUP="${WHUSE_STAGE2_FULL_MAX_GROUP:-all}"
 export WHUSE_STAGE2_IOZONE_PROFILE="${WHUSE_STAGE2_IOZONE_PROFILE:-smoke}"
 export WHUSE_STAGE2_IOZONE_FULL_SCOPE="${WHUSE_STAGE2_IOZONE_FULL_SCOPE:-full}"
+export WHUSE_STAGE2_BASIC_PROFILE="${WHUSE_STAGE2_BASIC_PROFILE:-full}"
+export WHUSE_STAGE2_BUSYBOX_PROFILE="${WHUSE_STAGE2_BUSYBOX_PROFILE:-full}"
+export WHUSE_STAGE2_LIBCBENCH_SCOPE="${WHUSE_STAGE2_LIBCBENCH_SCOPE:-full}"
+export WHUSE_STAGE2_LMBENCH_SCOPE="${WHUSE_STAGE2_LMBENCH_SCOPE:-full}"
 export WHUSE_STAGE2_CHAIN_REAL_STEPS="${WHUSE_STAGE2_CHAIN_REAL_STEPS:-busybox_testcode.sh,iozone_testcode.sh,libctest_testcode.sh}"
 export WHUSE_OSCOMP_PROFILE="${WHUSE_OSCOMP_PROFILE:-}"
 
@@ -53,9 +57,9 @@ smoke | full) ;;
 	;;
 esac
 case "${WHUSE_STAGE2_FULL_MAX_GROUP}" in
-time-test | busybox | iozone | libctest | libc-bench | lmbench | lua | unixbench | netperf | iperf | cyclic | all) ;;
+time-test | basic | busybox | iozone | libctest | libc-bench | lmbench | lua | unixbench | netperf | iperf | ltp | cyclic | all) ;;
 *)
-	echo "WHUSE_STAGE2_FULL_MAX_GROUP must be one of: time-test,busybox,iozone,libctest,libc-bench,lmbench,lua,unixbench,netperf,iperf,cyclic,all" >&2
+	echo "WHUSE_STAGE2_FULL_MAX_GROUP must be one of: time-test,basic,busybox,iozone,libctest,libc-bench,lmbench,lua,unixbench,netperf,iperf,ltp,cyclic,all" >&2
 	exit 1
 	;;
 esac
@@ -70,6 +74,34 @@ case "${WHUSE_STAGE2_IOZONE_FULL_SCOPE}" in
 probe | full) ;;
 *)
 	echo "WHUSE_STAGE2_IOZONE_FULL_SCOPE must be probe or full" >&2
+	exit 1
+	;;
+esac
+case "${WHUSE_STAGE2_BASIC_PROFILE}" in
+full | smoke) ;;
+*)
+	echo "WHUSE_STAGE2_BASIC_PROFILE must be full or smoke" >&2
+	exit 1
+	;;
+esac
+case "${WHUSE_STAGE2_BUSYBOX_PROFILE}" in
+full | smoke) ;;
+*)
+	echo "WHUSE_STAGE2_BUSYBOX_PROFILE must be full or smoke" >&2
+	exit 1
+	;;
+esac
+case "${WHUSE_STAGE2_LIBCBENCH_SCOPE}" in
+full | smoke) ;;
+*)
+	echo "WHUSE_STAGE2_LIBCBENCH_SCOPE must be full or smoke" >&2
+	exit 1
+	;;
+esac
+case "${WHUSE_STAGE2_LMBENCH_SCOPE}" in
+full | smoke) ;;
+*)
+	echo "WHUSE_STAGE2_LMBENCH_SCOPE must be full or smoke" >&2
 	exit 1
 	;;
 esac
@@ -143,7 +175,27 @@ profile_root_step() {
 resolve_expected_root_steps() {
 	local profile="${1:-full}"
 	if [[ -z "${profile}" || "${profile}" == "full" ]]; then
-		printf '%s\n' "${full_root_steps[@]}"
+		local step
+		for step in "${full_root_steps[@]}"; do
+			printf '%s\n' "${step}"
+			case "${step}:${WHUSE_STAGE2_FULL_MAX_GROUP}" in
+			time-test:time-test | \
+				basic_testcode.sh:basic | \
+				busybox_testcode.sh:busybox | \
+				iozone_testcode.sh:iozone | \
+				libctest_testcode.sh:libctest | \
+				libc-bench:libc-bench | \
+				lmbench_testcode.sh:lmbench | \
+				lua_testcode.sh:lua | \
+				unixbench_testcode.sh:unixbench | \
+				netperf_testcode.sh:netperf | \
+				iperf_testcode.sh:iperf | \
+				ltp_testcode.sh:ltp | \
+				cyclic_testcode.sh:cyclic)
+				return 0
+				;;
+			esac
+		done
 		return 0
 	fi
 	profile_root_step "${profile}"
@@ -302,6 +354,20 @@ inject_oscomp_profile() {
 	write_runtime_image_config "${image}" "/whuse-oscomp-profile" "${profile}"
 }
 
+inject_stage2_local_env() {
+	local image="$1"
+	local local_env
+	printf -v local_env '%s\n%s\n%s\n' \
+		"WHUSE_STAGE2_FULL_MAX_GROUP=${WHUSE_STAGE2_FULL_MAX_GROUP}" \
+		"WHUSE_STAGE2_IOZONE_PROFILE=${WHUSE_STAGE2_IOZONE_PROFILE}" \
+		"WHUSE_STAGE2_BASIC_PROFILE=${WHUSE_STAGE2_BASIC_PROFILE}"
+	local_env+="WHUSE_STAGE2_BUSYBOX_PROFILE=${WHUSE_STAGE2_BUSYBOX_PROFILE}"$'\n'
+	local_env+="WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE}"$'\n'
+	local_env+="WHUSE_STAGE2_LIBCBENCH_SCOPE=${WHUSE_STAGE2_LIBCBENCH_SCOPE}"$'\n'
+	local_env+="WHUSE_STAGE2_LMBENCH_SCOPE=${WHUSE_STAGE2_LMBENCH_SCOPE}"$'\n'
+	write_runtime_image_config "${image}" "/musl/.whuse_stage2_local.env" "${local_env}"
+}
+
 inject_stage2_profile_files() {
 	local arch="$1"
 	local image="$2"
@@ -317,7 +383,8 @@ inject_stage2_profile_files() {
 	if [[ -n "${WHUSE_OSCOMP_PROFILE}" ]]; then
 		inject_oscomp_profile "${image}" "${WHUSE_OSCOMP_PROFILE}"
 	fi
-	echo "[${arch}] stage2 timeout profile: ${WHUSE_STAGE2_TIMEOUT_PROFILE}, real-phase: ${WHUSE_STAGE2_REAL_PHASE}, gate-libctest-scope: ${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE}, full-max-group: ${WHUSE_STAGE2_FULL_MAX_GROUP}, iozone-profile: ${WHUSE_STAGE2_IOZONE_PROFILE}, iozone-full-scope: ${WHUSE_STAGE2_IOZONE_FULL_SCOPE} (chain-real-steps=${WHUSE_STAGE2_CHAIN_REAL_STEPS}, oscomp-profile=${effective_profile})"
+	inject_stage2_local_env "${image}"
+	echo "[${arch}] stage2 timeout profile: ${WHUSE_STAGE2_TIMEOUT_PROFILE}, real-phase: ${WHUSE_STAGE2_REAL_PHASE}, gate-libctest-scope: ${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE}, libcbench-scope: ${WHUSE_STAGE2_LIBCBENCH_SCOPE}, lmbench-scope: ${WHUSE_STAGE2_LMBENCH_SCOPE}, full-max-group: ${WHUSE_STAGE2_FULL_MAX_GROUP}, basic-profile: ${WHUSE_STAGE2_BASIC_PROFILE}, busybox-profile: ${WHUSE_STAGE2_BUSYBOX_PROFILE}, iozone-profile: ${WHUSE_STAGE2_IOZONE_PROFILE}, iozone-full-scope: ${WHUSE_STAGE2_IOZONE_FULL_SCOPE} (chain-real-steps=${WHUSE_STAGE2_CHAIN_REAL_STEPS}, oscomp-profile=${effective_profile})"
 }
 
 run_xtask_with_timeout() {

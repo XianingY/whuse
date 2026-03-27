@@ -257,6 +257,27 @@ fn stage2_openat_debug(line: &str) {
     hal().console.put_byte(b'\n');
 }
 
+fn iozone_probe_log(line: &str) {
+    for byte in line.bytes() {
+        hal().console.put_byte(byte);
+    }
+    hal().console.put_byte(b'\n');
+}
+
+fn is_iozone_script_probe_path(path: &str) -> bool {
+    matches!(
+        path,
+        "iozone_testcode.sh"
+            | "./iozone_testcode.sh"
+            | "/musl/iozone_testcode.sh"
+            | "/glibc/iozone_testcode.sh"
+    )
+}
+
+fn is_iozone_probe_path(path: &str) -> bool {
+    is_iozone_script_probe_path(path) || path.contains("iozone")
+}
+
 impl KernelVfs {
     pub fn new() -> Self {
         let root = Arc::new(Node::directory("/"));
@@ -401,8 +422,27 @@ impl KernelVfs {
         mode: u32,
     ) -> KernelResult<FileHandle> {
         let absolute = normalize_path(cwd, path);
+        let iozone_probe = is_iozone_probe_path(absolute.as_str());
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-open-enter cwd={} path={} absolute={} flags={:#x}",
+                cwd, path, absolute, flags
+            ));
+        }
         if let Some(handle) = self.try_open_external(&absolute, flags)? {
+            if iozone_probe {
+                iozone_probe_log(&format!(
+                    "whuse-la-iozone:vfs-open-external-ok absolute={} resolved={}",
+                    absolute, handle.path
+                ));
+            }
             return Ok(handle);
+        }
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-open-fallback-mem absolute={}",
+                absolute
+            ));
         }
         self.open_mem(&absolute, flags, mode)
     }
@@ -1471,10 +1511,23 @@ impl KernelVfs {
     }
 
     fn stat_path_follow(&self, absolute: &str, depth: usize) -> KernelResult<FileStat> {
+        let iozone_probe = is_iozone_probe_path(absolute);
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-stat-path-enter absolute={} depth={}",
+                absolute, depth
+            ));
+        }
         if depth >= 16 {
             return Err(ELOOP);
         }
         if let Some(stat) = self.external_stat_path(absolute)? {
+            if iozone_probe {
+                iozone_probe_log(&format!(
+                    "whuse-la-iozone:vfs-stat-path-external-hit absolute={} mode={:#o} size={}",
+                    absolute, stat.mode, stat.size
+                ));
+            }
             return Ok(stat);
         }
         let node = self.lookup_abs(absolute)?;
@@ -1486,6 +1539,12 @@ impl KernelVfs {
             let parent = split_parent(absolute)?.0;
             let resolved = normalize_path(&parent, &target);
             return self.stat_path_follow(&resolved, depth + 1);
+        }
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-stat-path-mem-hit absolute={} kind={:?}",
+                absolute, node.kind
+            ));
         }
         self.stat(absolute, &node)
     }
@@ -1508,26 +1567,72 @@ impl KernelVfs {
     }
 
     fn external_stat_path(&self, absolute: &str) -> KernelResult<Option<FileStat>> {
+        let iozone_probe = is_iozone_probe_path(absolute);
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-external-stat-enter absolute={}",
+                absolute
+            ));
+        }
         if is_shell_token_path(absolute) {
             return Ok(None);
         }
-        if self.is_memory_preferred_path(absolute) && self.lookup_abs(absolute).is_ok() {
+        if self.lookup_abs(absolute).is_ok() {
+            if iozone_probe {
+                iozone_probe_log(&format!(
+                    "whuse-la-iozone:vfs-external-stat-mem-hit absolute={}",
+                    absolute
+                ));
+            }
+            return Ok(None);
+        }
+        if self.is_memory_preferred_path(absolute) {
+            if iozone_probe {
+                iozone_probe_log(&format!(
+                    "whuse-la-iozone:vfs-external-stat-memory-preferred absolute={}",
+                    absolute
+                ));
+            }
             return Ok(None);
         }
         if let Some((_, stat)) = self.external_preloaded.get(absolute) {
+            if iozone_probe {
+                iozone_probe_log(&format!(
+                    "whuse-la-iozone:vfs-external-stat-preloaded absolute={} mode={:#o} size={}",
+                    absolute, stat.mode, stat.size
+                ));
+            }
             return Ok(Some(*stat));
         }
         if self.external_deletions.contains(absolute) {
             return Ok(None);
         }
         if let Some(stat) = self.external_stat_cache.get(absolute) {
+            if iozone_probe {
+                iozone_probe_log(&format!(
+                    "whuse-la-iozone:vfs-external-stat-cache-hit absolute={} mode={:#o} size={}",
+                    absolute, stat.mode, stat.size
+                ));
+            }
             return Ok(Some(*stat));
         }
         // hal_api::hal().console.put_byte(b'M'); // Mark a miss if needed, or use full trace
 
         let Some((mount, fs_path)) = self.resolve_external_path(absolute) else {
+            if iozone_probe {
+                iozone_probe_log(&format!(
+                    "whuse-la-iozone:vfs-external-stat-no-mount absolute={}",
+                    absolute
+                ));
+            }
             return Ok(None);
         };
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-external-stat-resolved absolute={} fs_path={}",
+                absolute, fs_path
+            ));
+        }
 
         let dir_prefix = if absolute == "/" {
             "/".to_string()
@@ -1541,8 +1646,14 @@ impl KernelVfs {
             || self
                 .external_stat_cache
                 .keys()
-                .any(|entry| entry.starts_with(&dir_prefix))
+            .any(|entry| entry.starts_with(&dir_prefix))
         {
+            if iozone_probe {
+                iozone_probe_log(&format!(
+                    "whuse-la-iozone:vfs-external-stat-dir-synth absolute={}",
+                    absolute
+                ));
+            }
             return Ok(Some(FileStat {
                 mode: S_IFDIR | 0o755,
                 size: 0,
@@ -1551,13 +1662,29 @@ impl KernelVfs {
         }
 
         match mount.ext4.stat(&fs_path) {
-            Ok(stat) => Ok(Some(FileStat {
-                mode: stat.mode,
-                size: stat.size,
-                nlink: stat.nlink,
-            })),
+            Ok(stat) => {
+                if iozone_probe {
+                    iozone_probe_log(&format!(
+                        "whuse-la-iozone:vfs-external-stat-ok absolute={} fs_path={} mode={:#o} size={}",
+                        absolute, fs_path, stat.mode, stat.size
+                    ));
+                }
+                Ok(Some(FileStat {
+                    mode: stat.mode,
+                    size: stat.size,
+                    nlink: stat.nlink,
+                }))
+            }
             Err(err) if err == ENOENT => Ok(None),
-            Err(err) => Err(err),
+            Err(err) => {
+                if iozone_probe {
+                    iozone_probe_log(&format!(
+                        "whuse-la-iozone:vfs-external-stat-err absolute={} fs_path={} err={}",
+                        absolute, fs_path, err
+                    ));
+                }
+                Err(err)
+            }
         }
     }
 
@@ -1566,21 +1693,58 @@ impl KernelVfs {
         absolute: &str,
         flags: u32,
     ) -> KernelResult<Option<FileHandle>> {
+        let iozone_probe = is_iozone_probe_path(absolute);
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-try-open-external-enter absolute={} flags={:#x}",
+                absolute, flags
+            ));
+        }
         if is_shell_token_path(absolute) {
             return Ok(None);
         }
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-try-open-external-before-lookup absolute={}",
+                absolute
+            ));
+        }
         if self.lookup_abs(absolute).is_ok() {
+            if iozone_probe {
+                iozone_probe_log(&format!(
+                    "whuse-la-iozone:vfs-try-open-external-hit-mem absolute={}",
+                    absolute
+                ));
+            }
             return Ok(None);
         }
         if self.external_deletions.contains(absolute) {
             return Ok(None);
         }
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-try-open-external-before-resolve absolute={}",
+                absolute
+            ));
+        }
         let (mount, fs_path) = {
             let Some((mount, fs_path)) = self.resolve_external_path(absolute) else {
+                if iozone_probe {
+                    iozone_probe_log(&format!(
+                        "whuse-la-iozone:vfs-try-open-external-no-mount absolute={}",
+                        absolute
+                    ));
+                }
                 return Ok(None);
             };
             (mount.ext4.clone(), fs_path)
         };
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-try-open-external-resolved absolute={} fs_path={}",
+                absolute, fs_path
+            ));
+        }
         let trace_path = stage2_openat_debug_enabled()
             && (absolute.starts_with("/musl/")
                 || absolute.starts_with("/lib/")
@@ -1588,6 +1752,12 @@ impl KernelVfs {
                 || absolute.starts_with("/glibc/"));
         if flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC) != 0 {
             return Ok(None);
+        }
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-try-open-external-check-preloaded absolute={}",
+                absolute
+            ));
         }
         if let Some((cached, stat)) = self.external_preloaded.get(absolute).cloned() {
             if trace_path {
@@ -1613,6 +1783,13 @@ impl KernelVfs {
         }
 
         let cached = self.external_stat_cache.get(absolute).copied();
+        if iozone_probe {
+            iozone_probe_log(&format!(
+                "whuse-la-iozone:vfs-try-open-external-cache absolute={} hit={}",
+                absolute,
+                cached.is_some()
+            ));
+        }
         if cached.is_none() && should_use_statless_external_open(absolute, flags) {
             if trace_path {
                 stage2_openat_debug(&format!(
@@ -1639,6 +1816,12 @@ impl KernelVfs {
                 nlink: stat.nlink,
             },
             None => {
+                if iozone_probe {
+                    iozone_probe_log(&format!(
+                        "whuse-la-iozone:vfs-try-open-external-stat-begin absolute={} fs_path={} flags={:#x}",
+                        absolute, fs_path, flags
+                    ));
+                }
                 if trace_path {
                     stage2_openat_debug(&format!(
                         "whuse-libctest:vfs-open-external-stat-begin path={} fs_path={} flags={:#x}",
@@ -1648,6 +1831,12 @@ impl KernelVfs {
                 let stat = match mount.stat(&fs_path) {
                     Ok(stat) => stat,
                     Err(err) if err == ENOENT => {
+                        if iozone_probe {
+                            iozone_probe_log(&format!(
+                                "whuse-la-iozone:vfs-try-open-external-stat-enoent absolute={} fs_path={}",
+                                absolute, fs_path
+                            ));
+                        }
                         if trace_path {
                             stage2_openat_debug(&format!(
                                 "whuse-libctest:vfs-open-external-stat-enoent path={} fs_path={}",
@@ -1657,6 +1846,12 @@ impl KernelVfs {
                         return Ok(None);
                     }
                     Err(err) => {
+                        if iozone_probe {
+                            iozone_probe_log(&format!(
+                                "whuse-la-iozone:vfs-try-open-external-stat-err absolute={} fs_path={} err={}",
+                                absolute, fs_path, err
+                            ));
+                        }
                         if trace_path {
                             stage2_openat_debug(&format!(
                                 "whuse-libctest:vfs-open-external-stat-err path={} fs_path={} err={}",
@@ -1666,6 +1861,12 @@ impl KernelVfs {
                         return Err(err);
                     }
                 };
+                if iozone_probe {
+                    iozone_probe_log(&format!(
+                        "whuse-la-iozone:vfs-try-open-external-stat-ok absolute={} fs_path={} mode={:#o} size={}",
+                        absolute, fs_path, stat.mode, stat.size
+                    ));
+                }
                 if trace_path {
                     stage2_openat_debug(&format!(
                         "whuse-libctest:vfs-open-external-stat-ok path={} fs_path={} mode={:#o} size={}",
@@ -2714,6 +2915,12 @@ mod tests {
         image
     }
 
+    fn repo_target_image(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/oscomp")
+            .join(relative)
+    }
+
     #[test]
     fn vfs_file_round_trip() {
         let mut vfs = KernelVfs::new();
@@ -2815,5 +3022,31 @@ mod tests {
             .open("/", "/musl/basic/wait", super::O_RDONLY, 0)
             .unwrap();
         assert_eq!(vfs.read(&mut after, 16).unwrap(), b"wait-ok");
+    }
+
+    #[test]
+    fn real_loongarch_image_alias_reads_musl_loader() {
+        let image = repo_target_image("sdcard-la.img");
+        if !image.exists() {
+            return;
+        }
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+        let _ = vfs.mkdir("/", "/lib64", 0o755);
+        vfs.create_symlink("/", "/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so")
+            .unwrap();
+
+        let mut direct = vfs.open("/", "/musl/lib/libc.so", super::O_RDONLY, 0).unwrap();
+        let direct_bytes = vfs.read(&mut direct, 4 * 1024 * 1024).unwrap();
+        assert!(!direct_bytes.is_empty());
+
+        let mut alias = vfs
+            .open("/", "/lib64/ld-musl-loongarch-lp64d.so.1", super::O_RDONLY, 0)
+            .unwrap();
+        let alias_bytes = vfs.read(&mut alias, 4 * 1024 * 1024).unwrap();
+        assert_eq!(alias_bytes, direct_bytes);
     }
 }

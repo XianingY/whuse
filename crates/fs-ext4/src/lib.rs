@@ -438,6 +438,12 @@ mod tests {
         image
     }
 
+    fn repo_target_image(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/oscomp")
+            .join(relative)
+    }
+
     #[test]
     fn probe_and_read_file_from_ext4_image() {
         let image = build_test_image();
@@ -469,11 +475,12 @@ mod tests {
 
     #[test]
     fn real_oscomp_image_stats_lmbench_script() {
-        let image = Path::new("/home/wslootie/github/whuse/target/oscomp/sdcard-rv.img");
+        let image = repo_target_image("sdcard-rv.img");
         if !image.exists() {
             return;
         }
-        let device = std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(image)));
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
         let mount = Ext4Mount::probe(device).unwrap();
 
         let stat = mount.stat("/musl/lmbench_testcode.sh").unwrap();
@@ -484,5 +491,29 @@ mod tests {
             .read_range("/musl/lmbench_testcode.sh", 0, 64)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn real_loongarch_oscomp_image_reads_musl_loader_range() {
+        let image = repo_target_image("sdcard-la.img");
+        if !image.exists() {
+            return;
+        }
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+        let mount = Ext4Mount::probe(device).unwrap();
+
+        let stat = mount.stat("/musl/lib/libc.so").unwrap();
+        assert_eq!(stat.mode & 0o170000, 0o100000);
+        assert!(stat.size > 0);
+
+        let full = mount.read("/musl/lib/libc.so").unwrap();
+        assert!(!full.is_empty());
+
+        let ranged = mount
+            .read_range("/musl/lib/libc.so", 0, full.len().max(256 * 1024))
+            .unwrap();
+        assert!(!ranged.is_empty());
+        assert_eq!(ranged, full);
     }
 }

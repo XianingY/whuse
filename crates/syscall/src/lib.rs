@@ -445,6 +445,31 @@ fn is_libctest_probe_path(path: &str) -> bool {
     )
 }
 
+fn is_iozone_script_probe_path(path: &str) -> bool {
+    matches!(
+        path,
+        "iozone_testcode.sh"
+            | "./iozone_testcode.sh"
+            | "/musl/iozone_testcode.sh"
+            | "/glibc/iozone_testcode.sh"
+    )
+}
+
+fn is_iozone_binary_probe_path(path: &str) -> bool {
+    matches!(path, "/musl/iozone" | "/glibc/iozone" | "./iozone" | "iozone")
+}
+
+fn is_iozone_probe_target(name: &str, path: &str) -> bool {
+    is_iozone_task_name(name)
+        || is_iozone_script_probe_path(path)
+        || is_iozone_binary_probe_path(path)
+        || path.contains("iozone")
+}
+
+fn is_glibc_iozone_shell(name: &str, cwd: &str) -> bool {
+    cwd == "/glibc" && name.contains("busybox")
+}
+
 fn cancel_debug(line: &str) {
     if cancel_debug_enabled() {
         log_always(line);
@@ -458,6 +483,7 @@ fn signal_frame_debug(line: &str) {
 }
 
 static LIBCBENCH_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(4096);
+static IOZONE_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(512);
 
 fn is_libcbench_task(process: &proc::Process) -> bool {
     process.name.contains("libc-bench")
@@ -465,6 +491,25 @@ fn is_libcbench_task(process: &proc::Process) -> bool {
 
 fn libcbench_debug(line: &str) {
     if LIBCBENCH_TRACE_BUDGET
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            if remaining > 0 {
+                Some(remaining - 1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+    {
+        log_always(line);
+    }
+}
+
+fn is_iozone_task_name(name: &str) -> bool {
+    name == "iozone" || name.ends_with("/iozone")
+}
+
+fn iozone_debug(line: &str) {
+    if IOZONE_TRACE_BUDGET
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
             if remaining > 0 {
                 Some(remaining - 1)
@@ -926,10 +971,28 @@ impl SyscallDispatcher {
             scheduler,
             vfs,
         };
+        let mut iozone_trace_process: Option<(usize, String)> = None;
         if syscall_trace_enabled() {
             if let Ok(process) = ctx.procs.current() {
                 trace_line(&format!(
                     "whuse: syscall enter tgid={} name={} sysno={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    process.tgid,
+                    process.name,
+                    sysno,
+                    args.0[0],
+                    args.0[1],
+                    args.0[2],
+                    args.0[3],
+                    args.0[4],
+                    args.0[5]
+                ));
+            }
+        }
+        if let Ok(process) = ctx.procs.current() {
+            if is_iozone_task_name(&process.name) {
+                iozone_trace_process = Some((process.tgid, process.name.clone()));
+                iozone_debug(&format!(
+                    "whuse-iozone-syscall-enter tgid={} name={} sysno={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
                     process.tgid,
                     process.name,
                     sysno,
@@ -986,6 +1049,12 @@ impl SyscallDispatcher {
                     process.tgid, process.name, sysno, res
                 ));
             }
+        }
+        if let Some((tgid, name)) = iozone_trace_process {
+            iozone_debug(&format!(
+                "whuse-iozone-syscall-exit tgid={} name={} sysno={} res={:#x}",
+                tgid, name, sysno, res
+            ));
         }
         res
     }
@@ -1144,6 +1213,13 @@ impl SyscallDispatcher {
             .current()?
             .read_user_cstr(path_ptr)
             .map_err(|_| EFAULT)?;
+        let iozone_probe = is_iozone_probe_target(name.as_str(), path.as_str());
+        if iozone_probe {
+            log_always(&format!(
+                "whuse-la-iozone:openat-enter tid={} tgid={} name={} dirfd={} cwd={} path={} raw_flags={:#x} flags={:#x}",
+                tid, tgid, name, dirfd, proc_cwd, path, raw_flags, flags
+            ));
+        }
         let openat_probe = stage2_openat_debug_enabled()
             && is_libctest_openat_probe_task(name.as_str(), tgid, proc_cwd.as_str());
         if openat_probe {
@@ -1153,6 +1229,12 @@ impl SyscallDispatcher {
             ));
         }
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
+        if iozone_probe {
+            log_always(&format!(
+                "whuse-la-iozone:openat-vfs-open-begin tid={} tgid={} cwd={} path={}",
+                tid, tgid, cwd, path
+            ));
+        }
         if openat_probe {
             log_always(&format!(
                 "whuse-libctest:openat-vfs-open-begin tid={} tgid={} cwd={} path={}",
@@ -1162,6 +1244,12 @@ impl SyscallDispatcher {
         let mut handle = match vfs.open(&cwd, &path, flags, mode) {
             Ok(handle) => handle,
             Err(err) => {
+                if iozone_probe {
+                    log_always(&format!(
+                        "whuse-la-iozone:openat-vfs-open-err tid={} tgid={} err={} cwd={} path={}",
+                        tid, tgid, err, cwd, path
+                    ));
+                }
                 if openat_probe {
                     log_always(&format!(
                         "whuse-libctest:openat-vfs-open-err tid={} tgid={} err={} cwd={} path={}",
@@ -1171,6 +1259,12 @@ impl SyscallDispatcher {
                 return Err(err);
             }
         };
+        if iozone_probe {
+            log_always(&format!(
+                "whuse-la-iozone:openat-vfs-open-ok tid={} tgid={} resolved={}",
+                tid, tgid, handle.path
+            ));
+        }
         if openat_probe {
             log_always(&format!(
                 "whuse-libctest:openat-vfs-open-ok tid={} tgid={} resolved={}",
@@ -1179,6 +1273,12 @@ impl SyscallDispatcher {
         }
         handle.flags = with_cloexec_flag(handle.flags, (raw_flags as usize & O_CLOEXEC) != 0);
         let fd = procs.current_mut()?.add_fd(handle);
+        if iozone_probe {
+            log_always(&format!(
+                "whuse-la-iozone:openat-exit tid={} tgid={} fd={}",
+                tid, tgid, fd
+            ));
+        }
         if openat_probe {
             log_always(&format!(
                 "whuse-libctest:openat-exit tid={} tgid={} fd={}",
@@ -1287,6 +1387,13 @@ impl SyscallDispatcher {
             let is_pipe = vfs.is_pipe(handle);
             let is_socket = vfs.is_socket(handle);
             let pipe_path = handle.path.clone();
+            let iozone_probe = is_iozone_script_probe_path(pipe_path.as_str());
+            if iozone_probe {
+                log_always(&format!(
+                    "whuse-la-iozone:read-enter tid={} tgid={} fd={} path={} count={} off={}",
+                    proc_tid, proc_tgid, fd, pipe_path, count, handle.offset
+                ));
+            }
             let probe = stage2_openat_debug_enabled()
                 && is_libctest_openat_probe_task(proc_name.as_str(), proc_tgid, proc_cwd.as_str())
                 && is_libctest_probe_path(pipe_path.as_str());
@@ -1298,6 +1405,17 @@ impl SyscallDispatcher {
             }
             match vfs.read(handle, count) {
                 Ok(bytes) => {
+                    if iozone_probe {
+                        log_always(&format!(
+                            "whuse-la-iozone:read-ok tid={} tgid={} fd={} path={} bytes={} off={}",
+                            proc_tid,
+                            proc_tgid,
+                            fd,
+                            pipe_path,
+                            bytes.len(),
+                            handle.offset
+                        ));
+                    }
                     if probe {
                         log_always(&format!(
                             "whuse-libctest:read-ok tid={} tgid={} fd={} path={} bytes={} off={}",
@@ -1320,6 +1438,12 @@ impl SyscallDispatcher {
                     return Err(EAGAIN);
                 }
                 Err(err) => {
+                    if iozone_probe {
+                        log_always(&format!(
+                            "whuse-la-iozone:read-err tid={} tgid={} fd={} path={} err={}",
+                            proc_tid, proc_tgid, fd, pipe_path, err
+                        ));
+                    }
                     if probe {
                         log_always(&format!(
                             "whuse-libctest:read-err tid={} tgid={} fd={} path={} err={}",
@@ -1761,9 +1885,17 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let current = procs.current()?;
         let name = current.name.clone();
+        let cwd = current.cwd.clone();
         let libcbench_task = is_libcbench_task(current);
+        let glibc_iozone_shell = is_glibc_iozone_shell(name.as_str(), cwd.as_str());
         let parent_pid = procs.current_pid()?;
         let flags = request.flags;
+        if glibc_iozone_shell {
+            log_always(&format!(
+                "whuse-la-glibc-iozone:clone-enter parent_tgid={} cwd={} flags={:#x} stack={:#x} parent_tid={:#x} child_tid={:#x}",
+                parent_pid, cwd, flags, request.stack, request.parent_tid, request.child_tid
+            ));
+        }
         if libcbench_task {
             libcbench_debug(&format!(
                 "whuse-libcbench:clone-enter parent_tgid={} flags={:#x} stack={:#x} parent_tid={:#x} child_tid={:#x} tls={:#x}",
@@ -1854,6 +1986,12 @@ impl SyscallDispatcher {
         } else {
             procs.fork_process_from_current()?
         };
+        if glibc_iozone_shell {
+            log_always(&format!(
+                "whuse-la-glibc-iozone:clone-child parent_tgid={} child_tgid={} flags={:#x} shared_vm={}",
+                parent_pid, pid, flags, shared_vm
+            ));
+        }
         trace_line(&format!(
             "whuse: clone parent_tgid={} flags={:#x} child_tgid={} shared_vm={}",
             parent_pid, flags, pid, shared_vm
@@ -1948,6 +2086,15 @@ impl SyscallDispatcher {
             .current()?
             .read_user_cstr(args.0[0])
             .map_err(|_| EFAULT)?;
+        let execve_iozone_probe = is_iozone_binary_probe_path(path.as_str());
+        if execve_iozone_probe {
+            log_always(&format!(
+                "whuse-la-iozone:execve-enter tgid={} cwd={} path={}",
+                procs.current_tgid().unwrap_or(0),
+                procs.current().map(|p| p.cwd.as_str()).unwrap_or(""),
+                path
+            ));
+        }
         trace_line(&format!(
             "whuse: execve enter tgid={} path={}",
             procs.current_tgid().unwrap_or(0),
@@ -1958,6 +2105,13 @@ impl SyscallDispatcher {
         let mut argv = read_string_vector(procs.current()?, args.0[1])?;
         if argv.is_empty() {
             argv.push(display_path.clone());
+        }
+        if execve_iozone_probe {
+            log_always(&format!(
+                "whuse-la-iozone:execve-stage path-ready display={} argv0={}",
+                display_path,
+                argv.first().map(String::as_str).unwrap_or("")
+            ));
         }
         if let Some(shell_cmd) = shell_exec_command(path.as_str(), &argv) {
             if let Some(simple_cmd) = simple_shell_command_path(shell_cmd) {
@@ -2036,6 +2190,13 @@ impl SyscallDispatcher {
                 path,
                 file_data.len()
             ));
+            if execve_iozone_probe {
+                log_always(&format!(
+                    "whuse-la-iozone:execve-image path={} bytes={}",
+                    path,
+                    file_data.len()
+                ));
+            }
             if let Some((mut interp_path, mut interp_arg)) = parse_shebang_line(&file_data) {
                 trace_line(&format!(
                     "whuse: execve stage shebang path={} interp={} arg={}",
@@ -2145,6 +2306,12 @@ impl SyscallDispatcher {
                 return Ok(0);
             }
             let interp = if let Some(interp_path) = parse_elf_interp(&file_data) {
+                if execve_iozone_probe {
+                    log_always(&format!(
+                        "whuse-la-iozone:execve-interp-detected path={} interp={}",
+                        display_path, interp_path
+                    ));
+                }
                 trace_line(&format!(
                     "whuse: execve stage interp-detected path={} interp={}",
                     path, interp_path
@@ -2156,12 +2323,26 @@ impl SyscallDispatcher {
                     "/lib/ld-linux-riscv64-lp64d.so.1",
                     "/musl/lib/libc.so",
                 ] {
+                    if execve_iozone_probe {
+                        log_always(&format!(
+                            "whuse-la-iozone:execve-interp-candidate path={} candidate={}",
+                            display_path, candidate
+                        ));
+                    }
                     trace_line(&format!(
                         "whuse: execve stage interp-candidate-try path={} candidate={}",
                         path, candidate
                     ));
                     match read_exec_file_image(vfs, "/", candidate) {
                         Ok(image) => {
+                            if execve_iozone_probe {
+                                log_always(&format!(
+                                    "whuse-la-iozone:execve-interp-ok path={} candidate={} bytes={}",
+                                    display_path,
+                                    candidate,
+                                    image.len()
+                                ));
+                            }
                             trace_line(&format!(
                                 "whuse: execve stage interp-candidate-ok path={} candidate={} bytes={}",
                                 path,
@@ -2172,6 +2353,12 @@ impl SyscallDispatcher {
                             break;
                         }
                         Err(err) => {
+                            if execve_iozone_probe {
+                                log_always(&format!(
+                                    "whuse-la-iozone:execve-interp-err path={} candidate={} err={}",
+                                    display_path, candidate, err
+                                ));
+                            }
                             trace_line(&format!(
                                 "whuse: execve stage interp-candidate-err path={} candidate={} err={}",
                                 path, candidate, err
@@ -2179,8 +2366,22 @@ impl SyscallDispatcher {
                         }
                     }
                 }
-                let (interp_path, interp_image) = interp_loaded.ok_or(ENOENT)?;
+                let Some((interp_path, interp_image)) = interp_loaded else {
+                    if execve_iozone_probe {
+                        log_always(&format!(
+                            "whuse-la-iozone:execve-interp-missing path={}",
+                            display_path
+                        ));
+                    }
+                    return Err(ENOENT);
+                };
                 if interp_image.is_empty() {
+                    if execve_iozone_probe {
+                        log_always(&format!(
+                            "whuse-la-iozone:execve-interp-empty path={} interp={}",
+                            display_path, interp_path
+                        ));
+                    }
                     return Err(ENOEXEC);
                 }
                 trace_line(&format!(
@@ -2190,6 +2391,12 @@ impl SyscallDispatcher {
                 ));
                 Some((interp_path, interp_image))
             } else {
+                if execve_iozone_probe {
+                    log_always(&format!(
+                        "whuse-la-iozone:execve-interp-none path={}",
+                        display_path
+                    ));
+                }
                 trace_line(&format!("whuse: execve stage interp-none path={}", path));
                 None
             };
@@ -2210,6 +2417,15 @@ impl SyscallDispatcher {
                 argv.len(),
                 envp.len()
             ));
+            if execve_iozone_probe {
+                log_always(&format!(
+                    "whuse-la-iozone:execve-load-elf-begin tgid={} path={} argv={} env={}",
+                    procs.current_tgid().unwrap_or(0),
+                    display_path,
+                    argv.len(),
+                    envp.len()
+                ));
+            }
             let loaded = {
                 let process = procs.current_mut()?;
                 match process.address_space.load_elf_images(
@@ -2221,6 +2437,12 @@ impl SyscallDispatcher {
                 ) {
                     Ok(loaded) => loaded,
                     Err(err) => {
+                        if execve_iozone_probe {
+                            log_always(&format!(
+                                "whuse-la-iozone:execve-load-elf-err tgid={} name={} err={}",
+                                process.tgid, process.name, err
+                            ));
+                        }
                         trace_line(&format!(
                             "whuse: execve stage load-elf-err tgid={} path={} err={}",
                             process.tgid, process.name, err
@@ -2229,14 +2451,23 @@ impl SyscallDispatcher {
                     }
                 }
             };
-            trace_line(&format!(
-                "whuse: execve stage load-elf-done tgid={} entry={:#x} sp={:#x} dyn={} interp_base={:#x}",
-                procs.current_tgid().unwrap_or(0),
-                loaded.entry,
-                loaded.stack_pointer,
-                loaded.is_dyn,
-                loaded.interp_base
-            ));
+                trace_line(&format!(
+                    "whuse: execve stage load-elf-done tgid={} entry={:#x} sp={:#x} dyn={} interp_base={:#x}",
+                    procs.current_tgid().unwrap_or(0),
+                    loaded.entry,
+                    loaded.stack_pointer,
+                    loaded.is_dyn,
+                    loaded.interp_base
+                ));
+                if execve_iozone_probe {
+                    log_always(&format!(
+                        "whuse-la-iozone:execve-load-elf-done tgid={} entry={:#x} dyn={} interp_base={:#x}",
+                        procs.current_tgid().unwrap_or(0),
+                        loaded.entry,
+                        loaded.is_dyn,
+                        loaded.interp_base
+                    ));
+                }
             let process = procs.current_mut()?;
             process.trap_frame.sepc = loaded.entry;
             process.trap_frame.regs[2] = loaded.stack_pointer;
@@ -3700,6 +3931,15 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let dirfd = args.0[0] as i32;
         let flags = args.0[2];
+        let (tid, tgid, name, proc_cwd) = {
+            let process = procs.current()?;
+            (
+                process.tid,
+                process.tgid,
+                process.name.clone(),
+                process.cwd.clone(),
+            )
+        };
         let statx_probe = stage2_openat_debug_enabled()
             && procs
                 .current()
@@ -3712,6 +3952,17 @@ impl SyscallDispatcher {
             ));
         }
         let path = read_at_path_allow_empty(procs.current()?, args.0[1], flags)?;
+        let iozone_probe = is_iozone_probe_target(name.as_str(), path.as_str());
+        if iozone_probe {
+            log_always(&format!(
+                "whuse-la-iozone:statx-enter tid={} tgid={} name={} dirfd={} cwd={} flags={:#x} mask={:#x} path_ptr={:#x}",
+                tid, tgid, name, dirfd, proc_cwd, flags, args.0[3], args.0[1]
+            ));
+            log_always(&format!(
+                "whuse-la-iozone:statx-path tid={} tgid={} dirfd={} path={} flags={:#x} mask={:#x}",
+                tid, tgid, dirfd, path, flags, args.0[3]
+            ));
+        }
         if statx_probe {
             stage2_openat_debug(&format!(
                 "whuse-libctest:statx-path dirfd={} path={} flags={:#x} mask={:#x}",
@@ -3729,6 +3980,12 @@ impl SyscallDispatcher {
         let stat = if path.is_empty() && (flags & AT_EMPTY_PATH_FLAG) != 0 {
             if dirfd == AT_FDCWD {
                 let cwd = procs.current()?.cwd.clone();
+                if iozone_probe {
+                    log_always(&format!(
+                        "whuse-la-iozone:statx-vfs-begin tid={} tgid={} cwd={} path={} mode=empty-at-cwd",
+                        tid, tgid, cwd, path
+                    ));
+                }
                 if statx_probe {
                     stage2_openat_debug(&format!(
                         "whuse-libctest:statx-vfs-begin cwd={} path={} mode=empty-at-cwd",
@@ -3738,6 +3995,12 @@ impl SyscallDispatcher {
                 vfs.stat_path(&cwd, &cwd)?
             } else {
                 let handle = procs.current()?.fd(dirfd)?;
+                if iozone_probe {
+                    log_always(&format!(
+                        "whuse-la-iozone:statx-fd-begin tid={} tgid={} dirfd={} handle_path={}",
+                        tid, tgid, dirfd, handle.path
+                    ));
+                }
                 if statx_probe {
                     stage2_openat_debug(&format!(
                         "whuse-libctest:statx-fd dirfd={} handle_path={}",
@@ -3748,6 +4011,12 @@ impl SyscallDispatcher {
             }
         } else {
             let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
+            if iozone_probe {
+                log_always(&format!(
+                    "whuse-la-iozone:statx-vfs-begin tid={} tgid={} cwd={} path={} mode=path",
+                    tid, tgid, cwd, path
+                ));
+            }
             if statx_probe {
                 stage2_openat_debug(&format!(
                     "whuse-libctest:statx-vfs-begin cwd={} path={} mode=path",
@@ -3756,6 +4025,12 @@ impl SyscallDispatcher {
             }
             vfs.stat_path(&cwd, &path)?
         };
+        if iozone_probe {
+            log_always(&format!(
+                "whuse-la-iozone:statx-vfs-ok tid={} tgid={} path={} mode={:#o} size={}",
+                tid, tgid, path, stat.mode, stat.size
+            ));
+        }
         if statx_probe {
             stage2_openat_debug(&format!(
                 "whuse-libctest:statx-vfs-ok path={} mode={:#o} size={}",
@@ -6387,12 +6662,25 @@ fn read_exec_file_image(vfs: &mut KernelVfs, cwd: &str, path: &str) -> Result<Ve
             return Ok(bytes);
         }
     }
+    let loader_probe = path.contains("ld-musl-loongarch-lp64d.so.1");
+    if loader_probe {
+        log_always(&format!(
+            "whuse-la-iozone:loader-open-begin cwd={} path={}",
+            cwd, path
+        ));
+    }
 
     trace_line(&format!(
         "whuse: execve open image cwd={} path={}",
         cwd, path
     ));
     let mut handle = vfs.open(cwd, path, O_RDONLY, 0).map_err(|_| ENOENT)?;
+    if loader_probe {
+        log_always(&format!(
+            "whuse-la-iozone:loader-open-ok resolved={} off={}",
+            handle.path, handle.offset
+        ));
+    }
     trace_line(&format!(
         "whuse: execve open ok resolved={} off={}",
         handle.path, handle.offset
@@ -6407,6 +6695,14 @@ fn read_exec_file_image(vfs: &mut KernelVfs, cwd: &str, path: &str) -> Result<Ve
         }
         let read_len = EXEC_READ_CHUNK.min(remaining);
         let chunk = vfs.read(&mut handle, read_len).map_err(|_| EFAULT)?;
+        if loader_probe {
+            log_always(&format!(
+                "whuse-la-iozone:loader-read-chunk resolved={} bytes={} off={}",
+                handle.path,
+                chunk.len(),
+                handle.offset
+            ));
+        }
         trace_line(&format!(
             "whuse: execve read chunk path={} bytes={} off={}",
             handle.path,
@@ -6426,6 +6722,13 @@ fn read_exec_file_image(vfs: &mut KernelVfs, cwd: &str, path: &str) -> Result<Ve
         path,
         file_data.len()
     ));
+    if loader_probe {
+        log_always(&format!(
+            "whuse-la-iozone:loader-read-done path={} bytes={}",
+            path,
+            file_data.len()
+        ));
+    }
     Ok(file_data)
 }
 

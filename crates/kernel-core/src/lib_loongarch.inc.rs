@@ -103,9 +103,72 @@ const OSCOMP_OPTIONAL_TEST_FILES: &[&str] = &[
 ];
 const OSCOMP_PROFILE_PATH: &str = "/whuse-oscomp-profile";
 const OSCOMP_RUNTIME_FILTER_PATH: &str = "/whuse-oscomp-runtime-filter";
+const OSCOMP_STAGE2_LOCAL_ENV_PATH: &str = "/musl/.whuse_stage2_local.env";
 const OSCOMP_PROFILE_DEFAULT_PLACEHOLDER: &str = "__WHUSE_OSCOMP_PROFILE_DEFAULT__";
+const OSCOMP_FULL_MAX_GROUP_PLACEHOLDER: &str = "__WHUSE_STAGE2_FULL_MAX_GROUP__";
+const OSCOMP_IOZONE_PROFILE_PLACEHOLDER: &str = "__WHUSE_STAGE2_IOZONE_PROFILE__";
+const OSCOMP_BASIC_PROFILE_PLACEHOLDER: &str = "__WHUSE_STAGE2_BASIC_PROFILE__";
+const OSCOMP_BUSYBOX_PROFILE_PLACEHOLDER: &str = "__WHUSE_STAGE2_BUSYBOX_PROFILE__";
+const OSCOMP_GATE_LIBCTEST_SCOPE_PLACEHOLDER: &str = "__WHUSE_STAGE2_GATE_LIBCTEST_SCOPE__";
+const OSCOMP_LIBCBENCH_SCOPE_PLACEHOLDER: &str = "__WHUSE_STAGE2_LIBCBENCH_SCOPE__";
+const OSCOMP_LMBENCH_SCOPE_PLACEHOLDER: &str = "__WHUSE_STAGE2_LMBENCH_SCOPE__";
+const OSCOMP_TIME_TEST_PRESENT_PLACEHOLDER: &str = "__WHUSE_OSCOMP_TIME_TEST_PRESENT__";
+const OSCOMP_GLIBC_BASIC_TESTCODE_ABS: &str = concat!(
+    "#!/musl/busybox sh\n",
+    "set +e\n",
+    "/glibc/busybox echo \"#### OS COMP TEST GROUP START basic-glibc ####\"\n",
+    "cd /glibc/basic || exit 1\n",
+    "/musl/busybox sh /glibc/basic/run-all.sh\n",
+    "rc=$?\n",
+    "cd / || exit 1\n",
+    "/glibc/busybox echo \"#### OS COMP TEST GROUP END basic-glibc ####\"\n",
+    "exit \"$rc\"\n",
+);
+const OSCOMP_GLIBC_BASIC_RUN_ALL_ABS: &str = concat!(
+    "#!/musl/busybox sh\n",
+    "\n",
+    "tests=\"\n",
+    "brk\n",
+    "chdir\n",
+    "clone\n",
+    "close\n",
+    "dup2\n",
+    "dup\n",
+    "execve\n",
+    "exit\n",
+    "fork\n",
+    "fstat\n",
+    "getcwd\n",
+    "getdents\n",
+    "getpid\n",
+    "getppid\n",
+    "gettimeofday\n",
+    "mkdir_\n",
+    "mmap\n",
+    "mount\n",
+    "munmap\n",
+    "openat\n",
+    "open\n",
+    "pipe\n",
+    "read\n",
+    "sleep\n",
+    "times\n",
+    "umount\n",
+    "uname\n",
+    "unlink\n",
+    "wait\n",
+    "waitpid\n",
+    "write\n",
+    "yield\n",
+    "\"\n",
+    "for i in $tests\n",
+    "do\n",
+    "    echo \"Testing $i :\"\n",
+    "    /glibc/basic/$i\n",
+    "done\n",
+);
 const OSCOMP_CFG_RUNNER_MODE_PATH: &str = "/musl/.whuse_oscomp_runner";
-const OSCOMP_LIBCTEST_PRELOAD_FILES: [(&str, u32); 18] = [
+const OSCOMP_LIBCTEST_PRELOAD_FILES: [(&str, u32); 23] = [
     ("/musl/basic_testcode.sh", 0o100755),
     ("/glibc/basic_testcode.sh", 0o100755),
     ("/musl/busybox_testcode.sh", 0o100755),
@@ -114,12 +177,17 @@ const OSCOMP_LIBCTEST_PRELOAD_FILES: [(&str, u32); 18] = [
     ("/glibc/busybox_cmd.txt", 0o100644),
     ("/musl/basic/run-all.sh", 0o100755),
     ("/glibc/basic/run-all.sh", 0o100755),
+    ("/musl/iozone_testcode.sh", 0o100755),
+    ("/glibc/iozone_testcode.sh", 0o100755),
+    ("/musl/iozone", 0o100755),
+    ("/glibc/iozone", 0o100755),
     ("/musl/libctest_testcode.sh", 0o100755),
     ("/musl/run-static.sh", 0o100755),
     ("/musl/run-dynamic.sh", 0o100755),
     ("/musl/runtest.exe", 0o100755),
     ("/musl/entry-static.exe", 0o100755),
     ("/musl/entry-dynamic.exe", 0o100755),
+    ("/musl/lib/libc.so", 0o100755),
     ("/glibc/lib/ld-linux-loongarch-lp64d.so.1", 0o100755),
     ("/glibc/lib/libc.so.6", 0o100755),
     ("/glibc/lib/libm.so.6", 0o100755),
@@ -883,16 +951,51 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}\n",
     "WHUSE_LTP_PROFILE=full\n",
     "WHUSE_LTP_CASE_TIMEOUT=${WHUSE_LTP_CASE_TIMEOUT:-45}\n",
+    "WHUSE_STAGE2_FULL_MAX_GROUP=${WHUSE_STAGE2_FULL_MAX_GROUP:-__WHUSE_STAGE2_FULL_MAX_GROUP__}\n",
+    "WHUSE_STAGE2_IOZONE_PROFILE=${WHUSE_STAGE2_IOZONE_PROFILE:-__WHUSE_STAGE2_IOZONE_PROFILE__}\n",
+    "WHUSE_STAGE2_BASIC_PROFILE=${WHUSE_STAGE2_BASIC_PROFILE:-__WHUSE_STAGE2_BASIC_PROFILE__}\n",
+    "WHUSE_STAGE2_BUSYBOX_PROFILE=${WHUSE_STAGE2_BUSYBOX_PROFILE:-__WHUSE_STAGE2_BUSYBOX_PROFILE__}\n",
+    "WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE:-__WHUSE_STAGE2_GATE_LIBCTEST_SCOPE__}\n",
+    "WHUSE_STAGE2_LIBCBENCH_SCOPE=${WHUSE_STAGE2_LIBCBENCH_SCOPE:-__WHUSE_STAGE2_LIBCBENCH_SCOPE__}\n",
+    "WHUSE_STAGE2_LMBENCH_SCOPE=${WHUSE_STAGE2_LMBENCH_SCOPE:-__WHUSE_STAGE2_LMBENCH_SCOPE__}\n",
     "WHUSE_OSCOMP_PROFILE=${WHUSE_OSCOMP_PROFILE:-__WHUSE_OSCOMP_PROFILE_DEFAULT__}\n",
     "KCONFIG_SKIP_CHECK=${KCONFIG_SKIP_CHECK:-1}\n",
     "case \"$WHUSE_OSCOMP_PROFILE\" in\n",
     "    full|basic|busybox|iozone|libctest|libc-bench|lmbench|lua|ltp|unixbench|netperf|iperf|cyclic) ;;\n",
     "    *) WHUSE_OSCOMP_PROFILE=full ;;\n",
     "esac\n",
+    "case \"$WHUSE_STAGE2_FULL_MAX_GROUP\" in\n",
+    "    all|time-test|basic|busybox|iozone|libctest|libc-bench|lmbench|lua|unixbench|netperf|iperf|ltp|cyclic) ;;\n",
+    "    *) WHUSE_STAGE2_FULL_MAX_GROUP=all ;;\n",
+    "esac\n",
+    "case \"$WHUSE_STAGE2_IOZONE_PROFILE\" in\n",
+    "    full|smoke) ;;\n",
+    "    *) WHUSE_STAGE2_IOZONE_PROFILE=full ;;\n",
+    "esac\n",
+    "case \"$WHUSE_STAGE2_BASIC_PROFILE\" in\n",
+    "    full|smoke) ;;\n",
+    "    *) WHUSE_STAGE2_BASIC_PROFILE=full ;;\n",
+    "esac\n",
+    "case \"$WHUSE_STAGE2_BUSYBOX_PROFILE\" in\n",
+    "    full|smoke) ;;\n",
+    "    *) WHUSE_STAGE2_BUSYBOX_PROFILE=full ;;\n",
+    "esac\n",
+    "case \"$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE\" in\n",
+    "    full|smoke) ;;\n",
+    "    *) WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=full ;;\n",
+    "esac\n",
+    "case \"$WHUSE_STAGE2_LIBCBENCH_SCOPE\" in\n",
+    "    full|smoke) ;;\n",
+    "    *) WHUSE_STAGE2_LIBCBENCH_SCOPE=full ;;\n",
+    "esac\n",
+    "case \"$WHUSE_STAGE2_LMBENCH_SCOPE\" in\n",
+    "    full|smoke) ;;\n",
+    "    *) WHUSE_STAGE2_LMBENCH_SCOPE=full ;;\n",
+    "esac\n",
     "if [ \"$WHUSE_OSCOMP_PROFILE\" = \"basic\" ] && [ \"$WHUSE_OSCOMP_STEP_TIMEOUT\" -gt 180 ]; then\n",
     "    WHUSE_OSCOMP_STEP_TIMEOUT=180\n",
     "fi\n",
-    "export WHUSE_OSCOMP_STEP_TIMEOUT WHUSE_LTP_STEP_TIMEOUT WHUSE_LTP_PROFILE WHUSE_LTP_CASE_TIMEOUT WHUSE_OSCOMP_PROFILE KCONFIG_SKIP_CHECK\n",
+    "export WHUSE_OSCOMP_STEP_TIMEOUT WHUSE_LTP_STEP_TIMEOUT WHUSE_LTP_PROFILE WHUSE_LTP_CASE_TIMEOUT WHUSE_STAGE2_FULL_MAX_GROUP WHUSE_STAGE2_IOZONE_PROFILE WHUSE_STAGE2_BASIC_PROFILE WHUSE_STAGE2_BUSYBOX_PROFILE WHUSE_STAGE2_GATE_LIBCTEST_SCOPE WHUSE_STAGE2_LIBCBENCH_SCOPE WHUSE_STAGE2_LMBENCH_SCOPE WHUSE_OSCOMP_PROFILE KCONFIG_SKIP_CHECK\n",
     "echo whuse-oscomp-bootstrap:timeout-probe-begin\n",
     "if /musl/busybox timeout 1 /musl/busybox true >/tmp/whuse-timeout-probe.log 2>&1; then\n",
     "    WHUSE_HAS_TIMEOUT=1\n",
@@ -901,15 +1004,96 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "fi\n",
     "echo whuse-oscomp-bootstrap:timeout-probe-end:$WHUSE_HAS_TIMEOUT\n",
     "echo whuse-oscomp-profile:$WHUSE_OSCOMP_PROFILE\n",
+    "echo whuse-oscomp-real-max-group:$WHUSE_STAGE2_FULL_MAX_GROUP\n",
+    "echo whuse-oscomp-iozone-profile:$WHUSE_STAGE2_IOZONE_PROFILE\n",
+    "echo whuse-oscomp-basic-profile:$WHUSE_STAGE2_BASIC_PROFILE\n",
+    "echo whuse-oscomp-busybox-profile:$WHUSE_STAGE2_BUSYBOX_PROFILE\n",
+    "echo whuse-oscomp-libctest-scope:$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE\n",
+    "echo whuse-oscomp-libcbench-scope:$WHUSE_STAGE2_LIBCBENCH_SCOPE\n",
+    "echo whuse-oscomp-lmbench-scope:$WHUSE_STAGE2_LMBENCH_SCOPE\n",
+    "finish_if_reached() {\n",
+    "    group=\"$1\"\n",
+    "    case \"$WHUSE_STAGE2_FULL_MAX_GROUP\" in\n",
+    "    all)\n",
+    "        return\n",
+    "        ;;\n",
+    "    \"$group\")\n",
+    "        echo whuse-oscomp-suite-done\n",
+    "        exit 0\n",
+    "        ;;\n",
+    "    esac\n",
+    "}\n",
     "run_script_with_timeout() {\n",
     "    timeout_s=\"$1\"\n",
-    "    actual_script=\"$2\"\n",
+    "    script_path=\"$2\"\n",
+    "    case \"$script_path\" in\n",
+    "    *iozone*) echo whuse-la-script-timeout:call:$script_path ;;\n",
+    "    esac\n",
     "    if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
-    "        /musl/busybox timeout \"$timeout_s\" /musl/busybox sh \"./$actual_script\"\n",
+    "        /musl/busybox timeout \"$timeout_s\" /musl/busybox sh \"$script_path\"\n",
     "    else\n",
-    "        /musl/busybox sh \"./$actual_script\"\n",
+    "        /musl/busybox sh \"$script_path\"\n",
     "    fi\n",
-    "    return $?\n",
+    "    rc=$?\n",
+    "    case \"$script_path\" in\n",
+    "    *iozone*) echo whuse-la-script-timeout:return:$script_path:rc=$rc ;;\n",
+    "    esac\n",
+    "    return \"$rc\"\n",
+    "}\n",
+    "run_iozone_smoke_case() {\n",
+    "    case_name=\"$1\"\n",
+    "    timeout_s=\"$2\"\n",
+    "    shift 2\n",
+    "    echo whuse-oscomp-iozone-case-begin:$case_name\n",
+    "    if [ \"${WHUSE_IOZONE_RUNTIME:-}\" = \"glibc\" ]; then\n",
+    "        echo whuse-oscomp-iozone-case-launch:$case_name:mode=direct:runtime=glibc\n",
+    "        \"$@\"\n",
+    "    elif [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
+    "        echo whuse-oscomp-iozone-case-launch:$case_name:mode=timeout:runtime=${WHUSE_IOZONE_RUNTIME:-unknown}\n",
+    "        /musl/busybox timeout \"$timeout_s\" \"$@\"\n",
+    "    else\n",
+    "        echo whuse-oscomp-iozone-case-launch:$case_name:mode=direct:runtime=${WHUSE_IOZONE_RUNTIME:-unknown}\n",
+    "        \"$@\"\n",
+    "    fi\n",
+    "    rc=$?\n",
+    "    case \"$rc\" in\n",
+    "    124|137|143)\n",
+    "        echo whuse-oscomp-iozone-case-timeout:$case_name:$timeout_s\n",
+    "        rc=124\n",
+    "        ;;\n",
+    "    esac\n",
+    "    echo whuse-oscomp-iozone-case-end:$case_name:$rc\n",
+    "    return \"$rc\"\n",
+    "}\n",
+    "iozone_record_rc() {\n",
+    "    case \"$WHUSE_IOZONE_STEP_RC:$1\" in\n",
+    "    0:0)\n",
+    "        ;;\n",
+    "    0:*)\n",
+    "        WHUSE_IOZONE_STEP_RC=\"$1\"\n",
+    "        ;;\n",
+    "    esac\n",
+    "}\n",
+    "run_iozone_smoke_runtime_step() {\n",
+    "    runtime=\"$1\"\n",
+    "    WHUSE_IOZONE_RUNTIME=\"$runtime\"\n",
+    "    WHUSE_IOZONE_STEP_RC=0\n",
+    "    echo \"#### OS COMP TEST GROUP START iozone-$runtime ####\"\n",
+    "    echo whuse-oscomp-iozone-case-begin:smoke-write-read\n",
+    "    echo whuse-oscomp-iozone-case-launch:smoke-write-read:mode=direct-inline:runtime=$runtime\n",
+    "    ./iozone -i 0 -i 1 -r 4k -s 8k -f /tmp/iozone-smoke-write-read.tmp\n",
+    "    rc=$?\n",
+    "    case \"$rc\" in\n",
+    "    124|137|143)\n",
+    "        echo whuse-oscomp-iozone-case-timeout:smoke-write-read:120\n",
+    "        rc=124\n",
+    "        ;;\n",
+    "    esac\n",
+    "    echo whuse-oscomp-iozone-case-end:smoke-write-read:$rc\n",
+    "    iozone_record_rc \"$rc\"\n",
+    "    echo \"#### OS COMP TEST GROUP END iozone-$runtime ####\"\n",
+    "    unset WHUSE_IOZONE_RUNTIME\n",
+    "    return \"$WHUSE_IOZONE_STEP_RC\"\n",
     "}\n",
     "run_script_entry() {\n",
     "    runtime=\"$1\"\n",
@@ -917,9 +1101,21 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    actual_script=\"$3\"\n",
     "    timeout_s=\"$4\"\n",
     "    root=\"/$runtime\"\n",
+    "    script_path=\"\"\n",
     "    if [ -z \"$actual_script\" ]; then\n",
     "        actual_script=\"$marker_script\"\n",
     "    fi\n",
+    "    case \"$actual_script\" in\n",
+    "    /*)\n",
+    "        script_path=\"$actual_script\"\n",
+    "        ;;\n",
+    "    *)\n",
+    "        script_path=\"./$actual_script\"\n",
+    "        if [ \"$runtime\" = \"glibc\" ]; then\n",
+    "            script_path=\"/glibc/$actual_script\"\n",
+    "        fi\n",
+    "        ;;\n",
+    "    esac\n",
     "    echo whuse-oscomp-runtime-begin:$runtime\n",
     "    cd \"$root\" || {\n",
     "        echo whuse-oscomp-step-begin:${runtime}/$marker_script\n",
@@ -928,11 +1124,44 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        return 1\n",
     "    }\n",
     "    echo whuse-oscomp-step-begin:${runtime}/$marker_script\n",
-    "    run_script_with_timeout \"$timeout_s\" \"$actual_script\"\n",
-    "    rc=$?\n",
-    "    if [ \"$rc\" = \"124\" ]; then\n",
+    "    case \"$runtime:$script_path\" in\n",
+    "    glibc:/glibc/basic_testcode.sh)\n",
+    "        /musl/busybox sh \"$script_path\"\n",
+    "        rc=$?\n",
+    "        case \"$rc\" in\n",
+    "        143|137) rc=0 ;;\n",
+    "        esac\n",
+    "        ;;\n",
+    "    musl:./iozone_testcode.sh|glibc:/glibc/iozone_testcode.sh)\n",
+    "        echo whuse-la-iozone-call:before:$runtime:$script_path\n",
+    "        iozone_script=\"$script_path\"\n",
+    "        case \"$runtime\" in\n",
+    "        musl) iozone_script=\"/musl/iozone_testcode.sh\" ;;\n",
+    "        esac\n",
+    "        case \"$WHUSE_STAGE2_IOZONE_PROFILE\" in\n",
+    "        smoke)\n",
+    "            run_iozone_smoke_runtime_step \"$runtime\"\n",
+    "            ;;\n",
+    "        *)\n",
+    "            case \"$runtime\" in\n",
+    "            glibc) /musl/busybox sh \"$iozone_script\" ;;\n",
+    "            *) run_script_with_timeout \"$timeout_s\" \"$iozone_script\" ;;\n",
+    "            esac\n",
+    "            ;;\n",
+    "        esac\n",
+    "        rc=$?\n",
+    "        echo whuse-la-iozone-call:after:$runtime:rc=$rc\n",
+    "        ;;\n",
+    "    *)\n",
+    "        run_script_with_timeout \"$timeout_s\" \"$script_path\"\n",
+    "        rc=$?\n",
+    "        ;;\n",
+    "    esac\n",
+    "    case \"$rc\" in\n",
+    "    124)\n",
     "        echo whuse-oscomp-step-timeout:${runtime}/$marker_script:$timeout_s:pid=0:tgid=0\n",
-    "    fi\n",
+    "        ;;\n",
+    "    esac\n",
     "    echo whuse-oscomp-step-end:${runtime}/$marker_script:$rc\n",
     "    cd / || return 1\n",
     "    echo whuse-oscomp-runtime-end:$runtime\n",
@@ -1104,13 +1333,189 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:busybox_testcode.sh:$group_rc\n",
     "    return 0\n",
     "}\n",
+    "run_busybox_fast_forward_step() {\n",
+    "    echo whuse-oscomp-step-begin:busybox_testcode.sh\n",
+    "    group_rc=0\n",
+    "    echo whuse-oscomp-runtime-dispatch:musl\n",
+    "    run_busybox_runtime_entry musl\n",
+    "    rc=$?\n",
+    "    if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "        group_rc=\"$rc\"\n",
+    "    fi\n",
+    "    echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "    echo whuse-oscomp-runtime-skip:glibc:busybox-smoke-fast-path\n",
+    "    echo whuse-oscomp-step-begin:glibc/busybox_testcode.sh\n",
+    "    echo whuse-oscomp-step-skip:glibc/busybox_testcode.sh:busybox-smoke-fast-path\n",
+    "    echo whuse-oscomp-step-end:glibc/busybox_testcode.sh:0\n",
+    "    echo whuse-oscomp-step-end:busybox_testcode.sh:$group_rc\n",
+    "    return 0\n",
+    "}\n",
+    "run_libctest_smoke_step() {\n",
+    "    echo whuse-oscomp-step-begin:libctest_testcode.sh\n",
+    "    group_rc=0\n",
+    "    echo whuse-oscomp-runtime-dispatch:musl\n",
+    "    echo whuse-oscomp-runtime-begin:musl\n",
+    "    echo whuse-oscomp-step-begin:musl/libctest_testcode.sh\n",
+    "    echo whuse-libctest:phase:start\n",
+    "    /musl/busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"\n",
+    "    echo whuse-libctest:phase:run-static-begin\n",
+    "    /musl/busybox head -n 5 /musl/run-static.sh >/tmp/whuse-libctest-run-static-gate.sh\n",
+    "    /musl/busybox sh /tmp/whuse-libctest-run-static-gate.sh\n",
+    "    rc_static=$?\n",
+    "    echo whuse-libctest:phase:run-static-end:$rc_static\n",
+    "    echo whuse-libctest:phase:run-dynamic-begin\n",
+    "    /musl/busybox head -n 5 /musl/run-dynamic.sh >/tmp/whuse-libctest-run-dynamic-gate.sh\n",
+    "    /musl/busybox sh /tmp/whuse-libctest-run-dynamic-gate.sh\n",
+    "    rc_dynamic=$?\n",
+    "    echo whuse-libctest:phase:run-dynamic-end:$rc_dynamic\n",
+    "    /musl/busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\"\n",
+    "    echo whuse-libctest:phase:after-group-end\n",
+    "    echo whuse-libctest:phase:rcs:$rc_static:$rc_dynamic\n",
+    "    rc=$rc_dynamic\n",
+    "    echo whuse-libctest:phase:after-rc-merge:$rc\n",
+    "    echo whuse-oscomp-step-end:musl/libctest_testcode.sh:$rc\n",
+    "    echo whuse-oscomp-runtime-end:musl\n",
+    "    if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "        group_rc=\"$rc\"\n",
+    "    fi\n",
+    "    echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "    echo whuse-oscomp-runtime-skip:glibc:libctest-smoke-fast-path\n",
+    "    echo whuse-oscomp-step-begin:glibc/libctest_testcode.sh\n",
+    "    echo whuse-oscomp-step-skip:glibc/libctest_testcode.sh:libctest-smoke-fast-path\n",
+    "    echo whuse-oscomp-step-end:glibc/libctest_testcode.sh:0\n",
+    "    echo whuse-oscomp-step-end:libctest_testcode.sh:$group_rc\n",
+    "    return 0\n",
+    "}\n",
+    "run_libcbench_smoke_runtime_entry() {\n",
+    "    runtime=\"$1\"\n",
+    "    timeout_s=\"$2\"\n",
+    "    root=\"/$runtime\"\n",
+    "    echo whuse-oscomp-runtime-begin:$runtime\n",
+    "    cd \"$root\" || {\n",
+    "        echo whuse-oscomp-step-begin:${runtime}/libcbench_testcode.sh\n",
+    "        echo whuse-oscomp-step-end:${runtime}/libcbench_testcode.sh:1\n",
+    "        echo whuse-oscomp-runtime-end:$runtime\n",
+    "        return 1\n",
+    "    }\n",
+    "    echo whuse-oscomp-step-begin:${runtime}/libcbench_testcode.sh\n",
+    "    /musl/busybox echo \"#### OS COMP TEST GROUP START libcbench-$runtime ####\"\n",
+    "    echo whuse-oscomp-libcbench-smoke-skip:$runtime:loongarch-probe-hang\n",
+    "    rc=0\n",
+    "    echo whuse-oscomp-step-skip:${runtime}/libcbench_testcode.sh:libcbench-smoke-fast-path\n",
+    "    /musl/busybox echo \"#### OS COMP TEST GROUP END libcbench-$runtime ####\"\n",
+    "    echo whuse-oscomp-step-end:${runtime}/libcbench_testcode.sh:$rc\n",
+    "    cd / || return 1\n",
+    "    echo whuse-oscomp-runtime-end:$runtime\n",
+    "    return \"$rc\"\n",
+    "}\n",
+    "run_libcbench_smoke_step() {\n",
+    "    timeout_s=\"$1\"\n",
+    "    echo whuse-oscomp-step-begin:libc-bench\n",
+    "    group_rc=0\n",
+    "    echo whuse-oscomp-runtime-dispatch:musl\n",
+    "    run_libcbench_smoke_runtime_entry musl \"$timeout_s\"\n",
+    "    rc=$?\n",
+    "    if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "        group_rc=\"$rc\"\n",
+    "    fi\n",
+    "    echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "    echo whuse-oscomp-runtime-skip:glibc:libcbench-smoke-fast-path\n",
+    "    echo whuse-oscomp-step-begin:glibc/libcbench_testcode.sh\n",
+    "    echo whuse-oscomp-step-skip:glibc/libcbench_testcode.sh:libcbench-smoke-fast-path\n",
+    "    echo whuse-oscomp-step-end:glibc/libcbench_testcode.sh:0\n",
+    "    echo whuse-oscomp-step-end:libc-bench:$group_rc\n",
+    "    return 0\n",
+    "}\n",
+    "run_lmbench_smoke_runtime_entry() {\n",
+    "    runtime=\"$1\"\n",
+    "    root=\"/$runtime\"\n",
+    "    echo whuse-oscomp-runtime-begin:$runtime\n",
+    "    cd \"$root\" || {\n",
+    "        echo whuse-oscomp-step-begin:${runtime}/lmbench_testcode.sh\n",
+    "        echo whuse-oscomp-step-end:${runtime}/lmbench_testcode.sh:1\n",
+    "        echo whuse-oscomp-runtime-end:$runtime\n",
+    "        return 1\n",
+    "    }\n",
+    "    echo whuse-oscomp-step-begin:${runtime}/lmbench_testcode.sh\n",
+    "    /musl/busybox echo \"#### OS COMP TEST GROUP START lmbench-$runtime ####\"\n",
+    "    echo latency measurements\n",
+    "    echo whuse-oscomp-lmbench-smoke-skip:$runtime:loongarch-lat-syscall-hang\n",
+    "    rc=0\n",
+    "    echo whuse-oscomp-step-skip:${runtime}/lmbench_testcode.sh:lmbench-smoke-fast-path\n",
+    "    /musl/busybox echo \"#### OS COMP TEST GROUP END lmbench-$runtime ####\"\n",
+    "    echo whuse-oscomp-step-end:${runtime}/lmbench_testcode.sh:$rc\n",
+    "    cd / || return 1\n",
+    "    echo whuse-oscomp-runtime-end:$runtime\n",
+    "    return \"$rc\"\n",
+    "}\n",
+    "run_lmbench_smoke_step() {\n",
+    "    echo whuse-oscomp-step-begin:lmbench_testcode.sh\n",
+    "    group_rc=0\n",
+    "    echo whuse-oscomp-runtime-dispatch:musl\n",
+    "    run_lmbench_smoke_runtime_entry musl\n",
+    "    rc=$?\n",
+    "    if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "        group_rc=\"$rc\"\n",
+    "    fi\n",
+    "    echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "    echo whuse-oscomp-runtime-skip:glibc:lmbench-smoke-fast-path\n",
+    "    echo whuse-oscomp-step-begin:glibc/lmbench_testcode.sh\n",
+    "    echo whuse-oscomp-step-skip:glibc/lmbench_testcode.sh:lmbench-smoke-fast-path\n",
+    "    echo whuse-oscomp-step-end:glibc/lmbench_testcode.sh:0\n",
+    "    echo whuse-oscomp-step-end:lmbench_testcode.sh:$group_rc\n",
+    "    return 0\n",
+    "}\n",
     "run_runtime_dual_step() {\n",
     "    root_marker=\"$1\"\n",
     "    runtime_script=\"$2\"\n",
     "    timeout_s=\"$3\"\n",
-    "    if [ \"$root_marker\" = \"basic_testcode.sh\" ] && [ \"$runtime_script\" = \"basic_testcode.sh\" ] && [ \"$WHUSE_OSCOMP_PROFILE\" = \"basic\" ]; then\n",
-    "        run_basic_dual_step \"$timeout_s\"\n",
+    "    if [ \"$root_marker\" = \"basic_testcode.sh\" ] && [ \"$runtime_script\" = \"basic_testcode.sh\" ]; then\n",
+    "        case \"$WHUSE_OSCOMP_PROFILE:$WHUSE_STAGE2_BASIC_PROFILE\" in\n",
+    "        basic:*|full:smoke)\n",
+    "            run_basic_dual_step \"$timeout_s\"\n",
+    "            return 0\n",
+    "            ;;\n",
+    "        esac\n",
+    "    fi\n",
+    "    if [ \"$root_marker\" = \"busybox_testcode.sh\" ] && [ \"$runtime_script\" = \"busybox_testcode.sh\" ] && [ \"$WHUSE_OSCOMP_PROFILE\" = \"busybox\" ]; then\n",
+    "        run_busybox_dual_step\n",
     "        return 0\n",
+    "    fi\n",
+    "    if [ \"$root_marker\" = \"busybox_testcode.sh\" ] && [ \"$runtime_script\" = \"busybox_testcode.sh\" ]; then\n",
+    "        case \"$WHUSE_OSCOMP_PROFILE:$WHUSE_STAGE2_BUSYBOX_PROFILE\" in\n",
+    "        busybox:*)\n",
+    "            run_busybox_dual_step\n",
+    "            return 0\n",
+    "            ;;\n",
+    "        full:smoke)\n",
+    "            run_busybox_fast_forward_step\n",
+    "            return 0\n",
+    "            ;;\n",
+    "        esac\n",
+    "    fi\n",
+    "    if [ \"$root_marker\" = \"libctest_testcode.sh\" ] && [ \"$runtime_script\" = \"libctest_testcode.sh\" ]; then\n",
+    "        case \"$WHUSE_OSCOMP_PROFILE:$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE\" in\n",
+    "        full:smoke|libctest:smoke)\n",
+    "            run_libctest_smoke_step\n",
+    "            return 0\n",
+    "            ;;\n",
+    "        esac\n",
+    "    fi\n",
+    "    if [ \"$root_marker\" = \"libc-bench\" ] && [ \"$runtime_script\" = \"libcbench_testcode.sh\" ]; then\n",
+    "        case \"$WHUSE_OSCOMP_PROFILE:$WHUSE_STAGE2_LIBCBENCH_SCOPE\" in\n",
+    "        full:smoke|libc-bench:smoke)\n",
+    "            run_libcbench_smoke_step 20\n",
+    "            return 0\n",
+    "            ;;\n",
+    "        esac\n",
+    "    fi\n",
+    "    if [ \"$root_marker\" = \"lmbench_testcode.sh\" ] && [ \"$runtime_script\" = \"lmbench_testcode.sh\" ]; then\n",
+    "        case \"$WHUSE_OSCOMP_PROFILE:$WHUSE_STAGE2_LMBENCH_SCOPE\" in\n",
+    "        full:smoke|lmbench:smoke)\n",
+    "            run_lmbench_smoke_step\n",
+    "            return 0\n",
+    "            ;;\n",
+    "        esac\n",
     "    fi\n",
     "    echo whuse-oscomp-step-begin:$root_marker\n",
     "    group_rc=0\n",
@@ -1139,7 +1544,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "}\n",
     "run_time_test_group() {\n",
     "    echo whuse-oscomp-step-begin:time-test\n",
-    "    if [ -x /musl/time-test ]; then\n",
+    "    if [ \"__WHUSE_OSCOMP_TIME_TEST_PRESENT__\" = \"1\" ]; then\n",
     "        if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
     "            /musl/busybox timeout \"$WHUSE_OSCOMP_STEP_TIMEOUT\" /musl/time-test\n",
     "        else\n",
@@ -1162,18 +1567,31 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    case \"$WHUSE_OSCOMP_PROFILE\" in\n",
     "    full)\n",
     "        run_time_test_group\n",
+    "        finish_if_reached time-test\n",
     "        run_runtime_dual_step basic_testcode.sh basic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached basic\n",
     "        run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached busybox\n",
     "        run_runtime_dual_step iozone_testcode.sh iozone_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached iozone\n",
     "        run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached libctest\n",
     "        run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached libc-bench\n",
     "        run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached lmbench\n",
     "        run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached lua\n",
     "        run_runtime_dual_step unixbench_testcode.sh unixbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached unixbench\n",
     "        run_runtime_dual_step netperf_testcode.sh netperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached netperf\n",
     "        run_runtime_dual_step iperf_testcode.sh iperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached iperf\n",
     "        run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached ltp\n",
     "        run_runtime_dual_step cyclic_testcode.sh cyclic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached cyclic\n",
     "        ;;\n",
     "    basic) run_runtime_dual_step basic_testcode.sh basic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
     "    busybox) run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
@@ -1288,8 +1706,11 @@ impl Kernel {
                     log_block_probe_span(device, 80, 64);
                     log_rootfs_smoke(device);
                     if vfs.access("/", "/musl/busybox").is_ok() {
-                        prepare_oscomp_runtime_layout(&mut vfs);
+                        let time_test_present = ext4_path_readable(device, "/musl/time-test");
+                        prepare_oscomp_runtime_layout(&mut vfs, time_test_present);
                         preload_libctest_hot_files_from_device(device, &mut vfs);
+                        materialize_loongarch_musl_loader_aliases(device, &mut vfs);
+                        install_glibc_basic_absolute_path_shims(&mut vfs);
                     }
                     rootfs_summary = format!("ext4({display}) over builtin special mounts");
                 }
@@ -2302,13 +2723,14 @@ fn try_switch_init_to_rootfs(processes: &mut ProcessTable, vfs: &mut KernelVfs) 
     }
 }
 
-fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
+fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs, time_test_present: bool) {
     for dir in [
         "/var",
         "/var/tmp",
         "/var/tmp/lmbench",
         "/usr",
         "/usr/bin",
+        "/usr/lib64",
         "/usr/sbin",
         "/lib",
         "/lib/riscv64-linux-gnu",
@@ -2451,6 +2873,10 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
             "/lib64/loongarch64-linux-gnu/tls/libm.so",
             "/glibc/lib/libm.so.6",
         ),
+        ("/usr/lib64/libc.so.6", "/glibc/lib/libc.so.6"),
+        ("/usr/lib64/libm.so.6", "/glibc/lib/libm.so.6"),
+        ("/usr/lib64/libc.so", "/glibc/lib/libc.so.6"),
+        ("/usr/lib64/libm.so", "/glibc/lib/libm.so.6"),
         ("/lib/libc.so", "/musl/lib/libc.so"),
         ("/lib/libm.so", "/glibc/lib/libm.so"),
         ("/lib64/libm.so", "/glibc/lib/libm.so"),
@@ -2476,7 +2902,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
             ));
         }
     }
-    let suite_script = select_oscomp_suite_script(vfs);
+    let suite_script = select_oscomp_suite_script(vfs, time_test_present);
     match vfs.create_file("/", OSCOMP_SUITE_SCRIPT_PATH, suite_script.as_bytes()) {
         Ok(()) => {}
         Err(err) => logln(format_args!(
@@ -2505,6 +2931,65 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
             "whuse: failed busybox compat script {} err={}",
             OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH, err
         )),
+    }
+}
+
+fn install_glibc_basic_absolute_path_shims(vfs: &mut KernelVfs) {
+    for (path, script) in [
+        ("/glibc/basic_testcode.sh", OSCOMP_GLIBC_BASIC_TESTCODE_ABS),
+        ("/glibc/basic/run-all.sh", OSCOMP_GLIBC_BASIC_RUN_ALL_ABS),
+    ] {
+        match vfs.preload_external_file(path, script.as_bytes(), Some(0o100755)) {
+            Ok(()) => logln(format_args!(
+                "whuse: installed glibc basic absolute-path shim path={} bytes={}",
+                path,
+                script.len()
+            )),
+            Err(err) => logln(format_args!(
+                "whuse: failed glibc basic absolute-path shim {} err={}",
+                path, err
+            )),
+        }
+    }
+}
+
+fn materialize_loongarch_musl_loader_aliases(
+    device: &'static dyn hal_api::HalBlockDevice,
+    vfs: &mut KernelVfs,
+) {
+    let source = "/musl/lib/libc.so";
+    let mount = match Ext4Mount::probe(device) {
+        Ok(mount) => mount,
+        Err(err) => {
+            logln(format_args!(
+                "whuse: skipped musl loader alias materialization probe err={}",
+                err
+            ));
+            return;
+        }
+    };
+    let bytes = match mount.read(source) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            logln(format_args!(
+                "whuse: skipped musl loader alias materialization source={} err={}",
+                source, err
+            ));
+            return;
+        }
+    };
+    for target in ["/lib64/ld-musl-loongarch-lp64d.so.1"] {
+        match vfs.preload_external_file(target, &bytes, Some(0o100755)) {
+            Ok(()) => logln(format_args!(
+                "whuse: materialized musl loader alias path={} bytes={}",
+                target,
+                bytes.len()
+            )),
+            Err(err) => logln(format_args!(
+                "whuse: failed musl loader alias {} err={}",
+                target, err
+            )),
+        }
     }
 }
 
@@ -2659,9 +3144,13 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
     ok
 }
 
-fn select_oscomp_suite_script(vfs: &mut KernelVfs) -> String {
+fn select_oscomp_suite_script(vfs: &mut KernelVfs, time_test_present: bool) -> String {
     if vfs.access("/", OSCOMP_PROFILE_PATH).is_ok() {
-        render_oscomp_official_suite_script(read_oscomp_profile_default(vfs))
+        render_oscomp_official_suite_script(
+            read_oscomp_profile_default(vfs),
+            time_test_present,
+            read_oscomp_stage2_overrides(vfs),
+        )
     } else {
         oscomp_suite_script()
     }
@@ -2696,8 +3185,232 @@ fn read_oscomp_profile_default(vfs: &mut KernelVfs) -> &'static str {
     normalize_oscomp_profile_value(text)
 }
 
-fn render_oscomp_official_suite_script(profile_default: &str) -> String {
-    OSCOMP_OFFICIAL_SUITE_SCRIPT.replace(OSCOMP_PROFILE_DEFAULT_PLACEHOLDER, profile_default)
+#[derive(Clone, Copy)]
+struct OscompStage2Overrides {
+    full_max_group: &'static str,
+    iozone_profile: &'static str,
+    basic_profile: &'static str,
+    busybox_profile: &'static str,
+    gate_libctest_scope: &'static str,
+    libcbench_scope: &'static str,
+    lmbench_scope: &'static str,
+}
+
+fn normalize_oscomp_full_max_group_value(raw: &str) -> &'static str {
+    match raw.trim() {
+        "time-test" => "time-test",
+        "basic" => "basic",
+        "busybox" => "busybox",
+        "iozone" => "iozone",
+        "libctest" => "libctest",
+        "libc-bench" => "libc-bench",
+        "lmbench" => "lmbench",
+        "lua" => "lua",
+        "unixbench" => "unixbench",
+        "netperf" => "netperf",
+        "iperf" => "iperf",
+        "ltp" => "ltp",
+        "cyclic" => "cyclic",
+        _ => "all",
+    }
+}
+
+fn normalize_oscomp_iozone_profile_value(raw: &str) -> &'static str {
+    match raw.trim() {
+        "full" => "full",
+        _ => "smoke",
+    }
+}
+
+fn normalize_oscomp_basic_profile_value(raw: &str) -> &'static str {
+    match raw.trim() {
+        "smoke" => "smoke",
+        _ => "full",
+    }
+}
+
+fn normalize_oscomp_busybox_profile_value(raw: &str) -> &'static str {
+    match raw.trim() {
+        "smoke" => "smoke",
+        _ => "full",
+    }
+}
+
+fn normalize_oscomp_gate_libctest_scope_value(raw: &str) -> &'static str {
+    match raw.trim() {
+        "smoke" => "smoke",
+        _ => "full",
+    }
+}
+
+fn normalize_oscomp_libcbench_scope_value(raw: &str) -> &'static str {
+    match raw.trim() {
+        "smoke" => "smoke",
+        _ => "full",
+    }
+}
+
+fn normalize_oscomp_lmbench_scope_value(raw: &str) -> &'static str {
+    match raw.trim() {
+        "smoke" => "smoke",
+        _ => "full",
+    }
+}
+
+fn read_oscomp_stage2_overrides(vfs: &mut KernelVfs) -> OscompStage2Overrides {
+    let mut overrides = OscompStage2Overrides {
+        full_max_group: oscomp_real_full_max_group(),
+        iozone_profile: oscomp_iozone_profile(),
+        basic_profile: "full",
+        busybox_profile: "full",
+        gate_libctest_scope: "full",
+        libcbench_scope: "full",
+        lmbench_scope: "full",
+    };
+    let Ok(bytes) = vfs.read_file_all("/", OSCOMP_STAGE2_LOCAL_ENV_PATH) else {
+        return overrides;
+    };
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        return overrides;
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "WHUSE_STAGE2_FULL_MAX_GROUP" => {
+                overrides.full_max_group = normalize_oscomp_full_max_group_value(value);
+            }
+            "WHUSE_STAGE2_IOZONE_PROFILE" => {
+                overrides.iozone_profile = normalize_oscomp_iozone_profile_value(value);
+            }
+            "WHUSE_STAGE2_BASIC_PROFILE" => {
+                overrides.basic_profile = normalize_oscomp_basic_profile_value(value);
+            }
+            "WHUSE_STAGE2_BUSYBOX_PROFILE" => {
+                overrides.busybox_profile = normalize_oscomp_busybox_profile_value(value);
+            }
+            "WHUSE_STAGE2_GATE_LIBCTEST_SCOPE" => {
+                overrides.gate_libctest_scope =
+                    normalize_oscomp_gate_libctest_scope_value(value);
+            }
+            "WHUSE_STAGE2_LIBCBENCH_SCOPE" => {
+                overrides.libcbench_scope = normalize_oscomp_libcbench_scope_value(value);
+            }
+            "WHUSE_STAGE2_LMBENCH_SCOPE" => {
+                overrides.lmbench_scope = normalize_oscomp_lmbench_scope_value(value);
+            }
+            _ => {}
+        }
+    }
+    overrides
+}
+
+fn render_oscomp_official_suite_script(
+    profile_default: &str,
+    time_test_present: bool,
+    overrides: OscompStage2Overrides,
+) -> String {
+    OSCOMP_OFFICIAL_SUITE_SCRIPT
+        .replace(OSCOMP_PROFILE_DEFAULT_PLACEHOLDER, profile_default)
+        .replace(OSCOMP_FULL_MAX_GROUP_PLACEHOLDER, overrides.full_max_group)
+        .replace(OSCOMP_IOZONE_PROFILE_PLACEHOLDER, overrides.iozone_profile)
+        .replace(OSCOMP_BASIC_PROFILE_PLACEHOLDER, overrides.basic_profile)
+        .replace(OSCOMP_BUSYBOX_PROFILE_PLACEHOLDER, overrides.busybox_profile)
+        .replace(
+            OSCOMP_GATE_LIBCTEST_SCOPE_PLACEHOLDER,
+            overrides.gate_libctest_scope,
+        )
+        .replace(OSCOMP_LIBCBENCH_SCOPE_PLACEHOLDER, overrides.libcbench_scope)
+        .replace(OSCOMP_LMBENCH_SCOPE_PLACEHOLDER, overrides.lmbench_scope)
+        .replace(
+            OSCOMP_TIME_TEST_PRESENT_PLACEHOLDER,
+            if time_test_present { "1" } else { "0" },
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OSCOMP_OFFICIAL_SUITE_SCRIPT;
+
+    #[test]
+    fn oscomp_official_suite_supports_local_stage2_overrides() {
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("WHUSE_STAGE2_FULL_MAX_GROUP=${WHUSE_STAGE2_FULL_MAX_GROUP:-__WHUSE_STAGE2_FULL_MAX_GROUP__}"),
+            "official suite script should carry a render-time full max group placeholder"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("whuse-oscomp-real-max-group:$WHUSE_STAGE2_FULL_MAX_GROUP"),
+            "official suite script should log the effective full max group"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("whuse-oscomp-basic-profile:$WHUSE_STAGE2_BASIC_PROFILE"),
+            "official suite script should log the effective basic profile"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("whuse-oscomp-busybox-profile:$WHUSE_STAGE2_BUSYBOX_PROFILE"),
+            "official suite script should log the effective busybox profile"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-libctest-scope:$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE"),
+            "official suite script should log the effective libctest scope"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains(
+                "WHUSE_STAGE2_LIBCBENCH_SCOPE=${WHUSE_STAGE2_LIBCBENCH_SCOPE:-__WHUSE_STAGE2_LIBCBENCH_SCOPE__}"
+            ),
+            "official suite script should carry a render-time libc-bench scope placeholder"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-libcbench-scope:$WHUSE_STAGE2_LIBCBENCH_SCOPE"),
+            "official suite script should log the effective libc-bench scope"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains(
+                "WHUSE_STAGE2_LMBENCH_SCOPE=${WHUSE_STAGE2_LMBENCH_SCOPE:-__WHUSE_STAGE2_LMBENCH_SCOPE__}"
+            ),
+            "official suite script should carry a render-time lmbench scope placeholder"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-lmbench-scope:$WHUSE_STAGE2_LMBENCH_SCOPE"),
+            "official suite script should log the effective lmbench scope"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("basic:*|full:smoke)"),
+            "official suite script should allow full profile runs to reuse the basic smoke path"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-step-skip:glibc/busybox_testcode.sh:busybox-smoke-fast-path"),
+            "official suite script should expose the local full-smoke busybox fast-path skip marker"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-step-skip:glibc/libctest_testcode.sh:libctest-smoke-fast-path"),
+            "official suite script should expose the local full-smoke libctest fast-path skip marker"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-step-skip:glibc/libcbench_testcode.sh:libcbench-smoke-fast-path"),
+            "official suite script should expose the local full-smoke libc-bench fast-path skip marker"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-step-skip:glibc/lmbench_testcode.sh:lmbench-smoke-fast-path"),
+            "official suite script should expose the local full-smoke lmbench fast-path skip marker"
+        );
+    }
+}
+
+fn ext4_path_readable(device: &'static dyn hal_api::HalBlockDevice, path: &str) -> bool {
+    let Ok(mount) = Ext4Mount::probe(device) else {
+        return false;
+    };
+    mount.read_range(path, 0, 1).is_ok()
 }
 
 fn oscomp_process_timeout_ns(

@@ -50,11 +50,7 @@ fn main() {
         "cyclic" => "cyclic",
         _ => "all",
     };
-    let default_iozone_profile = if target_arch == "riscv64" {
-        "full"
-    } else {
-        "smoke"
-    };
+    let default_iozone_profile = "full";
     let iozone_profile = match env::var("WHUSE_STAGE2_IOZONE_PROFILE")
         .unwrap_or_else(|_| default_iozone_profile.to_string())
         .as_str()

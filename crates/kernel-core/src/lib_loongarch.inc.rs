@@ -102,6 +102,7 @@ const OSCOMP_OPTIONAL_TEST_FILES: &[&str] = &[
     "/glibc/cyclictest_testcode.sh",
 ];
 const OSCOMP_PROFILE_PATH: &str = "/whuse-oscomp-profile";
+const OSCOMP_RUNTIME_FILTER_PATH: &str = "/whuse-oscomp-runtime-filter";
 const OSCOMP_PROFILE_DEFAULT_PLACEHOLDER: &str = "__WHUSE_OSCOMP_PROFILE_DEFAULT__";
 const OSCOMP_CFG_RUNNER_MODE_PATH: &str = "/musl/.whuse_oscomp_runner";
 const OSCOMP_LIBCTEST_PRELOAD_FILES: [(&str, u32); 18] = [
@@ -941,13 +942,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    runtime=\"$1\"\n",
     "    timeout_s=\"$2\"\n",
     "    root=\"/$runtime\"\n",
-    "    brk_path=\"./basic/brk\"\n",
     "    fallback_script=\"basic_testcode.sh\"\n",
-    "    if [ \"$runtime\" = \"glibc\" ]; then\n",
-    "        root=\"/\"\n",
-    "        brk_path=\"/glibc/basic/brk\"\n",
-    "        fallback_script=\"/glibc/basic_testcode.sh\"\n",
-    "    fi\n",
     "    echo whuse-oscomp-runtime-begin:$runtime\n",
     "    cd \"$root\" || {\n",
     "        echo whuse-oscomp-step-begin:${runtime}/basic_testcode.sh\n",
@@ -956,30 +951,8 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        return 1\n",
     "    }\n",
     "    echo whuse-oscomp-step-begin:${runtime}/basic_testcode.sh\n",
-    "    echo \"Testing brk :\"\n",
-    "    if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
-    "        /musl/busybox timeout \"$timeout_s\" \"$brk_path\"\n",
-    "    else\n",
-    "        \"$brk_path\"\n",
-    "    fi\n",
+    "    /musl/busybox sh \"$fallback_script\"\n",
     "    rc=$?\n",
-    "    if [ \"$runtime\" = \"musl\" ] && [ \"$rc\" = \"0\" ]; then\n",
-    "        echo \"Testing sleep :\"\n",
-    "        if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
-    "            /musl/busybox timeout \"$timeout_s\" ./basic/sleep\n",
-    "        else\n",
-    "            ./basic/sleep\n",
-    "        fi\n",
-    "        rc=$?\n",
-    "    fi\n",
-    "    if [ \"$rc\" = \"127\" ] || [ \"$rc\" = \"126\" ]; then\n",
-    "        if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
-    "            /musl/busybox timeout \"$timeout_s\" /musl/busybox sh \"$fallback_script\"\n",
-    "        else\n",
-    "            /musl/busybox sh \"$fallback_script\"\n",
-    "        fi\n",
-    "        rc=$?\n",
-    "    fi\n",
     "    if [ \"$rc\" = \"124\" ]; then\n",
     "        echo whuse-oscomp-step-timeout:${runtime}/basic_testcode.sh:$timeout_s:pid=0:tgid=0\n",
     "    fi\n",
@@ -992,32 +965,90 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    timeout_s=\"$1\"\n",
     "    echo whuse-oscomp-step-begin:basic_testcode.sh\n",
     "    group_rc=0\n",
-    "    echo whuse-oscomp-runtime-dispatch:musl\n",
-    "    run_basic_runtime_entry musl \"$timeout_s\"\n",
-    "    rc=$?\n",
-    "    if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
-    "        group_rc=\"$rc\"\n",
+    "    if runtime_selected musl; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:musl\n",
+    "        run_basic_runtime_entry musl \"$timeout_s\"\n",
+    "        rc=$?\n",
+    "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "            group_rc=\"$rc\"\n",
+    "        fi\n",
+    "    else\n",
+    "        skip_runtime_step musl basic_testcode.sh\n",
     "    fi\n",
-    "    echo whuse-oscomp-runtime-dispatch:glibc\n",
-    "    run_basic_runtime_entry glibc \"$timeout_s\"\n",
-    "    rc=$?\n",
-    "    if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
-    "        group_rc=\"$rc\"\n",
+    "    if runtime_selected glibc; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "        run_basic_runtime_entry glibc \"$timeout_s\"\n",
+    "        rc=$?\n",
+    "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "            group_rc=\"$rc\"\n",
+    "        fi\n",
+    "    else\n",
+    "        skip_runtime_step glibc basic_testcode.sh\n",
     "    fi\n",
     "    echo whuse-oscomp-step-end:basic_testcode.sh:$group_rc\n",
     "    return 0\n",
     "}\n",
-    "run_busybox_smoke_case() {\n",
-    "    busybox_bin=\"$1\"\n",
-    "    label=\"$2\"\n",
-    "    shift 2\n",
-    "    \"$busybox_bin\" \"$@\"\n",
+    "read_local_case_filter() {\n",
+    "    if [ -f /whuse-oscomp-case-filter ]; then\n",
+    "        value=''\n",
+    "        IFS= read -r value < /whuse-oscomp-case-filter || true\n",
+    "        printf '%s' \"$value\"\n",
+    "    fi\n",
+    "}\n",
+    "read_local_runtime_filter() {\n",
+    "    WHUSE_LOCAL_RUNTIME_FILTER=both\n",
+    "}\n",
+    "runtime_selected() {\n",
+    "    runtime=\"$1\"\n",
+    "    case \"$WHUSE_LOCAL_RUNTIME_FILTER\" in\n",
+    "        both|'') return 0 ;;\n",
+    "        \"$runtime\") return 0 ;;\n",
+    "        *) return 1 ;;\n",
+    "    esac\n",
+    "}\n",
+    "skip_runtime_step() {\n",
+    "    runtime=\"$1\"\n",
+    "    marker_script=\"$2\"\n",
+    "    echo whuse-oscomp-runtime-skip:$runtime:runtime-filter\n",
+    "    echo whuse-oscomp-step-begin:${runtime}/$marker_script\n",
+    "    echo whuse-oscomp-step-skip:${runtime}/$marker_script:runtime-filter\n",
+    "    echo whuse-oscomp-step-end:${runtime}/$marker_script:0\n",
+    "}\n",
+    "local_case_filter_matches() {\n",
+    "    expected=\"$1\"\n",
+    "    value=\"$(read_local_case_filter)\"\n",
+    "    case \"$value\" in\n",
+    "        \"$expected\":*) return 0 ;;\n",
+    "        *) return 1 ;;\n",
+    "    esac\n",
+    "}\n",
+    "run_busybox_case_line() {\n",
+    "    runtime=\"$1\"\n",
+    "    busybox_bin=\"$2\"\n",
+    "    line=\"$3\"\n",
+    "    eval \"\\\"$busybox_bin\\\" $line\"\n",
     "    rc=$?\n",
-    "    if [ \"$rc\" -ne 0 ]; then\n",
-    "        echo \"testcase busybox $label fail\"\n",
+    "    printf '\\nwhuse-oscomp-busybox-case:%s:%s:%s\\n' \"$runtime\" \"$line\" \"$rc\"\n",
+    "    if [ \"$rc\" -ne 0 ] && [ \"$line\" != \"false\" ]; then\n",
+    "        printf 'testcase busybox %s fail\\n' \"$line\"\n",
     "        return \"$rc\"\n",
     "    fi\n",
-    "    echo \"testcase busybox $label success\"\n",
+    "    printf 'testcase busybox %s success\\n' \"$line\"\n",
+    "    return 0\n",
+    "}\n",
+    "run_busybox_smoke_case() {\n",
+    "    runtime=\"$1\"\n",
+    "    busybox_bin=\"$2\"\n",
+    "    label=\"$3\"\n",
+    "    shift 3\n",
+    "    \"$busybox_bin\" \"$@\"\n",
+    "    rc=$?\n",
+    "    printf '\\nwhuse-oscomp-busybox-case:%s:%s:%s\\n' \"$runtime\" \"$label\" \"$rc\"\n",
+    "    if [ \"$rc\" -ne 0 ]; then\n",
+    "        printf 'testcase busybox %s fail\\n' \"$label\"\n",
+    "        return \"$rc\"\n",
+    "    fi\n",
+    "    printf 'testcase busybox %s success\\n' \"$label\"\n",
     "    return 0\n",
     "}\n",
     "run_busybox_runtime_entry() {\n",
@@ -1028,18 +1059,21 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        echo whuse-oscomp-step-begin:${runtime}/busybox_testcode.sh\n",
     "        echo whuse-oscomp-step-end:${runtime}/busybox_testcode.sh:1\n",
     "        echo whuse-oscomp-runtime-end:$runtime\n",
-    "        return 1\n",
+        "        return 1\n",
     "    }\n",
     "    echo whuse-oscomp-step-begin:${runtime}/busybox_testcode.sh\n",
     "    fail=0\n",
-    "    run_busybox_smoke_case \"$busybox_bin\" true true || fail=1\n",
-    "    run_busybox_smoke_case \"$busybox_bin\" 'echo smoke' echo '#### busybox smoke ####' || fail=1\n",
-    "    run_busybox_smoke_case \"$busybox_bin\" 'sh -c exit' sh -c 'exit 0' || fail=1\n",
-    "    run_busybox_smoke_case \"$busybox_bin\" 'basename /aaa/bbb' basename /aaa/bbb || fail=1\n",
-    "    run_busybox_smoke_case \"$busybox_bin\" 'dirname /aaa/bbb' dirname /aaa/bbb || fail=1\n",
-    "    run_busybox_smoke_case \"$busybox_bin\" date date || fail=1\n",
-    "    run_busybox_smoke_case \"$busybox_bin\" uname uname || fail=1\n",
-    "    run_busybox_smoke_case \"$busybox_bin\" pwd pwd || fail=1\n",
+    "    exec 9<\"/$runtime/busybox_cmd.txt\" || {\n",
+    "        echo whuse-oscomp-step-end:${runtime}/busybox_testcode.sh:1\n",
+    "        echo whuse-oscomp-runtime-end:$runtime\n",
+    "        return 1\n",
+    "    }\n",
+    "    while IFS= read -r line <&9 || [ -n \"$line\" ]; do\n",
+    "        [ -n \"$line\" ] || continue\n",
+        "        echo whuse-oscomp-busybox-next:${runtime}:$line\n",
+    "        run_busybox_case_line \"$runtime\" \"$busybox_bin\" \"$line\" || fail=1\n",
+    "    done\n",
+    "    exec 9<&-\n",
     "    echo whuse-oscomp-step-end:${runtime}/busybox_testcode.sh:$fail\n",
     "    echo whuse-oscomp-runtime-end:$runtime\n",
     "    return \"$fail\"\n",
@@ -1047,17 +1081,25 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "run_busybox_dual_step() {\n",
     "    echo whuse-oscomp-step-begin:busybox_testcode.sh\n",
     "    group_rc=0\n",
-    "    echo whuse-oscomp-runtime-dispatch:musl\n",
-    "    run_busybox_runtime_entry musl\n",
-    "    rc=$?\n",
-    "    if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
-    "        group_rc=\"$rc\"\n",
+    "    if runtime_selected musl; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:musl\n",
+    "        run_busybox_runtime_entry musl\n",
+    "        rc=$?\n",
+    "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "            group_rc=\"$rc\"\n",
+    "        fi\n",
+    "    else\n",
+    "        skip_runtime_step musl busybox_testcode.sh\n",
     "    fi\n",
-    "    echo whuse-oscomp-runtime-dispatch:glibc\n",
-    "    run_busybox_runtime_entry glibc\n",
-    "    rc=$?\n",
-    "    if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
-    "        group_rc=\"$rc\"\n",
+    "    if runtime_selected glibc; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "        run_busybox_runtime_entry glibc\n",
+    "        rc=$?\n",
+    "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "            group_rc=\"$rc\"\n",
+    "        fi\n",
+    "    else\n",
+    "        skip_runtime_step glibc busybox_testcode.sh\n",
     "    fi\n",
     "    echo whuse-oscomp-step-end:busybox_testcode.sh:$group_rc\n",
     "    return 0\n",
@@ -1070,23 +1112,27 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        run_basic_dual_step \"$timeout_s\"\n",
     "        return 0\n",
     "    fi\n",
-    "    if [ \"$root_marker\" = \"busybox_testcode.sh\" ] && [ \"$runtime_script\" = \"busybox_testcode.sh\" ] && [ \"$WHUSE_OSCOMP_PROFILE\" = \"busybox\" ]; then\n",
-    "        run_busybox_dual_step\n",
-    "        return 0\n",
-    "    fi\n",
     "    echo whuse-oscomp-step-begin:$root_marker\n",
     "    group_rc=0\n",
-    "    echo whuse-oscomp-runtime-dispatch:musl\n",
-    "    run_script_entry musl \"$runtime_script\" \"\" \"$timeout_s\"\n",
-    "    rc=$?\n",
-    "    if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
-        "        group_rc=\"$rc\"\n",
+    "    if runtime_selected musl; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:musl\n",
+    "        run_script_entry musl \"$runtime_script\" \"\" \"$timeout_s\"\n",
+    "        rc=$?\n",
+    "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "            group_rc=\"$rc\"\n",
+    "        fi\n",
+    "    else\n",
+    "        skip_runtime_step musl \"$runtime_script\"\n",
     "    fi\n",
-    "    echo whuse-oscomp-runtime-dispatch:glibc\n",
-    "    run_script_entry glibc \"$runtime_script\" \"\" \"$timeout_s\"\n",
-    "    rc=$?\n",
-    "    if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
-    "        group_rc=\"$rc\"\n",
+    "    if runtime_selected glibc; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "        run_script_entry glibc \"$runtime_script\" \"\" \"$timeout_s\"\n",
+    "        rc=$?\n",
+    "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "            group_rc=\"$rc\"\n",
+    "        fi\n",
+    "    else\n",
+    "        skip_runtime_step glibc \"$runtime_script\"\n",
     "    fi\n",
     "    echo whuse-oscomp-step-end:$root_marker:$group_rc\n",
     "    return 0\n",
@@ -1110,6 +1156,8 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    fi\n",
     "    return 0\n",
     "}\n",
+    "WHUSE_LOCAL_RUNTIME_FILTER=both\n",
+    "read_local_runtime_filter\n",
     "run_selected_profile() {\n",
     "    case \"$WHUSE_OSCOMP_PROFILE\" in\n",
     "    full)\n",
@@ -1329,18 +1377,7 @@ impl Kernel {
 
     pub fn run_forever(&mut self) -> ! {
         logln(format_args!("whuse: entering scheduler loop"));
-        static mut LOOP_COUNT: usize = 0;
         loop {
-            unsafe {
-                LOOP_COUNT += 1;
-                if LOOP_COUNT == 1000
-                    || LOOP_COUNT == 5000
-                    || (LOOP_COUNT >= 10000 && LOOP_COUNT % 10000 == 0 && LOOP_COUNT <= 100000)
-                {
-                    logln(format_args!("[LOOP:{}]", LOOP_COUNT));
-                }
-            }
-
             if self.enforce_oscomp_watchdog() {
                 continue;
             }
@@ -1352,18 +1389,6 @@ impl Kernel {
                     .any(|process| process.tgid > 1 && !process.is_thread);
 
                 if has_non_init {
-                    static mut SPIN_LOG_COUNT: usize = 0;
-                    unsafe {
-                        SPIN_LOG_COUNT += 1;
-                        if SPIN_LOG_COUNT == 1000
-                            || SPIN_LOG_COUNT == 5000
-                            || (SPIN_LOG_COUNT >= 10000
-                                && SPIN_LOG_COUNT % 10000 == 0
-                                && SPIN_LOG_COUNT <= 100000)
-                        {
-                            logln(format_args!("[SPIN:{}]", SPIN_LOG_COUNT));
-                        }
-                    }
                     let idle_ticks = KERNEL_IDLE_TIMER_TICKS.swap(0, Ordering::Relaxed);
                     let now = hal().timer.monotonic_nanos();
                     let expired_tids = self.processes.timed_wait_expired_tids(now);
@@ -1507,36 +1532,6 @@ impl Kernel {
         }
         let in_iozone_busybox_window =
             OSCOMP_IOZONE_BUSYBOX_WINDOW_NS > 0 && now <= self.watchdog_iozone_window_until_ns;
-        if !all_groups.is_empty()
-            && (self.watchdog_last_heartbeat_ns == 0
-                || now.saturating_sub(self.watchdog_last_heartbeat_ns) >= 2_000_000_000)
-        {
-            self.watchdog_last_heartbeat_ns = now;
-            let mut sample = String::new();
-            for (idx, (tgid, name)) in all_groups.iter().enumerate() {
-                if idx >= 8 {
-                    break;
-                }
-                if !sample.is_empty() {
-                    sample.push_str(", ");
-                }
-                let age_s = self
-                    .watchdog_started_at
-                    .get(tgid)
-                    .map(|started| now.saturating_sub(*started) / 1_000_000_000)
-                    .unwrap_or(0);
-                let _ = core::fmt::Write::write_fmt(
-                    &mut sample,
-                    format_args!("{}:{}:age_s={}", tgid, name, age_s),
-                );
-            }
-            logln(format_args!(
-                "whuse: oscomp watchdog heartbeat groups={} watched={} sample=[{}]",
-                all_groups.len(),
-                watched.len(),
-                sample
-            ));
-        }
         let in_bench_phase = watched
             .values()
             .any(|name| name.contains("lmbench") || name.contains("unixbench"));
@@ -1877,6 +1872,7 @@ impl Kernel {
         }
 
         if is_syscall {
+            let trap_tid = self.processes.current_tid().ok();
             let result = self.syscalls.dispatch(
                 sysno,
                 SyscallArgs(args),
@@ -1884,7 +1880,34 @@ impl Kernel {
                 &mut self.scheduler,
                 &mut self.vfs,
             );
-            if let Ok(process) = self.processes.current_mut() {
+            if let Some(tid) = trap_tid {
+                if let Ok(process) = self.processes.find_by_tid_mut(tid) {
+                    let blocked_restart = result == EAGAIN_RET
+                        && matches!(
+                            sysno,
+                            SYS_WAIT
+                                | SYS_READ
+                                | SYS_READV
+                                | SYS_RT_SIGSUSPEND
+                                | SYS_RT_SIGTIMEDWAIT
+                                | SYS_FUTEX
+                                | SYS_PPOLL
+                                | SYS_PSELECT6
+                                | SYS_EPOLL_PWAIT
+                                | SYS_EPOLL_PWAIT2
+                                | SYS_NANOSLEEP
+                                | SYS_CLOCK_NANOSLEEP
+                        );
+                    if !blocked_restart {
+                        process.trap_frame.set_retval(result as usize);
+                        if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN)
+                            || (result as i32) < 0
+                        {
+                            process.trap_frame.sepc = sepc + 4;
+                        }
+                    }
+                }
+            } else if let Ok(process) = self.processes.current_mut() {
                 let blocked_restart = result == EAGAIN_RET
                     && matches!(
                         sysno,
@@ -2151,7 +2174,7 @@ fn log_rootfs_smoke(device: &'static dyn hal_api::HalBlockDevice) {
         return;
     };
     match mount.exists("/musl/busybox") {
-        Ok(true) => logln(format_args!("whuse: rootfs smoke found /musl/busybox")),
+        Ok(true) => {}
         Ok(false) => {}
         Err(err) => logln(format_args!(
             "whuse: rootfs smoke exists check /musl/busybox failed err={}",
@@ -2161,14 +2184,7 @@ fn log_rootfs_smoke(device: &'static dyn hal_api::HalBlockDevice) {
     let mut last_error = None;
     for path in ["/musl/basic/run-all.sh", "/etc/issue", "/bin/sh"] {
         match mount.read_detailed(path) {
-            Ok(bytes) => {
-                logln(format_args!(
-                    "whuse: rootfs smoke read success path={} bytes={}",
-                    path,
-                    bytes.len(),
-                ));
-                return;
-            }
+            Ok(_) => return,
             Err(detail) => {
                 let errno = match mount.read(path) {
                     Ok(_) => 0,
@@ -2462,10 +2478,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
     }
     let suite_script = select_oscomp_suite_script(vfs);
     match vfs.create_file("/", OSCOMP_SUITE_SCRIPT_PATH, suite_script.as_bytes()) {
-        Ok(()) => logln(format_args!(
-            "whuse: installed suite script {}",
-            OSCOMP_SUITE_SCRIPT_PATH
-        )),
+        Ok(()) => {}
         Err(err) => logln(format_args!(
             "whuse: failed suite script {} err={}",
             OSCOMP_SUITE_SCRIPT_PATH, err
@@ -2476,10 +2489,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         OSCOMP_SUITE_ENTRY_PATH,
         OSCOMP_SUITE_ENTRY_SCRIPT.as_bytes(),
     ) {
-        Ok(()) => logln(format_args!(
-            "whuse: installed suite entry {}",
-            OSCOMP_SUITE_ENTRY_PATH
-        )),
+        Ok(()) => {}
         Err(err) => logln(format_args!(
             "whuse: failed suite entry {} err={}",
             OSCOMP_SUITE_ENTRY_PATH, err
@@ -2490,10 +2500,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH,
         OSCOMP_BUSYBOX_COMPAT_SCRIPT.as_bytes(),
     ) {
-        Ok(()) => logln(format_args!(
-            "whuse: installed busybox compat script {}",
-            OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH
-        )),
+        Ok(()) => {}
         Err(err) => logln(format_args!(
             "whuse: failed busybox compat script {} err={}",
             OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH, err
@@ -2534,11 +2541,7 @@ fn preload_libctest_hot_files_from_device(
             continue;
         }
         match vfs.preload_external_file(path, &bytes, Some(mode)) {
-            Ok(()) => logln(format_args!(
-                "whuse: libctest preloaded path={} bytes={}",
-                path,
-                bytes.len()
-            )),
+            Ok(()) => {}
             Err(err) => logln(format_args!(
                 "whuse: libctest preload failed path={} err={}",
                 path, err
@@ -2831,10 +2834,7 @@ fn is_oscomp_heavy_process(name: &str) -> bool {
 fn log_block_probe(device: &'static dyn hal_api::HalBlockDevice, sector: usize) {
     let mut buf = [0u8; 512];
     match device.read_sector(sector, &mut buf) {
-        Ok(()) => logln(format_args!(
-            "whuse: block probe sector={} ok bytes={:02x} {:02x} {:02x} {:02x}",
-            sector, buf[0], buf[1], buf[2], buf[3]
-        )),
+        Ok(()) => {}
         Err(err) => logln(format_args!(
             "whuse: block probe sector={} failed err={}",
             sector, err
@@ -2854,8 +2854,37 @@ fn log_block_probe_span(device: &'static dyn hal_api::HalBlockDevice, start: usi
             return;
         }
     }
-    logln(format_args!(
-        "whuse: block probe span ok start={} count={}",
-        start, count
-    ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_RUNTIME_FILTER_PATH};
+
+    #[test]
+    fn official_suite_reads_busybox_cases_via_dedicated_fd() {
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("exec 9<\"/$runtime/busybox_cmd.txt\""),
+            "LoongArch official suite should read busybox cases via a dedicated file descriptor"
+        );
+        assert!(
+            !OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("done < \"/$runtime/busybox_cmd.txt\""),
+            "LoongArch official suite should not redirect the whole while-loop stdin from busybox_cmd.txt"
+        );
+    }
+
+    #[test]
+    fn official_suite_supports_local_runtime_filter() {
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("runtime_selected()"),
+            "LoongArch official suite should expose runtime_selected()"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("WHUSE_LOCAL_RUNTIME_FILTER=both\n"),
+            "LoongArch official suite should initialize runtime filter once"
+        );
+        assert!(
+            !OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("filter=\"$(read_local_runtime_filter)\""),
+            "LoongArch official suite should not depend on command substitution for runtime filter"
+        );
+    }
 }

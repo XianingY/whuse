@@ -116,6 +116,16 @@ pub struct ProcessSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessRelationSnapshot {
+    pub tid: usize,
+    pub tgid: usize,
+    pub parent: Option<usize>,
+    pub name: String,
+    pub state: ProcessState,
+    pub is_thread: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessDebugSnapshot {
     pub tid: usize,
     pub tgid: usize,
@@ -868,6 +878,41 @@ impl ProcessTable {
         Ok((child_tid, status))
     }
 
+    pub fn wait_child_snapshot(
+        &self,
+        parent_tgid: usize,
+        selector: WaitSelector,
+    ) -> Vec<ProcessSnapshot> {
+        self.processes
+            .values()
+            .filter(|process| !process.is_thread)
+            .filter(|process| process.parent == Some(parent_tgid))
+            .filter(|process| selector_matches(selector, process))
+            .map(|process| ProcessSnapshot {
+                tid: process.tid,
+                tgid: process.tgid,
+                name: process.name.clone(),
+                state: process.state,
+                is_thread: process.is_thread,
+            })
+            .collect()
+    }
+
+    pub fn active_process_relations(&self) -> Vec<ProcessRelationSnapshot> {
+        self.processes
+            .values()
+            .filter(|process| process.state != ProcessState::Exited)
+            .map(|process| ProcessRelationSnapshot {
+                tid: process.tid,
+                tgid: process.tgid,
+                parent: process.parent,
+                name: process.name.clone(),
+                state: process.state,
+                is_thread: process.is_thread,
+            })
+            .collect()
+    }
+
     pub fn fork_current(&mut self) -> KernelResult<usize> {
         self.fork_process_from_current()
     }
@@ -1194,10 +1239,6 @@ impl ProcessTable {
             return Err(ESRCH);
         }
         process.pending_signals |= 1u64 << (signal - 1);
-        if signal == 33 {
-            process.mark_cancel_signal_dispatched();
-            process.arm_cancel_interrupt_once();
-        }
         Ok(target_tid)
     }
 
@@ -1213,10 +1254,6 @@ impl ProcessTable {
             return Ok(tid);
         }
         process.pending_signals |= 1u64 << (signal - 1);
-        if signal == 33 {
-            process.mark_cancel_signal_dispatched();
-            process.arm_cancel_interrupt_once();
-        }
         Ok(tid)
     }
 
@@ -1895,6 +1932,21 @@ impl ProcessTable {
     }
 
     fn reap_thread_group(&mut self, tgid: usize) {
+        let init_tgid = self
+            .processes
+            .values()
+            .find(|process| !process.is_thread && process.parent.is_none())
+            .map(|process| process.tgid)
+            .unwrap_or(1);
+        for process in self.processes.values_mut() {
+            if !process.is_thread
+                && process.state != ProcessState::Exited
+                && process.parent == Some(tgid)
+                && process.tgid != tgid
+            {
+                process.parent = Some(init_tgid);
+            }
+        }
         let tids = self
             .processes
             .iter()
@@ -2258,6 +2310,26 @@ mod tests {
     }
 
     #[test]
+    fn reaping_process_group_reparents_live_children_to_init() {
+        let mut table = ProcessTable::new();
+        let init = table.spawn_init("init", 0x1000);
+        let shell = table.spawn("shell", Some(init), 0x1000);
+        let worker = table.spawn("worker", Some(shell), 0x1000);
+        let grandchild = table.spawn("grandchild", Some(worker), 0x1000);
+
+        table.set_current(worker).unwrap();
+        table.exit_current_thread(0).unwrap();
+        table.set_current(shell).unwrap();
+        let (waited, status) = table
+            .wait_child(shell, WaitSelector::Pid(worker), 0)
+            .unwrap();
+
+        assert_eq!(waited, worker);
+        assert_eq!(status, 0);
+        assert_eq!(table.find_process_by_pid(grandchild).unwrap().parent, Some(init));
+    }
+
+    #[test]
     fn cancel_interrupt_token_is_one_shot() {
         let mut table = ProcessTable::new();
         let pid = table.spawn_init("init", 0x1000);
@@ -2277,6 +2349,20 @@ mod tests {
         process.mark_cancel_signal_dispatched();
         process.arm_cancel_interrupt_once();
         process.reset_image(0x2000, None);
+        assert!(!process.cancel_signal_seen);
+        assert!(!process.cancel_interrupt_once);
+    }
+
+    #[test]
+    fn queued_sigcancel_does_not_arm_interrupt_before_delivery() {
+        let mut table = ProcessTable::new();
+        let pid = table.spawn_init("init", 0x1000);
+        table.set_current(pid).unwrap();
+
+        table.send_signal_tid(pid, 33).unwrap();
+
+        let process = table.current().unwrap();
+        assert_ne!(process.pending_signals & (1u64 << (33 - 1)), 0);
         assert!(!process.cancel_signal_seen);
         assert!(!process.cancel_interrupt_once);
     }

@@ -102,6 +102,7 @@ const KEY_SPEC_USER_KEYRING: i32 = -4;
 const KEY_SPEC_USER_SESSION_KEYRING: i32 = -5;
 const KEYCTL_GET_KEYRING_ID: usize = 0;
 const KEYCTL_JOIN_SESSION_KEYRING: usize = 1;
+const SIGCANCEL: usize = 33;
 const TIME_OK: usize = 0;
 const ADJ_OFFSET: u32 = 0x0001;
 const ADJ_FREQUENCY: u32 = 0x0002;
@@ -340,6 +341,22 @@ pub const SIGNAL_TRAMPOLINE_CODE: [u8; 16] = [
 #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
 pub const SIGNAL_TRAMPOLINE_CODE: [u8; 16] = [0u8; 16];
 const SYSCALL_TRACE_DEFAULT: bool = false;
+static CONSOLE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn write_console_bytes(bytes: &[u8]) {
+    let _guard = CONSOLE_WRITE_LOCK.lock();
+    for byte in bytes.iter().copied() {
+        hal().console.put_byte(byte);
+    }
+}
+
+fn write_console_line(line: &str) {
+    let _guard = CONSOLE_WRITE_LOCK.lock();
+    for byte in line.bytes() {
+        hal().console.put_byte(byte);
+    }
+    hal().console.put_byte(b'\n');
+}
 
 #[inline]
 fn syscall_trace_enabled() -> bool {
@@ -354,27 +371,18 @@ fn trace_line(line: &str) {
     if !syscall_trace_enabled() {
         return;
     }
-    for byte in line.bytes() {
-        hal().console.put_byte(byte);
-    }
-    hal().console.put_byte(b'\n');
+    write_console_line(line);
 }
 
 fn trace_enosys(line: &str) {
     if !(ENOSYS_TRACE_DEFAULT || matches!(option_env!("WHUSE_DEBUG_ENOSYS"), Some("1"))) {
         return;
     }
-    for byte in line.bytes() {
-        hal().console.put_byte(byte);
-    }
-    hal().console.put_byte(b'\n');
+    write_console_line(line);
 }
 
 fn log_always(line: &str) {
-    for byte in line.bytes() {
-        hal().console.put_byte(byte);
-    }
-    hal().console.put_byte(b'\n');
+    write_console_line(line);
 }
 
 fn wake_process_group_threads(
@@ -1850,13 +1858,6 @@ impl SyscallDispatcher {
             "whuse: clone parent_tgid={} flags={:#x} child_tgid={} shared_vm={}",
             parent_pid, flags, pid, shared_vm
         ));
-        if name.contains("/basic/clone") {
-            log_always(&format!(
-                "whuse-clone-debug: parent={} flags={:#x} child={} stack={:#x} ptid={:#x} ctid={:#x} shared_vm={}",
-                parent_pid, flags, pid, child_stack, parent_tid, child_tid_ptr, shared_vm
-            ));
-        }
-
         if compat_flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
             procs
                 .current_mut()?
@@ -1879,15 +1880,9 @@ impl SyscallDispatcher {
 
         if child_stack != 0 {
             procs.set_thread_stack_pointer(pid, child_stack)?;
-            if name.contains("/basic/clone") {
-                log_always(&format!(
-                    "whuse-clone-debug: child={} stack-set={:#x}",
-                    pid, child_stack
-                ));
-            }
         }
         if (flags & CLONE_VFORK) != 0 {
-            procs.set_vfork_parent_tid(pid, parent_tid)?;
+            procs.set_vfork_parent_tid(pid, procs.current_tid()?)?;
             let _ = scheduler.block_current();
         }
         scheduler.spawn(&name, pid, pid);
@@ -2457,20 +2452,6 @@ impl SyscallDispatcher {
         let options = args.0[2] as u32;
         let _rusage = args.0[3];
         let parent_pid = procs.current_pid()?;
-        let (parent_name, parent_cwd) = {
-            let process = procs.current()?;
-            (process.name.clone(), process.cwd.clone())
-        };
-        let busybox_wait_debug =
-            parent_name.contains("busybox") && parent_cwd == "/musl" && wait_pid > 0;
-        let clone_wait_debug = parent_name.contains("/basic/clone");
-        let wait_debug = busybox_wait_debug || clone_wait_debug;
-        if wait_debug {
-            log_always(&format!(
-                "whuse-wait: enter tgid={} name={} wait_pid={} options={:#x}",
-                parent_pid, parent_name, wait_pid, options
-            ));
-        }
         trace_line(&format!(
             "whuse: wait enter tgid={} wait_pid={} status_ptr={:#x} options={:#x}",
             parent_pid, wait_pid, status_ptr, options
@@ -2479,12 +2460,6 @@ impl SyscallDispatcher {
         let (child_pid, status) = match procs.wait_child(parent_pid, selector, options) {
             Ok(pair) => pair,
             Err(err) => {
-                if wait_debug {
-                    log_always(&format!(
-                        "whuse-wait: err tgid={} wait_pid={} err={}",
-                        parent_pid, wait_pid, err
-                    ));
-                }
                 trace_line(&format!(
                     "whuse: wait error tgid={} err={}",
                     parent_pid, err
@@ -2493,12 +2468,6 @@ impl SyscallDispatcher {
             }
         };
         if child_pid == 0 {
-            if wait_debug {
-                log_always(&format!(
-                    "whuse-wait: no-exited-child tgid={} wait_pid={} options={:#x}",
-                    parent_pid, wait_pid, options
-                ));
-            }
             if options & WNOHANG != 0 {
                 trace_line(&format!(
                     "whuse: wait return tgid={} child=0 wnohang",
@@ -2515,12 +2484,6 @@ impl SyscallDispatcher {
                 .current_mut()?
                 .write_user_bytes(status_ptr, &(status as i32).to_le_bytes())
                 .map_err(|_| EFAULT)?;
-        }
-        if wait_debug {
-            log_always(&format!(
-                "whuse-wait: return tgid={} child={} status={}",
-                parent_pid, child_pid, status
-            ));
         }
         trace_line(&format!(
             "whuse: wait return tgid={} child={} status={}",
@@ -2816,9 +2779,7 @@ impl SyscallDispatcher {
                 .read_user_bytes(iov.iov_base, iov.iov_len)
                 .map_err(|_| EFAULT)?;
             if fd == 1 || fd == 2 {
-                for byte in bytes.iter().copied() {
-                    hal().console.put_byte(byte);
-                }
+                write_console_bytes(&bytes);
                 total += bytes.len();
             } else {
                 let written_res = {
@@ -3904,6 +3865,7 @@ impl SyscallDispatcher {
         let val = args.0[2] as i32;
         match op {
             FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+                let cancel_mask = 1u64 << (SIGCANCEL - 1);
                 let tid = procs.current_tid()?;
                 let now = hal().timer.monotonic_nanos();
                 if let (Some(wait_addr), Some(deadline)) = (
@@ -3913,10 +3875,11 @@ impl SyscallDispatcher {
                     if wait_addr == uaddr {
                         let pending =
                             procs.current()?.pending_signals & !procs.current()?.signal_mask;
+                        let non_cancel_pending = pending & !cancel_mask;
                         let signal_frame_pending = procs.current()?.signal_frame_pending;
                         let cancel_seen = procs.current()?.cancel_signal_seen;
                         let cancel_once = procs.current()?.cancel_interrupt_once;
-                        if pending != 0 || signal_frame_pending || cancel_once {
+                        if non_cancel_pending != 0 || signal_frame_pending || cancel_once {
                             procs.clear_futex_wait_state(tid);
                             let consumed = if cancel_once {
                                 procs.current_mut()?.consume_cancel_interrupt_once()
@@ -3960,10 +3923,11 @@ impl SyscallDispatcher {
                     }
                 }
                 let pending = procs.current()?.pending_signals & !procs.current()?.signal_mask;
+                let non_cancel_pending = pending & !cancel_mask;
                 let signal_frame_pending = procs.current()?.signal_frame_pending;
                 let cancel_seen = procs.current()?.cancel_signal_seen;
                 let cancel_once = procs.current()?.cancel_interrupt_once;
-                if pending != 0 || signal_frame_pending || cancel_once {
+                if non_cancel_pending != 0 || signal_frame_pending || cancel_once {
                     let consumed = if cancel_once {
                         procs.current_mut()?.consume_cancel_interrupt_once()
                     } else {
@@ -7773,6 +7737,32 @@ mod tests {
     }
 
     #[test]
+    fn clone_vfork_tracks_blocked_parent_tid_not_parent_tid_pointer() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let child = dispatcher.dispatch(
+            SYS_CLONE,
+            SyscallArgs([super::CLONE_VFORK, 0, 0xdead_beef, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        ) as usize;
+
+        assert_eq!(
+            procs.find_by_tid_mut(child).unwrap().vfork_parent_tid,
+            Some(init)
+        );
+    }
+
+    #[test]
     fn futex_cancel_interrupt_is_one_shot() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
@@ -7838,6 +7828,45 @@ mod tests {
             0
         );
         assert_eq!(procs.current().unwrap().futex_wait_addr, None);
+    }
+
+    #[test]
+    fn queued_sigcancel_alone_does_not_interrupt_futex_wait() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xa800, &0i32.to_le_bytes());
+        {
+            let process = procs.current_mut().unwrap();
+            process.pending_signals = 1u64 << (33 - 1);
+            process.signal_mask = 0;
+            process.signal_frame_pending = false;
+            process.cancel_signal_seen = false;
+            process.cancel_interrupt_once = false;
+        }
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FUTEX,
+                SyscallArgs([0xa800, super::FUTEX_WAIT, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EAGAIN as isize
+        );
+        assert_eq!(procs.current().unwrap().futex_wait_addr, Some(0xa800));
     }
 
     #[test]

@@ -54,6 +54,22 @@ const PROC_VERSION: &[u8] = b"Linux version 6.8.0-whuse (whuse@localdomain) #1 S
 const PROC_SELF_STAT: &[u8] = b"1 (self) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 1 4096 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
 const PROC_SELF_MAPS: &[u8] = b"50000000-50080000 r-xp 00000000 00:00 0 /proc/self/exe\n";
 const EXT4_DIR_STAT_CACHE_MAX_SIZE: u64 = 512 * 1024;
+static CONSOLE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn write_console_bytes(bytes: &[u8]) {
+    let _guard = CONSOLE_WRITE_LOCK.lock();
+    for byte in bytes.iter().copied() {
+        hal().console.put_byte(byte);
+    }
+}
+
+fn write_console_line(line: &str) {
+    let _guard = CONSOLE_WRITE_LOCK.lock();
+    for byte in line.bytes() {
+        hal().console.put_byte(byte);
+    }
+    hal().console.put_byte(b'\n');
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeKind {
@@ -251,10 +267,7 @@ fn stage2_openat_debug(line: &str) {
     if !stage2_openat_debug_enabled() {
         return;
     }
-    for byte in line.bytes() {
-        hal().console.put_byte(byte);
-    }
-    hal().console.put_byte(b'\n');
+    write_console_line(line);
 }
 
 impl KernelVfs {
@@ -780,7 +793,7 @@ impl KernelVfs {
 
     pub fn access(&self, cwd: &str, path: &str) -> KernelResult<()> {
         let absolute = normalize_path(cwd, path);
-        self.path_exists_follow(&absolute, 0)
+        self.stat_path_follow(&absolute, 0).map(|_| ())
     }
 
     pub fn read_file_all(&mut self, cwd: &str, path: &str) -> KernelResult<Vec<u8>> {
@@ -2190,9 +2203,7 @@ impl KernelObject for FileHandle {
                 {
                     return Ok(data.len());
                 }
-                for byte in data.iter().copied() {
-                    hal().console.put_byte(byte);
-                }
+                write_console_bytes(data);
                 Ok(data.len())
             }
         }
@@ -2790,6 +2801,18 @@ mod tests {
                 nlink: 1,
             })
         );
+    }
+
+    #[test]
+    fn access_reports_missing_files_under_ext4_root_mount() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        assert!(matches!(vfs.access("/", "/test.txt"), Err(super::ENOENT)));
     }
 
     #[test]

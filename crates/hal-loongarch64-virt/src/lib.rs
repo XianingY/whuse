@@ -636,16 +636,9 @@ impl HalCpu for VirtCpu {
     fn set_kernel_timer_callback(&self, cb: fn()) {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
-            use core::fmt::Write;
-            use hal_api::ConsoleWriter;
-            let mut console = ConsoleWriter;
-            let _ = write!(console, "whuse-debug: set_kernel_timer_callback called\n");
-
             KERNEL_TRAP_HANDLER.store(cb as usize, core::sync::atomic::Ordering::Relaxed);
             let eentry = __whuse_kernel_trap_entry as *const () as usize;
             core::arch::asm!("csrwr {}, 0xc", in(reg) eentry);
-
-            let _ = write!(console, "whuse-debug: EENTRY set to {:#x}\n", eentry);
         }
         #[cfg(not(target_arch = "loongarch64"))]
         {

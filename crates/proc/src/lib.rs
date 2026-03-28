@@ -196,8 +196,7 @@ pub struct Process {
     /// FUTEX_WAIT checks this flag and returns -EINTR repeatedly until thread exits.
     /// This allows musl's cancellation path to progress through multiple blocking points.
     pub cancellation_in_progress: bool,
-    /// Parent task id blocked by CLONE_VFORK. Set on the child process until
-    /// the child reaches execve/exit and releases the parent.
+    pub eintr_count: u32,
     pub vfork_parent_tid: Option<usize>,
 }
 
@@ -271,6 +270,7 @@ impl Process {
             signal_frame_pending: false,
             cancel_signal_seen: false,
             cancellation_in_progress: false,
+            eintr_count: 0,
             vfork_parent_tid: None,
         }
     }
@@ -537,6 +537,7 @@ impl Process {
             signal_frame_pending: false,
             cancel_signal_seen: false,
             cancellation_in_progress: false,
+            eintr_count: 0,
             vfork_parent_tid: None,
         })
     }
@@ -595,6 +596,7 @@ impl Process {
             signal_frame_pending: false,
             cancel_signal_seen: false,
             cancellation_in_progress: false,
+            eintr_count: 0,
             vfork_parent_tid: None,
         }
     }
@@ -664,6 +666,7 @@ impl Process {
             signal_frame_pending: false,
             cancel_signal_seen: false,
             cancellation_in_progress: false,
+            eintr_count: 0,
             vfork_parent_tid: None,
         }
     }
@@ -1787,6 +1790,7 @@ impl ProcessTable {
         let addr = self.processes.get_mut(&tid).and_then(|p| {
             let a = p.futex_wait_addr.take();
             p.futex_wait_deadline_ns = None;
+            p.eintr_count = 0;
             a
         });
         if let Some(addr) = addr {

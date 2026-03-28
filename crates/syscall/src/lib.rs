@@ -4349,17 +4349,38 @@ impl SyscallDispatcher {
                         let cancel_seen = procs.current()?.cancel_signal_seen;
                         let cancel_in_progress = procs.current()?.is_cancellation_in_progress();
                         if non_cancel_pending != 0 || signal_frame_pending || cancel_in_progress {
-                            procs.clear_futex_wait_state(tid);
+                            let eintr_count = {
+                                let p = procs.current_mut()?;
+                                p.eintr_count = p.eintr_count.saturating_add(1);
+                                p.eintr_count
+                            };
+                            if !cancel_in_progress {
+                                procs.clear_futex_wait_state(tid);
+                            }
                             if libctest_task {
                                 log_always(&format!(
-                                    "whuse-libctest:futex-eintr tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={}",
-                                    tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_in_progress
+                                    "whuse-libctest:futex-eintr tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={} eintr_count={}",
+                                    tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_in_progress, eintr_count
                                 ));
                             }
                             cancel_debug(&format!(
-                                "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={}",
-                                tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_in_progress
+                                "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={} eintr_count={}",
+                                tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_in_progress, eintr_count
                             ));
+                            if eintr_count >= 1000 {
+                                cancel_debug(&format!(
+                                    "whuse-debug: EINTR livelock detected tid={} eintr_count={}, blocking",
+                                    tid, eintr_count
+                                ));
+                                if libctest_task {
+                                    log_always(&format!(
+                                        "whuse-libctest: EINTR livelock tid={} eintr_count={}, blocking",
+                                        tid, eintr_count
+                                    ));
+                                }
+                                let _ = scheduler.block_current();
+                                return Err(EAGAIN);
+                            }
                             return Err(EINTR);
                         }
                         if !procs.is_futex_waiting(wait_addr, tid) {
@@ -4392,16 +4413,47 @@ impl SyscallDispatcher {
                 let cancel_seen = procs.current()?.cancel_signal_seen;
                 let cancel_in_progress = procs.current()?.is_cancellation_in_progress();
                 if non_cancel_pending != 0 || signal_frame_pending || cancel_in_progress {
+                    let eintr_count = {
+                        let p = procs.current_mut()?;
+                        p.eintr_count = p.eintr_count.saturating_add(1);
+                        p.eintr_count
+                    };
                     if libctest_task {
                         log_always(&format!(
-                            "whuse-libctest:futex-eintr-fresh tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={}",
-                            tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_in_progress
+                            "whuse-libctest:futex-eintr-fresh tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={} eintr_count={}",
+                            tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_in_progress, eintr_count
                         ));
                     }
                     cancel_debug(&format!(
-                        "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={}",
-                        tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_in_progress
+                        "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={} eintr_count={}",
+                        tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_in_progress, eintr_count
                     ));
+                    if eintr_count >= 1000 {
+                        cancel_debug(&format!(
+                            "whuse-debug: EINTR livelock detected tid={} eintr_count={}, forcing exit",
+                            tid, eintr_count
+                        ));
+                        if libctest_task {
+                            log_always(&format!(
+                                "whuse-libctest: forcing exit tid={} due to EINTR livelock",
+                                tid
+                            ));
+                        }
+                    }
+                    if eintr_count >= 1000 {
+                        cancel_debug(&format!(
+                            "whuse-debug: EINTR livelock detected tid={} eintr_count={}, blocking",
+                            tid, eintr_count
+                        ));
+                        if libctest_task {
+                            log_always(&format!(
+                                "whuse-libctest: EINTR livelock tid={} eintr_count={}, blocking",
+                                tid, eintr_count
+                            ));
+                        }
+                        let _ = scheduler.block_current();
+                        return Err(EAGAIN);
+                    }
                     return Err(EINTR);
                 }
                 let current = read_i32(procs.current()?, uaddr)?;

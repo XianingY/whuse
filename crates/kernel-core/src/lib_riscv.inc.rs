@@ -94,7 +94,6 @@ const OSCOMP_REQUIRED_TEST_FILES: &[&str] = &[
     "/glibc/libc-bench",
     "/glibc/iozone_testcode.sh",
     "/glibc/iozone",
-    "/glibc/libctest_testcode.sh",
     "/glibc/lmbench_testcode.sh",
     "/glibc/lua_testcode.sh",
     "/glibc/lua",
@@ -112,6 +111,7 @@ const OSCOMP_OPTIONAL_TEST_FILES: &[&str] = &[
     "/glibc/netperf_testcode.sh",
     "/glibc/iperf_testcode.sh",
     "/glibc/cyclictest_testcode.sh",
+    "/glibc/libctest_testcode.sh",
 ];
 const OSCOMP_PROFILE_PATH: &str = "/whuse-oscomp-profile";
 const OSCOMP_RUNTIME_FILTER_PATH: &str = "/whuse-oscomp-runtime-filter";

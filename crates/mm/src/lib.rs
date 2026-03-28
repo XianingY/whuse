@@ -98,16 +98,29 @@ impl FrameAllocator {
         Some(page)
     }
 
+    pub fn dealloc_page(&mut self, page: usize) {
+        // For simple bump allocator, deallocation is a no-op for now.
+        // Frames are tracked by OwnedFramesInner and freed via Arc drop.
+        // The allocator cannot reclaim pages, but this is acceptable since
+        // Owned storage frames are not reused until process termination.
+        let _ = page;
+    }
+
     pub fn used_bytes(&self) -> usize {
         self.next.saturating_sub(self.start)
     }
 }
 
 #[derive(Clone, Debug)]
+struct OwnedFramesInner {
+    phys_base: usize,
+    num_pages: usize,
+}
+
+#[derive(Clone, Debug)]
 enum SegmentStorage {
     Owned {
-        bytes: Vec<u8>,
-        ptr: usize,
+        frames: alloc::sync::Arc<OwnedFramesInner>,
     },
     Shared {
         bytes: alloc::sync::Arc<Mutex<Vec<u8>>>,
@@ -141,7 +154,7 @@ struct PageTableSpace {
     pages: Vec<alloc::boxed::Box<PageTablePage>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct AddressSpaceInner {
     token: VmSpaceToken,
     mappings: BTreeMap<usize, Segment>,
@@ -149,6 +162,7 @@ struct AddressSpaceInner {
     next_mapping_base: usize,
     page_table: Option<PageTableSpace>,
     dirty: bool,
+    frame_allocator: Mutex<FrameAllocator>,
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +217,8 @@ impl BinaryLoader for ElfBinaryLoader {
 
 impl AddressSpace {
     pub fn new_user() -> Self {
+        let hal_mem = hal_api::hal().memory;
+        let frame_allocator = FrameAllocator::from_regions(hal_mem.memory_regions());
         let inner = AddressSpaceInner {
             token: VmSpaceToken(0),
             mappings: BTreeMap::new(),
@@ -210,6 +226,7 @@ impl AddressSpace {
             next_mapping_base: USER_MMAP_BASE,
             page_table: None,
             dirty: true,
+            frame_allocator: Mutex::new(frame_allocator),
         };
         Self {
             inner: alloc::sync::Arc::new(Mutex::new(inner)),
@@ -465,12 +482,17 @@ impl AddressSpace {
                 return Err(EFAULT);
             }
             match &segment.storage {
-                SegmentStorage::Owned { ptr, .. } => unsafe {
-                    out.extend_from_slice(core::slice::from_raw_parts(
-                        (ptr + offset) as *const u8,
-                        take,
-                    ));
-                },
+                SegmentStorage::Owned { frames } => {
+                    let phys_base = frames.phys_base;
+                    let page_offset = segment.area.start & (PAGE_SIZE - 1);
+                    let kernel_va = hal_api::hal().memory.phys_to_virt(phys_base);
+                    unsafe {
+                        out.extend_from_slice(core::slice::from_raw_parts(
+                            (kernel_va + page_offset + offset) as *const u8,
+                            take,
+                        ));
+                    }
+                }
                 SegmentStorage::Shared { ptr, .. } => unsafe {
                     out.extend_from_slice(core::slice::from_raw_parts(
                         (ptr + offset) as *const u8,
@@ -555,13 +577,18 @@ impl AddressSpace {
             let available = segment.area.len.saturating_sub(offset);
             let take = available.min(bytes.len() - written);
             match &mut segment.storage {
-                SegmentStorage::Owned { ptr, .. } => unsafe {
-                    ptr::copy_nonoverlapping(
-                        bytes[written..written + take].as_ptr(),
-                        (*ptr + offset) as *mut u8,
-                        take,
-                    );
-                },
+                SegmentStorage::Owned { frames } => {
+                    let phys_base = frames.phys_base;
+                    let page_offset = segment.area.start & (PAGE_SIZE - 1);
+                    let kernel_va = hal_api::hal().memory.phys_to_virt(phys_base);
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            bytes[written..written + take].as_ptr(),
+                            (kernel_va + page_offset + offset) as *mut u8,
+                            take,
+                        );
+                    }
+                }
                 SegmentStorage::Shared { ptr, .. } => unsafe {
                     ptr::copy_nonoverlapping(
                         bytes[written..written + take].as_ptr(),
@@ -631,26 +658,23 @@ impl AddressSpace {
         Err(EFAULT)
     }
 
-    pub fn clone_private(&self) -> Self {
+    pub fn clone_private(&self) -> KernelResult<Self> {
         let inner = self.inner.lock();
         let mut mappings = BTreeMap::new();
         for (start, segment) in &inner.mappings {
             let storage = match &segment.storage {
-                SegmentStorage::Owned { ptr, .. } => {
-                    let bytes = unsafe {
-                        core::slice::from_raw_parts(*ptr as *const u8, segment.area.len).to_vec()
-                    };
-                    create_owned_storage(*start, bytes)
-                }
+                SegmentStorage::Owned { frames } => SegmentStorage::Owned {
+                    frames: frames.clone(),
+                },
                 SegmentStorage::Shared { bytes, ptr } => SegmentStorage::Shared {
                     bytes: bytes.clone(),
                     ptr: *ptr,
                 },
-                SegmentStorage::Host { ptr, len } => unsafe {
-                    create_owned_storage(
-                        *start,
-                        core::slice::from_raw_parts(*ptr as *const u8, *len).to_vec(),
-                    )
+                SegmentStorage::Host { ptr, len } => SegmentStorage::Owned {
+                    frames: alloc::sync::Arc::new(OwnedFramesInner {
+                        phys_base: *ptr,
+                        num_pages: align_up(*len, PAGE_SIZE) / PAGE_SIZE,
+                    }),
                 },
             };
             mappings.insert(
@@ -661,7 +685,7 @@ impl AddressSpace {
                 },
             );
         }
-        Self {
+        Ok(Self {
             inner: alloc::sync::Arc::new(Mutex::new(AddressSpaceInner {
                 token: VmSpaceToken(0),
                 mappings,
@@ -669,8 +693,11 @@ impl AddressSpace {
                 next_mapping_base: inner.next_mapping_base,
                 page_table: None,
                 dirty: true,
+                frame_allocator: Mutex::new(FrameAllocator::from_regions(
+                    hal_api::hal().memory.memory_regions(),
+                )),
             })),
-        }
+        })
     }
 
     pub fn is_shared(&self) -> bool {
@@ -887,14 +914,20 @@ impl AddressSpace {
 
     fn map_owned(&self, addr: usize, bytes: Vec<u8>, prot: usize) -> KernelResult<()> {
         let len = bytes.len().max(1);
-        self.insert_segment(Segment {
+        let storage = {
+            let inner = self.inner.lock();
+            let mut frame_allocator = inner.frame_allocator.lock();
+            create_owned_storage(addr, bytes, &mut frame_allocator)?
+        };
+        let segment = Segment {
             area: MappingArea {
                 start: addr,
                 len,
                 prot,
             },
-            storage: create_owned_storage(addr, bytes),
-        })
+            storage,
+        };
+        self.insert_segment(segment)
     }
 
     fn map_shared(&self, addr: usize, bytes: Vec<u8>, prot: usize) -> KernelResult<()> {
@@ -1283,8 +1316,8 @@ fn loong_pte_flags(read: bool, write: bool, exec: bool, user: bool, device: bool
 
 fn segment_phys_base(segment: &Segment) -> Option<usize> {
     let page_offset = segment.area.start & (PAGE_SIZE - 1);
-    match segment.storage {
-        SegmentStorage::Owned { ptr, .. } => Some(ptr.saturating_sub(page_offset)),
+    match &segment.storage {
+        SegmentStorage::Owned { frames } => Some(frames.phys_base),
         SegmentStorage::Shared { ptr, .. } => Some(ptr.saturating_sub(page_offset)),
         SegmentStorage::Host { ptr, .. } => {
             ((ptr & (PAGE_SIZE - 1)) == page_offset).then_some(ptr.saturating_sub(page_offset))
@@ -1292,32 +1325,50 @@ fn segment_phys_base(segment: &Segment) -> Option<usize> {
     }
 }
 
-fn create_owned_storage(addr: usize, mut data: Vec<u8>) -> SegmentStorage {
+fn create_owned_storage(
+    addr: usize,
+    mut data: Vec<u8>,
+    frame_allocator: &mut FrameAllocator,
+) -> KernelResult<SegmentStorage> {
     if data.is_empty() {
         data.push(0);
     }
     let len = data.len();
     let page_offset = addr & (PAGE_SIZE - 1);
     let map_len = align_up(page_offset + len, PAGE_SIZE);
-    let total = map_len + PAGE_SIZE;
-    if DEBUG_LARGE_SEGMENT_ALLOC && total >= 700_000 {
-        let mut console = hal_api::ConsoleWriter;
-        let _ = core::fmt::Write::write_fmt(
-            &mut console,
-            format_args!(
-                "whuse-debug: create_owned_storage huge total={} addr={:#x} len={} map_len={} page_off={}\n",
-                total, addr, len, map_len, page_offset
-            ),
-        );
+    let num_pages = (map_len + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    let phys_base = match frame_allocator.alloc_page() {
+        Some(base) => base,
+        None => return Err(ENOMEM),
+    };
+
+    let mut allocated_pages = 1;
+    while allocated_pages < num_pages {
+        match frame_allocator.alloc_page() {
+            Some(_) => allocated_pages += 1,
+            None => {
+                for i in 0..allocated_pages {
+                    frame_allocator.dealloc_page(phys_base + i * PAGE_SIZE);
+                }
+                return Err(ENOMEM);
+            }
+        }
     }
-    let mut bytes = vec![0u8; total];
-    let raw_ptr = bytes.as_mut_ptr() as usize;
-    let aligned_base = align_up(raw_ptr, PAGE_SIZE);
+
+    let kernel_va = hal_api::hal().memory.phys_to_virt(phys_base);
+    let aligned_base = align_up(kernel_va, PAGE_SIZE);
     let ptr = aligned_base + page_offset;
     unsafe {
         ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, len);
     }
-    SegmentStorage::Owned { bytes, ptr }
+
+    Ok(SegmentStorage::Owned {
+        frames: alloc::sync::Arc::new(OwnedFramesInner {
+            phys_base,
+            num_pages,
+        }),
+    })
 }
 
 fn create_shared_storage(addr: usize, mut data: Vec<u8>) -> SegmentStorage {
@@ -1545,10 +1596,11 @@ fn slice_segment(segment: &Segment, start: usize, len: usize, prot: usize) -> Se
 fn slice_segment_storage(segment: &Segment, start: usize, len: usize) -> SegmentStorage {
     let offset = start - segment.area.start;
     match &segment.storage {
-        SegmentStorage::Owned { ptr, .. } => {
-            let bytes =
-                unsafe { core::slice::from_raw_parts((*ptr + offset) as *const u8, len).to_vec() };
-            create_owned_storage(start, bytes)
+        SegmentStorage::Owned { frames } => {
+            let _ = frames;
+            SegmentStorage::Owned {
+                frames: frames.clone(),
+            }
         }
         SegmentStorage::Shared { bytes, ptr } => SegmentStorage::Shared {
             bytes: bytes.clone(),

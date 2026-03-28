@@ -483,7 +483,7 @@ impl Process {
         self.cancellation_in_progress
     }
 
-    fn fork_from(&self, pid: usize) -> Self {
+    fn fork_from(&self, pid: usize) -> KernelResult<Self> {
         let user_stack = self.user_stack.to_vec().into_boxed_slice();
         let new_sp = self.trap_frame.regs[2];
 
@@ -492,9 +492,9 @@ impl Process {
         trap_frame.set_retval(0);
         trap_frame.sepc += 4;
 
-        let address_space = self.address_space.clone_private();
+        let address_space = self.address_space.clone_private()?;
 
-        Self {
+        Ok(Self {
             pid,
             tid: pid,
             tgid: pid,
@@ -538,7 +538,7 @@ impl Process {
             cancel_signal_seen: false,
             cancellation_in_progress: false,
             vfork_parent_tid: None,
-        }
+        })
     }
 
     fn fork_from_shared(&self, pid: usize) -> Self {
@@ -924,7 +924,7 @@ impl ProcessTable {
         {
             return Err(EAGAIN);
         }
-        let parent = self.current()?.fork_from(pid);
+        let parent = self.current()?.fork_from(pid)?;
         self.processes.insert(pid, parent);
         Ok(pid)
     }
@@ -981,7 +981,7 @@ impl ProcessTable {
         }
         let process = self.current_mut()?;
         if process.address_space.is_shared() {
-            process.address_space = process.address_space.clone_private();
+            process.address_space = process.address_space.clone_private()?;
         }
         process
             .fds

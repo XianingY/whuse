@@ -175,7 +175,7 @@ Steps confirmed completing with `step-end` marker:
 - `time-test` — skip (missing binary, expected)
 - `busybox_testcode.sh` — completes
 - `iozone_testcode.sh` — completes
-- `libctest_testcode.sh` — enters `pthread_cancel_points` and no longer hard-deadlocks, but still livelocks in post-cancel futex handling (see Section 10)
+- `libctest_testcode.sh` — **Note**: libctest only provides **musl** binaries (`run-static.sh` and `run-dynamic.sh` use musl libc). The glibc variant **does not exist** in the testsuits. Attempting to run glibc/libctest results in a kernel panic due to 33MB memory allocation failure in `create_owned_storage`. The test script at `scripts/libctest/libctest_testcode.sh` does not distinguish between musl and glibc — it simply runs `./run-static.sh` and `./run-dynamic.sh`, which are the musl versions only.
 
 Steps not yet reached due to libctest hang:
 

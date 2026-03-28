@@ -411,6 +411,14 @@ fn stage2_openat_debug(line: &str) {
     }
 }
 
+fn is_busybox_testfile_probe_task(name: &str, cwd: &str) -> bool {
+    name.ends_with("/busybox") && cwd == "/"
+}
+
+fn is_busybox_testfile_probe_path(path: &str) -> bool {
+    matches!(path, "test.txt" | "/test.txt")
+}
+
 fn cancel_debug_enabled() -> bool {
     match option_env!("WHUSE_DEBUG_CANCEL") {
         Some("1") => true,
@@ -456,7 +464,10 @@ fn is_iozone_script_probe_path(path: &str) -> bool {
 }
 
 fn is_iozone_binary_probe_path(path: &str) -> bool {
-    matches!(path, "/musl/iozone" | "/glibc/iozone" | "./iozone" | "iozone")
+    matches!(
+        path,
+        "/musl/iozone" | "/glibc/iozone" | "./iozone" | "iozone"
+    )
 }
 
 fn is_iozone_probe_target(name: &str, path: &str) -> bool {
@@ -1222,9 +1233,18 @@ impl SyscallDispatcher {
         }
         let openat_probe = stage2_openat_debug_enabled()
             && is_libctest_openat_probe_task(name.as_str(), tgid, proc_cwd.as_str());
+        let busybox_testfile_probe =
+            is_busybox_testfile_probe_task(name.as_str(), proc_cwd.as_str())
+                && is_busybox_testfile_probe_path(path.as_str());
         if openat_probe {
             log_always(&format!(
                 "whuse-libctest:openat-enter tid={} tgid={} name={} dirfd={} cwd={} path={} raw_flags={:#x} flags={:#x}",
+                tid, tgid, name, dirfd, proc_cwd, path, raw_flags, flags
+            ));
+        }
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:openat-enter tid={} tgid={} name={} dirfd={} cwd={} path={} raw_flags={:#x} flags={:#x}",
                 tid, tgid, name, dirfd, proc_cwd, path, raw_flags, flags
             ));
         }
@@ -1238,6 +1258,12 @@ impl SyscallDispatcher {
         if openat_probe {
             log_always(&format!(
                 "whuse-libctest:openat-vfs-open-begin tid={} tgid={} cwd={} path={}",
+                tid, tgid, cwd, path
+            ));
+        }
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:openat-vfs-open-begin tid={} tgid={} cwd={} path={}",
                 tid, tgid, cwd, path
             ));
         }
@@ -1256,6 +1282,12 @@ impl SyscallDispatcher {
                         tid, tgid, err, cwd, path
                     ));
                 }
+                if busybox_testfile_probe {
+                    log_always(&format!(
+                        "whuse-busybox:openat-vfs-open-err tid={} tgid={} err={} cwd={} path={}",
+                        tid, tgid, err, cwd, path
+                    ));
+                }
                 return Err(err);
             }
         };
@@ -1268,6 +1300,12 @@ impl SyscallDispatcher {
         if openat_probe {
             log_always(&format!(
                 "whuse-libctest:openat-vfs-open-ok tid={} tgid={} resolved={}",
+                tid, tgid, handle.path
+            ));
+        }
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:openat-vfs-open-ok tid={} tgid={} resolved={}",
                 tid, tgid, handle.path
             ));
         }
@@ -1285,6 +1323,12 @@ impl SyscallDispatcher {
                 tid, tgid, fd
             ));
         }
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:openat-exit tid={} tgid={} fd={}",
+                tid, tgid, fd
+            ));
+        }
         Ok(fd as usize)
     }
 
@@ -1298,11 +1342,35 @@ impl SyscallDispatcher {
         let fd = args.0[0] as i32;
         let owner_tgid = procs.current_tgid()?;
         let handle = procs.current()?.fd(fd)?.clone();
+        let (tid, tgid, name, proc_cwd) = {
+            let process = procs.current()?;
+            (
+                process.tid,
+                process.tgid,
+                process.name.clone(),
+                process.cwd.clone(),
+            )
+        };
+        let busybox_testfile_probe =
+            is_busybox_testfile_probe_task(name.as_str(), proc_cwd.as_str())
+                && handle.path == "/test.txt";
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:close-enter tid={} tgid={} name={} fd={} path={}",
+                tid, tgid, name, fd, handle.path
+            ));
+        }
         procs.current_mut()?.close_fd(fd)?;
         let wake_blocked = vfs.is_pipe(&handle);
         let released_locks = FCNTL_LOCK_STATE
             .lock()
             .clear_for_owner_path(owner_tgid, &handle.path);
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:close-exit tid={} tgid={} name={} fd={} path={} wake_blocked={} released_locks={}",
+                tid, tgid, name, fd, handle.path, wake_blocked, released_locks
+            ));
+        }
         drop(handle);
         if wake_blocked || released_locks {
             let _ = scheduler.wake_all_blocked();
@@ -2319,9 +2387,9 @@ impl SyscallDispatcher {
                 let mut interp_loaded: Option<(String, Vec<u8>)> = None;
                 for candidate in [
                     interp_path.as_str(),
+                    "/musl/lib/libc.so",
                     "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
                     "/lib/ld-linux-riscv64-lp64d.so.1",
-                    "/musl/lib/libc.so",
                 ] {
                     if execve_iozone_probe {
                         log_always(&format!(
@@ -2451,7 +2519,7 @@ impl SyscallDispatcher {
                     }
                 }
             };
-                trace_line(&format!(
+            trace_line(&format!(
                     "whuse: execve stage load-elf-done tgid={} entry={:#x} sp={:#x} dyn={} interp_base={:#x}",
                     procs.current_tgid().unwrap_or(0),
                     loaded.entry,
@@ -2459,15 +2527,15 @@ impl SyscallDispatcher {
                     loaded.is_dyn,
                     loaded.interp_base
                 ));
-                if execve_iozone_probe {
-                    log_always(&format!(
+            if execve_iozone_probe {
+                log_always(&format!(
                         "whuse-la-iozone:execve-load-elf-done tgid={} entry={:#x} dyn={} interp_base={:#x}",
                         procs.current_tgid().unwrap_or(0),
                         loaded.entry,
                         loaded.is_dyn,
                         loaded.interp_base
                     ));
-                }
+            }
             let process = procs.current_mut()?;
             process.trap_frame.sepc = loaded.entry;
             process.trap_frame.regs[2] = loaded.stack_pointer;
@@ -3313,8 +3381,43 @@ impl SyscallDispatcher {
             .current()?
             .read_user_cstr(args.0[1])
             .map_err(|_| EFAULT)?;
+        let (tid, tgid, name, proc_cwd) = {
+            let process = procs.current()?;
+            (
+                process.tid,
+                process.tgid,
+                process.name.clone(),
+                process.cwd.clone(),
+            )
+        };
+        let busybox_testfile_probe =
+            is_busybox_testfile_probe_task(name.as_str(), proc_cwd.as_str())
+                && is_busybox_testfile_probe_path(path.as_str());
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:fstatat-enter tid={} tgid={} name={} dirfd={} cwd={} path={}",
+                tid, tgid, name, dirfd, proc_cwd, path
+            ));
+        }
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
-        let stat = vfs.stat_path(&cwd, &path)?;
+        let stat = match vfs.stat_path(&cwd, &path) {
+            Ok(stat) => stat,
+            Err(err) => {
+                if busybox_testfile_probe {
+                    log_always(&format!(
+                        "whuse-busybox:fstatat-vfs-err tid={} tgid={} cwd={} path={} err={}",
+                        tid, tgid, cwd, path, err
+                    ));
+                }
+                return Err(err);
+            }
+        };
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:fstatat-vfs-ok tid={} tgid={} cwd={} path={} mode={:#o} size={}",
+                tid, tgid, cwd, path, stat.mode, stat.size
+            ));
+        }
         if matches!(
             BUSYBOX_APPLETS
                 .lock()
@@ -3361,6 +3464,24 @@ impl SyscallDispatcher {
         let flags = args.0[3];
         let path = read_at_path_allow_empty(procs.current()?, args.0[1], flags)?;
         let mode = args.0[2];
+        let (tid, tgid, name, proc_cwd) = {
+            let process = procs.current()?;
+            (
+                process.tid,
+                process.tgid,
+                process.name.clone(),
+                process.cwd.clone(),
+            )
+        };
+        let busybox_testfile_probe =
+            is_busybox_testfile_probe_task(name.as_str(), proc_cwd.as_str())
+                && is_busybox_testfile_probe_path(path.as_str());
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:faccessat-enter tid={} tgid={} name={} dirfd={} cwd={} path={} mode={:#x} flags={:#x}",
+                tid, tgid, name, dirfd, proc_cwd, path, mode, flags
+            ));
+        }
         trace_line(&format!(
             "whuse: faccessat path-check tgid={} name={} dirfd={} path={} mode={:#x} flags={:#x}",
             procs.current_tgid().unwrap_or(0),
@@ -3382,20 +3503,61 @@ impl SyscallDispatcher {
             return Ok(0);
         }
         if path.is_empty() {
+            if busybox_testfile_probe {
+                log_always(&format!(
+                    "whuse-busybox:faccessat-err tid={} tgid={} path={} err={}",
+                    tid, tgid, path, ENOENT
+                ));
+            }
             return Err(ENOENT);
         }
         if path.len() >= PATH_MAX {
+            if busybox_testfile_probe {
+                log_always(&format!(
+                    "whuse-busybox:faccessat-err tid={} tgid={} path={} err={}",
+                    tid, tgid, path, ENAMETOOLONG
+                ));
+            }
             return Err(ENAMETOOLONG);
         }
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
-        let stat = vfs.stat_path(&cwd, &path)?;
+        let stat = match vfs.stat_path(&cwd, &path) {
+            Ok(stat) => stat,
+            Err(err) => {
+                if busybox_testfile_probe {
+                    log_always(&format!(
+                        "whuse-busybox:faccessat-vfs-err tid={} tgid={} cwd={} path={} err={}",
+                        tid, tgid, cwd, path, err
+                    ));
+                }
+                return Err(err);
+            }
+        };
         if (mode & W_OK) != 0 && (vfs.mount_flags_for_path(&cwd, &path) & (MS_RDONLY as u32)) != 0 {
+            if busybox_testfile_probe {
+                log_always(&format!(
+                    "whuse-busybox:faccessat-err tid={} tgid={} cwd={} path={} err={}",
+                    tid, tgid, cwd, path, EROFS
+                ));
+            }
             return Err(EROFS);
         }
         let current = procs.current()?;
         let uid = current.euid;
         if !access_mode_allowed(uid, stat, mode) {
+            if busybox_testfile_probe {
+                log_always(&format!(
+                    "whuse-busybox:faccessat-err tid={} tgid={} cwd={} path={} err={}",
+                    tid, tgid, cwd, path, EACCES
+                ));
+            }
             return Err(EACCES);
+        }
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:faccessat-ok tid={} tgid={} cwd={} path={} mode={:#x}",
+                tid, tgid, cwd, path, mode
+            ));
         }
         Ok(0)
     }
@@ -3952,6 +4114,9 @@ impl SyscallDispatcher {
             ));
         }
         let path = read_at_path_allow_empty(procs.current()?, args.0[1], flags)?;
+        let busybox_testfile_probe =
+            is_busybox_testfile_probe_task(name.as_str(), proc_cwd.as_str())
+                && is_busybox_testfile_probe_path(path.as_str());
         let iozone_probe = is_iozone_probe_target(name.as_str(), path.as_str());
         if iozone_probe {
             log_always(&format!(
@@ -3967,6 +4132,12 @@ impl SyscallDispatcher {
             stage2_openat_debug(&format!(
                 "whuse-libctest:statx-path dirfd={} path={} flags={:#x} mask={:#x}",
                 dirfd, path, flags, args.0[3]
+            ));
+        }
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:statx-enter tid={} tgid={} name={} dirfd={} cwd={} path={} flags={:#x} mask={:#x}",
+                tid, tgid, name, dirfd, proc_cwd, path, flags, args.0[3]
             ));
         }
         if let Some(applet) = BUSYBOX_APPLETS.lock().get(&procs.current_tgid()?).cloned() {
@@ -4011,6 +4182,12 @@ impl SyscallDispatcher {
             }
         } else {
             let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
+            if busybox_testfile_probe {
+                log_always(&format!(
+                    "whuse-busybox:statx-vfs-begin tid={} tgid={} cwd={} path={}",
+                    tid, tgid, cwd, path
+                ));
+            }
             if iozone_probe {
                 log_always(&format!(
                     "whuse-la-iozone:statx-vfs-begin tid={} tgid={} cwd={} path={} mode=path",
@@ -4023,7 +4200,18 @@ impl SyscallDispatcher {
                     cwd, path
                 ));
             }
-            vfs.stat_path(&cwd, &path)?
+            match vfs.stat_path(&cwd, &path) {
+                Ok(stat) => stat,
+                Err(err) => {
+                    if busybox_testfile_probe {
+                        log_always(&format!(
+                            "whuse-busybox:statx-vfs-err tid={} tgid={} cwd={} path={} err={}",
+                            tid, tgid, cwd, path, err
+                        ));
+                    }
+                    return Err(err);
+                }
+            }
         };
         if iozone_probe {
             log_always(&format!(
@@ -4035,6 +4223,12 @@ impl SyscallDispatcher {
             stage2_openat_debug(&format!(
                 "whuse-libctest:statx-vfs-ok path={} mode={:#o} size={}",
                 path, stat.mode, stat.size
+            ));
+        }
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:statx-vfs-ok tid={} tgid={} path={} mode={:#o} size={}",
+                tid, tgid, path, stat.mode, stat.size
             ));
         }
         let bytes = statx_bytes(stat);
@@ -4715,6 +4909,15 @@ impl SyscallDispatcher {
         let path_ptr = args.0[1];
         let _times = args.0[2];
         let flags = args.0[3];
+        let (tid, tgid, name, proc_cwd) = {
+            let process = procs.current()?;
+            (
+                process.tid,
+                process.tgid,
+                process.name.clone(),
+                process.cwd.clone(),
+            )
+        };
         // If path pointer is null, treat as empty path.
         let path = if path_ptr == 0 {
             String::new()
@@ -4724,16 +4927,49 @@ impl SyscallDispatcher {
                 .read_user_cstr(path_ptr)
                 .map_err(|_| EFAULT)?
         };
+        let busybox_testfile_probe =
+            is_busybox_testfile_probe_task(name.as_str(), proc_cwd.as_str())
+                && (path.is_empty() || is_busybox_testfile_probe_path(path.as_str()));
+        if busybox_testfile_probe {
+            log_always(&format!(
+                "whuse-busybox:utimensat-enter tid={} tgid={} name={} dirfd={} cwd={} path={} flags={:#x} times_ptr={:#x}",
+                tid, tgid, name, dirfd, proc_cwd, path, flags, args.0[2]
+            ));
+        }
         if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
             // Operate on the fd directly. We don't track timestamps, so just
             // validate that the fd exists and return success.
             if dirfd != AT_FDCWD {
                 let _ = procs.current()?.fd(dirfd)?;
             }
+            if busybox_testfile_probe {
+                log_always(&format!(
+                    "whuse-busybox:utimensat-empty-ok tid={} tgid={} dirfd={}",
+                    tid, tgid, dirfd
+                ));
+            }
             return Ok(0);
         }
         let cwd = procs.current()?.cwd.clone();
-        vfs.access(&cwd, &path)?;
+        match vfs.access(&cwd, &path) {
+            Ok(()) => {
+                if busybox_testfile_probe {
+                    log_always(&format!(
+                        "whuse-busybox:utimensat-ok tid={} tgid={} cwd={} path={}",
+                        tid, tgid, cwd, path
+                    ));
+                }
+            }
+            Err(err) => {
+                if busybox_testfile_probe {
+                    log_always(&format!(
+                        "whuse-busybox:utimensat-err tid={} tgid={} cwd={} path={} err={}",
+                        tid, tgid, cwd, path, err
+                    ));
+                }
+                return Err(err);
+            }
+        }
         Ok(0)
     }
 

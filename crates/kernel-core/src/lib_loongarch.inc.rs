@@ -2362,8 +2362,7 @@ impl Kernel {
                         );
                     if !blocked_restart {
                         process.trap_frame.set_retval(result as usize);
-                        if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN)
-                            || (result as i32) < 0
+                        if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN) || (result as i32) < 0
                         {
                             process.trap_frame.sepc = sepc + 4;
                         }
@@ -2774,8 +2773,6 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs, time_test_present: bool) {
         "/usr/lib64",
         "/usr/sbin",
         "/lib",
-        "/lib/riscv64-linux-gnu",
-        "/lib/riscv64-linux-gnu/tls",
         "/lib/loongarch64-linux-gnu",
         "/lib/loongarch64-linux-gnu/tls",
         "/lib64",
@@ -2864,12 +2861,6 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs, time_test_present: bool) {
         ),
         ("/lib/libc.so.6", "/glibc/lib/libc.so.6"),
         ("/lib/libm.so.6", "/glibc/lib/libm.so.6"),
-        ("/lib/riscv64-linux-gnu/libc.so.6", "/glibc/lib/libc.so.6"),
-        ("/lib/riscv64-linux-gnu/libm.so.6", "/glibc/lib/libm.so.6"),
-        ("/lib/riscv64-linux-gnu/libc.so", "/glibc/lib/libc.so.6"),
-        ("/lib/riscv64-linux-gnu/libm.so", "/glibc/lib/libm.so.6"),
-        ("/lib/riscv64-linux-gnu/tls/libc.so", "/glibc/lib/libc.so.6"),
-        ("/lib/riscv64-linux-gnu/tls/libm.so", "/glibc/lib/libm.so.6"),
         (
             "/lib/loongarch64-linux-gnu/libc.so.6",
             "/glibc/lib/libc.so.6",
@@ -3149,7 +3140,11 @@ fn sanitize_loongarch_busybox_cmd(bytes: &[u8]) -> Vec<u8> {
             out.push('\n');
         }
     }
-    if changed { out.into_bytes() } else { bytes.to_vec() }
+    if changed {
+        out.into_bytes()
+    } else {
+        bytes.to_vec()
+    }
 }
 
 fn install_fallback_symlink(vfs: &mut KernelVfs, path: &str, target: &str) {
@@ -3353,8 +3348,7 @@ fn read_oscomp_stage2_overrides(vfs: &mut KernelVfs) -> OscompStage2Overrides {
                 overrides.busybox_profile = normalize_oscomp_busybox_profile_value(value);
             }
             "WHUSE_STAGE2_GATE_LIBCTEST_SCOPE" => {
-                overrides.gate_libctest_scope =
-                    normalize_oscomp_gate_libctest_scope_value(value);
+                overrides.gate_libctest_scope = normalize_oscomp_gate_libctest_scope_value(value);
             }
             "WHUSE_STAGE2_LIBCBENCH_SCOPE" => {
                 overrides.libcbench_scope = normalize_oscomp_libcbench_scope_value(value);
@@ -3378,12 +3372,18 @@ fn render_oscomp_official_suite_script(
         .replace(OSCOMP_FULL_MAX_GROUP_PLACEHOLDER, overrides.full_max_group)
         .replace(OSCOMP_IOZONE_PROFILE_PLACEHOLDER, overrides.iozone_profile)
         .replace(OSCOMP_BASIC_PROFILE_PLACEHOLDER, overrides.basic_profile)
-        .replace(OSCOMP_BUSYBOX_PROFILE_PLACEHOLDER, overrides.busybox_profile)
+        .replace(
+            OSCOMP_BUSYBOX_PROFILE_PLACEHOLDER,
+            overrides.busybox_profile,
+        )
         .replace(
             OSCOMP_GATE_LIBCTEST_SCOPE_PLACEHOLDER,
             overrides.gate_libctest_scope,
         )
-        .replace(OSCOMP_LIBCBENCH_SCOPE_PLACEHOLDER, overrides.libcbench_scope)
+        .replace(
+            OSCOMP_LIBCBENCH_SCOPE_PLACEHOLDER,
+            overrides.libcbench_scope,
+        )
         .replace(OSCOMP_LMBENCH_SCOPE_PLACEHOLDER, overrides.lmbench_scope)
         .replace(
             OSCOMP_TIME_TEST_PRESENT_PLACEHOLDER,
@@ -3403,15 +3403,18 @@ mod tests {
             "official suite script should carry a render-time full max group placeholder"
         );
         assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("whuse-oscomp-real-max-group:$WHUSE_STAGE2_FULL_MAX_GROUP"),
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-real-max-group:$WHUSE_STAGE2_FULL_MAX_GROUP"),
             "official suite script should log the effective full max group"
         );
         assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("whuse-oscomp-basic-profile:$WHUSE_STAGE2_BASIC_PROFILE"),
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-basic-profile:$WHUSE_STAGE2_BASIC_PROFILE"),
             "official suite script should log the effective basic profile"
         );
         assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("whuse-oscomp-busybox-profile:$WHUSE_STAGE2_BUSYBOX_PROFILE"),
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-busybox-profile:$WHUSE_STAGE2_BUSYBOX_PROFILE"),
             "official suite script should log the effective busybox profile"
         );
         assert!(

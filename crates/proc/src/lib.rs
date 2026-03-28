@@ -197,6 +197,9 @@ pub struct Process {
     /// This allows musl's cancellation path to progress through multiple blocking points.
     pub cancellation_in_progress: bool,
     pub eintr_count: u32,
+    /// When true, scheduler will forcibly exit this thread at next opportunity.
+    /// Used to break EINTR livelock in cancellation cleanup.
+    pub force_thread_exit: bool,
     pub vfork_parent_tid: Option<usize>,
 }
 
@@ -271,6 +274,7 @@ impl Process {
             cancel_signal_seen: false,
             cancellation_in_progress: false,
             eintr_count: 0,
+            force_thread_exit: false,
             vfork_parent_tid: None,
         }
     }
@@ -538,6 +542,7 @@ impl Process {
             cancel_signal_seen: false,
             cancellation_in_progress: false,
             eintr_count: 0,
+            force_thread_exit: false,
             vfork_parent_tid: None,
         })
     }
@@ -597,6 +602,7 @@ impl Process {
             cancel_signal_seen: false,
             cancellation_in_progress: false,
             eintr_count: 0,
+            force_thread_exit: false,
             vfork_parent_tid: None,
         }
     }
@@ -667,6 +673,7 @@ impl Process {
             cancel_signal_seen: false,
             cancellation_in_progress: false,
             eintr_count: 0,
+            force_thread_exit: false,
             vfork_parent_tid: None,
         }
     }

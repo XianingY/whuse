@@ -4369,15 +4369,16 @@ impl SyscallDispatcher {
                             ));
                             if eintr_count >= 1000 {
                                 cancel_debug(&format!(
-                                    "whuse-debug: EINTR livelock detected tid={} eintr_count={}, blocking",
+                                    "whuse-debug: EINTR livelock detected tid={} eintr_count={}, forcing exit",
                                     tid, eintr_count
                                 ));
                                 if libctest_task {
                                     log_always(&format!(
-                                        "whuse-libctest: EINTR livelock tid={} eintr_count={}, blocking",
+                                        "whuse-libctest: EINTR livelock tid={} eintr_count={}, forcing exit",
                                         tid, eintr_count
                                     ));
                                 }
+                                procs.current_mut()?.force_thread_exit = true;
                                 let _ = scheduler.block_current();
                                 return Err(EAGAIN);
                             }
@@ -4442,15 +4443,16 @@ impl SyscallDispatcher {
                     }
                     if eintr_count >= 1000 {
                         cancel_debug(&format!(
-                            "whuse-debug: EINTR livelock detected tid={} eintr_count={}, blocking",
+                            "whuse-debug: EINTR livelock detected tid={} eintr_count={}, forcing exit",
                             tid, eintr_count
                         ));
                         if libctest_task {
                             log_always(&format!(
-                                "whuse-libctest: EINTR livelock tid={} eintr_count={}, blocking",
+                                "whuse-libctest: EINTR livelock tid={} eintr_count={}, forcing exit",
                                 tid, eintr_count
                             ));
                         }
+                        procs.current_mut()?.force_thread_exit = true;
                         let _ = scheduler.block_current();
                         return Err(EAGAIN);
                     }

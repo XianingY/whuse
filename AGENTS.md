@@ -170,19 +170,20 @@ The suite script order is:
 
 ### 4.3 Current known status (as of last verified run)
 
+**Scoring Policy**: Based on official contest scoring table, **only musl-rv and glibc-rv score**. glibc-la and musl-la do not score. glibc libctest is marked "-" (not scored).
+
 Steps confirmed completing with `step-end` marker:
 
 - `time-test` — skip (missing binary, expected)
-- `busybox_testcode.sh` — completes
-- `iozone_testcode.sh` — completes
-- `libctest_testcode.sh` — **Note**: libctest only provides **musl** binaries (`run-static.sh` and `run-dynamic.sh` use musl libc). The glibc variant **does not exist** in the testsuits. Attempting to run glibc/libctest results in a kernel panic due to 33MB memory allocation failure in `create_owned_storage`. The test script at `scripts/libctest/libctest_testcode.sh` does not distinguish between musl and glibc — it simply runs `./run-static.sh` and `./run-dynamic.sh`, which are the musl versions only.
+- `basic_testcode.sh` — completes (musl-rv + glibc-rv score)
+- `busybox_testcode.sh` — completes (musl-rv + glibc-rv score)
+- `iozone_testcode.sh` — completes (musl-rv only scores, glibc-rv=0)
+- `lua_testcode.sh` — completes but scores 0 (reason unknown)
+- `libctest_testcode.sh` — **BLOCKING**: musl-rv hang (pthread_cancel livelock), glibc-rv marked "-" (not scored)
 
 Steps not yet reached due to libctest hang:
 
-- `libc-bench`, `lmbench_testcode.sh`, `lua_testcode.sh`, `unixbench_testcode.sh`, `netperf_testcode.sh`, `iperf_testcode.sh`, `cyclic_testcode.sh`
-
-- 180s run reaches `whuse-oscomp-shell-entered`
-- 180s run is progressing but currently blocked by `mmap` behaviors in dynamic loader (see Section 10.4)
+- `libc-bench`, `lmbench_testcode.sh`, `unixbench_testcode.sh`, `netperf_testcode.sh`, `iperf_testcode.sh`, `cyclic_testcode.sh`
 
 ## 5) Target Flow (理想真实执行 / Real Execution)
 

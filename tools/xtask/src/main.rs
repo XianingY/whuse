@@ -1647,6 +1647,10 @@ fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
         .map(|value| value == "1")
         .unwrap_or(false);
 
+    if !apply_makefile_optimizations(testsuits) {
+        eprintln!("warning: failed to apply makefile optimizations, continuing anyway");
+    }
+
     if !host_first {
         if run_make_sdcard_docker(testsuits, &docker_image) {
             return true;
@@ -1671,7 +1675,65 @@ fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
     false
 }
 
+fn apply_makefile_optimizations(testsuits: &PathBuf) -> bool {
+    let makesub = testsuits.join("Makefile.sub");
+    if !makesub.exists() {
+        eprintln!("Makefile.sub not found at {}", makesub.display());
+        return false;
+    }
+
+    let content = match fs::read_to_string(&makesub) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to read {}: {}", makesub.display(), e);
+            return false;
+        }
+    };
+
+    let mut modified = content.clone();
+
+    // P0: libc-test -j 1 -> -j $(NPROC)
+    if content.contains("make -C libc-test disk PREFIX=$(PREFIX) -j 1") {
+        modified = modified.replace(
+            "make -C libc-test disk PREFIX=$(PREFIX) -j 1",
+            "make -C libc-test disk PREFIX=$(PREFIX) -j $(NPROC)",
+        );
+        println!("applied P0: libc-test -j 1 -> -j $(NPROC)");
+    }
+
+    // P1: netperf -j 8 -> -j $(NPROC)
+    if content.contains("make -j 8") && content.contains("netperf/netperf-2.7.0") {
+        modified = modified.replace("make -j 8", "make -j $(NPROC)");
+        println!("applied P1: netperf -j 8 -> -j $(NPROC)");
+    }
+
+    if modified == content {
+        println!("makefile optimizations: no changes needed");
+        return true;
+    }
+
+    match fs::write(&makesub, &modified) {
+        Ok(_) => {
+            println!("makefile optimizations applied to {}", makesub.display());
+            true
+        }
+        Err(e) => {
+            eprintln!("failed to write {}: {}", makesub.display(), e);
+            false
+        }
+    }
+}
+
 fn run_make_sdcard_host(testsuits: &PathBuf) -> bool {
+    let enable_parallel = env::var("WHUSE_OSCOMP_PARALLEL_BUILD")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+
+    if enable_parallel {
+        println!("P3: running parallel 4-arch build...");
+        return run_parallel_build_all(testsuits);
+    }
+
     let status = Command::new("make")
         .arg("sdcard")
         .current_dir(testsuits)
@@ -1691,6 +1753,82 @@ fn run_make_sdcard_host(testsuits: &PathBuf) -> bool {
                 "failed to execute host make sdcard in {} ({err})",
                 testsuits.display()
             );
+            false
+        }
+    }
+}
+
+fn run_parallel_build_all(testsuits: &PathBuf) -> bool {
+    let makesub = "Makefile.sub";
+
+    let builds = [
+        ("riscv64-buildroot-linux-musl-", "/code/sdcard/riscv/musl"),
+        ("riscv64-linux-gnu-", "/code/sdcard/riscv/glibc"),
+        ("loongarch64-linux-musl-", "/code/sdcard/loongarch/musl"),
+        ("loongarch64-linux-gnu-", "/code/sdcard/loongarch/glibc"),
+    ];
+
+    let mut handles = Vec::new();
+
+    for (prefix, destdir) in &builds {
+        let testsuits = testsuits.clone();
+        let makesub = makesub.to_string();
+        let prefix = prefix.to_string();
+        let destdir = destdir.to_string();
+
+        let handle = std::thread::spawn(move || {
+            let status = Command::new("make")
+                .args(&[
+                    makesub.as_str(),
+                    &format!("PREFIX={}", prefix),
+                    &format!("DESTDIR={}", destdir),
+                ])
+                .current_dir(&testsuits)
+                .status();
+
+            (prefix, status)
+        });
+
+        handles.push(handle);
+    }
+
+    let mut all_success = true;
+    for handle in handles {
+        let (prefix, status) = handle.join().expect("thread join failed");
+        match status {
+            Ok(status) if status.success() => {
+                println!("{} build: SUCCESS", prefix);
+            }
+            Ok(status) => {
+                eprintln!("{} build: FAILED (exit {:?})", prefix, status.code());
+                all_success = false;
+            }
+            Err(e) => {
+                eprintln!("{} build: FAILED ({})", prefix, e);
+                all_success = false;
+            }
+        }
+    }
+
+    if !all_success {
+        return false;
+    }
+
+    println!("P3: all 4 arch builds succeeded, creating sdcard images...");
+
+    let status = Command::new("make")
+        .arg("sdcard")
+        .current_dir(testsuits)
+        .status();
+
+    match status {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("make sdcard failed (exit code {:?})", status.code());
+            false
+        }
+        Err(err) => {
+            eprintln!("failed to execute make sdcard: {}", err);
             false
         }
     }
@@ -1968,8 +2106,12 @@ fn debugfs_write_text(image: &PathBuf, path: &str, value: &str) -> Result<(), St
             .map_err(|err| format!("failed to read system clock: {err}"))?
             .as_nanos()
     ));
-    fs::write(&temp_path, format!("{value}\n"))
-        .map_err(|err| format!("failed to write temporary profile {}: {err}", temp_path.display()))?;
+    fs::write(&temp_path, format!("{value}\n")).map_err(|err| {
+        format!(
+            "failed to write temporary profile {}: {err}",
+            temp_path.display()
+        )
+    })?;
     debugfs_remove(image, path)?;
     let status = Command::new("debugfs")
         .args([

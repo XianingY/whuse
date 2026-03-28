@@ -253,6 +253,7 @@ count_step_semantic_lines() {
 runtime_images=()
 cleanup_target_images=()
 cleanup_done=0
+prepared_runtime_image=""
 
 cleanup_runtime_images() {
     for img in "${runtime_images[@]}"; do
@@ -402,14 +403,14 @@ prepare_runtime_image() {
     local src="$2"
     if [[ "${WHUSE_STAGE2_USE_IMAGE_COPY}" != "1" && -z "${WHUSE_OSCOMP_CASE_FILTER}" && "${WHUSE_OSCOMP_RUNTIME_FILTER}" == "both" ]]; then
         cleanup_target_images+=("${src}")
-        echo "${src}"
+        prepared_runtime_image="${src}"
         return
     fi
     local dst="/tmp/whuse-${arch}-stage2-${TS}.img"
     cp --reflink=auto "${src}" "${dst}"
     runtime_images+=("${dst}")
     cleanup_target_images+=("${dst}")
-    echo "${dst}"
+    prepared_runtime_image="${dst}"
 }
 
 write_runtime_image_config() {
@@ -742,7 +743,8 @@ run_arch() {
     local suite_done_seen=0
     local terminated_by_suite_done=0
     local effective_profile
-    runtime_image="$(prepare_runtime_image "${arch}" "${image}")"
+    prepare_runtime_image "${arch}" "${image}"
+    runtime_image="${prepared_runtime_image}"
     if [[ -n "${WHUSE_OSCOMP_PROFILE}" ]]; then
         inject_oscomp_profile "${runtime_image}" "${WHUSE_OSCOMP_PROFILE}"
     fi
@@ -915,7 +917,8 @@ run_ltp_riscv() {
     local runtime_image
     local suite_done_seen=0
     local terminated_by_suite_done=0
-    runtime_image="$(prepare_runtime_image "rv" "${RV_IMG}")"
+    prepare_runtime_image "rv" "${RV_IMG}"
+    runtime_image="${prepared_runtime_image}"
     inject_ltp_runtime_config "${runtime_image}"
 
     echo "[rv-ltp] running ltp-only, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, profile=${WHUSE_LTP_PROFILE}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"

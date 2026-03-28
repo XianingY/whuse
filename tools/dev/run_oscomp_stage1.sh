@@ -350,6 +350,7 @@ cleanup_target_images=()
 active_run_pid=""
 active_run_pgid=""
 active_run_label=""
+prepared_runtime_image=""
 cleanup_done=0
 
 cleanup_runtime_images() {
@@ -437,14 +438,14 @@ prepare_runtime_image() {
 	local src="$2"
 	if [[ "${WHUSE_STAGE1_USE_IMAGE_COPY}" != "1" && -z "${WHUSE_OSCOMP_CASE_FILTER}" && "${WHUSE_OSCOMP_RUNTIME_FILTER}" == "both" ]]; then
 		cleanup_target_images+=("${src}")
-		echo "${src}"
+		prepared_runtime_image="${src}"
 		return
 	fi
 	local dst="/tmp/whuse-${arch}-stage1-${TS}.img"
 	cp --reflink=auto "${src}" "${dst}"
 	runtime_images+=("${dst}")
 	cleanup_target_images+=("${dst}")
-	echo "${dst}"
+	prepared_runtime_image="${dst}"
 }
 
 write_runtime_image_config() {
@@ -800,7 +801,8 @@ run_arch() {
 		echo "[${arch}] runtime-filter=${effective_runtime_filter} is not supported on loongarch yet; falling back to both"
 		effective_runtime_filter="both"
 	fi
-	runtime_image="$(prepare_runtime_image "${arch}" "${image}")"
+	prepare_runtime_image "${arch}" "${image}"
+	runtime_image="${prepared_runtime_image}"
 	inject_stage2_profile_files "${arch}" "${runtime_image}" "${effective_runtime_filter}"
 	effective_profile="$(effective_oscomp_profile)"
 	if [[ "${arch}" == "la" ]]; then

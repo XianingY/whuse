@@ -2744,12 +2744,6 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         ),
         ("/lib/libc.so.6", "/glibc/lib/libc.so.6"),
         ("/lib/libm.so.6", "/glibc/lib/libm.so.6"),
-        ("/lib/riscv64-linux-gnu/libc.so.6", "/glibc/lib/libc.so.6"),
-        ("/lib/riscv64-linux-gnu/libm.so.6", "/glibc/lib/libm.so.6"),
-        ("/lib/riscv64-linux-gnu/libc.so", "/glibc/lib/libc.so.6"),
-        ("/lib/riscv64-linux-gnu/libm.so", "/glibc/lib/libm.so.6"),
-        ("/lib/riscv64-linux-gnu/tls/libc.so", "/glibc/lib/libc.so.6"),
-        ("/lib/riscv64-linux-gnu/tls/libm.so", "/glibc/lib/libm.so.6"),
         (
             "/lib/loongarch64-linux-gnu/libc.so.6",
             "/glibc/lib/libc.so.6",

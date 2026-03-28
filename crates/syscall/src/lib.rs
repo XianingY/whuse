@@ -4347,23 +4347,18 @@ impl SyscallDispatcher {
                         let non_cancel_pending = pending & !cancel_mask;
                         let signal_frame_pending = procs.current()?.signal_frame_pending;
                         let cancel_seen = procs.current()?.cancel_signal_seen;
-                        let cancel_once = procs.current()?.cancel_interrupt_once;
-                        if non_cancel_pending != 0 || signal_frame_pending || cancel_once {
+                        let cancel_in_progress = procs.current()?.is_cancellation_in_progress();
+                        if non_cancel_pending != 0 || signal_frame_pending || cancel_in_progress {
                             procs.clear_futex_wait_state(tid);
-                            let consumed = if cancel_once {
-                                procs.current_mut()?.consume_cancel_interrupt_once()
-                            } else {
-                                false
-                            };
                             if libctest_task {
                                 log_always(&format!(
-                                    "whuse-libctest:futex-eintr tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
-                                    tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
+                                    "whuse-libctest:futex-eintr tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={}",
+                                    tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_in_progress
                                 ));
                             }
                             cancel_debug(&format!(
-                                "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
-                                tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
+                                "whuse-debug: FUTEX_WAIT EINTR tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={}",
+                                tid, wait_addr, pending, signal_frame_pending, cancel_seen, cancel_in_progress
                             ));
                             return Err(EINTR);
                         }
@@ -4395,22 +4390,17 @@ impl SyscallDispatcher {
                 let non_cancel_pending = pending & !cancel_mask;
                 let signal_frame_pending = procs.current()?.signal_frame_pending;
                 let cancel_seen = procs.current()?.cancel_signal_seen;
-                let cancel_once = procs.current()?.cancel_interrupt_once;
-                if non_cancel_pending != 0 || signal_frame_pending || cancel_once {
-                    let consumed = if cancel_once {
-                        procs.current_mut()?.consume_cancel_interrupt_once()
-                    } else {
-                        false
-                    };
+                let cancel_in_progress = procs.current()?.is_cancellation_in_progress();
+                if non_cancel_pending != 0 || signal_frame_pending || cancel_in_progress {
                     if libctest_task {
                         log_always(&format!(
-                            "whuse-libctest:futex-eintr-fresh tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
-                            tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
+                            "whuse-libctest:futex-eintr-fresh tid={} addr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={}",
+                            tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_in_progress
                         ));
                     }
                     cancel_debug(&format!(
-                        "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_once={} consumed={}",
-                        tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_once, consumed
+                        "whuse-debug: FUTEX_WAIT EINTR(fresh) tid={} uaddr={:#x} pending={:#x} sfp={} cancel_seen={} cancel_in_progress={}",
+                        tid, uaddr, pending, signal_frame_pending, cancel_seen, cancel_in_progress
                     ));
                     return Err(EINTR);
                 }
@@ -4435,7 +4425,7 @@ impl SyscallDispatcher {
                         val,
                         procs.current()?.signal_frame_pending,
                         procs.current()?.cancel_signal_seen,
-                        procs.current()?.cancel_interrupt_once
+                        procs.current()?.is_cancellation_in_progress()
                     ));
                     procs.enqueue_futex_waiter(uaddr, tid);
                     {
@@ -5376,20 +5366,20 @@ impl SyscallDispatcher {
         };
 
         cancel_debug(&format!(
-            "whuse-debug: rt_sigreturn tid={} sfp={} cancel_seen={} cancel_once={} saved_pc={:#x}",
+            "whuse-debug: rt_sigreturn tid={} sfp={} cancel_seen={} cancel_in_progress={} saved_pc={:#x}",
             process.tid,
             process.signal_frame_pending,
             process.cancel_signal_seen,
-            process.cancel_interrupt_once,
+            process.is_cancellation_in_progress(),
             saved_pc
         ));
         if libctest_task {
             log_always(&format!(
-                "whuse-libctest:rt_sigreturn tid={} sfp={} cancel_seen={} cancel_once={} saved_pc={:#x}",
+                "whuse-libctest:rt_sigreturn tid={} sfp={} cancel_seen={} cancel_in_progress={} saved_pc={:#x}",
                 process.tid,
                 process.signal_frame_pending,
                 process.cancel_signal_seen,
-                process.cancel_interrupt_once,
+                process.is_cancellation_in_progress(),
                 saved_pc
             ));
         }
@@ -5405,7 +5395,7 @@ impl SyscallDispatcher {
         ));
         process.signal_mask = saved_mask;
         process.signal_frame_pending = false;
-        process.arm_cancel_interrupt_once();
+        process.arm_cancellation_persistent();
         process.trap_frame.sepc = saved_pc;
         #[cfg(target_arch = "riscv64")]
         {
@@ -8320,7 +8310,8 @@ mod tests {
             .install_bytes(0xa400, &0i32.to_le_bytes());
         {
             let process = procs.current_mut().unwrap();
-            process.cancel_interrupt_once = true;
+            process.mark_cancel_signal_dispatched();
+            process.arm_cancellation_persistent();
         }
         assert_eq!(
             dispatcher.dispatch(
@@ -8332,7 +8323,7 @@ mod tests {
             ),
             -super::EINTR as isize
         );
-        assert!(!procs.current().unwrap().cancel_interrupt_once);
+        assert!(procs.current().unwrap().is_cancellation_in_progress());
 
         assert_eq!(
             dispatcher.dispatch(
@@ -8342,9 +8333,9 @@ mod tests {
                 &mut scheduler,
                 &mut vfs,
             ),
-            -super::EAGAIN as isize
+            -super::EINTR as isize
         );
-        assert_eq!(procs.current().unwrap().futex_wait_addr, Some(0xa400));
+        assert!(procs.current().unwrap().is_cancellation_in_progress());
         assert_eq!(
             dispatcher.dispatch(
                 SYS_FUTEX,
@@ -8392,7 +8383,6 @@ mod tests {
             process.signal_mask = 0;
             process.signal_frame_pending = false;
             process.cancel_signal_seen = false;
-            process.cancel_interrupt_once = false;
         }
 
         assert_eq!(
@@ -8409,7 +8399,7 @@ mod tests {
     }
 
     #[test]
-    fn rt_sigreturn_arms_cancel_interrupt_once() {
+    fn rt_sigreturn_arms_cancellation_persistent() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
         let mut procs = ProcessTable::new();
@@ -8440,7 +8430,6 @@ mod tests {
             let process = procs.current_mut().unwrap();
             process.signal_frame_pending = true;
             process.cancel_signal_seen = true;
-            process.cancel_interrupt_once = false;
             process.signal_mask = 0xffff;
             process.trap_frame.regs[2] = frame_sp;
             process.address_space.install_bytes(frame_sp, &frame);
@@ -8460,7 +8449,7 @@ mod tests {
         assert_eq!(process.signal_mask, saved_mask);
         assert!(!process.signal_frame_pending);
         assert!(!process.cancel_signal_seen);
-        assert!(process.cancel_interrupt_once);
+        assert!(process.is_cancellation_in_progress());
     }
 
     #[test]

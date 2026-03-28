@@ -192,9 +192,10 @@ pub struct Process {
     /// by rt_sigreturn. This tracks cancellation arrival without forcing all
     /// subsequent blocking syscalls to return EINTR forever.
     pub cancel_signal_seen: bool,
-    /// One-shot futex interrupt token armed by rt_sigreturn after SIGCANCEL.
-    /// FUTEX_WAIT consumes this token and returns -EINTR once.
-    pub cancel_interrupt_once: bool,
+    /// Persistent futex interrupt flag armed by rt_sigreturn after SIGCANCEL.
+    /// FUTEX_WAIT checks this flag and returns -EINTR repeatedly until thread exits.
+    /// This allows musl's cancellation path to progress through multiple blocking points.
+    pub cancellation_in_progress: bool,
     /// Parent task id blocked by CLONE_VFORK. Set on the child process until
     /// the child reaches execve/exit and releases the parent.
     pub vfork_parent_tid: Option<usize>,
@@ -252,10 +253,10 @@ impl Process {
             tid_address: None,
             clear_child_tid: None,
             robust_list: None,
-            signal_mask: 0,
             pending_signals: 0,
             sigaltstack: None,
             signal_actions: BTreeMap::new(),
+            signal_mask: 0,
             sleep_deadline_ns: None,
             sleep_requested_ns: 0,
             sleep_remain_ptr: None,
@@ -269,7 +270,7 @@ impl Process {
             is_thread: false,
             signal_frame_pending: false,
             cancel_signal_seen: false,
-            cancel_interrupt_once: false,
+            cancellation_in_progress: false,
             vfork_parent_tid: None,
         }
     }
@@ -384,22 +385,7 @@ impl Process {
 
     pub fn mark_cancel_signal_dispatched(&mut self) {
         self.cancel_signal_seen = true;
-        self.cancel_interrupt_once = false;
-    }
-
-    pub fn arm_cancel_interrupt_once(&mut self) {
-        if self.cancel_signal_seen {
-            self.cancel_signal_seen = false;
-            self.cancel_interrupt_once = true;
-        }
-    }
-
-    pub fn consume_cancel_interrupt_once(&mut self) -> bool {
-        if self.cancel_interrupt_once {
-            self.cancel_interrupt_once = false;
-            return true;
-        }
-        false
+        self.cancellation_in_progress = false;
     }
 
     fn collect_robust_futex_addrs_for_exit(&mut self) -> Vec<usize> {
@@ -483,8 +469,18 @@ impl Process {
         self.sigsuspend_saved_mask = None;
         self.signal_frame_pending = false;
         self.cancel_signal_seen = false;
-        self.cancel_interrupt_once = false;
-        self.vfork_parent_tid = None;
+        self.cancellation_in_progress = false;
+    }
+
+    pub fn arm_cancellation_persistent(&mut self) {
+        if self.cancel_signal_seen {
+            self.cancel_signal_seen = false;
+            self.cancellation_in_progress = true;
+        }
+    }
+
+    pub fn is_cancellation_in_progress(&self) -> bool {
+        self.cancellation_in_progress
     }
 
     fn fork_from(&self, pid: usize) -> Self {
@@ -540,7 +536,7 @@ impl Process {
             is_thread: false,
             signal_frame_pending: false,
             cancel_signal_seen: false,
-            cancel_interrupt_once: false,
+            cancellation_in_progress: false,
             vfork_parent_tid: None,
         }
     }
@@ -598,7 +594,7 @@ impl Process {
             is_thread: false,
             signal_frame_pending: false,
             cancel_signal_seen: false,
-            cancel_interrupt_once: false,
+            cancellation_in_progress: false,
             vfork_parent_tid: None,
         }
     }
@@ -664,10 +660,10 @@ impl Process {
             futex_wait_deadline_ns: None,
             epoll_wait_deadline_ns: None,
             sigsuspend_saved_mask: None,
-            is_thread: true,
+            is_thread: false,
             signal_frame_pending: false,
             cancel_signal_seen: false,
-            cancel_interrupt_once: false,
+            cancellation_in_progress: false,
             vfork_parent_tid: None,
         }
     }
@@ -1704,7 +1700,7 @@ impl ProcessTable {
                     && ((p.pending_signals & !p.signal_mask) != 0
                         || p.signal_frame_pending
                         || p.cancel_signal_seen
-                        || p.cancel_interrupt_once)
+                        || p.cancellation_in_progress)
                     && p.state != ProcessState::Exited
             })
             .map(|p| p.tid)
@@ -2326,7 +2322,10 @@ mod tests {
 
         assert_eq!(waited, worker);
         assert_eq!(status, 0);
-        assert_eq!(table.find_process_by_pid(grandchild).unwrap().parent, Some(init));
+        assert_eq!(
+            table.find_process_by_pid(grandchild).unwrap().parent,
+            Some(init)
+        );
     }
 
     #[test]
@@ -2338,19 +2337,18 @@ mod tests {
 
         process.mark_cancel_signal_dispatched();
         assert!(process.cancel_signal_seen);
-        assert!(!process.cancel_interrupt_once);
+        assert!(!process.cancellation_in_progress);
 
-        process.arm_cancel_interrupt_once();
+        process.arm_cancellation_persistent();
         assert!(!process.cancel_signal_seen);
-        assert!(process.cancel_interrupt_once);
-        assert!(process.consume_cancel_interrupt_once());
-        assert!(!process.consume_cancel_interrupt_once());
+        assert!(process.cancellation_in_progress);
+        assert!(process.is_cancellation_in_progress());
 
         process.mark_cancel_signal_dispatched();
-        process.arm_cancel_interrupt_once();
+        process.arm_cancellation_persistent();
         process.reset_image(0x2000, None);
         assert!(!process.cancel_signal_seen);
-        assert!(!process.cancel_interrupt_once);
+        assert!(!process.cancellation_in_progress);
     }
 
     #[test]
@@ -2364,7 +2362,7 @@ mod tests {
         let process = table.current().unwrap();
         assert_ne!(process.pending_signals & (1u64 << (33 - 1)), 0);
         assert!(!process.cancel_signal_seen);
-        assert!(!process.cancel_interrupt_once);
+        assert!(!process.cancellation_in_progress);
     }
 
     #[test]

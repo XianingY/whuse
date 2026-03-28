@@ -1167,52 +1167,24 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-runtime-end:$runtime\n",
     "    return \"$rc\"\n",
     "}\n",
-"run_basic_runtime_entry() {\n",
-"    runtime=\"$1\"\n",
-"    timeout_s=\"$2\"\n",
-"    root=\"/$runtime\"\n",
-"    brk_path=\"./basic/brk\"\n",
-"    fallback_script=\"basic_testcode.sh\"\n",
-"    if [ \"$runtime\" = \"glibc\" ]; then\n",
-"        root=\"/\"\n",
-"        brk_path=\"/glibc/basic/brk\"\n",
-"        fallback_script=\"/glibc/basic_testcode.sh\"\n",
-"    fi\n",
-"    echo whuse-oscomp-runtime-begin:$runtime\n",
-"    cd \"$root\" || {\n",
-"        echo whuse-oscomp-step-begin:${runtime}/basic_testcode.sh\n",
-"        echo whuse-oscomp-step-end:${runtime}/basic_testcode.sh:1\n",
-"        echo whuse-oscomp-runtime-end:$runtime\n",
-"        return 1\n",
-"    }\n",
-"    echo whuse-oscomp-step-begin:${runtime}/basic_testcode.sh\n",
-"    echo \"Testing brk :\"\n",
-"    if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
-"        /musl/busybox timeout \"$timeout_s\" \"$brk_path\"\n",
-"    else\n",
-"        \"$brk_path\"\n",
-"    fi\n",
-"    rc=$?\n",
-"    if [ \"$runtime\" = \"musl\" ] && [ \"$rc\" = \"0\" ]; then\n",
-"        echo \"Testing sleep :\"\n",
-"        if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
-"            /musl/busybox timeout \"$timeout_s\" ./basic/sleep\n",
-"        else\n",
-"            ./basic/sleep\n",
-"        fi\n",
-"        rc=$?\n",
-"    fi\n",
-"    if [ \"$rc\" = \"127\" ] || [ \"$rc\" = \"126\" ]; then\n",
-"        if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
-"            /musl/busybox timeout \"$timeout_s\" /musl/busybox sh \"$fallback_script\"\n",
-"        else\n",
-"            /musl/busybox sh \"$fallback_script\"\n",
-"        fi\n",
-"        rc=$?\n",
-"    fi\n",
-"    if [ \"$rc\" = \"124\" ]; then\n",
-"        echo whuse-oscomp-step-timeout:${runtime}/basic_testcode.sh:$timeout_s:pid=0:tgid=0\n",
-"    fi\n",
+    "run_basic_runtime_entry() {\n",
+    "    runtime=\"$1\"\n",
+    "    timeout_s=\"$2\"\n",
+    "    root=\"/$runtime\"\n",
+    "    fallback_script=\"basic_testcode.sh\"\n",
+    "    echo whuse-oscomp-runtime-begin:$runtime\n",
+    "    cd \"$root\" || {\n",
+    "        echo whuse-oscomp-step-begin:${runtime}/basic_testcode.sh\n",
+    "        echo whuse-oscomp-step-end:${runtime}/basic_testcode.sh:1\n",
+    "        echo whuse-oscomp-runtime-end:$runtime\n",
+    "        return 1\n",
+    "    }\n",
+    "    echo whuse-oscomp-step-begin:${runtime}/basic_testcode.sh\n",
+    "    /musl/busybox sh \"$fallback_script\"\n",
+    "    rc=$?\n",
+    "    if [ \"$rc\" = \"124\" ]; then\n",
+    "        echo whuse-oscomp-step-timeout:${runtime}/basic_testcode.sh:$timeout_s:pid=0:tgid=0\n",
+    "    fi\n",
     "    echo whuse-oscomp-step-end:${runtime}/basic_testcode.sh:$rc\n",
     "    cd / || return 1\n",
     "    echo whuse-oscomp-runtime-end:$runtime\n",
@@ -1232,16 +1204,16 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    else\n",
     "        skip_runtime_step musl basic_testcode.sh\n",
     "    fi\n",
-"    if runtime_selected glibc; then\n",
-"        echo whuse-oscomp-runtime-dispatch:glibc\n",
-"        run_basic_runtime_entry glibc \"$timeout_s\"\n",
-"        rc=$?\n",
-"        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
-"            group_rc=\"$rc\"\n",
-"        fi\n",
-"    else\n",
-"        skip_runtime_step glibc basic_testcode.sh\n",
-"    fi\n",
+    "    if runtime_selected glibc; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "        run_basic_runtime_entry glibc \"$timeout_s\"\n",
+    "        rc=$?\n",
+    "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "            group_rc=\"$rc\"\n",
+    "        fi\n",
+    "    else\n",
+    "        skip_runtime_step glibc basic_testcode.sh\n",
+    "    fi\n",
     "    echo whuse-oscomp-step-end:basic_testcode.sh:$group_rc\n",
     "    return 0\n",
     "}\n",
@@ -1279,23 +1251,10 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        *) return 1 ;;\n",
     "    esac\n",
     "}\n",
-    "busybox_case_is_known_hang() {\n",
-    "    line=\"$1\"\n",
-    "    case \"$line\" in\n",
-    "        \"stat test.txt\" | \"more test.txt\" | \"sh -c exit\" | \"sh -c 'sleep 5' & ./busybox kill $!\" | \"dmesg \" | \"du\" | \"hwclock\" | \"sleep 1\" | \"ls\" | \"sort test.txt | ./busybox uniq\" | \"find -name \\\"busybox_cmd.txt\\\"\" ) return 0 ;;\n",
-    "        *) return 1 ;;\n",
-    "    esac\n",
-    "}\n",
     "run_busybox_case_line() {\n",
     "    runtime=\"$1\"\n",
     "    busybox_bin=\"$2\"\n",
     "    line=\"$3\"\n",
-    "    if busybox_case_is_known_hang \"$line\"; then\n",
-    "        printf '\\nwhuse-oscomp-busybox-skip:%s:%s:known-loongarch-hang\\n' \"$runtime\" \"$line\"\n",
-    "        printf '\\nwhuse-oscomp-busybox-case:%s:%s:%s\\n' \"$runtime\" \"$line\" 124\n",
-    "        printf 'testcase busybox %s fail\\n' \"$line\"\n",
-    "        return 124\n",
-    "    fi\n",
     "    eval \"\\\"$busybox_bin\\\" $line\"\n",
     "    rc=$?\n",
     "    printf '\\nwhuse-oscomp-busybox-case:%s:%s:%s\\n' \"$runtime\" \"$line\" \"$rc\"\n",
@@ -1329,7 +1288,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        echo whuse-oscomp-step-begin:${runtime}/busybox_testcode.sh\n",
     "        echo whuse-oscomp-step-end:${runtime}/busybox_testcode.sh:1\n",
     "        echo whuse-oscomp-runtime-end:$runtime\n",
-    "        return 1\n",
+        "        return 1\n",
     "    }\n",
     "    echo whuse-oscomp-step-begin:${runtime}/busybox_testcode.sh\n",
     "    fail=0\n",
@@ -1340,7 +1299,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    }\n",
     "    while IFS= read -r line <&9 || [ -n \"$line\" ]; do\n",
     "        [ -n \"$line\" ] || continue\n",
-    "        echo whuse-oscomp-busybox-next:${runtime}:$line\n",
+        "        echo whuse-oscomp-busybox-next:${runtime}:$line\n",
     "        run_busybox_case_line \"$runtime\" \"$busybox_bin\" \"$line\" || fail=1\n",
     "    done\n",
     "    exec 9<&-\n",
@@ -2362,7 +2321,8 @@ impl Kernel {
                         );
                     if !blocked_restart {
                         process.trap_frame.set_retval(result as usize);
-                        if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN) || (result as i32) < 0
+                        if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN)
+                            || (result as i32) < 0
                         {
                             process.trap_frame.sepc = sepc + 4;
                         }
@@ -2773,6 +2733,8 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs, time_test_present: bool) {
         "/usr/lib64",
         "/usr/sbin",
         "/lib",
+        "/lib/riscv64-linux-gnu",
+        "/lib/riscv64-linux-gnu/tls",
         "/lib/loongarch64-linux-gnu",
         "/lib/loongarch64-linux-gnu/tls",
         "/lib64",
@@ -2861,6 +2823,12 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs, time_test_present: bool) {
         ),
         ("/lib/libc.so.6", "/glibc/lib/libc.so.6"),
         ("/lib/libm.so.6", "/glibc/lib/libm.so.6"),
+        ("/lib/riscv64-linux-gnu/libc.so.6", "/glibc/lib/libc.so.6"),
+        ("/lib/riscv64-linux-gnu/libm.so.6", "/glibc/lib/libm.so.6"),
+        ("/lib/riscv64-linux-gnu/libc.so", "/glibc/lib/libc.so.6"),
+        ("/lib/riscv64-linux-gnu/libm.so", "/glibc/lib/libm.so.6"),
+        ("/lib/riscv64-linux-gnu/tls/libc.so", "/glibc/lib/libc.so.6"),
+        ("/lib/riscv64-linux-gnu/tls/libm.so", "/glibc/lib/libm.so.6"),
         (
             "/lib/loongarch64-linux-gnu/libc.so.6",
             "/glibc/lib/libc.so.6",
@@ -3040,7 +3008,7 @@ fn preload_libctest_hot_files_from_device(
         }
     };
     for (path, mode) in OSCOMP_LIBCTEST_PRELOAD_FILES {
-        let mut bytes = match mount.read(path) {
+        let bytes = match mount.read(path) {
             Ok(bytes) => bytes,
             Err(err) => {
                 logln(format_args!(
@@ -3056,9 +3024,6 @@ fn preload_libctest_hot_files_from_device(
                 path
             ));
             continue;
-        }
-        if path.ends_with("/busybox_cmd.txt") {
-            bytes = sanitize_loongarch_busybox_cmd(&bytes);
         }
         match vfs.preload_external_file(path, &bytes, Some(mode)) {
             Ok(()) => {}
@@ -3122,28 +3087,6 @@ fn preload_libctest_hot_files_from_device(
                 path, err
             ));
         }
-    }
-}
-
-fn sanitize_loongarch_busybox_cmd(bytes: &[u8]) -> Vec<u8> {
-    let Ok(text) = core::str::from_utf8(bytes) else {
-        return bytes.to_vec();
-    };
-    let mut changed = false;
-    let mut out = String::new();
-    for line in text.lines() {
-        if line == "[ -f test.txt ]" {
-            out.push_str("test -f test.txt\n");
-            changed = true;
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if changed {
-        out.into_bytes()
-    } else {
-        bytes.to_vec()
     }
 }
 
@@ -3348,7 +3291,8 @@ fn read_oscomp_stage2_overrides(vfs: &mut KernelVfs) -> OscompStage2Overrides {
                 overrides.busybox_profile = normalize_oscomp_busybox_profile_value(value);
             }
             "WHUSE_STAGE2_GATE_LIBCTEST_SCOPE" => {
-                overrides.gate_libctest_scope = normalize_oscomp_gate_libctest_scope_value(value);
+                overrides.gate_libctest_scope =
+                    normalize_oscomp_gate_libctest_scope_value(value);
             }
             "WHUSE_STAGE2_LIBCBENCH_SCOPE" => {
                 overrides.libcbench_scope = normalize_oscomp_libcbench_scope_value(value);
@@ -3372,18 +3316,12 @@ fn render_oscomp_official_suite_script(
         .replace(OSCOMP_FULL_MAX_GROUP_PLACEHOLDER, overrides.full_max_group)
         .replace(OSCOMP_IOZONE_PROFILE_PLACEHOLDER, overrides.iozone_profile)
         .replace(OSCOMP_BASIC_PROFILE_PLACEHOLDER, overrides.basic_profile)
-        .replace(
-            OSCOMP_BUSYBOX_PROFILE_PLACEHOLDER,
-            overrides.busybox_profile,
-        )
+        .replace(OSCOMP_BUSYBOX_PROFILE_PLACEHOLDER, overrides.busybox_profile)
         .replace(
             OSCOMP_GATE_LIBCTEST_SCOPE_PLACEHOLDER,
             overrides.gate_libctest_scope,
         )
-        .replace(
-            OSCOMP_LIBCBENCH_SCOPE_PLACEHOLDER,
-            overrides.libcbench_scope,
-        )
+        .replace(OSCOMP_LIBCBENCH_SCOPE_PLACEHOLDER, overrides.libcbench_scope)
         .replace(OSCOMP_LMBENCH_SCOPE_PLACEHOLDER, overrides.lmbench_scope)
         .replace(
             OSCOMP_TIME_TEST_PRESENT_PLACEHOLDER,
@@ -3403,18 +3341,15 @@ mod tests {
             "official suite script should carry a render-time full max group placeholder"
         );
         assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-real-max-group:$WHUSE_STAGE2_FULL_MAX_GROUP"),
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("whuse-oscomp-real-max-group:$WHUSE_STAGE2_FULL_MAX_GROUP"),
             "official suite script should log the effective full max group"
         );
         assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-basic-profile:$WHUSE_STAGE2_BASIC_PROFILE"),
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("whuse-oscomp-basic-profile:$WHUSE_STAGE2_BASIC_PROFILE"),
             "official suite script should log the effective basic profile"
         );
         assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-busybox-profile:$WHUSE_STAGE2_BUSYBOX_PROFILE"),
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("whuse-oscomp-busybox-profile:$WHUSE_STAGE2_BUSYBOX_PROFILE"),
             "official suite script should log the effective busybox profile"
         );
         assert!(

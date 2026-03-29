@@ -1873,6 +1873,48 @@ impl Kernel {
                 let _ = self.scheduler.yield_now();
                 continue;
             }
+            {
+                let process = match self.processes.current() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if process.force_thread_exit {
+                    let tid = process.tid;
+                    let tgid = process.tgid;
+                    if cancel_debug_enabled() {
+                        logln(format_args!(
+                            "whuse-debug: force_thread_exit tid={} tgid={}",
+                            tid, tgid
+                        ));
+                    }
+                    drop(process);
+                    if let Ok(exit) = self.processes.exit_current_thread(7) {
+                        self.scheduler.remove_task(exit.tid);
+                        if exit.group_exited {
+                            self.scheduler.exit_group(exit.tgid);
+                        }
+                        if let Some(parent_tgid) = exit.parent_tgid {
+                            let _ = self.processes.deliver_signal(parent_tgid, 17);
+                        }
+                        let mut wake_addrs = [exit.clear_child_tid, exit.tid_address];
+                        if wake_addrs[0] == wake_addrs[1] {
+                            wake_addrs[1] = None;
+                        }
+                        for addr in wake_addrs.into_iter().flatten() {
+                            for wtid in self.processes.wake_futex(addr, usize::MAX) {
+                                let _ = self.scheduler.wake_task(wtid);
+                            }
+                        }
+                        for addr in exit.robust_futex_addrs {
+                            let woken = self.processes.wake_futex(addr, 1);
+                            for wtid in woken {
+                                let _ = self.scheduler.wake_task(wtid);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
             self.run_current_process();
         }
     }

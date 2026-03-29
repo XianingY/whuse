@@ -5765,7 +5765,7 @@ impl SyscallDispatcher {
         let addr = procs
             .current_mut()?
             .address_space
-            .map_anonymous(data_len, 0b11)?;
+            .map_anonymous_shared(data_len, 0b11)?;
 
         let mut state = SHM_STATE.lock();
         if let Some(segment) = state.segments.get_mut(&id) {
@@ -5843,11 +5843,23 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
-    fn sys_shmdt(&self, args: SyscallArgs) -> Result<usize, i32> {
+    fn sys_shmdt(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let addr = args.0[0];
 
-        let mut state = SHM_STATE.lock();
+        let segment_info = {
+            let state = SHM_STATE.lock();
+            state
+                .segments
+                .values()
+                .find(|s| s.attachments.iter().any(|a| a.addr == addr))
+                .map(|s| s.data.len())
+        };
 
+        if let Some(len) = segment_info {
+            procs.current_mut()?.address_space.unmap(addr, len)?;
+        }
+
+        let mut state = SHM_STATE.lock();
         for segment in state.segments.values_mut() {
             if let Some(pos) = segment.attachments.iter().position(|a| a.addr == addr) {
                 segment.attachments.remove(pos);

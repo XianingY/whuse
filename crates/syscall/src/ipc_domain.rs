@@ -9,7 +9,7 @@ pub(crate) fn dispatch(
         SYS_SHMGET => ctx.dispatcher.sys_shmget(args),
         SYS_SHMAT => ctx.dispatcher.sys_shmat(args, ctx.procs),
         SYS_SHMCTL => ctx.dispatcher.sys_shmctl(args, ctx.procs),
-        SYS_SHMDT => ctx.dispatcher.sys_shmdt(),
+        SYS_SHMDT => ctx.dispatcher.sys_shmdt(args),
         _ => return None,
     })
 }

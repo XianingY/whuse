@@ -63,6 +63,8 @@ const EDQUOT: i32 = 122;
 const EBADMSG: i32 = 74;
 const ETIMEDOUT: i32 = 110;
 const EPROTOTYPE: i32 = 91;
+const EEXIST: i32 = 17;
+const EIDRM: i32 = 43;
 const AT_FDCWD: i32 = -100;
 const F_OK: usize = 0;
 const X_OK: usize = 1;
@@ -605,11 +607,68 @@ struct MsgHdr {
     _pad1: u32,
 }
 
+/// shmid_ds structure for shmctl IPC_STAT
+#[repr(C)]
+struct ShmidDs {
+    shm_segsz: usize,  // size of segment
+    shm_nattch: usize, // number of attaches
+    shm_cpid: usize,   // pid of creator
+    shm_lpid: usize,   // pid of last operator
+    shm_atime: usize,  // last attach time
+    shm_dtime: usize,  // last detach time
+    shm_ctime: usize,  // last change time
+    _pad: [u64; 3],
+}
+
+impl Default for ShmidDs {
+    fn default() -> Self {
+        ShmidDs {
+            shm_segsz: 0,
+            shm_nattch: 0,
+            shm_cpid: 0,
+            shm_lpid: 0,
+            shm_atime: 0,
+            shm_dtime: 0,
+            shm_ctime: 0,
+            _pad: [0; 3],
+        }
+    }
+}
+
+/// Track attached address for each process
+struct ShmAttachment {
+    addr: usize,
+    id: usize,
+}
+
+/// Segment with attachment tracking
+struct ShmSegment {
+    data: Vec<u8>,
+    key: i32,
+    creator_pid: usize,
+    attach_count: usize,
+    attachments: Vec<ShmAttachment>,
+    destroyed: bool,
+}
+
+impl ShmSegment {
+    fn new(key: i32, size: usize, creator_pid: usize) -> Self {
+        ShmSegment {
+            data: vec![0; size.max(1)],
+            key,
+            creator_pid,
+            attach_count: 0,
+            attachments: Vec::new(),
+            destroyed: false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct SharedMemoryState {
     next_id: usize,
     keys: BTreeMap<i32, usize>,
-    segments: BTreeMap<usize, Vec<u8>>,
+    segments: BTreeMap<usize, ShmSegment>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5666,15 +5725,25 @@ impl SyscallDispatcher {
     fn sys_shmget(&self, args: SyscallArgs) -> Result<usize, i32> {
         let key = args.0[0] as i32;
         let size = args.0[1];
-        let _flags = args.0[2];
+        let flags = args.0[2];
         let mut state = SHM_STATE.lock();
-        if let Some(id) = state.keys.get(&key).copied() {
-            return Ok(id);
+
+        if key != 0 {
+            if let Some(id) = state.keys.get(&key).copied() {
+                if flags & 0x8000 != 0 {
+                    return Err(EEXIST);
+                }
+                return Ok(id);
+            }
         }
+
         let id = state.next_id;
         state.next_id += 1;
-        state.keys.insert(key, id);
-        state.segments.insert(id, vec![0; size.max(1)]);
+        let segment = ShmSegment::new(key, size, 0);
+        state.segments.insert(id, segment);
+        if key != 0 {
+            state.keys.insert(key, id);
+        }
         Ok(id)
     }
 
@@ -5682,16 +5751,35 @@ impl SyscallDispatcher {
         let id = args.0[0];
         let _addr = args.0[1];
         let _flags = args.0[2];
-        let data = SHM_STATE.lock().segments.get(&id).cloned().ok_or(ENOENT)?;
+
+        let mut state = SHM_STATE.lock();
+        let segment = state.segments.get_mut(&id).ok_or(ENOENT)?;
+
+        if segment.destroyed && segment.attach_count == 0 {
+            return Err(EIDRM);
+        }
+
+        let data_len = segment.data.len();
+        drop(state);
+
         let addr = procs
             .current_mut()?
             .address_space
-            .map_anonymous(data.len(), 0b11)?;
-        procs
-            .current_mut()?
-            .address_space
-            .write_bytes(addr, &data)
-            .map_err(|_| EFAULT)?;
+            .map_anonymous(data_len, 0b11)?;
+
+        let mut state = SHM_STATE.lock();
+        if let Some(segment) = state.segments.get_mut(&id) {
+            segment.attach_count += 1;
+            segment.attachments.push(ShmAttachment { addr, id });
+        }
+
+        if let Some(segment) = state.segments.get(&id) {
+            let _ = procs
+                .current_mut()?
+                .address_space
+                .write_bytes(addr, &segment.data);
+        }
+
         Ok(addr)
     }
 
@@ -5699,25 +5787,82 @@ impl SyscallDispatcher {
         let id = args.0[0];
         let cmd = args.0[1] as i32;
         let buf = args.0[2];
+
+        let mut state = SHM_STATE.lock();
         match cmd {
             0 => {
-                SHM_STATE.lock().segments.remove(&id).ok_or(ENOENT)?;
-            }
-            2 => {
-                if buf != 0 {
-                    procs
-                        .current_mut()?
-                        .write_user_bytes(buf, &[0; 128])
-                        .map_err(|_| EFAULT)?;
+                let key = {
+                    let segment = state.segments.get(&id).ok_or(ENOENT)?;
+                    segment.key
+                };
+                let segment = state.segments.get_mut(&id).ok_or(ENOENT)?;
+                segment.destroyed = true;
+                if key != 0 {
+                    drop(segment);
+                    state.keys.remove(&key);
+                    let segment = state.segments.get_mut(&id).ok_or(ENOENT)?;
+                    if segment.attach_count == 0 {
+                        state.segments.remove(&id);
+                    }
+                } else if segment.attach_count == 0 {
+                    state.segments.remove(&id);
                 }
             }
-            _ => {}
+            2 => {
+                if buf == 0 {
+                    return Err(EFAULT);
+                }
+                let segment = state.segments.get(&id).ok_or(ENOENT)?;
+
+                let info = ShmidDs {
+                    shm_segsz: segment.data.len(),
+                    shm_nattch: segment.attach_count,
+                    shm_cpid: segment.creator_pid,
+                    shm_lpid: 0,
+                    shm_atime: 0,
+                    shm_dtime: 0,
+                    shm_ctime: 0,
+                    _pad: [0; 3],
+                };
+
+                let bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(
+                        &info as *const ShmidDs as *const u8,
+                        core::mem::size_of::<ShmidDs>(),
+                    )
+                };
+                procs
+                    .current_mut()?
+                    .write_user_bytes(buf, bytes)
+                    .map_err(|_| EFAULT)?;
+            }
+            _ => {
+                return Err(EINVAL);
+            }
         }
         Ok(0)
     }
 
-    fn sys_shmdt(&self) -> Result<usize, i32> {
-        Ok(0)
+    fn sys_shmdt(&self, args: SyscallArgs) -> Result<usize, i32> {
+        let addr = args.0[0];
+
+        let mut state = SHM_STATE.lock();
+
+        for segment in state.segments.values_mut() {
+            if let Some(pos) = segment.attachments.iter().position(|a| a.addr == addr) {
+                segment.attachments.remove(pos);
+                segment.attach_count = segment.attach_count.saturating_sub(1);
+
+                if segment.destroyed && segment.attach_count == 0 {
+                    state
+                        .segments
+                        .retain(|_, s| s.attach_count > 0 || !s.destroyed);
+                }
+                return Ok(0);
+            }
+        }
+
+        Err(EINVAL)
     }
 
     fn sys_socket(

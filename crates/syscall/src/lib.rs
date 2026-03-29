@@ -643,7 +643,7 @@ struct ShmAttachment {
 
 /// Segment with attachment tracking
 struct ShmSegment {
-    data: Vec<u8>,
+    data: alloc::sync::Arc<Mutex<Vec<u8>>>,
     key: i32,
     creator_pid: usize,
     attach_count: usize,
@@ -654,7 +654,7 @@ struct ShmSegment {
 impl ShmSegment {
     fn new(key: i32, size: usize, creator_pid: usize) -> Self {
         ShmSegment {
-            data: vec![0; size.max(1)],
+            data: alloc::sync::Arc::new(Mutex::new(vec![0; size.max(1)])),
             key,
             creator_pid,
             attach_count: 0,
@@ -5759,28 +5759,40 @@ impl SyscallDispatcher {
             return Err(EIDRM);
         }
 
-        let data_len = segment.data.len();
+        let data_arc = {
+            let segment = match state.segments.get(&id) {
+                Some(s) => s,
+                None => return Err(ENOENT),
+            };
+            if segment.destroyed && segment.attach_count == 0 {
+                return Err(EIDRM);
+            }
+            segment.data.clone()
+        };
+
+        let data_len = data_arc.lock().len();
         drop(state);
 
-        let addr = procs
-            .current_mut()?
-            .address_space
-            .map_anonymous_shared(data_len, 0b11)?;
+        let addr = procs.current_mut()?.address_space.map_shared_existing(
+            data_len,
+            data_arc.clone(),
+            0b11,
+        )?;
 
         let mut state = SHM_STATE.lock();
         if let Some(segment) = state.segments.get_mut(&id) {
             segment.attach_count += 1;
             segment.attachments.push(ShmAttachment { addr, id });
         }
+        drop(state);
 
-        if let Some(segment) = state.segments.get(&id) {
-            let _ = procs
-                .current_mut()?
-                .address_space
-                .write_bytes(addr, &segment.data);
-        }
+        let data = data_arc.lock();
+        let _ = procs
+            .current_mut()?
+            .address_space
+            .write_bytes(addr, &data)?;
 
-        Ok(addr)
+        Ok(0)
     }
 
     fn sys_shmctl(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
@@ -5791,20 +5803,25 @@ impl SyscallDispatcher {
         let mut state = SHM_STATE.lock();
         match cmd {
             0 => {
-                let key = {
-                    let segment = state.segments.get(&id).ok_or(ENOENT)?;
-                    segment.key
+                let (key, attach_count) = {
+                    let segment = match state.segments.get(&id) {
+                        Some(s) => s,
+                        None => return Err(ENOENT),
+                    };
+                    (segment.key, segment.attach_count)
                 };
-                let segment = state.segments.get_mut(&id).ok_or(ENOENT)?;
+                let segment = match state.segments.get_mut(&id) {
+                    Some(s) => s,
+                    None => return Err(ENOENT),
+                };
                 segment.destroyed = true;
                 if key != 0 {
                     drop(segment);
                     state.keys.remove(&key);
-                    let segment = state.segments.get_mut(&id).ok_or(ENOENT)?;
-                    if segment.attach_count == 0 {
+                    if attach_count == 0 {
                         state.segments.remove(&id);
                     }
-                } else if segment.attach_count == 0 {
+                } else if attach_count == 0 {
                     state.segments.remove(&id);
                 }
             }
@@ -5812,10 +5829,13 @@ impl SyscallDispatcher {
                 if buf == 0 {
                     return Err(EFAULT);
                 }
-                let segment = state.segments.get(&id).ok_or(ENOENT)?;
+                let segment = match state.segments.get(&id) {
+                    Some(s) => s,
+                    None => return Err(ENOENT),
+                };
 
                 let info = ShmidDs {
-                    shm_segsz: segment.data.len(),
+                    shm_segsz: segment.data.lock().len(),
                     shm_nattch: segment.attach_count,
                     shm_cpid: segment.creator_pid,
                     shm_lpid: 0,
@@ -5852,7 +5872,7 @@ impl SyscallDispatcher {
                 .segments
                 .values()
                 .find(|s| s.attachments.iter().any(|a| a.addr == addr))
-                .map(|s| s.data.len())
+                .map(|s| s.data.lock().len())
         };
 
         if let Some(len) = segment_info {

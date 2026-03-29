@@ -170,7 +170,10 @@ The suite script order is:
 
 ### 4.3 Current known status (as of last verified run)
 
-**Scoring Policy**: Based on official contest scoring table, **only musl-rv and glibc-rv score**. glibc-la and musl-la do not score. glibc libctest is marked "-" (not scored).
+**Scoring Policy**: Based on official contest scoring table, all four variants
+**participate in scoring**: glibc-rv, glibc-la, musl-rv, musl-la.
+The only exception is `libctest` for glibc variants, which is marked "-"
+(not scored), as shown in the official scoring table.
 
 Steps confirmed completing with `step-end` marker:
 

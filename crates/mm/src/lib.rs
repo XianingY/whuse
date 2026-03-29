@@ -909,6 +909,27 @@ impl AddressSpace {
         })
     }
 
+    pub fn map_shared_existing(
+        &self,
+        addr: usize,
+        data: alloc::sync::Arc<Mutex<Vec<u8>>>,
+        prot: usize,
+    ) -> KernelResult<usize> {
+        let len = data.lock().len().max(1);
+        self.insert_segment(Segment {
+            area: MappingArea {
+                start: addr,
+                len,
+                prot,
+            },
+            storage: SegmentStorage::Shared {
+                bytes: data,
+                ptr: addr,
+            },
+        })?;
+        Ok(addr)
+    }
+
     fn insert_segment(&self, segment: Segment) -> KernelResult<()> {
         let mut inner = self.inner.lock();
         if overlaps(&inner.mappings, segment.area.start, segment.area.len) {

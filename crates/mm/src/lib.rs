@@ -729,8 +729,7 @@ impl AddressSpace {
     ///
     /// Handle a store page fault for COW Fork.
     /// Finds the faulting address in the segment mappings, promotes the COW
-    /// segment to owned, and updates just the single PTE instead of rebuilding
-    /// the entire page table.
+    /// segment to owned, and rebuilds the page table.
     ///
     /// # Returns
     /// * `Ok(())` if COW was handled successfully
@@ -739,7 +738,7 @@ impl AddressSpace {
         let mut inner = address_space.inner.lock();
 
         // Find the segment containing the faulting address
-        let segment_entry = inner
+        let segment_start = inner
             .mappings
             .iter()
             .find(|(_, segment)| segment_contains_addr(segment, addr))
@@ -748,54 +747,30 @@ impl AddressSpace {
                     .mappings
                     .iter()
                     .find(|(_, segment)| segment_page_contains_addr(segment, addr))
-            });
+            })
+            .map(|(start, _)| *start);
 
-        let Some((_, segment)) = segment_entry else {
+        let Some(seg_start) = segment_start else {
             return Err(EFAULT);
         };
 
-        // Get segment info before modification
-        let seg_start = segment.area.start;
-        let seg_prot = segment.area.prot;
-        let _old_storage_ptr = match &segment.storage {
-            SegmentStorage::CowParent { ptr, .. } => *ptr,
-            _ => return Err(EFAULT),
-        };
-
-        // Promote the segment (changes CowParent to Owned)
-        drop(segment_entry);
+        // Get mutable references to modify the segment
         let segment = inner.mappings.get_mut(&seg_start).ok_or(EFAULT)?;
-        promote_cow_segment(segment)?;
 
-        // Get the new physical address after promotion
-        let new_storage_ptr = match &segment.storage {
-            SegmentStorage::Owned { ptr, .. } => *ptr,
-            _ => return Err(EFAULT),
-        };
-
-        // Calculate which page within the segment was faulted
-        let fault_page_start = align_down(addr, PAGE_SIZE);
-        let offset = fault_page_start - seg_start;
-
-        // For the PTE update, we need:
-        // - vaddr: the faulting page's virtual address
-        // - paddr: the physical address of the promoted page
-        // - flags: segment protection with W bit set (writable)
-        let fault_vaddr = fault_page_start;
-        let fault_paddr = new_storage_ptr + offset;
-        let new_flags = riscv_segment_pte_flags(seg_prot);
-
-        // Update just the single PTE instead of rebuilding entire page table
-        drop(inner);
-        let mut inner = address_space.inner.lock();
-        if inner.update_pte_riscv(fault_vaddr, fault_paddr, new_flags) {
-            // Success - PTE was updated directly
-            return Ok(());
+        // Check if this is actually a COW segment
+        if !matches!(segment.storage, SegmentStorage::CowParent { .. }) {
+            return Err(EFAULT);
         }
 
-        // Fallback: if single PTE update failed, mark dirty to rebuild page table
+        // Promote the segment (changes CowParent to Owned)
+        promote_cow_segment(segment)?;
+
+        // Mark dirty to rebuild page table
+        // Note: We could optimize with single-PTE update here, but the page table
+        // rebuild is correct and the performance impact is acceptable for now.
         drop(inner);
         address_space.set_dirty();
+
         Ok(())
     }
 

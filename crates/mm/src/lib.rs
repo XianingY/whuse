@@ -229,6 +229,12 @@ impl AddressSpace {
         inner.token
     }
 
+    /// Mark the address space as dirty, forcing page table rebuild on next token() call.
+    pub fn set_dirty(&self) {
+        let mut inner = self.inner.lock();
+        inner.dirty = true;
+    }
+
     pub fn map_anonymous(&self, len: usize, prot: usize) -> KernelResult<usize> {
         if len == 0 {
             return Err(EINVAL);

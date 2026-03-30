@@ -727,6 +727,11 @@ impl AddressSpace {
     /// * `addr` - Faulting virtual address
     /// * `address_space` - Process address space to modify
     ///
+    /// Handle a store page fault for COW Fork.
+    /// Finds the faulting address in the segment mappings, promotes the COW
+    /// segment to owned, and updates just the single PTE instead of rebuilding
+    /// the entire page table.
+    ///
     /// # Returns
     /// * `Ok(())` if COW was handled successfully
     /// * `Err(EFAULT)` if address not found or not COW segment
@@ -734,7 +739,7 @@ impl AddressSpace {
         let mut inner = address_space.inner.lock();
 
         // Find the segment containing the faulting address
-        let segment_start = inner
+        let segment_entry = inner
             .mappings
             .iter()
             .find(|(_, segment)| segment_contains_addr(segment, addr))
@@ -743,22 +748,54 @@ impl AddressSpace {
                     .mappings
                     .iter()
                     .find(|(_, segment)| segment_page_contains_addr(segment, addr))
-            })
-            .map(|(start, _)| *start);
+            });
 
-        let Some(seg_start) = segment_start else {
+        let Some((_, segment)) = segment_entry else {
             return Err(EFAULT);
         };
 
-        // Get mutable references to modify the segment
-        let segment = inner.mappings.get_mut(&seg_start).ok_or(EFAULT)?;
+        // Get segment info before modification
+        let seg_start = segment.area.start;
+        let seg_prot = segment.area.prot;
+        let _old_storage_ptr = match &segment.storage {
+            SegmentStorage::CowParent { ptr, .. } => *ptr,
+            _ => return Err(EFAULT),
+        };
 
+        // Promote the segment (changes CowParent to Owned)
+        drop(segment_entry);
+        let segment = inner.mappings.get_mut(&seg_start).ok_or(EFAULT)?;
         promote_cow_segment(segment)?;
 
-        // Mark dirty to rebuild page table
+        // Get the new physical address after promotion
+        let new_storage_ptr = match &segment.storage {
+            SegmentStorage::Owned { ptr, .. } => *ptr,
+            _ => return Err(EFAULT),
+        };
+
+        // Calculate which page within the segment was faulted
+        let fault_page_start = align_down(addr, PAGE_SIZE);
+        let offset = fault_page_start - seg_start;
+
+        // For the PTE update, we need:
+        // - vaddr: the faulting page's virtual address
+        // - paddr: the physical address of the promoted page
+        // - flags: segment protection with W bit set (writable)
+        let fault_vaddr = fault_page_start;
+        let fault_paddr = new_storage_ptr + offset;
+        let new_flags = riscv_segment_pte_flags(seg_prot);
+
+        // Update just the single PTE instead of rebuilding entire page table
+        drop(inner);
+        let mut inner = address_space.inner.lock();
+        if inner.update_pte_riscv(fault_vaddr, fault_paddr, new_flags) {
+            // Success - PTE was updated directly
+            return Ok(());
+        }
+
+        // Fallback: if single PTE update failed, mark dirty to rebuild page table
         drop(inner);
         address_space.set_dirty();
-
         Ok(())
     }
 
@@ -1040,6 +1077,53 @@ impl AddressSpaceInner {
         self.page_table = None;
     }
 
+    /// Update a single PTE in the existing RISC-V Sv39 page table.
+    /// Returns true on success, false if the page table doesn't exist or PTE not found.
+    fn update_pte_riscv(&mut self, vaddr: usize, paddr: usize, flags: u64) -> bool {
+        let page_table = match &mut self.page_table {
+            Some(pt) => pt,
+            None => return false,
+        };
+
+        // Sv39 VPN indices
+        let vpn2 = (vaddr >> 30) & 0x1ff;
+        let vpn1 = (vaddr >> 21) & 0x1ff;
+        let vpn0 = (vaddr >> 12) & 0x1ff;
+
+        // Get root page table (first page in the vec)
+        if page_table.pages.is_empty() {
+            return false;
+        }
+
+        // Walk down the page table
+        // Level 2: root
+        let pte2 = page_table.pages[0].0[vpn2];
+        if pte2 & RISCV_PTE_V == 0 {
+            return false;
+        }
+        // Not a leaf
+        if pte2 & (RISCV_PTE_R | RISCV_PTE_W | RISCV_PTE_X) != 0 {
+            return false;
+        }
+        let l1_phys = ((pte2 >> 10) as usize) << 12;
+
+        // Level 1
+        let pte1 = unsafe { &mut (*(l1_phys as *mut PageTablePage)).0 }[vpn1];
+        if pte1 & RISCV_PTE_V == 0 {
+            return false;
+        }
+        if pte1 & (RISCV_PTE_R | RISCV_PTE_W | RISCV_PTE_X) != 0 {
+            return false;
+        }
+        let l0_phys = ((pte1 >> 10) as usize) << 12;
+
+        // Level 0 - update the PTE
+        let pte_array = unsafe { &mut (*(l0_phys as *mut PageTablePage)).0 };
+        pte_array[vpn0] = ((paddr >> 12) as u64) << 10 | flags | RISCV_PTE_V;
+        true
+    }
+
+    /// Get a mutable reference to a page table page given its physical address.
     fn build_riscv_page_table(&mut self) {
         let mut builder = Sv39PageTableBuilder::new();
         builder.map_identity_2m(

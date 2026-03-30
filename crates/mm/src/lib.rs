@@ -647,12 +647,17 @@ impl AddressSpace {
         for (start, segment) in &inner.mappings {
             let storage = match &segment.storage {
                 SegmentStorage::Owned { ptr, .. } => {
-                    let bytes = unsafe {
+                    // Create COW reference instead of eager copy
+                    let bytes = alloc::sync::Arc::new(Mutex::new(unsafe {
                         core::slice::from_raw_parts(*ptr as *const u8, segment.area.len).to_vec()
-                    };
-                    create_owned_storage(*start, bytes)
+                    }));
+                    SegmentStorage::CowParent { bytes, ptr: *ptr }
                 }
                 SegmentStorage::Shared { bytes, ptr } => SegmentStorage::Shared {
+                    bytes: bytes.clone(),
+                    ptr: *ptr,
+                },
+                SegmentStorage::CowParent { bytes, ptr } => SegmentStorage::CowParent {
                     bytes: bytes.clone(),
                     ptr: *ptr,
                 },

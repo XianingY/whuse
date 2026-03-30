@@ -113,6 +113,10 @@ enum SegmentStorage {
         bytes: alloc::sync::Arc<Mutex<Vec<u8>>>,
         ptr: usize,
     },
+    CowParent {
+        bytes: alloc::sync::Arc<Mutex<Vec<u8>>>,
+        ptr: usize,
+    },
     Host {
         ptr: usize,
         len: usize,

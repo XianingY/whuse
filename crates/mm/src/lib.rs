@@ -1062,7 +1062,12 @@ impl AddressSpaceInner {
             RISCV_PTE_R | RISCV_PTE_W | RISCV_PTE_A | RISCV_PTE_D,
         );
         for segment in self.mappings.values() {
-            map_segment_pages_riscv(&mut builder, segment);
+            let is_cow = matches!(&segment.storage, SegmentStorage::CowParent { .. });
+            if is_cow {
+                map_segment_pages_cow_riscv(&mut builder, segment);
+            } else {
+                map_segment_pages_riscv(&mut builder, segment);
+            }
         }
         let root_phys = builder.root_phys();
         self.token = VmSpaceToken(root_phys);
@@ -1085,7 +1090,12 @@ impl AddressSpaceInner {
             loong_kernel_pte_flags(true, true, false, true),
         );
         for segment in self.mappings.values() {
-            map_segment_pages_loongarch(&mut builder, segment);
+            let is_cow = matches!(&segment.storage, SegmentStorage::CowParent { .. });
+            if is_cow {
+                map_segment_pages_cow_loongarch(&mut builder, segment);
+            } else {
+                map_segment_pages_loongarch(&mut builder, segment);
+            }
         }
         let root_phys = builder.root_phys();
         self.token = VmSpaceToken(root_phys);
@@ -1314,6 +1324,38 @@ fn map_segment_pages_loongarch(builder: &mut LoongPageTableBuilder, segment: &Se
     }
 }
 
+fn map_segment_pages_cow_riscv(builder: &mut Sv39PageTableBuilder, segment: &Segment) {
+    let phys_base = match segment_phys_base(segment) {
+        Some(base) => base,
+        None => return,
+    };
+    let start = align_down(segment.area.start, PAGE_SIZE);
+    let end = align_up(segment.area.start + segment.area.len, PAGE_SIZE);
+    // COW pages are read-only: R=1, W=0, U=1, A=1, D=0 (dirty bit not set on read-only)
+    let flags = RISCV_PTE_U | RISCV_PTE_R | RISCV_PTE_A;
+    let mut vaddr = start;
+    while vaddr < end {
+        builder.map_4k(vaddr, phys_base + (vaddr - start), flags);
+        vaddr += PAGE_SIZE;
+    }
+}
+
+fn map_segment_pages_cow_loongarch(builder: &mut LoongPageTableBuilder, segment: &Segment) {
+    let phys_base = match segment_phys_base(segment) {
+        Some(base) => base,
+        None => return,
+    };
+    let start = align_down(segment.area.start, PAGE_SIZE);
+    let end = align_up(segment.area.start + segment.area.len, PAGE_SIZE);
+    // COW pages: read-only, no W flag
+    let flags = loong_pte_flags(true, false, segment.area.prot & 0b100 != 0, true, false);
+    let mut vaddr = start;
+    while vaddr < end {
+        builder.map_4k(vaddr, phys_base + (vaddr - start), flags);
+        vaddr += PAGE_SIZE;
+    }
+}
+
 fn riscv_make_leaf_pte(paddr: usize, flags: u64) -> u64 {
     ((paddr >> 12) as u64) << 10 | flags | RISCV_PTE_V
 }
@@ -1401,6 +1443,7 @@ fn segment_phys_base(segment: &Segment) -> Option<usize> {
     match segment.storage {
         SegmentStorage::Owned { ptr, .. } => Some(ptr.saturating_sub(page_offset)),
         SegmentStorage::Shared { ptr, .. } => Some(ptr.saturating_sub(page_offset)),
+        SegmentStorage::CowParent { ptr, .. } => Some(ptr.saturating_sub(page_offset)),
         SegmentStorage::Host { ptr, .. } => {
             ((ptr & (PAGE_SIZE - 1)) == page_offset).then_some(ptr.saturating_sub(page_offset))
         }
@@ -1666,6 +1709,10 @@ fn slice_segment_storage(segment: &Segment, start: usize, len: usize) -> Segment
             create_owned_storage(start, bytes)
         }
         SegmentStorage::Shared { bytes, ptr } => SegmentStorage::Shared {
+            bytes: bytes.clone(),
+            ptr: ptr.saturating_add(offset),
+        },
+        SegmentStorage::CowParent { bytes, ptr } => SegmentStorage::CowParent {
             bytes: bytes.clone(),
             ptr: ptr.saturating_add(offset),
         },

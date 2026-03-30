@@ -2225,6 +2225,38 @@ impl Kernel {
             return;
         }
 
+        // Check for store page fault (scause=15) - COW Fork trigger
+        let is_store_page_fault = scause == 15;
+        if is_store_page_fault {
+            let fault_addr = self
+                .processes
+                .current()
+                .map(|p| p.trap_frame.stval)
+                .unwrap_or(0);
+            let process = self.processes.current_mut();
+            if let Ok(process) = process {
+                match mm::AddressSpace::handle_page_fault(fault_addr, &mut process.address_space) {
+                    Ok(()) => {
+                        // COW handled successfully, resume execution
+                        logln(format_args!(
+                            "whuse: COW fault handled addr={:#x} pid={}",
+                            fault_addr,
+                            process.tgid
+                        ));
+                        return;
+                    }
+                    Err(_) => {
+                        // COW handling failed, fall through to kill process
+                        logln(format_args!(
+                            "whuse: COW fault failed addr={:#x} pid={}",
+                            fault_addr,
+                            process.tgid
+                        ));
+                    }
+                }
+            }
+        }
+
         let (name, stval, fault_sepc, ra) = self
             .processes
             .current()

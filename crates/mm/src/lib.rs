@@ -493,6 +493,13 @@ impl AddressSpace {
                         take,
                     ));
                 },
+                SegmentStorage::CowParent { bytes, ptr } => unsafe {
+                    let shared = bytes.lock();
+                    out.extend_from_slice(core::slice::from_raw_parts(
+                        (*ptr + offset) as *const u8,
+                        take,
+                    ));
+                },
             }
             cursor = cursor.checked_add(take).ok_or(EFAULT)?;
             remaining -= take;
@@ -591,6 +598,14 @@ impl AddressSpace {
                         );
                     }
                 }
+                SegmentStorage::CowParent { bytes, ptr } => unsafe {
+                    let mut shared = bytes.lock();
+                    ptr::copy_nonoverlapping(
+                        shared[written..written + take].as_ptr(),
+                        (*ptr + offset) as *mut u8,
+                        take,
+                    );
+                },
             }
             cursor = cursor.checked_add(take).ok_or(EFAULT)?;
             written += take;

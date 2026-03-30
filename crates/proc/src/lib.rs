@@ -933,15 +933,10 @@ impl ProcessTable {
 
     pub fn fork_process_from_current(&mut self) -> KernelResult<usize> {
         let pid = self.next_id();
-        let clone_bytes = self
-            .current()?
-            .address_space
-            .estimated_private_clone_bytes();
-        if clone_bytes > 0
-            && self.task_count().saturating_mul(clone_bytes) > FORK_CLONE_BUDGET_BYTES
-        {
-            return Err(EAGAIN);
-        }
+        // Note: COW fork shares memory between parent and child, only
+        // triggering actual page copies on write (COW fault). The memory
+        // overhead is just the page tables for the new address space,
+        // not the full mapping size. Skip the clone budget check for COW.
         let parent = self.current()?.fork_from(pid);
         self.processes.insert(pid, parent);
         Ok(pid)

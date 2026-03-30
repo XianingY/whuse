@@ -494,7 +494,7 @@ impl AddressSpace {
                     ));
                 },
                 SegmentStorage::CowParent { bytes, ptr } => unsafe {
-                    let shared = bytes.lock();
+                    let _shared = bytes.lock();
                     out.extend_from_slice(core::slice::from_raw_parts(
                         (*ptr + offset) as *const u8,
                         take,
@@ -568,44 +568,48 @@ impl AddressSpace {
         let mut cursor = addr;
         let mut written = 0usize;
         while written < bytes.len() {
-            let (segment, offset) = find_segment_mut(&mut inner.mappings, cursor, 1)?;
-            let available = segment.area.len.saturating_sub(offset);
-            let take = available.min(bytes.len() - written);
-            match &mut segment.storage {
-                SegmentStorage::Owned { ptr, .. } => unsafe {
-                    ptr::copy_nonoverlapping(
-                        bytes[written..written + take].as_ptr(),
-                        (*ptr + offset) as *mut u8,
-                        take,
-                    );
-                },
-                SegmentStorage::Shared { ptr, .. } => unsafe {
-                    ptr::copy_nonoverlapping(
-                        bytes[written..written + take].as_ptr(),
-                        (*ptr + offset) as *mut u8,
-                        take,
-                    );
-                },
-                SegmentStorage::Host { ptr, len } => {
-                    if offset + take > *len {
-                        return Err(EFAULT);
-                    }
-                    unsafe {
+            let mut promoted = false;
+            let take = {
+                let (segment, offset) = find_segment_mut(&mut inner.mappings, cursor, 1)?;
+                if matches!(segment.storage, SegmentStorage::CowParent { .. }) {
+                    promote_cow_segment(segment)?;
+                    promoted = true;
+                }
+                let available = segment.area.len.saturating_sub(offset);
+                let take = available.min(bytes.len() - written);
+                match &mut segment.storage {
+                    SegmentStorage::Owned { ptr, .. } => unsafe {
                         ptr::copy_nonoverlapping(
                             bytes[written..written + take].as_ptr(),
                             (*ptr + offset) as *mut u8,
                             take,
                         );
+                    },
+                    SegmentStorage::Shared { ptr, .. } => unsafe {
+                        ptr::copy_nonoverlapping(
+                            bytes[written..written + take].as_ptr(),
+                            (*ptr + offset) as *mut u8,
+                            take,
+                        );
+                    },
+                    SegmentStorage::Host { ptr, len } => {
+                        if offset + take > *len {
+                            return Err(EFAULT);
+                        }
+                        unsafe {
+                            ptr::copy_nonoverlapping(
+                                bytes[written..written + take].as_ptr(),
+                                (*ptr + offset) as *mut u8,
+                                take,
+                            );
+                        }
                     }
+                    SegmentStorage::CowParent { .. } => unreachable!(),
                 }
-                SegmentStorage::CowParent { bytes, ptr } => unsafe {
-                    let mut shared = bytes.lock();
-                    ptr::copy_nonoverlapping(
-                        shared[written..written + take].as_ptr(),
-                        (*ptr + offset) as *mut u8,
-                        take,
-                    );
-                },
+                take
+            };
+            if promoted {
+                inner.dirty = true;
             }
             cursor = cursor.checked_add(take).ok_or(EFAULT)?;
             written += take;
@@ -728,9 +732,11 @@ impl AddressSpace {
         let segment_start = inner
             .mappings
             .iter()
-            .find(|(start, segment)| {
-                let seg_end = start.saturating_add(segment.area.len);
-                **start <= addr && addr < seg_end
+            .find(|(_, segment)| segment_contains_addr(segment, addr))
+            .or_else(|| {
+                inner.mappings
+                    .iter()
+                    .find(|(_, segment)| segment_page_contains_addr(segment, addr))
             })
             .map(|(start, _)| *start);
 
@@ -744,31 +750,13 @@ impl AddressSpace {
             .get_mut(&seg_start)
             .ok_or(EFAULT)?;
 
-        match &mut segment.storage {
-            SegmentStorage::CowParent { bytes, ptr } => {
-                // Read current data from shared COW storage
-                let current_data = {
-                    let shared = bytes.lock();
-                    shared.clone()
-                };
+        promote_cow_segment(segment)?;
 
-                // Create new owned storage with the data
-                let new_storage = create_owned_storage(segment.area.start, current_data);
+        // Mark dirty to rebuild page table
+        drop(inner);
+        address_space.set_dirty();
 
-                // Replace the segment's storage with owned
-                segment.storage = new_storage;
-
-                // Mark dirty to rebuild page table
-                drop(inner);
-                address_space.set_dirty();
-
-                Ok(())
-            }
-            _ => {
-                // Not a COW segment - this is a real fault (e.g., write to read-only)
-                Err(EFAULT)
-            }
-        }
+        Ok(())
     }
 
     pub fn estimated_private_clone_bytes(&self) -> usize {
@@ -1453,6 +1441,35 @@ fn segment_phys_base(segment: &Segment) -> Option<usize> {
     }
 }
 
+fn segment_page_contains_addr(segment: &Segment, addr: usize) -> bool {
+    let start = align_down(segment.area.start, PAGE_SIZE);
+    let end = align_up(segment.area.start.saturating_add(segment.area.len), PAGE_SIZE);
+    start <= addr && addr < end
+}
+
+fn segment_contains_addr(segment: &Segment, addr: usize) -> bool {
+    let start = segment.area.start;
+    let end = start.saturating_add(segment.area.len);
+    start <= addr && addr < end
+}
+
+fn promote_cow_segment(segment: &mut Segment) -> KernelResult<()> {
+    if segment.area.prot & 0b010 == 0 {
+        return Err(EFAULT);
+    }
+
+    let current_data = match &segment.storage {
+        SegmentStorage::CowParent { bytes, .. } => {
+            let shared = bytes.lock();
+            shared.clone()
+        }
+        _ => return Err(EFAULT),
+    };
+
+    segment.storage = create_owned_storage(segment.area.start, current_data);
+    Ok(())
+}
+
 fn create_owned_storage(addr: usize, mut data: Vec<u8>) -> SegmentStorage {
     if data.is_empty() {
         data.push(0);
@@ -1907,7 +1924,10 @@ fn align_down(value: usize, alignment: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddressSpace, EFAULT, ENOEXEC};
+    use super::{
+        map_segment_pages_cow_riscv, AddressSpace, SegmentStorage, Sv39PageTableBuilder, EFAULT,
+        ENOEXEC, RISCV_PTE_R, RISCV_PTE_W, RISCV_PTE_X,
+    };
 
     const TEST_ELF: &[u8] = &[
         0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0xf3, 0, 1, 0, 0, 0,
@@ -1974,5 +1994,104 @@ mod tests {
             aspace.load_static_elf(b"nope", &[], &[]).unwrap_err(),
             ENOEXEC
         );
+    }
+
+    fn riscv_leaf_pte(builder: &mut Sv39PageTableBuilder, vaddr: usize) -> u64 {
+        let vpn2 = (vaddr >> 30) & 0x1ff;
+        let vpn1 = (vaddr >> 21) & 0x1ff;
+        let vpn0 = (vaddr >> 12) & 0x1ff;
+
+        let l2 = builder.table_mut(builder.root_phys);
+        let l1_phys = ((l2[vpn2] >> 10) as usize) << 12;
+        let l1 = builder.table_mut(l1_phys);
+        let l0_phys = ((l1[vpn1] >> 10) as usize) << 12;
+        let l0 = builder.table_mut(l0_phys);
+        l0[vpn0]
+    }
+
+    #[test]
+    fn cow_exec_segments_keep_x_and_clear_w_in_riscv_pte() {
+        let parent = AddressSpace::new_user();
+        parent
+            .map_fixed_bytes(0x4010, &[0x13, 0, 0, 0], 4, 0b111)
+            .unwrap();
+        let child = parent.clone_private();
+        let segment = child
+            .inner
+            .lock()
+            .mappings
+            .get(&0x4010)
+            .cloned()
+            .unwrap();
+
+        assert!(matches!(segment.storage, SegmentStorage::CowParent { .. }));
+
+        let mut builder = Sv39PageTableBuilder::new();
+        map_segment_pages_cow_riscv(&mut builder, &segment);
+        let pte = riscv_leaf_pte(&mut builder, 0x4010);
+
+        assert_ne!(pte & RISCV_PTE_R, 0);
+        assert_ne!(pte & RISCV_PTE_X, 0);
+        assert_eq!(pte & RISCV_PTE_W, 0);
+    }
+
+    #[test]
+    fn cow_fault_rejects_read_only_private_segments() {
+        let parent = AddressSpace::new_user();
+        parent.map_fixed_bytes(0x4003, b"A", 1, 0b101).unwrap();
+        let mut child = parent.clone_private();
+
+        assert_eq!(
+            AddressSpace::handle_page_fault(0x4003, &mut child).unwrap_err(),
+            EFAULT
+        );
+        assert!(matches!(
+            child.inner.lock().mappings.get(&0x4003).unwrap().storage,
+            SegmentStorage::CowParent { .. }
+        ));
+    }
+
+    #[test]
+    fn cow_fault_matches_full_mapped_page_span() {
+        let parent = AddressSpace::new_user();
+        parent.map_fixed_bytes(0x4003, b"A", 1, 0b011).unwrap();
+        let mut child = parent.clone_private();
+
+        AddressSpace::handle_page_fault(0x4fff, &mut child).unwrap();
+        assert!(matches!(
+            child.inner.lock().mappings.get(&0x4003).unwrap().storage,
+            SegmentStorage::Owned { .. }
+        ));
+    }
+
+    #[test]
+    fn write_bytes_promotes_writable_cow_segments() {
+        let parent = AddressSpace::new_user();
+        parent.map_fixed_bytes(0x5000, b"abcd", 4, 0b011).unwrap();
+        let child = parent.clone_private();
+
+        child.write_bytes(0x5000, b"Z").unwrap();
+
+        assert_eq!(parent.read_bytes(0x5000, 4).unwrap(), b"abcd");
+        assert_eq!(child.read_bytes(0x5000, 4).unwrap(), b"Zbcd");
+        assert!(matches!(
+            child.inner.lock().mappings.get(&0x5000).unwrap().storage,
+            SegmentStorage::Owned { .. }
+        ));
+    }
+
+    #[test]
+    fn cow_fault_prefers_logical_segment_before_page_span_fallback() {
+        let parent = AddressSpace::new_user();
+        parent.map_fixed_bytes(0x4000, &[0u8; 0x400], 0x400, 0b001).unwrap();
+        parent.map_fixed_bytes(0x4800, &[0u8; 0x400], 0x400, 0b011).unwrap();
+        let mut child = parent.clone_private();
+
+        AddressSpace::handle_page_fault(0x4800, &mut child).unwrap();
+
+        assert!(matches!(
+            child.inner.lock().mappings.get(&0x4800).unwrap().storage,
+            SegmentStorage::Owned { .. }
+        ));
     }
 }

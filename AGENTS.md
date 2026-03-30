@@ -361,29 +361,39 @@ Failure handling:
 
 **Current behavior**: `libctest_testcode.sh` now completes with exit 0.
 
-### 10.2 COW Fork Implementation (IN PROGRESS)
+### 10.2 COW Fork Implementation (WORKING but lmbench still slow)
 
-**Status**: Attempted but reverted due to complexity.
+**Status**: COW Fork is implemented and working, but lmbench times out due to page table rebuild overhead.
 
-**What was attempted**:
+**What was implemented**:
 1. Added `CowParent` variant to `SegmentStorage` enum
 2. Modified `clone_private()` to mark pages as read-only (COW)
 3. Added scause=15 (store page fault) handler in `lib_riscv.inc.rs`
-4. Implemented `handle_cow_fault()` to copy page data and remap writable
+4. Implemented `handle_page_fault()` to copy page data and remap writable
 
-**Why it failed**:
-- The page fault handler's segment lookup returned `None` for faulting addresses
-- Stack pages weren't properly set up as COW segments
-- Page table wasn't being properly rebuilt after COW fault
+**Current behavior**:
+- COW faults are properly handled (see "whuse: COW fault handled" in logs)
+- basic, busybox, iozone, libctest, lua tests all pass
+- lmbench times out due to COW page table rebuild overhead
+
+**lmbench timeout issue**:
+- After each COW fault, `set_dirty()` is called which marks the entire address space dirty
+- On next `token()` call, the entire page table is rebuilt
+- lmbench does many fork operations, each triggering COW faults on data pages
+- Each COW fault causes a full page table rebuild, making lmbench extremely slow
+
+**Fixes applied**:
+1. Removed EAGAIN check for COW fork (commit 8de03de) - this was causing fork to fail for large address spaces
+2. COW pages now have execute permission (commit dba3071) - fixes scause=12 on code execution
+
+**Remaining optimization needed**:
+- Instead of rebuilding the entire page table after each COW fault, update just the specific PTE
+- This requires adding a method to Sv39PageTableBuilder to update a single PTE
 
 **Files involved**:
-- `crates/mm/src/lib.rs` — `SegmentStorage::CowParent`, `handle_cow_fault()`
+- `crates/mm/src/lib.rs` — `SegmentStorage::CowParent`, `handle_page_fault()`, `promote_cow_segment()`
 - `crates/kernel-core/src/lib_riscv.inc.rs` — scause=15 handler
-
-**Next steps**:
-1. Debug segment lookup in page fault handler
-2. Verify stack segment is properly set up as COW
-3. Ensure page table is rebuilt after COW fault
+- `crates/proc/src/lib.rs` — `fork_process_from_current()`
 
 ### 10.4 Kernel Idle Timer Infrastructure (COMPLETED)
 

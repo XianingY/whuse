@@ -854,6 +854,12 @@ const OSCOMP_SUITE_SCRIPT_REAL_FULL_TEMPLATE: &str = concat!(
     "rc=$?\n",
     "echo whuse-oscomp-step-end:libc-bench:$rc\n",
     "finish_if_reached libc-bench\n",
+    "echo \"run ltp_testcode.sh\"\n",
+    "echo whuse-oscomp-step-begin:ltp_testcode.sh\n",
+    "run_runtime_dual_step ltp_testcode.sh 1800\n",
+    "rc=$?\n",
+    "echo whuse-oscomp-step-end:ltp_testcode.sh:$rc\n",
+    "finish_if_reached ltp\n",
     "echo \"run lmbench_testcode.sh\"\n",
     "echo whuse-oscomp-step-begin:lmbench_testcode.sh\n",
     "run_runtime_dual_step lmbench_testcode.sh 600\n",
@@ -875,12 +881,6 @@ const OSCOMP_SUITE_SCRIPT_REAL_FULL_TEMPLATE: &str = concat!(
     "echo \"run iperf_testcode.sh\"\n",
     "run_step_with_timeout iperf_testcode.sh 240 /musl/busybox sh ./iperf_testcode.sh\n",
     "finish_if_reached iperf\n",
-    "echo \"run ltp_testcode.sh\"\n",
-    "echo whuse-oscomp-step-begin:ltp_testcode.sh\n",
-    "run_runtime_dual_step ltp_testcode.sh 1800\n",
-    "rc=$?\n",
-    "echo whuse-oscomp-step-end:ltp_testcode.sh:$rc\n",
-    "finish_if_reached ltp\n",
     "echo \"run cyclic_testcode.sh\"\n",
     "if [ -f ./cyclic_testcode.sh ]; then\n",
     "    run_step_with_timeout cyclic_testcode.sh 240 /musl/busybox sh ./cyclic_testcode.sh\n",
@@ -1606,6 +1606,8 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        finish_if_reached libctest\n",
     "        run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        finish_if_reached libc-bench\n",
+    "        run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached ltp\n",
     "        run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        finish_if_reached lmbench\n",
     "        run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
@@ -1616,8 +1618,6 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        finish_if_reached netperf\n",
     "        run_runtime_dual_step iperf_testcode.sh iperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        finish_if_reached iperf\n",
-    "        run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"\n",
-    "        finish_if_reached ltp\n",
     "        run_runtime_dual_step cyclic_testcode.sh cyclic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        finish_if_reached cyclic\n",
     "        ;;\n",
@@ -3673,7 +3673,10 @@ fn log_block_probe_span(device: &'static dyn hal_api::HalBlockDevice, start: usi
 
 #[cfg(test)]
 mod tests {
-    use super::{OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_RUNTIME_FILTER_PATH};
+    use super::{
+        select_oscomp_suite_script, OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_RUNTIME_FILTER_PATH,
+    };
+    use vfs::KernelVfs;
 
     #[test]
     fn official_suite_reads_busybox_cases_via_dedicated_fd() {
@@ -3700,6 +3703,25 @@ mod tests {
         assert!(
             !OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("filter=\"$(read_local_runtime_filter)\""),
             "LoongArch official suite should not depend on command substitution for runtime filter"
+        );
+    }
+
+    #[test]
+    fn loongarch_full_profile_runs_ltp_before_lmbench() {
+        let mut vfs = KernelVfs::new();
+        let script = select_oscomp_suite_script(&mut vfs, false);
+        let ltp = script
+            .find("run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"")
+            .expect("LoongArch selected full suite should still include ltp");
+        let lmbench = script
+            .find(
+                "run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"",
+            )
+            .expect("LoongArch selected full suite should still include lmbench");
+
+        assert!(
+            ltp < lmbench,
+            "LoongArch selected full suite should schedule ltp before lmbench so contest fullsuite reaches ltp earlier"
         );
     }
 }

@@ -1350,11 +1350,11 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step unixbench_testcode.sh unixbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step netperf_testcode.sh netperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step iperf_testcode.sh iperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "        run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step cyclic_testcode.sh cyclic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        ;;\n",
     "    basic) run_runtime_dual_step basic_testcode.sh basic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
@@ -3497,6 +3497,24 @@ mod tests {
         assert!(
             script.contains("cd /musl || exit 1"),
             "ltp selected suite should execute from /musl so it can discover ltp_testcode.sh"
+        );
+    }
+
+    #[test]
+    fn riscv_full_profile_runs_ltp_before_lmbench() {
+        let script = render_oscomp_official_suite_script("full");
+        let ltp = script
+            .find("run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"")
+            .expect("full profile should still include ltp");
+        let lmbench = script
+            .find(
+                "run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"",
+            )
+            .expect("full profile should still include lmbench");
+
+        assert!(
+            ltp < lmbench,
+            "full profile should schedule ltp before lmbench so contest fullsuite reaches ltp earlier"
         );
     }
 }

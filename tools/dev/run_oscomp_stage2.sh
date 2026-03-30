@@ -61,12 +61,12 @@ full_root_steps=(
     "iozone_testcode.sh"
     "libctest_testcode.sh"
     "libc-bench"
+    "ltp_testcode.sh"
     "lmbench_testcode.sh"
     "lua_testcode.sh"
     "unixbench_testcode.sh"
     "netperf_testcode.sh"
     "iperf_testcode.sh"
-    "ltp_testcode.sh"
     "cyclic_testcode.sh"
 )
 

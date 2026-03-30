@@ -30,6 +30,29 @@ assert_not_contains() {
     fi
 }
 
+assert_order_in_array_block() {
+    local path="$1"
+    local block_name="$2"
+    local first="$3"
+    local second="$4"
+    local block_text first_line second_line
+    block_text="$(
+        awk -v block_name="${block_name}" '
+            $0 ~ "^" block_name "=\\(" { in_block = 1 }
+            in_block { print }
+            in_block && $0 ~ "^\\)" { exit }
+        ' "${path}"
+    )"
+    [[ -n "${block_text}" ]] || fail "expected to find array block ${block_name} in ${path}"
+    first_line="$(printf '%s\n' "${block_text}" | nl -ba | grep -F "\"${first}\"" | awk 'NR==1 {print $1}')"
+    second_line="$(printf '%s\n' "${block_text}" | nl -ba | grep -F "\"${second}\"" | awk 'NR==1 {print $1}')"
+    [[ -n "${first_line}" ]] || fail "expected ${block_name} in ${path} to contain ${first}"
+    [[ -n "${second_line}" ]] || fail "expected ${block_name} in ${path} to contain ${second}"
+    if (( first_line >= second_line )); then
+        fail "expected ${first} to appear before ${second} in ${block_name} from ${path}"
+    fi
+}
+
 assert_file_exists "${RUNNER}"
 assert_file_exists "${LTP_DIR}/score_whitelist.txt"
 assert_file_exists "${LTP_DIR}/score_blacklist.txt"
@@ -48,5 +71,6 @@ assert_contains "${RUNNER}" "ltp-riscv-curated"
 assert_contains "${RUNNER}" "refusing to overwrite protected score whitelist"
 assert_not_contains "${RUNNER}" "cp \"\${pass_candidates}\" \"\${REPO_ROOT}/tools/oscomp/ltp/score_whitelist.txt\""
 assert_not_contains "${RUNNER}" "cp \"\${bad_candidates}\" \"\${REPO_ROOT}/tools/oscomp/ltp/score_blacklist.txt\""
+assert_order_in_array_block "${RUNNER}" "full_root_steps" "ltp_testcode.sh" "lmbench_testcode.sh"
 
 echo "ok"

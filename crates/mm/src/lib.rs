@@ -429,16 +429,15 @@ impl AddressSpace {
             return Err(EINVAL);
         }
 
-        let new_break = align_up(requested_break, 16);
         let old_break = self.inner.lock().program_break;
-        if new_break > old_break {
+        if requested_break > old_break {
             let map_start = align_up(old_break, PAGE_SIZE);
-            let map_end = align_up(new_break, PAGE_SIZE);
+            let map_end = align_up(requested_break, PAGE_SIZE);
             if map_end > map_start {
                 self.map_fixed_bytes(map_start, &[], map_end - map_start, DEFAULT_PROT)?;
             }
-        } else if new_break < old_break {
-            let unmap_start = align_up(new_break, PAGE_SIZE);
+        } else if requested_break < old_break {
+            let unmap_start = align_up(requested_break, PAGE_SIZE);
             let unmap_end = align_up(old_break, PAGE_SIZE);
             if unmap_end > unmap_start {
                 let mut inner = self.inner.lock();
@@ -446,8 +445,8 @@ impl AddressSpace {
             }
         }
 
-        self.inner.lock().program_break = new_break;
-        Ok(new_break)
+        self.inner.lock().program_break = requested_break;
+        Ok(requested_break)
     }
 
     pub fn clear(&self) {
@@ -469,6 +468,9 @@ impl AddressSpace {
         let mut remaining = len;
         while remaining > 0 {
             let (segment, offset) = find_segment(&inner.mappings, cursor, 1)?;
+            if !segment_allows_read(segment) {
+                return Err(EFAULT);
+            }
             let available = segment.area.len.saturating_sub(offset);
             let take = available.min(remaining);
             if take == 0 {
@@ -571,6 +573,9 @@ impl AddressSpace {
             let mut promoted = false;
             let take = {
                 let (segment, offset) = find_segment_mut(&mut inner.mappings, cursor, 1)?;
+                if !segment_allows_write(segment) {
+                    return Err(EFAULT);
+                }
                 if matches!(segment.storage, SegmentStorage::CowParent { .. }) {
                     promote_cow_segment(segment)?;
                     promoted = true;
@@ -734,7 +739,8 @@ impl AddressSpace {
             .iter()
             .find(|(_, segment)| segment_contains_addr(segment, addr))
             .or_else(|| {
-                inner.mappings
+                inner
+                    .mappings
                     .iter()
                     .find(|(_, segment)| segment_page_contains_addr(segment, addr))
             })
@@ -745,10 +751,7 @@ impl AddressSpace {
         };
 
         // Get mutable references to modify the segment
-        let segment = inner
-            .mappings
-            .get_mut(&seg_start)
-            .ok_or(EFAULT)?;
+        let segment = inner.mappings.get_mut(&seg_start).ok_or(EFAULT)?;
 
         promote_cow_segment(segment)?;
 
@@ -1443,7 +1446,10 @@ fn segment_phys_base(segment: &Segment) -> Option<usize> {
 
 fn segment_page_contains_addr(segment: &Segment, addr: usize) -> bool {
     let start = align_down(segment.area.start, PAGE_SIZE);
-    let end = align_up(segment.area.start.saturating_add(segment.area.len), PAGE_SIZE);
+    let end = align_up(
+        segment.area.start.saturating_add(segment.area.len),
+        PAGE_SIZE,
+    );
     start <= addr && addr < end
 }
 
@@ -1781,6 +1787,14 @@ fn find_segment_mut(
         .ok_or(EFAULT)
 }
 
+fn segment_allows_read(segment: &Segment) -> bool {
+    segment.area.prot & 0b001 != 0
+}
+
+fn segment_allows_write(segment: &Segment) -> bool {
+    segment.area.prot & 0b010 != 0
+}
+
 fn build_initial_stack(
     args: &[String],
     envs: &[String],
@@ -1926,7 +1940,7 @@ fn align_down(value: usize, alignment: usize) -> usize {
 mod tests {
     use super::{
         map_segment_pages_cow_riscv, AddressSpace, SegmentStorage, Sv39PageTableBuilder, EFAULT,
-        ENOEXEC, RISCV_PTE_R, RISCV_PTE_W, RISCV_PTE_X,
+        ENOEXEC, PAGE_SIZE, RISCV_PTE_R, RISCV_PTE_W, RISCV_PTE_X,
     };
 
     const TEST_ELF: &[u8] = &[
@@ -1943,7 +1957,7 @@ mod tests {
         aspace.install_bytes(0x1000, b"hello\0");
         assert_eq!(aspace.read_cstr(0x1000).unwrap(), "hello");
 
-        let addr = aspace.map_anonymous(8192, 0).unwrap();
+        let addr = aspace.map_anonymous(8192, 0b11).unwrap();
         aspace.write_bytes(addr, b"abc").unwrap();
         assert_eq!(aspace.read_bytes(addr, 3).unwrap(), b"abc");
         aspace.unmap(addr, 8192).unwrap();
@@ -1965,6 +1979,34 @@ mod tests {
         assert_eq!(aspace.read_bytes(0x4001, 3).unwrap(), b"bcd");
         aspace.write_bytes(0x4001, b"XYZ").unwrap();
         assert_eq!(aspace.read_bytes(0x4000, 4).unwrap(), b"aXYZ");
+    }
+
+    #[test]
+    fn read_bytes_respects_read_permission() {
+        let aspace = AddressSpace::new_user();
+        aspace.map_fixed_bytes(0x5000, b"deny", PAGE_SIZE, 0).unwrap();
+        assert_eq!(aspace.read_bytes(0x5000, 4), Err(EFAULT));
+        assert_eq!(aspace.read_cstr(0x5000), Err(EFAULT));
+    }
+
+    #[test]
+    fn write_bytes_respects_write_permission() {
+        let aspace = AddressSpace::new_user();
+        aspace
+            .map_fixed_bytes(0x6000, b"ro", PAGE_SIZE, 0b001)
+            .unwrap();
+        assert_eq!(aspace.write_bytes(0x6000, b"x"), Err(EFAULT));
+    }
+
+    #[test]
+    fn brk_preserves_requested_break_without_extra_alignment() {
+        let aspace = AddressSpace::new_user();
+        let base = aspace.brk(None).unwrap();
+        let requested = base + PAGE_SIZE * 2 - 1;
+
+        assert_eq!(aspace.brk(Some(requested)).unwrap(), requested);
+        aspace.write_bytes(requested, b"X").unwrap();
+        assert_eq!(aspace.read_bytes(requested, 1).unwrap(), b"X");
     }
 
     #[test]
@@ -2016,13 +2058,7 @@ mod tests {
             .map_fixed_bytes(0x4010, &[0x13, 0, 0, 0], 4, 0b111)
             .unwrap();
         let child = parent.clone_private();
-        let segment = child
-            .inner
-            .lock()
-            .mappings
-            .get(&0x4010)
-            .cloned()
-            .unwrap();
+        let segment = child.inner.lock().mappings.get(&0x4010).cloned().unwrap();
 
         assert!(matches!(segment.storage, SegmentStorage::CowParent { .. }));
 
@@ -2083,8 +2119,12 @@ mod tests {
     #[test]
     fn cow_fault_prefers_logical_segment_before_page_span_fallback() {
         let parent = AddressSpace::new_user();
-        parent.map_fixed_bytes(0x4000, &[0u8; 0x400], 0x400, 0b001).unwrap();
-        parent.map_fixed_bytes(0x4800, &[0u8; 0x400], 0x400, 0b011).unwrap();
+        parent
+            .map_fixed_bytes(0x4000, &[0u8; 0x400], 0x400, 0b001)
+            .unwrap();
+        parent
+            .map_fixed_bytes(0x4800, &[0u8; 0x400], 0x400, 0b011)
+            .unwrap();
         let mut child = parent.clone_private();
 
         AddressSpace::handle_page_fault(0x4800, &mut child).unwrap();

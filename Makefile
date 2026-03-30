@@ -97,6 +97,9 @@ stage2-riscv: prepare-cargo-config
 stage2-riscv-ltp: prepare-cargo-config
 	TIMEOUT_SECS=$${TIMEOUT_SECS:-2400} WHUSE_LTP_PROFILE=$${WHUSE_LTP_PROFILE:-score} tools/dev/run_oscomp_stage2.sh ltp-riscv
 
+stage2-riscv-ltp-curated: prepare-cargo-config
+	TIMEOUT_SECS=$${TIMEOUT_SECS:-2400} tools/dev/run_oscomp_stage2.sh ltp-riscv-curated
+
 stage2-riscv-3x: prepare-cargo-config
 	RUNS=$${RUNS:-3} TIMEOUT_SECS=$${TIMEOUT_SECS:-3600} WHUSE_STAGE2_IMAGE_POLICY=$${WHUSE_STAGE2_IMAGE_POLICY:-auto} WHUSE_OSCOMP_COMPAT=$${WHUSE_OSCOMP_COMPAT:-0} WHUSE_STAGE2_STOP_ON_SUITE_DONE=$${WHUSE_STAGE2_STOP_ON_SUITE_DONE:-1} tools/dev/run_oscomp_stage2_3x.sh
 

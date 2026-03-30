@@ -13,6 +13,7 @@ dup206
 dup207
 dup3_01
 fchownat01
+fstat02
 fcntl01
 fcntl02
 fcntl02_64
@@ -26,7 +27,6 @@ fcntl10
 fcntl11
 fcntl21
 fcntl21_64
-fstat02
 lseek01
 lseek07
 mmap01

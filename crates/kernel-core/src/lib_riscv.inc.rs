@@ -3149,7 +3149,7 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
 }
 
 fn select_oscomp_suite_script(vfs: &mut KernelVfs) -> String {
-    render_oscomp_official_suite_script(read_oscomp_profile_default(vfs))
+    render_selected_oscomp_suite_script(read_oscomp_profile_default(vfs))
 }
 
 fn normalize_oscomp_profile_value(raw: &str) -> &'static str {
@@ -3190,6 +3190,27 @@ fn should_dispatch_pending_signals_after_syscall(unmasked: u64, blocked_restart:
 
 fn render_oscomp_official_suite_script(profile_default: &str) -> String {
     OSCOMP_OFFICIAL_SUITE_SCRIPT.replace(OSCOMP_PROFILE_DEFAULT_PLACEHOLDER, profile_default)
+}
+
+fn render_selected_oscomp_suite_script(profile_default: &str) -> String {
+    if profile_default == "ltp" {
+        return render_oscomp_internal_ltp_suite_script();
+    }
+    render_oscomp_official_suite_script(profile_default)
+}
+
+fn render_oscomp_internal_ltp_suite_script() -> String {
+    const OSCOMP_LEGACY_SUITE_ENTRY_MARKER: &str = "echo whuse-oscomp-script-start\n";
+
+    let (prefix, _) = OSCOMP_SUITE_SCRIPT
+        .split_once(OSCOMP_LEGACY_SUITE_ENTRY_MARKER)
+        .expect("legacy oscomp suite should contain runtime entry marker");
+    let mut script = String::from(prefix);
+    script.push_str(OSCOMP_LEGACY_SUITE_ENTRY_MARKER);
+    script.push_str("cd /musl || exit 1\n");
+    script.push_str("run_ltp_step ltp_testcode.sh \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\"\n");
+    script.push_str("echo whuse-oscomp-suite-done\n");
+    script
 }
 
 fn oscomp_process_timeout_ns(
@@ -3344,7 +3365,11 @@ fn log_block_probe_span(device: &'static dyn hal_api::HalBlockDevice, start: usi
 
 #[cfg(test)]
 mod tests {
-    use super::{OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_RUNTIME_FILTER_PATH};
+    use super::{
+        render_oscomp_official_suite_script, render_selected_oscomp_suite_script,
+        select_oscomp_suite_script, OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH,
+    };
+    use vfs::KernelVfs;
 
     #[test]
     fn oscomp_profile_is_not_read_by_guest_runtime_script() {
@@ -3389,6 +3414,89 @@ mod tests {
         assert!(
             !OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("filter=\"$(read_local_runtime_filter)\""),
             "official suite script should not depend on command substitution for runtime filter"
+        );
+    }
+
+    #[test]
+    fn ltp_profile_selects_internal_ltp_runner_suite() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file("/", OSCOMP_PROFILE_PATH, b"ltp").unwrap();
+
+        let script = select_oscomp_suite_script(&mut vfs);
+
+        assert!(
+            script.contains("run_ltp_step"),
+            "ltp profile should select suite script with internal LTP runner"
+        );
+        assert!(
+            script.contains("whuse-oscomp-command-begin:ltp_testcode.sh:$WHUSE_LTP_PROFILE"),
+            "ltp profile should emit case-control markers from internal runner"
+        );
+        assert!(
+            script.contains("whuse-ltp-case-result:"),
+            "ltp profile should emit per-case result markers for bucketing"
+        );
+        assert!(
+            script.contains("WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-score}"),
+            "ltp profile should default to score mode"
+        );
+        assert!(
+            script.contains(
+                "WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}"
+            ),
+            "ltp profile should default to score whitelist"
+        );
+        assert!(
+            script.contains(
+                "WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-/musl/ltp_score_blacklist.txt}"
+            ),
+            "ltp profile should default to score blacklist"
+        );
+    }
+
+    #[test]
+    fn non_ltp_profiles_keep_official_suite() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file("/", OSCOMP_PROFILE_PATH, b"full").unwrap();
+
+        let script = select_oscomp_suite_script(&mut vfs);
+
+        assert_eq!(script, render_oscomp_official_suite_script("full"));
+    }
+
+    #[test]
+    fn render_selected_suite_uses_legacy_script_only_for_ltp() {
+        assert_eq!(
+            render_selected_oscomp_suite_script("full"),
+            render_oscomp_official_suite_script("full")
+        );
+        assert!(
+            render_selected_oscomp_suite_script("ltp").contains("run_ltp_step"),
+            "ltp should use legacy internal runner suite"
+        );
+    }
+
+    #[test]
+    fn ltp_selected_suite_limits_execution_to_ltp_step() {
+        let script = render_selected_oscomp_suite_script("ltp");
+
+        assert!(
+            script.contains("run_ltp_step ltp_testcode.sh \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\""),
+            "ltp selected suite should invoke the internal ltp runner directly"
+        );
+        assert!(
+            !script.contains("echo \"run time-test\""),
+            "ltp selected suite should not execute the general legacy step loop"
+        );
+    }
+
+    #[test]
+    fn ltp_selected_suite_switches_into_musl_runtime_root() {
+        let script = render_selected_oscomp_suite_script("ltp");
+
+        assert!(
+            script.contains("cd /musl || exit 1"),
+            "ltp selected suite should execute from /musl so it can discover ltp_testcode.sh"
         );
     }
 }

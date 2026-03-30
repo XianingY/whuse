@@ -17,6 +17,7 @@ pub type KernelResult<T> = Result<T, i32>;
 const EBADF: i32 = 9;
 const EAGAIN: i32 = 11;
 const ECHILD: i32 = 10;
+const EMFILE: i32 = 24;
 const ENOENT: i32 = 2;
 const EINVAL: i32 = 22;
 const ESRCH: i32 = 3;
@@ -33,6 +34,7 @@ const ROBUST_LIST_MAX_SCAN: usize = 2048;
 const ROBUST_HEAD_WORDS: usize = 3;
 const PROCESS_NAME_MAX_BYTES: usize = 256;
 const FORK_CLONE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+pub const MAX_OPEN_FDS: i32 = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessState {
@@ -279,18 +281,24 @@ impl Process {
         }
     }
 
-    pub fn add_fd(&mut self, handle: FileHandle) -> i32 {
+    pub fn add_fd(&mut self, handle: FileHandle) -> KernelResult<i32> {
         let mut fd = 0;
         while self.fds.contains_key(&fd) {
             fd += 1;
+            if fd >= MAX_OPEN_FDS {
+                return Err(EMFILE);
+            }
+        }
+        if fd >= MAX_OPEN_FDS {
+            return Err(EMFILE);
         }
         self.fds.insert(fd, handle);
         self.fd_alias.insert(fd, fd);
-        fd
+        Ok(fd)
     }
 
     pub fn add_fd_from(&mut self, source_fd: i32, handle: FileHandle) -> KernelResult<i32> {
-        let new_fd = self.add_fd(handle);
+        let new_fd = self.add_fd(handle)?;
         let leader = self.fd_alias_leader(source_fd)?;
         self.fd_alias.insert(new_fd, leader);
         self.sync_fd_offset_from_alias(new_fd)?;
@@ -2386,23 +2394,52 @@ mod tests {
         let fd0 = table
             .current_mut()
             .unwrap()
-            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap())
+            .unwrap();
         let fd1 = table
             .current_mut()
             .unwrap()
-            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap())
+            .unwrap();
         let fd2 = table
             .current_mut()
             .unwrap()
-            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap())
+            .unwrap();
         assert_eq!((fd0, fd1, fd2), (0, 1, 2));
 
         table.current_mut().unwrap().close_fd(1).unwrap();
         let reused = table
             .current_mut()
             .unwrap()
-            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap());
+            .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap())
+            .unwrap();
         assert_eq!(reused, 1);
+    }
+
+    #[test]
+    fn add_fd_returns_emfile_at_process_limit() {
+        let mut table = ProcessTable::new();
+        let pid = table.spawn_init("init", 0x1000);
+        table.set_current(pid).unwrap();
+        let mut vfs = KernelVfs::new();
+
+        for expected_fd in 0..super::MAX_OPEN_FDS {
+            let fd = table
+                .current_mut()
+                .unwrap()
+                .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap())
+                .unwrap();
+            assert_eq!(fd, expected_fd);
+        }
+
+        assert_eq!(
+            table
+                .current_mut()
+                .unwrap()
+                .add_fd(vfs.open("/", "/dev/null", 0, 0).unwrap()),
+            Err(super::EMFILE)
+        );
     }
 
     #[test]

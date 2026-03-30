@@ -26,8 +26,8 @@ use spin::Mutex;
 use task::Scheduler;
 use user_init::builtin_program;
 use vfs::{
-    FileHandle, FileStat, KernelVfs, HANDLE_FLAG_CLOEXEC, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR,
-    O_TRUNC, O_WRONLY,
+    FileHandle, FileStat, KernelVfs, HANDLE_FLAG_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOATIME,
+    O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
 };
 
 const EAFNOSUPPORT: i32 = 97;
@@ -66,6 +66,7 @@ const EPROTOTYPE: i32 = 91;
 const EEXIST: i32 = 17;
 const EIDRM: i32 = 43;
 const AT_FDCWD: i32 = -100;
+const RLIMIT_NOFILE: usize = 7;
 const F_OK: usize = 0;
 const X_OK: usize = 1;
 const W_OK: usize = 2;
@@ -137,6 +138,7 @@ pub const SYS_DUP3: usize = 24;
 pub const SYS_FCNTL: usize = 25;
 pub const SYS_IOCTL: usize = 29;
 pub const SYS_FLOCK: usize = 32;
+pub const SYS_MKNODAT: usize = 33;
 pub const SYS_MKDIR: usize = 34;
 pub const SYS_MKDIRAT: usize = 34;
 pub const SYS_UNLINKAT: usize = 35;
@@ -1184,6 +1186,34 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
+    fn sys_mknodat(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        vfs: &mut KernelVfs,
+    ) -> Result<usize, i32> {
+        let dirfd = args.0[0] as i32;
+        let path_ptr = args.0[1];
+        let mode = args.0[2] as u32;
+        let path = match procs.current()?.read_user_cstr(path_ptr) {
+            Ok(path) => path,
+            Err(_) => {
+                log_user_path_fault(procs.current()?, "mknodat", path_ptr);
+                return Err(EFAULT);
+            }
+        };
+        if path_is_too_long(path.as_str()) {
+            return Err(ENAMETOOLONG);
+        }
+        let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
+        let (uid, gid) = {
+            let process = procs.current()?;
+            (process.euid, process.egid)
+        };
+        vfs.mknodat_with_owner(&cwd, &path, mode, uid, gid)?;
+        Ok(0)
+    }
+
     fn sys_unlinkat(
         &self,
         args: SyscallArgs,
@@ -1283,6 +1313,9 @@ impl SyscallDispatcher {
             .current()?
             .read_user_cstr(path_ptr)
             .map_err(|_| EFAULT)?;
+        if path_is_too_long(path.as_str()) {
+            return Err(ENAMETOOLONG);
+        }
         let iozone_probe = is_iozone_probe_target(name.as_str(), path.as_str());
         if iozone_probe {
             log_always(&format!(
@@ -1307,7 +1340,30 @@ impl SyscallDispatcher {
                 tid, tgid, name, dirfd, proc_cwd, path, raw_flags, flags
             ));
         }
+        let (current_euid, current_egid) = {
+            let process = procs.current()?;
+            (process.euid, process.egid)
+        };
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
+        if (raw_flags & O_NOATIME) != 0 && current_euid != 0 {
+            match vfs.stat_path(&cwd, &path) {
+                Ok(stat) if stat.uid == current_euid => {}
+                Ok(_) => return Err(EPERM),
+                Err(ENOENT) if (flags & O_CREAT) != 0 => {}
+                Err(err) => return Err(err),
+            }
+        }
+        if let Ok(stat) = vfs.stat_path(&cwd, &path) {
+            if (stat.mode & 0o170000) == 0o040000 && open_existing_directory_should_fail(flags) {
+                return Err(EISDIR);
+            }
+            let requested = open_required_access(flags);
+            if requested != F_OK
+                && !access_mode_allowed(current_euid, current_egid, stat, requested)
+            {
+                return Err(EACCES);
+            }
+        }
         if iozone_probe {
             log_always(&format!(
                 "whuse-la-iozone:openat-vfs-open-begin tid={} tgid={} cwd={} path={}",
@@ -1326,30 +1382,31 @@ impl SyscallDispatcher {
                 tid, tgid, cwd, path
             ));
         }
-        let mut handle = match vfs.open(&cwd, &path, flags, mode) {
-            Ok(handle) => handle,
-            Err(err) => {
-                if iozone_probe {
-                    log_always(&format!(
+        let mut handle =
+            match vfs.open_with_owner(&cwd, &path, flags, mode, current_euid, current_egid) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    if iozone_probe {
+                        log_always(&format!(
                         "whuse-la-iozone:openat-vfs-open-err tid={} tgid={} err={} cwd={} path={}",
                         tid, tgid, err, cwd, path
                     ));
-                }
-                if openat_probe {
-                    log_always(&format!(
+                    }
+                    if openat_probe {
+                        log_always(&format!(
                         "whuse-libctest:openat-vfs-open-err tid={} tgid={} err={} cwd={} path={}",
                         tid, tgid, err, cwd, path
                     ));
-                }
-                if busybox_testfile_probe {
-                    log_always(&format!(
+                    }
+                    if busybox_testfile_probe {
+                        log_always(&format!(
                         "whuse-busybox:openat-vfs-open-err tid={} tgid={} err={} cwd={} path={}",
                         tid, tgid, err, cwd, path
                     ));
+                    }
+                    return Err(err);
                 }
-                return Err(err);
-            }
-        };
+            };
         if iozone_probe {
             log_always(&format!(
                 "whuse-la-iozone:openat-vfs-open-ok tid={} tgid={} resolved={}",
@@ -1369,7 +1426,7 @@ impl SyscallDispatcher {
             ));
         }
         handle.flags = with_cloexec_flag(handle.flags, (raw_flags as usize & O_CLOEXEC) != 0);
-        let fd = procs.current_mut()?.add_fd(handle);
+        let fd = procs.current_mut()?.add_fd(handle)?;
         if iozone_probe {
             log_always(&format!(
                 "whuse-la-iozone:openat-exit tid={} tgid={} fd={}",
@@ -1514,6 +1571,9 @@ impl SyscallDispatcher {
             let is_pipe = vfs.is_pipe(handle);
             let is_socket = vfs.is_socket(handle);
             let pipe_path = handle.path.clone();
+            if !fd_is_readable(handle.flags) {
+                return Err(EBADF);
+            }
             let iozone_probe = is_iozone_script_probe_path(pipe_path.as_str());
             if iozone_probe {
                 log_always(&format!(
@@ -1607,6 +1667,9 @@ impl SyscallDispatcher {
             let process = procs.current_mut()?;
             process.sync_fd_offset_from_alias(fd)?;
             let handle = process.fd_mut(fd)?;
+            if !fd_is_writable(handle.flags) {
+                return Err(EBADF);
+            }
             let is_pipe = vfs.is_pipe(handle);
             let is_socket = vfs.is_socket(handle);
             match vfs.write(handle, &data) {
@@ -3056,8 +3119,8 @@ impl SyscallDispatcher {
         read_end.flags = with_cloexec_flag(read_end.flags, cloexec);
         write_end.flags = with_cloexec_flag(write_end.flags, cloexec);
         let process = procs.current_mut()?;
-        let read_fd = process.add_fd(read_end);
-        let write_fd = process.add_fd(write_end);
+        let read_fd = process.add_fd(read_end)?;
+        let write_fd = process.add_fd(write_end)?;
         let mut bytes = [0u8; 8];
         bytes[..4].copy_from_slice(&read_fd.to_le_bytes());
         bytes[4..].copy_from_slice(&write_fd.to_le_bytes());
@@ -3603,7 +3666,8 @@ impl SyscallDispatcher {
         }
         let current = procs.current()?;
         let uid = current.euid;
-        if !access_mode_allowed(uid, stat, mode) {
+        let gid = current.egid;
+        if !access_mode_allowed(uid, gid, stat, mode) {
             if busybox_testfile_probe {
                 log_always(&format!(
                     "whuse-busybox:faccessat-err tid={} tgid={} cwd={} path={} err={}",
@@ -4037,13 +4101,18 @@ impl SyscallDispatcher {
 
     fn sys_prlimit64(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let _pid = args.0[0];
-        let _resource = args.0[1];
+        let resource = args.0[1];
         let _new_limit = args.0[2];
         let old_limit = args.0[3];
         if old_limit != 0 {
             let mut bytes = [0u8; 16];
-            bytes[..8].copy_from_slice(&usize::MAX.to_le_bytes());
-            bytes[8..].copy_from_slice(&usize::MAX.to_le_bytes());
+            let limit = if resource == RLIMIT_NOFILE {
+                proc::MAX_OPEN_FDS as u64
+            } else {
+                u64::MAX
+            };
+            bytes[..8].copy_from_slice(&limit.to_le_bytes());
+            bytes[8..].copy_from_slice(&limit.to_le_bytes());
             procs
                 .current_mut()?
                 .write_user_bytes(old_limit, &bytes)
@@ -4692,7 +4761,7 @@ impl SyscallDispatcher {
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
         let handle = vfs.create_eventfd(args.0[0] as u64)?;
-        Ok(procs.current_mut()?.add_fd(handle) as usize)
+        Ok(procs.current_mut()?.add_fd(handle)? as usize)
     }
 
     fn sys_epoll_create1(
@@ -4702,7 +4771,7 @@ impl SyscallDispatcher {
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
         let handle = vfs.create_epoll()?;
-        Ok(procs.current_mut()?.add_fd(handle) as usize)
+        Ok(procs.current_mut()?.add_fd(handle)? as usize)
     }
 
     fn sys_epoll_ctl(
@@ -5916,7 +5985,7 @@ impl SyscallDispatcher {
             return Err(EPROTONOSUPPORT);
         }
         let handle = vfs.create_socket(family, sock_type, protocol)?;
-        Ok(procs.current_mut()?.add_fd(handle) as usize)
+        Ok(procs.current_mut()?.add_fd(handle)? as usize)
     }
 
     fn sys_socketpair(
@@ -5930,8 +5999,8 @@ impl SyscallDispatcher {
         }
         let (left, right) = vfs.create_socketpair()?;
         let process = procs.current_mut()?;
-        let left_fd = process.add_fd(left);
-        let right_fd = process.add_fd(right);
+        let left_fd = process.add_fd(left)?;
+        let right_fd = process.add_fd(right)?;
         let mut bytes = [0u8; 8];
         bytes[..4].copy_from_slice(&left_fd.to_le_bytes());
         bytes[4..].copy_from_slice(&right_fd.to_le_bytes());
@@ -6064,7 +6133,7 @@ impl SyscallDispatcher {
         } else {
             new_handle.flags &= !(O_NONBLOCK as u32);
         }
-        let new_fd = procs.current_mut()?.add_fd(new_handle.clone());
+        let new_fd = procs.current_mut()?.add_fd(new_handle.clone())?;
         if args.0[1] != 0 && args.0[2] != 0 {
             write_sockaddr(procs.current_mut()?, args.0[1], args.0[2], &new_handle.path)?;
         }
@@ -6387,7 +6456,7 @@ impl SyscallDispatcher {
             .map_err(|_| EFAULT)?;
         let _flags = args.0[1];
         let handle = vfs.create_memfd(&name)?;
-        Ok(procs.current_mut()?.add_fd(handle) as usize)
+        Ok(procs.current_mut()?.add_fd(handle)? as usize)
     }
 
     fn sys_pidfd_open(
@@ -6402,7 +6471,7 @@ impl SyscallDispatcher {
             return Err(ENOENT);
         }
         let handle = vfs.create_pidfd(pid)?;
-        Ok(procs.current_mut()?.add_fd(handle) as usize)
+        Ok(procs.current_mut()?.add_fd(handle)? as usize)
     }
 
     fn sys_pidfd_getfd(
@@ -6417,7 +6486,7 @@ impl SyscallDispatcher {
             vfs.pidfd_pid(handle)?
         };
         let target_handle = procs.duplicate_fd_from(pid, args.0[1] as i32)?;
-        Ok(procs.current_mut()?.add_fd(target_handle) as usize)
+        Ok(procs.current_mut()?.add_fd(target_handle)? as usize)
     }
 
     fn sys_pidfd_send_signal(
@@ -6459,7 +6528,15 @@ impl SyscallDispatcher {
 }
 
 fn normalize_open_flags(flags: u32) -> u32 {
-    let mut out = flags & (O_CREAT | O_TRUNC | O_DIRECTORY | (O_PATH as u32));
+    let mut out = flags
+        & (O_CREAT
+            | O_EXCL
+            | O_TRUNC
+            | O_NOFOLLOW
+            | O_DIRECTORY
+            | O_NOATIME
+            | (O_NONBLOCK as u32)
+            | (O_PATH as u32));
     out |= match flags & 0b11 {
         0 => O_RDONLY,
         1 => O_WRONLY,
@@ -6564,6 +6641,8 @@ fn stat_to_bytes(stat: FileStat) -> [u8; 128] {
     let mut out = [0u8; 128];
     out[16..20].copy_from_slice(&stat.mode.to_le_bytes());
     out[20..24].copy_from_slice(&stat.nlink.to_le_bytes());
+    out[24..28].copy_from_slice(&stat.uid.to_le_bytes());
+    out[28..32].copy_from_slice(&stat.gid.to_le_bytes());
     out[48..56].copy_from_slice(&stat.size.to_le_bytes());
     out[56..60].copy_from_slice(&(4096u32).to_le_bytes());
     out[64..72].copy_from_slice(&(stat.size / 512).to_le_bytes());
@@ -7189,11 +7268,18 @@ fn read_exec_file_image(vfs: &mut KernelVfs, cwd: &str, path: &str) -> Result<Ve
     Ok(file_data)
 }
 
-fn access_mode_allowed(uid: u32, stat: FileStat, mode: usize) -> bool {
+fn access_mode_allowed(uid: u32, gid: u32, stat: FileStat, mode: usize) -> bool {
     if mode == F_OK {
         return true;
     }
     let perm = stat.mode & 0o777;
+    let class_perm = if uid == stat.uid {
+        (perm >> 6) & 0o7
+    } else if gid == stat.gid {
+        (perm >> 3) & 0o7
+    } else {
+        perm & 0o7
+    };
     if uid == 0 {
         let exec_ok = (perm & 0o111) != 0;
         if (mode & X_OK) != 0 && !exec_ok {
@@ -7202,16 +7288,44 @@ fn access_mode_allowed(uid: u32, stat: FileStat, mode: usize) -> bool {
         return true;
     }
 
-    if (mode & R_OK) != 0 && (perm & 0o004) == 0 {
+    if (mode & R_OK) != 0 && (class_perm & 0o4) == 0 {
         return false;
     }
-    if (mode & W_OK) != 0 && (perm & 0o002) == 0 {
+    if (mode & W_OK) != 0 && (class_perm & 0o2) == 0 {
         return false;
     }
-    if (mode & X_OK) != 0 && (perm & 0o001) == 0 {
+    if (mode & X_OK) != 0 && (class_perm & 0o1) == 0 {
         return false;
     }
     true
+}
+
+fn open_required_access(flags: u32) -> usize {
+    match flags & 0b11 {
+        O_WRONLY => W_OK,
+        O_RDWR => R_OK | W_OK,
+        _ => R_OK,
+    }
+}
+
+fn open_existing_directory_should_fail(flags: u32) -> bool {
+    (flags & O_CREAT) != 0 || (flags & 0b11) != O_RDONLY
+}
+
+fn fd_is_readable(flags: u32) -> bool {
+    (flags & 0b11) != O_WRONLY
+}
+
+fn fd_is_writable(flags: u32) -> bool {
+    (flags & 0b11) != O_RDONLY
+}
+
+fn path_is_too_long(path: &str) -> bool {
+    path.len() >= PATH_MAX
+        || path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .any(|segment| segment.len() > 255)
 }
 
 fn read_u32(process: &proc::Process, addr: usize) -> Result<u32, i32> {
@@ -7723,10 +7837,12 @@ fn statfs_bytes() -> [u8; 120] {
 
 fn statx_bytes(stat: FileStat) -> [u8; 256] {
     let mut out = [0u8; 256];
-    out[..4].copy_from_slice(&0x1ffu32.to_le_bytes());
+    out[..4].copy_from_slice(&0x7ffu32.to_le_bytes());
     out[28..32].copy_from_slice(&stat.mode.to_le_bytes());
     out[40..48].copy_from_slice(&stat.size.to_le_bytes());
     out[16..20].copy_from_slice(&stat.nlink.to_le_bytes());
+    out[20..24].copy_from_slice(&stat.uid.to_le_bytes());
+    out[24..28].copy_from_slice(&stat.gid.to_le_bytes());
     out
 }
 
@@ -7736,20 +7852,21 @@ mod tests {
         SyscallArgs, SyscallDispatcher, SYS_ACCEPT, SYS_BIND, SYS_CLOCK_GETRES, SYS_CLONE,
         SYS_CLOSE, SYS_CONNECT, SYS_COPY_FILE_RANGE, SYS_DUP3, SYS_EPOLL_CREATE1, SYS_EPOLL_CTL,
         SYS_EPOLL_PWAIT, SYS_EVENTFD2, SYS_FACCESSAT2, SYS_FALLOCATE, SYS_FCHDIR, SYS_FCHMOD,
-        SYS_FCHMODAT, SYS_FCHOWN, SYS_FCHOWNAT, SYS_FDATASYNC, SYS_FLOCK, SYS_FSTATFS, SYS_FSYNC,
-        SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER, SYS_GETPRIORITY, SYS_GETSID,
-        SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTIMEOFDAY, SYS_GET_ROBUST_LIST, SYS_LINKAT,
-        SYS_LISTEN, SYS_LSEEK, SYS_MEMBARRIER, SYS_MEMFD_CREATE, SYS_MKDIR, SYS_MLOCK, SYS_MLOCK2,
-        SYS_MSYNC, SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL, SYS_PIPE,
-        SYS_PPOLL, SYS_PRCTL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PRLIMIT64, SYS_PSELECT6,
-        SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RENAMEAT,
-        SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE, SYS_RT_SIGPENDING, SYS_RT_SIGRETURN,
-        SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SECCOMP, SYS_SENDMSG, SYS_SENDTO, SYS_SETGID,
-        SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_ROBUST_LIST,
-        SYS_SET_TID_ADDRESS, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET, SYS_SHUTDOWN,
-        SYS_SIGACTION, SYS_SIGALTSTACK, SYS_SIGPROCMASK, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SPLICE,
-        SYS_STATX, SYS_SYMLINKAT, SYS_TIMES, SYS_TRUNCATE, SYS_UMASK, SYS_UNAME, SYS_UTIMENSAT,
-        SYS_WAIT, SYS_WRITE, SYS_WRITEV,
+        SYS_FCHMODAT, SYS_FCHOWN, SYS_FCHOWNAT, SYS_FDATASYNC, SYS_FLOCK, SYS_FSTAT, SYS_FSTATAT,
+        SYS_FSTATFS, SYS_FSYNC, SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER,
+        SYS_GETPRIORITY, SYS_GETSID, SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTIMEOFDAY,
+        SYS_GET_ROBUST_LIST, SYS_LINKAT, SYS_LISTEN, SYS_LSEEK, SYS_MEMBARRIER, SYS_MEMFD_CREATE,
+        SYS_MKDIR, SYS_MLOCK, SYS_MLOCK2, SYS_MSYNC, SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN,
+        SYS_PIDFD_SEND_SIGNAL, SYS_PIPE, SYS_PPOLL, SYS_PRCTL, SYS_PREAD64, SYS_PREADV,
+        SYS_PREADV2, SYS_PRLIMIT64, SYS_PSELECT6, SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2,
+        SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RENAMEAT, SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE,
+        SYS_RT_SIGPENDING, SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SECCOMP,
+        SYS_SENDMSG, SYS_SENDTO, SYS_SETGID, SYS_SETGROUPS, SYS_SETITIMER, SYS_SETSID,
+        SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS, SYS_SHMAT,
+        SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET, SYS_SHUTDOWN, SYS_SIGACTION, SYS_SIGALTSTACK,
+        SYS_SIGPROCMASK, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SPLICE, SYS_STATX, SYS_SYMLINKAT,
+        SYS_TIMES, SYS_TRUNCATE, SYS_UMASK, SYS_UNAME, SYS_UTIMENSAT, SYS_WAIT, SYS_WRITE,
+        SYS_WRITEV,
     };
     use hal_api::{
         register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
@@ -8164,6 +8281,483 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn openat_denies_o_noatime_for_non_owner() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb000, b"/tmp/noatime.txt\0");
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                0,
+                0xb000,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_CLOSE,
+                SyscallArgs([fd as usize, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        procs.current_mut().unwrap().euid = 65534;
+        let rc = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                0,
+                0xb000,
+                (vfs::O_RDONLY | vfs::O_NOATIME) as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert_eq!(rc, -(super::EPERM as isize));
+    }
+
+    #[test]
+    fn prlimit64_reports_finite_nofile_limit() {
+        const RLIMIT_NOFILE: usize = 7;
+        const EXPECTED_LIMIT: u64 = 256;
+
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb040, &[0; 16]);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_PRLIMIT64,
+                SyscallArgs([0, RLIMIT_NOFILE, 0, 0xb040, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        let raw = procs.current().unwrap().read_user_bytes(0xb040, 16).unwrap();
+        let mut soft = [0u8; 8];
+        let mut hard = [0u8; 8];
+        soft.copy_from_slice(&raw[..8]);
+        hard.copy_from_slice(&raw[8..16]);
+        assert_eq!(u64::from_le_bytes(soft), EXPECTED_LIMIT);
+        assert_eq!(u64::from_le_bytes(hard), EXPECTED_LIMIT);
+    }
+
+    #[test]
+    fn openat_reports_eisdir_before_directory_write_permission_denial() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        vfs.mkdir("/", "/locked", 0o500).unwrap();
+        {
+            let process = procs.current_mut().unwrap();
+            process.uid = 65534;
+            process.euid = 65534;
+            process.gid = 65534;
+            process.egid = 65534;
+        }
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb060, b"/locked\0");
+
+        let rc = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xb060,
+                vfs::O_RDWR as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert_eq!(rc, -(super::EISDIR as isize));
+    }
+
+    #[test]
+    fn openat_rejects_prot_none_path_pointer() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .map_fixed_bytes(0xb070, b"hidden\0", 4096, 0)
+            .unwrap();
+
+        let rc = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xb070,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert_eq!(rc, -(super::EFAULT as isize));
+    }
+
+    #[test]
+    fn mknodat_creates_char_device_that_can_be_opened() {
+        const SYS_MKNODAT: usize = 33;
+        const S_IFCHR: u32 = 0o020000;
+
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb080, b"/tmp/ltp-dev-null\0");
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MKNODAT,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xb080,
+                    (S_IFCHR | 0o666) as usize,
+                    0,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        let stat = vfs.stat_path("/", "/tmp/ltp-dev-null").unwrap();
+        assert_eq!(stat.mode & 0o170000, S_IFCHR);
+
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xb080,
+                vfs::O_RDONLY as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0);
+    }
+
+    #[test]
+    fn fstatat_reports_uid_and_gid_for_created_files() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        {
+            let process = procs.current_mut().unwrap();
+            process.uid = 65534;
+            process.euid = 65534;
+        }
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb100, b"/tmp/stat-owner.txt\0");
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                0,
+                0xb100,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_CLOSE,
+                SyscallArgs([fd as usize, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb200, &[0; 128]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSTATAT,
+                SyscallArgs([0, 0xb100, 0xb200, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        let stat = procs
+            .current()
+            .unwrap()
+            .read_user_bytes(0xb200, 128)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(stat[24..28].try_into().unwrap()), 65534);
+        assert_eq!(u32::from_le_bytes(stat[28..32].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn read_and_write_reject_wrong_open_modes() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb300, b"/tmp/mode-check.txt\0");
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                0,
+                0xb300,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_CLOSE,
+                SyscallArgs([fd as usize, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        let rdonly = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([0, 0xb300, vfs::O_RDONLY as usize, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(rdonly >= 0);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb340, b"x");
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_WRITE,
+                SyscallArgs([rdonly as usize, 0xb340, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EBADF as isize)
+        );
+
+        let wronly = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([0, 0xb300, vfs::O_WRONLY as usize, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(wronly >= 0);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb380, &[0; 1]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_READ,
+                SyscallArgs([wronly as usize, 0xb380, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EBADF as isize)
+        );
+    }
+
+    #[test]
+    fn fstat_reports_updated_nlink_after_linkat() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb400, b"/tmp/link-source.txt\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb440, b"/tmp/link-alias.txt\0");
+
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                0,
+                0xb400,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_LINKAT,
+                SyscallArgs([0, 0xb400, 0, 0xb440, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb480, &[0; 128]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSTAT,
+                SyscallArgs([fd as usize, 0xb480, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        let stat = procs
+            .current()
+            .unwrap()
+            .read_user_bytes(0xb480, 128)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(stat[20..24].try_into().unwrap()), 2);
     }
 
     #[test]

@@ -1968,8 +1968,12 @@ fn debugfs_write_text(image: &PathBuf, path: &str, value: &str) -> Result<(), St
             .map_err(|err| format!("failed to read system clock: {err}"))?
             .as_nanos()
     ));
-    fs::write(&temp_path, format!("{value}\n"))
-        .map_err(|err| format!("failed to write temporary profile {}: {err}", temp_path.display()))?;
+    fs::write(&temp_path, format!("{value}\n")).map_err(|err| {
+        format!(
+            "failed to write temporary profile {}: {err}",
+            temp_path.display()
+        )
+    })?;
     debugfs_remove(image, path)?;
     let status = Command::new("debugfs")
         .args([

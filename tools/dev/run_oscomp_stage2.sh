@@ -5,9 +5,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 XTASK_CMD=(cargo run --manifest-path "${REPO_ROOT}/tools/xtask/Cargo.toml" --)
 
+LTP_SCORE_WHITELIST="${REPO_ROOT}/tools/oscomp/ltp/score_whitelist.txt"
+LTP_SCORE_BLACKLIST="${REPO_ROOT}/tools/oscomp/ltp/score_blacklist.txt"
+LTP_CURATED_WHITELIST_DEFAULT="${REPO_ROOT}/tools/oscomp/ltp/musl_rv_curated_whitelist.txt"
+LTP_CURATED_BLACKLIST_DEFAULT="${REPO_ROOT}/tools/oscomp/ltp/musl_rv_curated_blacklist.txt"
+
 MODE="${1:-riscv}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-3600}"
 TS="$(date +%Y%m%d-%H%M%S)"
+
+LTP_PROFILE_WAS_SET=0
+LTP_WHITELIST_WAS_SET=0
+LTP_BLACKLIST_WAS_SET=0
+if [[ -v WHUSE_LTP_PROFILE ]]; then
+    LTP_PROFILE_WAS_SET=1
+fi
+if [[ -v WHUSE_LTP_WHITELIST ]]; then
+    LTP_WHITELIST_WAS_SET=1
+fi
+if [[ -v WHUSE_LTP_BLACKLIST ]]; then
+    LTP_BLACKLIST_WAS_SET=1
+fi
 
 export WHUSE_OSCOMP_DOCKER_IMAGE="${WHUSE_OSCOMP_DOCKER_IMAGE:-docker.educg.net/cg/os-contest:20260104}"
 export WHUSE_OSCOMP_COMPAT="${WHUSE_OSCOMP_COMPAT:-0}"
@@ -19,8 +37,10 @@ export WHUSE_OSCOMP_PROFILE="${WHUSE_OSCOMP_PROFILE:-}"
 export WHUSE_OSCOMP_CASE_FILTER="${WHUSE_OSCOMP_CASE_FILTER:-}"
 export WHUSE_OSCOMP_RUNTIME_FILTER="${WHUSE_OSCOMP_RUNTIME_FILTER:-both}"
 export WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE:-score}"
-export WHUSE_LTP_WHITELIST="${WHUSE_LTP_WHITELIST:-${REPO_ROOT}/tools/oscomp/ltp/score_whitelist.txt}"
-export WHUSE_LTP_BLACKLIST="${WHUSE_LTP_BLACKLIST:-${REPO_ROOT}/tools/oscomp/ltp/score_blacklist.txt}"
+export WHUSE_LTP_WHITELIST="${WHUSE_LTP_WHITELIST:-${LTP_SCORE_WHITELIST}}"
+export WHUSE_LTP_BLACKLIST="${WHUSE_LTP_BLACKLIST:-${LTP_SCORE_BLACKLIST}}"
+export WHUSE_LTP_CURATED_WHITELIST="${WHUSE_LTP_CURATED_WHITELIST:-${LTP_CURATED_WHITELIST_DEFAULT}}"
+export WHUSE_LTP_CURATED_BLACKLIST="${WHUSE_LTP_CURATED_BLACKLIST:-${LTP_CURATED_BLACKLIST_DEFAULT}}"
 export WHUSE_LTP_STEP_TIMEOUT="${WHUSE_LTP_STEP_TIMEOUT:-1800}"
 export WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT:-45}"
 export WHUSE_LTP_APPLY_CANDIDATES="${WHUSE_LTP_APPLY_CANDIDATES:-0}"
@@ -347,9 +367,10 @@ ensure_oscomp_images() {
     riscv) requested_arches=("rv") ;;
     loongarch) requested_arches=("la") ;;
     ltp-riscv) requested_arches=("rv") ;;
+    ltp-riscv-curated) requested_arches=("rv") ;;
     both) requested_arches=("rv" "la") ;;
     *)
-        echo "usage: $0 [riscv|loongarch|both]" >&2
+        echo "usage: $0 [riscv|loongarch|ltp-riscv|ltp-riscv-curated|both]" >&2
         exit 2
         ;;
     esac
@@ -627,12 +648,94 @@ inject_case_filter_files() {
     esac
 }
 
+canonicalize_path() {
+    local path="$1"
+    local dir base
+    dir="$(dirname "${path}")"
+    base="$(basename "${path}")"
+    if [[ -d "${dir}" ]]; then
+        (
+            cd "${dir}"
+            printf '%s/%s\n' "$(pwd -P)" "${base}"
+        )
+        return 0
+    fi
+    printf '%s\n' "${path}"
+}
+
+resolve_ltp_mode_config() {
+    local mode="$1"
+    local profile whitelist blacklist
+
+    profile="${WHUSE_LTP_PROFILE}"
+    whitelist="${WHUSE_LTP_WHITELIST}"
+    blacklist="${WHUSE_LTP_BLACKLIST}"
+
+    case "${mode}" in
+    score)
+        ;;
+    curated)
+        if [[ "${LTP_PROFILE_WAS_SET}" != "1" ]]; then
+            profile="curated"
+        fi
+        if [[ "${LTP_WHITELIST_WAS_SET}" != "1" ]]; then
+            whitelist="${WHUSE_LTP_CURATED_WHITELIST}"
+        fi
+        if [[ "${LTP_BLACKLIST_WAS_SET}" != "1" ]]; then
+            blacklist="${WHUSE_LTP_CURATED_BLACKLIST}"
+        fi
+        ;;
+    *)
+        echo "unsupported ltp mode config: ${mode}" >&2
+        return 1
+        ;;
+    esac
+
+    printf '%s\n%s\n%s\n' "${profile}" "${whitelist}" "${blacklist}"
+}
+
+apply_ltp_candidate_lists() {
+    local label="$1"
+    local pass_candidates="$2"
+    local bad_candidates="$3"
+    local target_whitelist="$4"
+    local target_blacklist="$5"
+    local score_whitelist_real score_blacklist_real
+    local target_whitelist_real target_blacklist_real
+
+    [[ "${WHUSE_LTP_APPLY_CANDIDATES}" == "1" ]] || return 0
+
+    if [[ -z "${target_whitelist}" || -z "${target_blacklist}" ]]; then
+        echo "[${label}] refusing to apply candidate lists without whitelist and blacklist targets" >&2
+        return 1
+    fi
+
+    score_whitelist_real="$(canonicalize_path "${LTP_SCORE_WHITELIST}")"
+    score_blacklist_real="$(canonicalize_path "${LTP_SCORE_BLACKLIST}")"
+    target_whitelist_real="$(canonicalize_path "${target_whitelist}")"
+    target_blacklist_real="$(canonicalize_path "${target_blacklist}")"
+
+    if [[ "${target_whitelist_real}" == "${score_whitelist_real}" ]]; then
+        echo "[${label}] refusing to overwrite protected score whitelist: ${target_whitelist}" >&2
+        return 1
+    fi
+    if [[ "${target_blacklist_real}" == "${score_blacklist_real}" ]]; then
+        echo "[${label}] refusing to overwrite protected score blacklist: ${target_blacklist}" >&2
+        return 1
+    fi
+
+    cp "${pass_candidates}" "${target_whitelist}"
+    cp "${bad_candidates}" "${target_blacklist}"
+    echo "[${label}] applied candidate lists to ${target_whitelist} and ${target_blacklist}"
+}
+
 inject_ltp_runtime_config() {
     local image="$1"
-    local ltp_whitelist_path="${WHUSE_LTP_WHITELIST:-}"
-    local ltp_blacklist_path="${WHUSE_LTP_BLACKLIST:-}"
+    local ltp_profile="$2"
+    local ltp_whitelist_path="$3"
+    local ltp_blacklist_path="$4"
     inject_oscomp_profile "${image}" "ltp"
-    write_runtime_image_config "${image}" "/musl/.whuse_ltp_profile" "${WHUSE_LTP_PROFILE}"
+    write_runtime_image_config "${image}" "/musl/.whuse_ltp_profile" "${ltp_profile}"
     if [[ -n "${ltp_whitelist_path}" && -f "${ltp_whitelist_path}" ]]; then
         write_runtime_image_file "${image}" "/musl/ltp_score_whitelist.host.txt" "${ltp_whitelist_path}"
         ltp_whitelist_path="/musl/ltp_score_whitelist.host.txt"
@@ -641,10 +744,10 @@ inject_ltp_runtime_config() {
         write_runtime_image_file "${image}" "/musl/ltp_score_blacklist.host.txt" "${ltp_blacklist_path}"
         ltp_blacklist_path="/musl/ltp_score_blacklist.host.txt"
     fi
-    if [[ -n "${WHUSE_LTP_WHITELIST:-}" ]]; then
+    if [[ -n "${ltp_whitelist_path}" ]]; then
         write_runtime_image_config "${image}" "/musl/.whuse_ltp_whitelist" "${ltp_whitelist_path}"
     fi
-    if [[ -n "${WHUSE_LTP_BLACKLIST:-}" ]]; then
+    if [[ -n "${ltp_blacklist_path}" ]]; then
         write_runtime_image_config "${image}" "/musl/.whuse_ltp_blacklist" "${ltp_blacklist_path}"
     fi
     if [[ -n "${WHUSE_LTP_STEP_TIMEOUT:-}" ]]; then
@@ -911,22 +1014,33 @@ run_arch() {
     return "${ok}"
 }
 
-run_ltp_riscv() {
-    local log="/tmp/rv-ltp-stage2-${TS}.log"
-    local text_log="/tmp/rv-ltp-stage2-${TS}.strings.log"
+run_ltp_riscv_mode() {
+    local mode="$1"
+    local log="/tmp/rv-ltp-${mode}-stage2-${TS}.log"
+    local text_log="/tmp/rv-ltp-${mode}-stage2-${TS}.strings.log"
     local runtime_image
     local suite_done_seen=0
     local terminated_by_suite_done=0
+    local ltp_profile
+    local ltp_whitelist
+    local ltp_blacklist
+    local label="rv-ltp-${mode}"
+    mapfile -t ltp_config < <(resolve_ltp_mode_config "${mode}")
+    ltp_profile="${ltp_config[0]}"
+    ltp_whitelist="${ltp_config[1]}"
+    ltp_blacklist="${ltp_config[2]}"
     prepare_runtime_image "rv" "${RV_IMG}"
     runtime_image="${prepared_runtime_image}"
-    inject_ltp_runtime_config "${runtime_image}"
+    inject_ltp_runtime_config "${runtime_image}" "${ltp_profile}" "${ltp_whitelist}" "${ltp_blacklist}"
 
-    echo "[rv-ltp] running ltp-only, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, profile=${WHUSE_LTP_PROFILE}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"
+    echo "[${label}] running ltp-only, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, profile=${ltp_profile}, whitelist=${ltp_whitelist:-none}, blacklist=${ltp_blacklist:-none}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"
     if [[ "${WHUSE_STAGE2_STOP_ON_SUITE_DONE}" == "1" ]]; then
         local runner_pid
         setsid timeout "${TIMEOUT_SECS}s" env \
             WHUSE_DISK_IMAGE="${runtime_image}" \
-            WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE}" \
+            WHUSE_LTP_PROFILE="${ltp_profile}" \
+            WHUSE_LTP_WHITELIST="${ltp_whitelist}" \
+            WHUSE_LTP_BLACKLIST="${ltp_blacklist}" \
             WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT}" \
             "${XTASK_CMD[@]}" qemu-riscv >"${log}" 2>&1 &
         runner_pid=$!
@@ -950,31 +1064,33 @@ run_ltp_riscv() {
     else
         timeout "${TIMEOUT_SECS}s" env \
             WHUSE_DISK_IMAGE="${runtime_image}" \
-            WHUSE_LTP_PROFILE="${WHUSE_LTP_PROFILE}" \
+            WHUSE_LTP_PROFILE="${ltp_profile}" \
+            WHUSE_LTP_WHITELIST="${ltp_whitelist}" \
+            WHUSE_LTP_BLACKLIST="${ltp_blacklist}" \
             WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT}" \
             "${XTASK_CMD[@]}" qemu-riscv >"${log}" 2>&1 || true
     fi
 
     strings "${log}" >"${text_log}" || true
-    echo "[rv-ltp] log: ${log}"
+    echo "[${label}] log: ${log}"
 
     if rg -q "KERNEL PANIC|panic|pid 1 \(init\).*trap" "${text_log}"; then
-        echo "[rv-ltp] detected kernel panic or init crash" >&2
+        echo "[${label}] detected kernel panic or init crash" >&2
         rg "KERNEL PANIC|panic|pid 1 \(init\).*trap" "${text_log}" >&2 || true
         return 1
     fi
 
     local ok=0
     if rg -q "whuse-oscomp-step-begin:ltp_testcode.sh" "${text_log}"; then
-        echo "[rv-ltp] step-begin ok: ltp_testcode.sh"
+        echo "[${label}] step-begin ok: ltp_testcode.sh"
     else
-        echo "[rv-ltp] missing step-begin: ltp_testcode.sh" >&2
+        echo "[${label}] missing step-begin: ltp_testcode.sh" >&2
         ok=1
     fi
     if rg -q "whuse-oscomp-step-end:ltp_testcode.sh:" "${text_log}" || rg -q "whuse-oscomp-step-timeout:ltp_testcode.sh" "${text_log}"; then
-        echo "[rv-ltp] step-close ok: ltp_testcode.sh"
+        echo "[${label}] step-close ok: ltp_testcode.sh"
     else
-        echo "[rv-ltp] missing step-close: ltp_testcode.sh" >&2
+        echo "[${label}] missing step-close: ltp_testcode.sh" >&2
         ok=1
     fi
 
@@ -985,22 +1101,26 @@ run_ltp_riscv() {
     tbrok="$(count_matches "TBROK" "${text_log}")"
     tconf="$(count_matches "TCONF" "${text_log}")"
     timeout_count="$(count_matches "whuse-oscomp-step-timeout:ltp_testcode.sh" "${text_log}")"
-    pass_candidates="/tmp/rv-ltp-pass-candidates-${TS}.txt"
-    bad_candidates="/tmp/rv-ltp-bad-candidates-${TS}.txt"
+    pass_candidates="/tmp/rv-ltp-${mode}-pass-candidates-${TS}.txt"
+    bad_candidates="/tmp/rv-ltp-${mode}-bad-candidates-${TS}.txt"
     generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}"
-    echo "[rv-ltp] pass-candidates: ${pass_candidates} ($(wc -l < "${pass_candidates}"))"
-    echo "[rv-ltp] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
-    if [[ "${WHUSE_LTP_APPLY_CANDIDATES}" == "1" ]]; then
-        cp "${pass_candidates}" "${REPO_ROOT}/tools/oscomp/ltp/score_whitelist.txt"
-        cp "${bad_candidates}" "${REPO_ROOT}/tools/oscomp/ltp/score_blacklist.txt"
-        echo "[rv-ltp] applied candidate lists to tools/oscomp/ltp/score_whitelist.txt and score_blacklist.txt"
-    fi
+    echo "[${label}] pass-candidates: ${pass_candidates} ($(wc -l < "${pass_candidates}"))"
+    echo "[${label}] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
+    apply_ltp_candidate_lists "${label}" "${pass_candidates}" "${bad_candidates}" "${ltp_whitelist}" "${ltp_blacklist}"
     if [[ "${suite_done_seen}" == "0" ]] && rg -q "whuse-oscomp-suite-done" "${text_log}"; then
         suite_done_seen=1
     fi
-    echo "[rv-ltp] summary: TPASS=${tpass} TFAIL=${tfail} TBROK=${tbrok} TCONF=${tconf} step-timeout=${timeout_count} suite_done_seen=${suite_done_seen} terminated_by_suite_done=${terminated_by_suite_done}"
+    echo "[${label}] summary: TPASS=${tpass} TFAIL=${tfail} TBROK=${tbrok} TCONF=${tconf} step-timeout=${timeout_count} suite_done_seen=${suite_done_seen} terminated_by_suite_done=${terminated_by_suite_done}"
     rg "whuse-oscomp-step-(begin|end|timeout|skip):ltp_testcode.sh|whuse-oscomp-suite-done|whuse-ltp-(skip-case|case-result):" "${text_log}" || true
     return "${ok}"
+}
+
+run_ltp_riscv() {
+    run_ltp_riscv_mode "score"
+}
+
+run_ltp_riscv_curated() {
+    run_ltp_riscv_mode "curated"
 }
 
 count_matches() {
@@ -1033,12 +1153,15 @@ loongarch)
 ltp-riscv)
     run_ltp_riscv
     ;;
+ltp-riscv-curated)
+    run_ltp_riscv_curated
+    ;;
 both)
     run_arch "rv" "${RV_IMG}" "qemu-riscv"
     run_arch "la" "${LA_IMG}" "qemu-loongarch"
     ;;
 *)
-    echo "usage: $0 [riscv|loongarch|ltp-riscv|both]" >&2
+    echo "usage: $0 [riscv|loongarch|ltp-riscv|ltp-riscv-curated|both]" >&2
     exit 2
     ;;
 esac

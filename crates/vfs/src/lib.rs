@@ -15,8 +15,11 @@ use spin::Mutex;
 pub type KernelResult<T> = Result<T, i32>;
 
 pub const O_CREAT: u32 = 0o100;
+pub const O_EXCL: u32 = 0o200;
 pub const O_TRUNC: u32 = 0o1000;
+pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_DIRECTORY: u32 = 0o200000;
+pub const O_NOATIME: u32 = 0o1000000;
 pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
@@ -47,6 +50,7 @@ const S_IFCHR: u32 = 0o020000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFLNK: u32 = 0o120000;
 const S_IFSOCK: u32 = 0o140000;
+const S_IFMT: u32 = 0o170000;
 const PROC_MEMINFO: &[u8] = b"MemTotal:       1048576 kB\nMemFree:         524288 kB\nMemAvailable:    524288 kB\nBuffers:              0 kB\nCached:               0 kB\nSwapTotal:            0 kB\nSwapFree:             0 kB\n";
 const PROC_UPTIME: &[u8] = b"1.00 1.00\n";
 const PROC_STAT: &[u8] = b"cpu  1 0 1 1 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 1735689600\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n";
@@ -90,6 +94,27 @@ pub struct FileStat {
     pub mode: u32,
     pub size: u64,
     pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InodeMeta {
+    mode: u32,
+    nlink: u32,
+    uid: u32,
+    gid: u32,
+}
+
+impl InodeMeta {
+    const fn root(mode: u32) -> Self {
+        Self {
+            mode,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -245,7 +270,7 @@ pub struct KernelVfs {
     external_stat_cache: BTreeMap<String, FileStat>,
     external_preloaded: BTreeMap<String, (Arc<Vec<u8>>, FileStat)>,
     external_deletions: BTreeSet<String>,
-    mem_modes: BTreeMap<String, u32>,
+    mem_meta: BTreeMap<String, InodeMeta>,
     next_pipe_id: usize,
     next_memfd_id: usize,
     next_ephemeral_port: u16,
@@ -301,7 +326,7 @@ impl KernelVfs {
             external_stat_cache: BTreeMap::new(),
             external_preloaded: BTreeMap::new(),
             external_deletions: BTreeSet::new(),
-            mem_modes: BTreeMap::new(),
+            mem_meta: BTreeMap::new(),
             next_pipe_id: 0,
             next_memfd_id: 0,
             next_ephemeral_port: 40000,
@@ -362,6 +387,33 @@ impl KernelVfs {
         self.create_node(path, NodeKind::CharDevice, Some(NodeData::CharDevice))
     }
 
+    pub fn mknodat_with_owner(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> KernelResult<()> {
+        let absolute = normalize_path(cwd, path);
+        match mode & S_IFMT {
+            S_IFCHR => {
+                self.create_node(&absolute, NodeKind::CharDevice, Some(NodeData::CharDevice))?;
+                self.mem_meta.insert(
+                    absolute,
+                    InodeMeta {
+                        mode: S_IFCHR | (mode & 0o7777),
+                        nlink: 1,
+                        uid,
+                        gid,
+                    },
+                );
+                Ok(())
+            }
+            _ => Err(EINVAL),
+        }
+    }
+
     pub fn create_proc_file(&mut self, path: &str, contents: &[u8]) -> KernelResult<()> {
         self.create_node(
             path,
@@ -387,7 +439,8 @@ impl KernelVfs {
             NodeKind::File,
             Some(NodeData::File(contents.to_vec())),
         )?;
-        self.mem_modes.insert(absolute, S_IFREG | (mode & 0o7777));
+        self.mem_meta
+            .insert(absolute, InodeMeta::root(S_IFREG | (mode & 0o7777)));
         Ok(())
     }
 
@@ -402,6 +455,8 @@ impl KernelVfs {
             mode: mode.unwrap_or(S_IFREG | 0o755),
             size: contents.len() as u64,
             nlink: 1,
+            uid: 0,
+            gid: 0,
         };
         self.external_preloaded
             .insert(absolute.clone(), (Arc::new(contents.to_vec()), stat));
@@ -416,15 +471,44 @@ impl KernelVfs {
             NodeKind::Symlink,
             Some(NodeData::Symlink(target.to_string())),
         )?;
-        self.mem_modes.insert(absolute, S_IFLNK | 0o777);
+        self.mem_meta
+            .insert(absolute, InodeMeta::root(S_IFLNK | 0o777));
         Ok(())
     }
 
     pub fn mkdir(&mut self, cwd: &str, path: &str, _mode: u32) -> KernelResult<()> {
         let absolute = normalize_path(cwd, path);
         self.create_node(&absolute, NodeKind::Directory, None)?;
-        self.mem_modes.insert(absolute, S_IFDIR | (_mode & 0o7777));
+        self.mem_meta
+            .insert(absolute, InodeMeta::root(S_IFDIR | (_mode & 0o7777)));
         Ok(())
+    }
+
+    pub fn open_with_owner(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        flags: u32,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> KernelResult<FileHandle> {
+        let absolute = normalize_path(cwd, path);
+        let existed = self.path_exists(&absolute).is_ok();
+        let handle = self.open(cwd, path, flags, mode)?;
+        if !existed && (flags & O_CREAT) != 0 {
+            let stat = self.stat_handle(&handle)?;
+            self.mem_meta.insert(
+                handle.path.clone(),
+                InodeMeta {
+                    mode: stat.mode,
+                    nlink: stat.nlink,
+                    uid,
+                    gid,
+                },
+            );
+        }
+        Ok(handle)
     }
 
     pub fn open(
@@ -463,7 +547,12 @@ impl KernelVfs {
     fn open_mem(&mut self, absolute: &str, flags: u32, mode: u32) -> KernelResult<FileHandle> {
         let mut resolved = absolute.to_string();
         let node = match self.lookup_abs(&resolved) {
-            Ok(node) => node,
+            Ok(node) => {
+                if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
+                    return Err(EEXIST);
+                }
+                node
+            }
             Err(err) if err == ENOENT && (flags & O_CREAT) != 0 => {
                 self.create_file_with_mode("/", &resolved, b"", mode)?;
                 self.lookup_abs(&resolved)?
@@ -471,6 +560,9 @@ impl KernelVfs {
             Err(err) => return Err(err),
         };
         let node = if node.kind == NodeKind::Symlink {
+            if (flags & O_NOFOLLOW) != 0 {
+                return Err(ELOOP);
+            }
             let target = match &*node.data.lock() {
                 NodeData::Symlink(target) => target.clone(),
                 _ => return Err(EINVAL),
@@ -493,6 +585,10 @@ impl KernelVfs {
 
         if (flags & O_DIRECTORY) != 0 && node.kind != NodeKind::Directory {
             return Err(ENOTDIR);
+        }
+
+        if node.kind == NodeKind::Directory && open_existing_directory_should_fail(flags) {
+            return Err(EISDIR);
         }
 
         if (flags & O_TRUNC) != 0 {
@@ -710,11 +806,17 @@ impl KernelVfs {
                 }
             }
         }
+        let removed = node.clone();
         entries.remove(name);
+        drop(guard);
         self.socket_bindings.remove(&absolute);
-        self.mem_modes.remove(&absolute);
+        self.mem_meta.remove(&absolute);
         self.external_preloaded.remove(&absolute);
         self.external_stat_cache.remove(&absolute);
+        let remaining_aliases = self.alias_paths_for_node(&removed);
+        if !remaining_aliases.is_empty() {
+            self.sync_nlink_for_paths(&removed, &remaining_aliases, remaining_aliases.len() as u32);
+        }
         if self.resolve_external_path(&absolute).is_some() {
             self.external_deletions.insert(absolute);
         }
@@ -734,11 +836,11 @@ impl KernelVfs {
         if entries.contains_key(name) {
             return Err(EEXIST);
         }
-        entries.insert(name.to_string(), node);
+        entries.insert(name.to_string(), node.clone());
+        drop(guard);
         self.external_deletions.remove(&new_absolute);
-        if let Some(mode) = self.mem_modes.get(&old_absolute).copied() {
-            self.mem_modes.insert(new_absolute, mode);
-        }
+        let aliases = self.alias_paths_for_node(&node);
+        self.sync_nlink_for_paths(&node, &aliases, aliases.len() as u32);
         Ok(())
     }
 
@@ -892,8 +994,8 @@ impl KernelVfs {
         }
         entries.insert(new_name.to_string(), node);
         self.external_deletions.remove(&new_absolute);
-        if let Some(mode) = self.mem_modes.remove(&old_absolute) {
-            self.mem_modes.insert(new_absolute, mode);
+        if let Some(meta) = self.mem_meta.remove(&old_absolute) {
+            self.mem_meta.insert(new_absolute, meta);
         }
         Ok(())
     }
@@ -901,15 +1003,69 @@ impl KernelVfs {
     pub fn chmod_path(&mut self, cwd: &str, path: &str, mode: u32) -> KernelResult<()> {
         let absolute = normalize_path(cwd, path);
         let stat = self.stat_path("/", &absolute)?;
-        self.mem_modes
-            .insert(absolute, (stat.mode & !0o7777) | (mode & 0o7777));
+        self.mem_meta.insert(
+            absolute,
+            InodeMeta {
+                mode: (stat.mode & !0o7777) | (mode & 0o7777),
+                nlink: stat.nlink,
+                uid: stat.uid,
+                gid: stat.gid,
+            },
+        );
         Ok(())
     }
 
     pub fn chmod_handle(&mut self, handle: &FileHandle, mode: u32) -> KernelResult<()> {
         let stat = self.stat_handle(handle)?;
-        self.mem_modes
-            .insert(handle.path.clone(), (stat.mode & !0o7777) | (mode & 0o7777));
+        self.mem_meta.insert(
+            handle.path.clone(),
+            InodeMeta {
+                mode: (stat.mode & !0o7777) | (mode & 0o7777),
+                nlink: stat.nlink,
+                uid: stat.uid,
+                gid: stat.gid,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn chown_path(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> KernelResult<()> {
+        let absolute = normalize_path(cwd, path);
+        let stat = self.stat_path("/", &absolute)?;
+        self.mem_meta.insert(
+            absolute,
+            InodeMeta {
+                mode: stat.mode,
+                nlink: stat.nlink,
+                uid: uid.unwrap_or(stat.uid),
+                gid: gid.unwrap_or(stat.gid),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn chown_handle(
+        &mut self,
+        handle: &FileHandle,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> KernelResult<()> {
+        let stat = self.stat_handle(handle)?;
+        self.mem_meta.insert(
+            handle.path.clone(),
+            InodeMeta {
+                mode: stat.mode,
+                nlink: stat.nlink,
+                uid: uid.unwrap_or(stat.uid),
+                gid: gid.unwrap_or(stat.gid),
+            },
+        );
         Ok(())
     }
 
@@ -1185,7 +1341,8 @@ impl KernelVfs {
                             return Err(EADDRINUSE);
                         }
                         entries.insert(name.to_string(), handle.node.clone());
-                        self.mem_modes.insert(absolute.clone(), S_IFSOCK | 0o777);
+                        self.mem_meta
+                            .insert(absolute.clone(), InodeMeta::root(S_IFSOCK | 0o777));
                     }
                 }
                 state.path = Some(absolute.clone());
@@ -1223,7 +1380,8 @@ impl KernelVfs {
                             return Err(EADDRINUSE);
                         }
                         entries.insert(name.to_string(), handle.node.clone());
-                        self.mem_modes.insert(absolute.clone(), S_IFSOCK | 0o777);
+                        self.mem_meta
+                            .insert(absolute.clone(), InodeMeta::root(S_IFSOCK | 0o777));
                     }
                 }
                 state.bound_path = Some(absolute.clone());
@@ -1659,7 +1817,7 @@ impl KernelVfs {
             || self
                 .external_stat_cache
                 .keys()
-            .any(|entry| entry.starts_with(&dir_prefix))
+                .any(|entry| entry.starts_with(&dir_prefix))
         {
             if iozone_probe {
                 iozone_probe_log(&format!(
@@ -1671,6 +1829,8 @@ impl KernelVfs {
                 mode: S_IFDIR | 0o755,
                 size: 0,
                 nlink: 1,
+                uid: 0,
+                gid: 0,
             }));
         }
 
@@ -1686,6 +1846,8 @@ impl KernelVfs {
                     mode: stat.mode,
                     size: stat.size,
                     nlink: stat.nlink,
+                    uid: 0,
+                    gid: 0,
                 }))
             }
             Err(err) if err == ENOENT => Ok(None),
@@ -1892,6 +2054,8 @@ impl KernelVfs {
                         mode: stat.mode,
                         size: stat.size,
                         nlink: stat.nlink,
+                        uid: 0,
+                        gid: 0,
                     },
                 );
                 stat
@@ -1968,6 +2132,8 @@ impl KernelVfs {
                 mode: stat.mode,
                 size: stat.size,
                 nlink: stat.nlink,
+                uid: 0,
+                gid: 0,
             },
         );
     }
@@ -2000,18 +2166,102 @@ impl KernelVfs {
     }
 
     fn lookup_abs(&self, path: &str) -> KernelResult<Arc<Node>> {
+        self.lookup_abs_follow(path, 0)
+    }
+
+    fn lookup_abs_follow(&self, path: &str, depth: usize) -> KernelResult<Arc<Node>> {
         if path == "/" {
             return Ok(self.root.clone());
         }
+        if depth >= 16 {
+            return Err(ELOOP);
+        }
         let mut current = self.root.clone();
-        for component in path.split('/').filter(|segment| !segment.is_empty()) {
+        let components = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        let mut current_path = String::from("/");
+        for (index, component) in components.iter().enumerate() {
             let next = match &*current.data.lock() {
-                NodeData::Directory(entries) => entries.get(component).cloned().ok_or(ENOENT)?,
+                NodeData::Directory(entries) => entries.get(*component).cloned().ok_or(ENOENT)?,
                 _ => return Err(ENOTDIR),
             };
+            let is_final = index + 1 == components.len();
+            if next.kind == NodeKind::Symlink && !is_final {
+                let target = match &*next.data.lock() {
+                    NodeData::Symlink(target) => target.clone(),
+                    _ => return Err(EINVAL),
+                };
+                let tail = components[index + 1..].join("/");
+                let base = normalize_path(&current_path, &target);
+                let resolved = if tail.is_empty() {
+                    base
+                } else {
+                    normalize_path(&base, &tail)
+                };
+                return self.lookup_abs_follow(&resolved, depth + 1);
+            }
             current = next;
+            current_path = if current_path == "/" {
+                format!("/{}", component)
+            } else {
+                format!("{}/{}", current_path, component)
+            };
         }
         Ok(current)
+    }
+
+    fn alias_paths_for_node(&self, needle: &Arc<Node>) -> Vec<String> {
+        let mut out = Vec::new();
+        self.collect_alias_paths("/", &self.root, needle, &mut out);
+        out
+    }
+
+    fn collect_alias_paths(
+        &self,
+        current_path: &str,
+        current: &Arc<Node>,
+        needle: &Arc<Node>,
+        out: &mut Vec<String>,
+    ) {
+        if current_path != "/" && Arc::ptr_eq(current, needle) {
+            out.push(current_path.to_string());
+        }
+        let children = {
+            let guard = current.data.lock();
+            match &*guard {
+                NodeData::Directory(entries) => entries
+                    .iter()
+                    .map(|(name, node)| (name.clone(), node.clone()))
+                    .collect::<Vec<_>>(),
+                _ => return,
+            }
+        };
+        for (name, node) in children {
+            let child_path = if current_path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", current_path, name)
+            };
+            self.collect_alias_paths(&child_path, &node, needle, out);
+        }
+    }
+
+    fn sync_nlink_for_paths(&mut self, node: &Arc<Node>, paths: &[String], nlink: u32) {
+        for path in paths {
+            if let Ok(stat) = self.stat(path, node) {
+                self.mem_meta.insert(
+                    path.clone(),
+                    InodeMeta {
+                        mode: stat.mode,
+                        nlink,
+                        uid: stat.uid,
+                        gid: stat.gid,
+                    },
+                );
+            }
+        }
     }
 
     fn ensure_memory_dir(&mut self, absolute_path: &str) -> KernelResult<()> {
@@ -2039,11 +2289,11 @@ impl KernelVfs {
             return Err(EEXIST);
         }
         let (parent_path, name) = split_parent(absolute_path)?;
-        let parent = match self.lookup_abs(&parent_path) {
-            Ok(parent) => parent,
+        let parent = match self.resolve_mem_path(&parent_path) {
+            Ok((_, parent)) => parent,
             Err(err) if err == ENOENT => {
                 self.ensure_memory_dir(&parent_path)?;
-                self.lookup_abs(&parent_path)?
+                self.resolve_mem_path(&parent_path)?.1
             }
             Err(err) => return Err(err),
         };
@@ -2095,27 +2345,29 @@ impl KernelVfs {
             NodeData::PidFd(_) => 0,
             NodeData::CharDevice => 0,
         };
+        let meta = self.mem_meta.get(path).copied();
         let mode = match &*guard {
             NodeData::Ext4File(state) => state.mode,
             NodeData::Ext4Dir(state) => state.mode,
-            _ => self
-                .mem_modes
-                .get(path)
-                .copied()
-                .unwrap_or(match node.kind {
-                    NodeKind::Directory => S_IFDIR | 0o755,
-                    NodeKind::File | NodeKind::Proc => S_IFREG | 0o644,
-                    NodeKind::CharDevice => S_IFCHR | 0o600,
-                    NodeKind::Pipe => S_IFIFO | 0o644,
-                    NodeKind::Symlink => S_IFLNK | 0o777,
-                    NodeKind::Event | NodeKind::Epoll | NodeKind::Socket => S_IFSOCK | 0o644,
-                    NodeKind::PidFd => S_IFREG | 0o444,
-                }),
+            _ => meta.map(|meta| meta.mode).unwrap_or(match node.kind {
+                NodeKind::Directory => S_IFDIR | 0o755,
+                NodeKind::File | NodeKind::Proc => S_IFREG | 0o644,
+                NodeKind::CharDevice => S_IFCHR | 0o600,
+                NodeKind::Pipe => S_IFIFO | 0o644,
+                NodeKind::Symlink => S_IFLNK | 0o777,
+                NodeKind::Event | NodeKind::Epoll | NodeKind::Socket => S_IFSOCK | 0o644,
+                NodeKind::PidFd => S_IFREG | 0o444,
+            }),
         };
+        let (uid, gid, nlink) = meta
+            .map(|meta| (meta.uid, meta.gid, meta.nlink))
+            .unwrap_or((0, 0, 1));
         Ok(FileStat {
             mode,
             size,
-            nlink: 1,
+            nlink,
+            uid,
+            gid,
         })
     }
 }
@@ -2188,6 +2440,8 @@ impl FileHandle {
             mode,
             size,
             nlink: 1,
+            uid: 0,
+            gid: 0,
         }
     }
 }
@@ -2622,6 +2876,14 @@ fn ensure_file_size(buf: &mut Vec<u8>, size: usize) -> KernelResult<()> {
     Ok(())
 }
 
+fn open_wants_write(flags: u32) -> bool {
+    matches!(flags & 0b11, O_WRONLY | O_RDWR)
+}
+
+fn open_existing_directory_should_fail(flags: u32) -> bool {
+    (flags & O_CREAT) != 0 || open_wants_write(flags)
+}
+
 fn normalize_path(cwd: &str, path: &str) -> String {
     let mut components = Vec::new();
     let source = if path.starts_with('/') {
@@ -2945,6 +3207,97 @@ mod tests {
     }
 
     #[test]
+    fn open_excl_rejects_existing_regular_file() {
+        let mut vfs = KernelVfs::new();
+        let _ = vfs
+            .open("/", "/tmp/existing.txt", O_CREAT | O_RDWR, 0o644)
+            .unwrap();
+        assert!(matches!(
+            vfs.open(
+                "/",
+                "/tmp/existing.txt",
+                O_CREAT | super::O_EXCL | O_RDWR,
+                0o644
+            ),
+            Err(super::EEXIST)
+        ));
+    }
+
+    #[test]
+    fn open_directory_for_write_returns_eisdir() {
+        let mut vfs = KernelVfs::new();
+        assert!(matches!(
+            vfs.open("/", "/tmp", O_RDWR, 0),
+            Err(super::EISDIR)
+        ));
+    }
+
+    #[test]
+    fn open_existing_directory_with_o_creat_returns_eisdir() {
+        let mut vfs = KernelVfs::new();
+        assert!(matches!(
+            vfs.open("/", "/tmp", super::O_CREAT | super::O_RDONLY, 0o644),
+            Err(super::EISDIR)
+        ));
+    }
+
+    #[test]
+    fn open_nofollow_rejects_final_symlink() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file_with_mode("/", "/tmp/target.txt", b"", 0o644)
+            .unwrap();
+        vfs.create_symlink("/", "/tmp/link.txt", "/tmp/target.txt")
+            .unwrap();
+        assert!(matches!(
+            vfs.open("/", "/tmp/link.txt", super::O_NOFOLLOW | super::O_RDONLY, 0),
+            Err(super::ELOOP)
+        ));
+    }
+
+    #[test]
+    fn open_nofollow_allows_files_inside_symlinked_directory() {
+        let mut vfs = KernelVfs::new();
+        vfs.mkdir("/", "/tmp/real-dir", 0o755).unwrap();
+        vfs.create_symlink("/", "/tmp/link-dir", "/tmp/real-dir")
+            .unwrap();
+
+        let mut created = vfs
+            .open(
+                "/",
+                "/tmp/link-dir/testfile",
+                O_CREAT | O_RDWR,
+                0o644,
+            )
+            .unwrap();
+        vfs.write(&mut created, b"ok").unwrap();
+
+        let mut handle = vfs
+            .open(
+                "/",
+                "/tmp/link-dir/testfile",
+                super::O_NOFOLLOW | super::O_RDONLY,
+                0,
+            )
+            .unwrap();
+        assert_eq!(vfs.read(&mut handle, 2).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn hard_links_share_updated_nlink() {
+        let mut vfs = KernelVfs::new();
+        let _ = vfs
+            .open("/", "/tmp/source.txt", O_CREAT | O_RDWR, 0o644)
+            .unwrap();
+        vfs.link("/", "/tmp/source.txt", "/tmp/alias.txt").unwrap();
+
+        assert_eq!(vfs.stat_path("/", "/tmp/source.txt").unwrap().nlink, 2);
+        assert_eq!(vfs.stat_path("/", "/tmp/alias.txt").unwrap().nlink, 2);
+
+        vfs.unlink("/", "/tmp/source.txt").unwrap();
+        assert_eq!(vfs.stat_path("/", "/tmp/alias.txt").unwrap().nlink, 1);
+    }
+
+    #[test]
     fn object_layer_reports_backend_kind() {
         let mut vfs = KernelVfs::new();
 
@@ -3006,6 +3359,8 @@ mod tests {
                 mode: super::S_IFREG | 0o644,
                 size: b"hello from ext4".len() as u64,
                 nlink: 1,
+                uid: 0,
+                gid: 0,
             })
         );
     }
@@ -3059,15 +3414,26 @@ mod tests {
         let mut vfs = KernelVfs::new();
         vfs.mount_ext4(device.name(), "/", device).unwrap();
         let _ = vfs.mkdir("/", "/lib64", 0o755);
-        vfs.create_symlink("/", "/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so")
-            .unwrap();
+        vfs.create_symlink(
+            "/",
+            "/lib64/ld-musl-loongarch-lp64d.so.1",
+            "/musl/lib/libc.so",
+        )
+        .unwrap();
 
-        let mut direct = vfs.open("/", "/musl/lib/libc.so", super::O_RDONLY, 0).unwrap();
+        let mut direct = vfs
+            .open("/", "/musl/lib/libc.so", super::O_RDONLY, 0)
+            .unwrap();
         let direct_bytes = vfs.read(&mut direct, 4 * 1024 * 1024).unwrap();
         assert!(!direct_bytes.is_empty());
 
         let mut alias = vfs
-            .open("/", "/lib64/ld-musl-loongarch-lp64d.so.1", super::O_RDONLY, 0)
+            .open(
+                "/",
+                "/lib64/ld-musl-loongarch-lp64d.so.1",
+                super::O_RDONLY,
+                0,
+            )
             .unwrap();
         let alias_bytes = vfs.read(&mut alias, 4 * 1024 * 1024).unwrap();
         assert_eq!(alias_bytes, direct_bytes);

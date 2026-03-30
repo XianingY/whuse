@@ -1331,8 +1331,11 @@ fn map_segment_pages_cow_riscv(builder: &mut Sv39PageTableBuilder, segment: &Seg
     };
     let start = align_down(segment.area.start, PAGE_SIZE);
     let end = align_up(segment.area.start + segment.area.len, PAGE_SIZE);
-    // COW pages are read-only: R=1, W=0, U=1, A=1, D=0 (dirty bit not set on read-only)
-    let flags = RISCV_PTE_U | RISCV_PTE_R | RISCV_PTE_A;
+    // COW pages are read-only but executable if original segment allowed exec:
+    // R=1, W=0, X=original segment's X, U=1, A=1, D=0
+    // Write attempts will trigger store page fault (scause=15) which COW handles
+    let exec = segment.area.prot & 0b100 != 0;
+    let flags = RISCV_PTE_U | RISCV_PTE_R | RISCV_PTE_A | if exec { RISCV_PTE_X } else { 0 };
     let mut vaddr = start;
     while vaddr < end {
         builder.map_4k(vaddr, phys_base + (vaddr - start), flags);

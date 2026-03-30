@@ -707,6 +707,70 @@ impl AddressSpace {
         alloc::sync::Arc::strong_count(&self.inner) > 1
     }
 
+    /// Handle store page fault for COW Fork
+    ///
+    /// When a child process writes to a COW page, this is called to:
+    /// 1. Find the COW segment
+    /// 2. Copy the data to a new owned page
+    /// 3. Convert the segment to Owned storage
+    ///
+    /// # Arguments
+    /// * `addr` - Faulting virtual address
+    /// * `address_space` - Process address space to modify
+    ///
+    /// # Returns
+    /// * `Ok(())` if COW was handled successfully
+    /// * `Err(EFAULT)` if address not found or not COW segment
+    pub fn handle_page_fault(addr: usize, address_space: &mut AddressSpace) -> KernelResult<()> {
+        let mut inner = address_space.inner.lock();
+
+        // Find the segment containing the faulting address
+        let segment_start = inner
+            .mappings
+            .iter()
+            .find(|(start, segment)| {
+                let seg_end = start.saturating_add(segment.area.len);
+                **start <= addr && addr < seg_end
+            })
+            .map(|(start, _)| *start);
+
+        let Some(seg_start) = segment_start else {
+            return Err(EFAULT);
+        };
+
+        // Get mutable references to modify the segment
+        let segment = inner
+            .mappings
+            .get_mut(&seg_start)
+            .ok_or(EFAULT)?;
+
+        match &mut segment.storage {
+            SegmentStorage::CowParent { bytes, ptr } => {
+                // Read current data from shared COW storage
+                let current_data = {
+                    let shared = bytes.lock();
+                    shared.clone()
+                };
+
+                // Create new owned storage with the data
+                let new_storage = create_owned_storage(segment.area.start, current_data);
+
+                // Replace the segment's storage with owned
+                segment.storage = new_storage;
+
+                // Mark dirty to rebuild page table
+                drop(inner);
+                address_space.set_dirty();
+
+                Ok(())
+            }
+            _ => {
+                // Not a COW segment - this is a real fault (e.g., write to read-only)
+                Err(EFAULT)
+            }
+        }
+    }
+
     pub fn estimated_private_clone_bytes(&self) -> usize {
         let inner = self.inner.lock();
         inner.mappings.values().fold(0usize, |acc, segment| {

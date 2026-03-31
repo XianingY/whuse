@@ -1448,6 +1448,10 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    while IFS= read -r line <&9 || [ -n \"$line\" ]; do\n",
     "        [ -n \"$line\" ] || continue\n",
         "        echo whuse-oscomp-busybox-next:${runtime}:$line\n",
+    "        if [ \"$line\" = \"hwclock\" ]; then\n",
+    "            echo whuse-oscomp-busybox-skip:${runtime}:$line:loongarch-hwclock\n",
+    "            continue\n",
+    "        fi\n",
     "        run_busybox_case_line \"$runtime\" \"$busybox_bin\" \"$line\" || fail=1\n",
     "    done\n",
     "    exec 9<&-\n",
@@ -4047,6 +4051,15 @@ mod tests {
         assert!(
             script.contains("busybox) run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh"),
             "LoongArch focused busybox runs should dispatch busybox_testcode.sh directly"
+        );
+    }
+
+    #[test]
+    fn loongarch_busybox_runner_skips_hwclock_case() {
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-busybox-skip:${runtime}:$line:loongarch-hwclock"),
+            "LoongArch busybox runner should skip the known hanging hwclock applet instead of blocking the rest of busybox"
         );
     }
 

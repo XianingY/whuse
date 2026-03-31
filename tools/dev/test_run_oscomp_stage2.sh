@@ -90,8 +90,12 @@ assert_contains "${REPO_ROOT}/crates/syscall/src/lib.rs" "whuse-busybox:utimensa
 assert_not_contains "${RUNNER}" "cp \"\${pass_candidates}\" \"\${REPO_ROOT}/tools/oscomp/ltp/score_whitelist.txt\""
 assert_not_contains "${RUNNER}" "cp \"\${bad_candidates}\" \"\${REPO_ROOT}/tools/oscomp/ltp/score_blacklist.txt\""
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "whuse-oscomp-step-skip:iozone_testcode.sh:riscv-known-panic"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "glibc-libctest-known-oom"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "glibc-ltp-not-scored"
 assert_not_contains "${RUNNER}" "rg -q \"KERNEL PANIC|panic|pid 1 \\(init\\).*trap\""
 assert_order_in_array_block "${RUNNER}" "full_root_steps" "libctest_testcode.sh" "iozone_testcode.sh"
+assert_order_in_array_block "${RUNNER}" "full_root_steps" "ltp_testcode.sh" "lua_testcode.sh"
+assert_order_in_array_block "${RUNNER}" "full_root_steps" "ltp_testcode.sh" "libc-bench"
 assert_order_in_array_block "${RUNNER}" "full_root_steps" "ltp_testcode.sh" "lmbench_testcode.sh"
 
 echo "ok"

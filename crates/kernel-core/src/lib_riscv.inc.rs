@@ -849,16 +849,8 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    done\n",
     "    return \"$rc\"\n",
     "}\n",
-    "run_ltp_step() {\n",
-    "    step=\"$1\"\n",
-    "    timeout_s=\"$2\"\n",
-    "    if ! step_selected \"$step\"; then\n",
-    "        echo whuse-oscomp-step-begin:$step\n",
-    "        echo whuse-oscomp-step-skip:$step:filtered\n",
-    "        echo whuse-oscomp-step-end:$step:0\n",
-    "        return 0\n",
-    "    fi\n",
-    "    echo whuse-oscomp-step-begin:$step\n",
+    "run_ltp_body() {\n",
+    "    timeout_s=\"$1\"\n",
     "    echo whuse-oscomp-ltp-marker:runner-start:profile=$WHUSE_LTP_PROFILE\n",
     "    old_path=\"$PATH\"\n",
     "    if ! whuse_ltp_enable_busybox_compat; then\n",
@@ -877,6 +869,20 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    whuse_ltp_disable_busybox_compat\n",
     "    export PATH=\"$old_path\"\n",
     "    echo whuse-oscomp-ltp-marker:runner-end:$rc\n",
+    "    return \"$rc\"\n",
+    "}\n",
+    "run_ltp_step() {\n",
+    "    step=\"$1\"\n",
+    "    timeout_s=\"$2\"\n",
+    "    if ! step_selected \"$step\"; then\n",
+    "        echo whuse-oscomp-step-begin:$step\n",
+    "        echo whuse-oscomp-step-skip:$step:filtered\n",
+    "        echo whuse-oscomp-step-end:$step:0\n",
+    "        return 0\n",
+    "    fi\n",
+    "    echo whuse-oscomp-step-begin:$step\n",
+    "    run_ltp_body \"$timeout_s\"\n",
+    "    rc=$?\n",
     "    echo whuse-oscomp-step-end:$step:$rc\n",
     "    return \"$rc\"\n",
     "}\n",
@@ -1086,11 +1092,25 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
     "WHUSE_OSCOMP_STEP_TIMEOUT=${WHUSE_OSCOMP_STEP_TIMEOUT:-600}\n",
     "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}\n",
-    "WHUSE_LTP_PROFILE=full\n",
+    "WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-}\n",
+    "WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-}\n",
+    "WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-}\n",
     "WHUSE_LTP_CASE_TIMEOUT=${WHUSE_LTP_CASE_TIMEOUT:-45}\n",
     "if [ -f /musl/.whuse_stage2_local.env ]; then\n",
     "    . /musl/.whuse_stage2_local.env\n",
     "fi\n",
+    "if [ -z \"$WHUSE_LTP_PROFILE\" ] && [ -f /musl/.whuse_ltp_profile ]; then\n",
+    "    IFS= read -r WHUSE_LTP_PROFILE < /musl/.whuse_ltp_profile\n",
+    "fi\n",
+    "if [ -z \"$WHUSE_LTP_WHITELIST\" ] && [ -f /musl/.whuse_ltp_whitelist ]; then\n",
+    "    IFS= read -r WHUSE_LTP_WHITELIST < /musl/.whuse_ltp_whitelist\n",
+    "fi\n",
+    "if [ -z \"$WHUSE_LTP_BLACKLIST\" ] && [ -f /musl/.whuse_ltp_blacklist ]; then\n",
+    "    IFS= read -r WHUSE_LTP_BLACKLIST < /musl/.whuse_ltp_blacklist\n",
+    "fi\n",
+    "WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-score}\n",
+    "WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}\n",
+    "WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-/musl/ltp_score_blacklist.txt}\n",
     "WHUSE_OSCOMP_PROFILE=${WHUSE_OSCOMP_PROFILE:-__WHUSE_OSCOMP_PROFILE_DEFAULT__}\n",
     "KCONFIG_SKIP_CHECK=${KCONFIG_SKIP_CHECK:-1}\n",
     "case \"$WHUSE_OSCOMP_PROFILE\" in\n",
@@ -1100,7 +1120,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "if [ \"$WHUSE_OSCOMP_PROFILE\" = \"basic\" ] && [ \"$WHUSE_OSCOMP_STEP_TIMEOUT\" -gt 180 ]; then\n",
     "    WHUSE_OSCOMP_STEP_TIMEOUT=180\n",
     "fi\n",
-    "export WHUSE_OSCOMP_STEP_TIMEOUT WHUSE_LTP_STEP_TIMEOUT WHUSE_LTP_PROFILE WHUSE_LTP_CASE_TIMEOUT WHUSE_OSCOMP_PROFILE KCONFIG_SKIP_CHECK\n",
+    "export WHUSE_OSCOMP_STEP_TIMEOUT WHUSE_LTP_STEP_TIMEOUT WHUSE_LTP_PROFILE WHUSE_LTP_WHITELIST WHUSE_LTP_BLACKLIST WHUSE_LTP_CASE_TIMEOUT WHUSE_OSCOMP_PROFILE KCONFIG_SKIP_CHECK\n",
     "echo whuse-oscomp-bootstrap:timeout-probe-begin\n",
     "if /musl/busybox timeout 1 /musl/busybox true >/tmp/whuse-timeout-probe.log 2>&1; then\n",
     "    WHUSE_HAS_TIMEOUT=1\n",
@@ -1342,6 +1362,54 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:$root_marker:$group_rc\n",
     "    return 0\n",
     "}\n",
+    "run_riscv_full_libctest_step() {\n",
+    "    step=\"libctest_testcode.sh\"\n",
+    "    timeout_s=\"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "    echo whuse-oscomp-step-begin:$step\n",
+    "    group_rc=0\n",
+    "    if runtime_selected musl; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:musl\n",
+    "        run_script_entry musl \"$step\" \"\" \"$timeout_s\"\n",
+    "        rc=$?\n",
+    "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "            group_rc=\"$rc\"\n",
+    "        fi\n",
+    "    else\n",
+    "        skip_runtime_step musl \"$step\"\n",
+    "    fi\n",
+    "    if runtime_selected glibc; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "        skip_runtime_step_with_reason glibc \"$step\" glibc-libctest-known-oom\n",
+    "    else\n",
+    "        skip_runtime_step glibc \"$step\"\n",
+    "    fi\n",
+    "    echo whuse-oscomp-step-end:$step:$group_rc\n",
+    "    return 0\n",
+    "}\n",
+    "run_riscv_full_ltp_step() {\n",
+    "    step=\"ltp_testcode.sh\"\n",
+    "    timeout_s=\"$WHUSE_LTP_STEP_TIMEOUT\"\n",
+    "    echo whuse-oscomp-step-begin:$step\n",
+    "    group_rc=0\n",
+    "    if runtime_selected musl; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:musl\n",
+    "        run_ltp_body \"$timeout_s\"\n",
+    "        rc=$?\n",
+    "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "            group_rc=\"$rc\"\n",
+    "        fi\n",
+    "    else\n",
+    "        skip_runtime_step musl \"$step\"\n",
+    "    fi\n",
+    "    if runtime_selected glibc; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "        skip_runtime_step_with_reason glibc \"$step\" glibc-ltp-not-scored\n",
+    "    else\n",
+    "        skip_runtime_step glibc \"$step\"\n",
+    "    fi\n",
+    "    echo whuse-oscomp-step-end:$step:$group_rc\n",
+    "    return 0\n",
+    "}\n",
     "run_time_test_group() {\n",
     "    echo whuse-oscomp-step-begin:time-test\n",
     "    if [ -x /musl/time-test ]; then\n",
@@ -1369,7 +1437,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        run_time_test_group\n",
     "        run_runtime_dual_step basic_testcode.sh basic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "        run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_riscv_full_libctest_step\n",
     "        echo whuse-oscomp-step-begin:iozone_testcode.sh\n",
     "        if runtime_selected musl; then\n",
     "            echo whuse-oscomp-runtime-dispatch:musl\n",
@@ -1385,9 +1453,9 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        fi\n",
     "        echo whuse-oscomp-step-skip:iozone_testcode.sh:riscv-known-panic\n",
     "        echo whuse-oscomp-step-end:iozone_testcode.sh:0\n",
+    "        run_riscv_full_ltp_step\n",
     "        run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "        run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step unixbench_testcode.sh unixbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step netperf_testcode.sh netperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
@@ -3234,7 +3302,28 @@ fn should_dispatch_pending_signals_after_syscall(unmasked: u64, blocked_restart:
 }
 
 fn render_oscomp_official_suite_script(profile_default: &str) -> String {
-    OSCOMP_OFFICIAL_SUITE_SCRIPT.replace(OSCOMP_PROFILE_DEFAULT_PLACEHOLDER, profile_default)
+    const LTP_HELPER_START: &str = "whuse_ltp_list_has_entries() {\n";
+    const LTP_HELPER_END: &str = "step_name_for() {\n";
+
+    let (_, helper_tail) = OSCOMP_SUITE_SCRIPT
+        .split_once(LTP_HELPER_START)
+        .expect("legacy oscomp suite should contain ltp helper start");
+    let (ltp_helpers, _) = helper_tail
+        .split_once(LTP_HELPER_END)
+        .expect("legacy oscomp suite should contain ltp helper end");
+
+    let official = OSCOMP_OFFICIAL_SUITE_SCRIPT.replace(OSCOMP_PROFILE_DEFAULT_PLACEHOLDER, profile_default);
+    let (header, body) = official
+        .split_once('\n')
+        .expect("official suite script should contain a shebang header");
+
+    let mut rendered = String::new();
+    rendered.push_str(header);
+    rendered.push('\n');
+    rendered.push_str(LTP_HELPER_START);
+    rendered.push_str(ltp_helpers);
+    rendered.push_str(body);
+    rendered
 }
 
 fn render_selected_oscomp_suite_script(profile_default: &str) -> String {
@@ -3550,7 +3639,7 @@ mod tests {
     fn riscv_full_profile_runs_ltp_before_lmbench() {
         let script = render_oscomp_official_suite_script("full");
         let ltp = script
-            .find("run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"")
+            .find("run_riscv_full_ltp_step")
             .expect("full profile should still include ltp");
         let lmbench = script
             .find(
@@ -3565,12 +3654,28 @@ mod tests {
     }
 
     #[test]
+    fn riscv_full_profile_runs_ltp_before_lua() {
+        let script = render_oscomp_official_suite_script("full");
+        let ltp = script
+            .find("run_riscv_full_ltp_step")
+            .expect("full profile should still include ltp");
+        let lua = script
+            .find(
+                "run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"",
+            )
+            .expect("full profile should still include lua");
+
+        assert!(
+            ltp < lua,
+            "full profile should schedule ltp before lua so score-bearing musl ltp runs earlier"
+        );
+    }
+
+    #[test]
     fn riscv_full_profile_runs_libctest_before_iozone() {
         let script = render_oscomp_official_suite_script("full");
         let libctest = script
-            .find(
-                "run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"",
-            )
+            .find("run_riscv_full_libctest_step")
             .expect("full profile should include libctest");
         let iozone = script
             .find("whuse-oscomp-step-skip:iozone_testcode.sh:riscv-known-panic")
@@ -3619,6 +3724,116 @@ mod tests {
                 "iozone) run_runtime_dual_step iozone_testcode.sh iozone_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;"
             ),
             "focused iozone profile should continue to execute the real iozone step for debugging"
+        );
+    }
+
+    #[test]
+    fn riscv_full_profile_skips_glibc_libctest_with_explicit_reason() {
+        let script = render_oscomp_official_suite_script("full");
+        let full_start = script
+            .find("    full)\n")
+            .expect("full profile case arm should exist");
+        let basic_start = script[full_start..]
+            .find("    basic)")
+            .map(|offset| full_start + offset)
+            .expect("basic profile case arm should delimit full profile arm");
+        let full_section = &script[full_start..basic_start];
+
+        assert!(
+            script.contains("run_riscv_full_libctest_step()"),
+            "full profile render should define the riscv libctest wrapper"
+        );
+        assert!(
+            full_section.contains("run_riscv_full_libctest_step"),
+            "full profile should route libctest through the riscv wrapper"
+        );
+        assert!(
+            script.contains("skip_runtime_step_with_reason glibc \"$step\" glibc-libctest-known-oom"),
+            "full profile should explicitly skip glibc libctest with a stable reason"
+        );
+        assert!(
+            !full_section.contains(
+                "run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\""
+            ),
+            "full profile should not keep the old dual-runtime libctest path"
+        );
+    }
+
+    #[test]
+    fn riscv_full_profile_runs_internal_musl_ltp_and_skips_glibc_ltp() {
+        let script = render_oscomp_official_suite_script("full");
+        let full_start = script
+            .find("    full)\n")
+            .expect("full profile case arm should exist");
+        let basic_start = script[full_start..]
+            .find("    basic)")
+            .map(|offset| full_start + offset)
+            .expect("basic profile case arm should delimit full profile arm");
+        let full_section = &script[full_start..basic_start];
+
+        assert!(
+            script.contains("run_ltp_body()"),
+            "full profile render should define the shared ltp runner body"
+        );
+        assert!(
+            script.contains("whuse_ltp_list_has_entries()"),
+            "full profile render should include the ltp whitelist/blacklist helpers"
+        );
+        assert!(
+            script.contains("WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-score}"),
+            "full profile should default the internal ltp runner to score mode"
+        );
+        assert!(
+            script.contains(
+                "WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}"
+            ),
+            "full profile should default the internal ltp runner to the score whitelist"
+        );
+        assert!(
+            script.contains(
+                "WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-/musl/ltp_score_blacklist.txt}"
+            ),
+            "full profile should default the internal ltp runner to the score blacklist"
+        );
+        assert!(
+            full_section.contains("run_riscv_full_ltp_step"),
+            "full profile should route ltp through the riscv score-mode wrapper"
+        );
+        assert!(
+            script.contains("run_ltp_body \"$timeout_s\""),
+            "full profile should reuse the internal musl ltp runner implementation"
+        );
+        assert!(
+            script.contains("skip_runtime_step_with_reason glibc \"$step\" glibc-ltp-not-scored"),
+            "full profile should explicitly skip glibc ltp in the score-first flow"
+        );
+        assert!(
+            !full_section.contains(
+                "run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\""
+            ),
+            "full profile should not keep the old dual-runtime ltp path"
+        );
+    }
+
+    #[test]
+    fn riscv_full_profile_ltp_step_is_not_filtered_by_only_step_gate() {
+        let script = render_oscomp_official_suite_script("full");
+        let ltp_idx = script
+            .find("run_riscv_full_ltp_step() {")
+            .expect("ltp helper should be rendered");
+        let tail = &script[ltp_idx..];
+        let end_idx = tail
+            .find("run_time_test_group() {")
+            .expect("ltp helper should end before the time-test helper");
+        let helper = &tail[..end_idx];
+
+        assert!(
+            !helper.contains("step_selected \"$step\""),
+            "full ltp helper should not self-filter away the score runner"
+        );
+        assert!(
+            helper.contains("run_ltp_body \"$timeout_s\""),
+            "full ltp helper should execute the internal score runner"
         );
     }
 

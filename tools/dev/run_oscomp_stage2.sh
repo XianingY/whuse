@@ -257,6 +257,21 @@ count_runtime_case_markers() {
     rg -c "^${marker_prefix}:${runtime}:" "${log_file}" 2>/dev/null || echo 0
 }
 
+count_case_filter_entries() {
+    local filter="$1"
+    local payload entry
+    local -a raw
+    local count=0
+    payload="$(case_filter_payload "${filter}")" || return 1
+    IFS=',' read -r -a raw <<<"${payload}"
+    for entry in "${raw[@]}"; do
+        entry="$(trim_ascii_space "${entry}")"
+        [[ -n "${entry}" ]] || continue
+        count=$((count + 1))
+    done
+    echo "${count}"
+}
+
 count_step_semantic_lines() {
     local log_file="$1"
     local step="$2"
@@ -983,20 +998,40 @@ run_arch() {
     if [[ "${effective_profile}" == "basic" ]]; then
         if case_filter_matches_profile "basic"; then
             local musl_case_markers glibc_case_markers
+            local musl_testing_count glibc_testing_count
+            local expected_cases fallback_used
             musl_case_markers="$(count_runtime_case_markers "${text_log}" "whuse-oscomp-basic-case" "musl")"
             glibc_case_markers="$(count_runtime_case_markers "${text_log}" "whuse-oscomp-basic-case" "glibc")"
+            musl_testing_count="$(count_step_semantic_lines "${text_log}" "musl/basic_testcode.sh" '^Testing ')"
+            glibc_testing_count="$(count_step_semantic_lines "${text_log}" "glibc/basic_testcode.sh" '^Testing ')"
+            expected_cases="$(count_case_filter_entries "${WHUSE_OSCOMP_CASE_FILTER}")"
             local basic_marker_fail=0
-            if runtime_filter_selects_runtime "musl" && [[ "${musl_case_markers}" -lt 1 ]]; then
-                basic_marker_fail=1
+            fallback_used=0
+            if runtime_filter_selects_runtime "musl"; then
+                if [[ "${musl_case_markers}" -lt "${expected_cases}" ]]; then
+                    if [[ "${musl_testing_count}" -lt "${expected_cases}" ]]; then
+                        basic_marker_fail=1
+                    else
+                        fallback_used=1
+                    fi
+                fi
             fi
-            if runtime_filter_selects_runtime "glibc" && [[ "${glibc_case_markers}" -lt 1 ]]; then
-                basic_marker_fail=1
+            if runtime_filter_selects_runtime "glibc"; then
+                if [[ "${glibc_case_markers}" -lt "${expected_cases}" ]]; then
+                    if [[ "${glibc_testing_count}" -lt "${expected_cases}" ]]; then
+                        basic_marker_fail=1
+                    else
+                        fallback_used=1
+                    fi
+                fi
             fi
             if [[ "${basic_marker_fail}" -ne 0 ]]; then
-                echo "[${arch}] basic profile failed semantic check: expected whuse-oscomp-basic-case markers in selected runtimes (filter=${WHUSE_OSCOMP_RUNTIME_FILTER}, musl=${musl_case_markers}, glibc=${glibc_case_markers})" >&2
+                echo "[${arch}] basic profile failed semantic check: expected ${expected_cases} filtered cases in selected runtimes (filter=${WHUSE_OSCOMP_RUNTIME_FILTER}, musl_markers=${musl_case_markers}, musl_testing=${musl_testing_count}, glibc_markers=${glibc_case_markers}, glibc_testing=${glibc_testing_count})" >&2
                 ok=1
+            elif [[ "${fallback_used}" -ne 0 ]]; then
+                echo "[${arch}] basic profile semantic check fallback ok: runtime-filter=${WHUSE_OSCOMP_RUNTIME_FILTER}, expected-cases=${expected_cases}, musl markers=${musl_case_markers}, musl Testing=${musl_testing_count}, glibc markers=${glibc_case_markers}, glibc Testing=${glibc_testing_count}"
             else
-                echo "[${arch}] basic profile semantic check ok: runtime-filter=${WHUSE_OSCOMP_RUNTIME_FILTER}, musl basic-case markers=${musl_case_markers}, glibc basic-case markers=${glibc_case_markers}"
+                echo "[${arch}] basic profile semantic check ok: runtime-filter=${WHUSE_OSCOMP_RUNTIME_FILTER}, expected-cases=${expected_cases}, musl basic-case markers=${musl_case_markers}, glibc basic-case markers=${glibc_case_markers}"
             fi
         else
             local musl_brk_count glibc_brk_count

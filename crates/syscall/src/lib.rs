@@ -1353,7 +1353,12 @@ impl SyscallDispatcher {
                 Err(err) => return Err(err),
             }
         }
-        if let Ok(stat) = vfs.stat_path(&cwd, &path) {
+        let existing_stat = if (flags & O_CREAT) != 0 {
+            vfs.stat_path_cached_only(&cwd, &path).ok()
+        } else {
+            vfs.stat_path_open_probe(&cwd, &path, flags)
+        };
+        if let Some(stat) = existing_stat {
             if (stat.mode & 0o170000) == 0o040000 && open_existing_directory_should_fail(flags) {
                 return Err(EISDIR);
             }
@@ -4328,7 +4333,12 @@ impl SyscallDispatcher {
                     cwd, path
                 ));
             }
-            match vfs.stat_path(&cwd, &path) {
+            let stat_result = if (flags & AT_SYMLINK_NOFOLLOW_FLAG) != 0 {
+                vfs.stat_path_nofollow(&cwd, &path)
+            } else {
+                vfs.stat_path(&cwd, &path)
+            };
+            match stat_result {
                 Ok(stat) => stat,
                 Err(err) => {
                     if busybox_testfile_probe {
@@ -7400,6 +7410,9 @@ fn simple_shell_command_path(command: &str) -> Option<&str> {
     if command.is_empty() || command.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return None;
     }
+    if is_shell_builtin_command(command) {
+        return None;
+    }
     if command.bytes().any(|byte| {
         matches!(
             byte,
@@ -7409,6 +7422,30 @@ fn simple_shell_command_path(command: &str) -> Option<&str> {
         return None;
     }
     Some(command)
+}
+
+fn is_shell_builtin_command(command: &str) -> bool {
+    matches!(
+        command,
+        ":"
+            | "."
+            | "break"
+            | "cd"
+            | "continue"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "export"
+            | "read"
+            | "return"
+            | "set"
+            | "shift"
+            | "times"
+            | "trap"
+            | "umask"
+            | "unset"
+            | "wait"
+    )
 }
 
 fn is_ipv6_recv_bool_opt(opt: usize) -> bool {
@@ -8466,6 +8503,59 @@ mod tests {
             &mut vfs,
         );
         assert_eq!(rc, -(super::EFAULT as isize));
+    }
+
+    #[test]
+    fn statx_respects_symlink_nofollow_flag() {
+        const S_IFLNK: u32 = 0o120000;
+
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        vfs.create_file_with_mode("/", "/tmp/statx-target.txt", b"", 0o644)
+            .unwrap();
+        vfs.create_symlink("/", "/tmp/statx-link.txt", "/tmp/statx-target.txt")
+            .unwrap();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb072, b"/tmp/statx-link.txt\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb180, &[0; 256]);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_STATX,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xb072,
+                    super::AT_SYMLINK_NOFOLLOW_FLAG,
+                    0x7ff,
+                    0xb180,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+
+        let bytes = procs.current().unwrap().read_user_bytes(0xb180, 256).unwrap();
+        let mode = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
+        assert_eq!(mode & 0o170000, S_IFLNK);
     }
 
     #[test]
@@ -9712,5 +9802,15 @@ mod tests {
         assert!(state
             .first_conflict("/tmp/a", 11, super::F_WRLCK, 0, None)
             .is_none());
+    }
+
+    #[test]
+    fn shell_simple_command_optimization_skips_shell_builtins() {
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "exit".to_string()];
+        let command = super::shell_exec_command("/bin/sh", &argv).expect("shell command");
+        assert_eq!(command, "exit");
+        assert_eq!(super::simple_shell_command_path(command), None);
+
+        assert_eq!(super::simple_shell_command_path("ls"), Some("ls"));
     }
 }

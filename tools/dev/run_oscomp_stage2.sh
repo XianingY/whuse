@@ -13,6 +13,7 @@ LTP_CURATED_BLACKLIST_DEFAULT="${REPO_ROOT}/tools/oscomp/ltp/musl_rv_curated_bla
 MODE="${1:-riscv}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-3600}"
 TS="$(date +%Y%m%d-%H%M%S)"
+RUN_ID="${TS}-$$-${RANDOM}"
 
 LTP_PROFILE_WAS_SET=0
 LTP_WHITELIST_WAS_SET=0
@@ -428,11 +429,45 @@ prepare_runtime_image() {
         prepared_runtime_image="${src}"
         return
     fi
-    local dst="/tmp/whuse-${arch}-stage2-${TS}.img"
+    local dst="/tmp/whuse-${arch}-stage2-${RUN_ID}.img"
     cp --reflink=auto "${src}" "${dst}"
     runtime_images+=("${dst}")
     cleanup_target_images+=("${dst}")
     prepared_runtime_image="${dst}"
+}
+
+runtime_image_path_exists() {
+    local image="$1"
+    local target="$2"
+    debugfs -R "stat ${target}" "${image}" 2>/dev/null | grep -q "^Inode:"
+}
+
+read_runtime_image_config() {
+    local image="$1"
+    local target="$2"
+    debugfs -R "cat ${target}" "${image}" 2>/dev/null | tr -d '\r'
+}
+
+verify_runtime_image_config() {
+    local image="$1"
+    local target="$2"
+    local expected="$3"
+    local actual
+    actual="$(read_runtime_image_config "${image}" "${target}")"
+    actual="${actual%$'\n'}"
+    if [[ "${actual}" != "${expected}" ]]; then
+        echo "runtime config verification failed for ${target} in ${image}: expected '${expected}', got '${actual}'" >&2
+        return 1
+    fi
+}
+
+verify_runtime_image_marker() {
+    local image="$1"
+    local target="$2"
+    if ! runtime_image_path_exists "${image}" "${target}"; then
+        echo "runtime marker verification failed for ${target} in ${image}" >&2
+        return 1
+    fi
 }
 
 write_runtime_image_config() {
@@ -482,12 +517,15 @@ inject_oscomp_profile() {
     done
     write_runtime_image_config "${image}" "/whuse-oscomp-profile" "${profile}"
     write_runtime_image_config "${image}" "/whuse-oscomp-profile.${profile}" ""
+    verify_runtime_image_config "${image}" "/whuse-oscomp-profile" "${profile}"
+    verify_runtime_image_marker "${image}" "/whuse-oscomp-profile.${profile}"
 }
 
 inject_oscomp_runtime_filter() {
     local image="$1"
     local runtime_filter="$2"
     write_runtime_image_config "${image}" "/whuse-oscomp-runtime-filter" "${runtime_filter}"
+    verify_runtime_image_config "${image}" "/whuse-oscomp-runtime-filter" "${runtime_filter}"
 }
 
 inject_oscomp_runtime_filter_env() {
@@ -846,8 +884,8 @@ run_arch() {
     local arch="$1"
     local image="$2"
     local xtask_cmd="$3"
-    local log="/tmp/${arch}-stage2-${TS}.log"
-    local text_log="/tmp/${arch}-stage2-${TS}.strings.log"
+    local log="/tmp/${arch}-stage2-${RUN_ID}.log"
+    local text_log="/tmp/${arch}-stage2-${RUN_ID}.strings.log"
     local runtime_image
     local suite_done_seen=0
     local terminated_by_suite_done=0
@@ -1056,8 +1094,8 @@ run_arch_raw_exit() {
 
 run_ltp_riscv_mode() {
     local mode="$1"
-    local log="/tmp/rv-ltp-${mode}-stage2-${TS}.log"
-    local text_log="/tmp/rv-ltp-${mode}-stage2-${TS}.strings.log"
+    local log="/tmp/rv-ltp-${mode}-stage2-${RUN_ID}.log"
+    local text_log="/tmp/rv-ltp-${mode}-stage2-${RUN_ID}.strings.log"
     local runtime_image
     local suite_done_seen=0
     local terminated_by_suite_done=0

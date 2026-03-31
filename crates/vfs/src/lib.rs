@@ -749,6 +749,32 @@ impl KernelVfs {
         self.stat_path_follow(&absolute, 0)
     }
 
+    pub fn stat_path_cached_only(&self, cwd: &str, path: &str) -> KernelResult<FileStat> {
+        let absolute = normalize_path(cwd, path);
+        self.stat_path_follow_cached_only(&absolute, 0)
+    }
+
+    pub fn stat_path_nofollow(&self, cwd: &str, path: &str) -> KernelResult<FileStat> {
+        let absolute = normalize_path(cwd, path);
+        if let Some(stat) = self.external_stat_path(&absolute)? {
+            return Ok(stat);
+        }
+        let node = self.lookup_abs(&absolute)?;
+        self.stat(&absolute, &node)
+    }
+
+    pub fn stat_path_open_probe(&self, cwd: &str, path: &str, flags: u32) -> Option<FileStat> {
+        let absolute = normalize_path(cwd, path);
+        if should_use_statless_external_open(&absolute, flags) {
+            return match self.stat_path_follow_cached_only(&absolute, 0) {
+                Ok(stat) => Some(stat),
+                Err(ENOENT) => None,
+                Err(_) => None,
+            };
+        }
+        self.stat_path_follow(&absolute, 0).ok()
+    }
+
     pub fn chdir(&self, cwd: &str, path: &str) -> KernelResult<String> {
         let absolute = normalize_path(cwd, path);
         if let Ok(node) = self.lookup_abs(&absolute) {
@@ -1681,6 +1707,26 @@ impl KernelVfs {
         Err(ENOENT)
     }
 
+    fn stat_path_follow_cached_only(&self, absolute: &str, depth: usize) -> KernelResult<FileStat> {
+        if depth >= 16 {
+            return Err(ELOOP);
+        }
+        if let Some(stat) = self.external_stat_path_cached_only(absolute)? {
+            return Ok(stat);
+        }
+        let node = self.lookup_abs(absolute)?;
+        if node.kind == NodeKind::Symlink {
+            let target = match &*node.data.lock() {
+                NodeData::Symlink(target) => target.clone(),
+                _ => return Err(EINVAL),
+            };
+            let parent = split_parent(absolute)?.0;
+            let resolved = normalize_path(&parent, &target);
+            return self.stat_path_follow_cached_only(&resolved, depth + 1);
+        }
+        self.stat(absolute, &node)
+    }
+
     fn stat_path_follow(&self, absolute: &str, depth: usize) -> KernelResult<FileStat> {
         let iozone_probe = is_iozone_probe_path(absolute);
         if iozone_probe {
@@ -1861,6 +1907,54 @@ impl KernelVfs {
                 Err(err)
             }
         }
+    }
+
+    fn external_stat_path_cached_only(&self, absolute: &str) -> KernelResult<Option<FileStat>> {
+        if is_shell_token_path(absolute) {
+            return Ok(None);
+        }
+        if self.lookup_abs(absolute).is_ok() {
+            return Ok(None);
+        }
+        if self.is_memory_preferred_path(absolute) {
+            return Ok(None);
+        }
+        if let Some((_, stat)) = self.external_preloaded.get(absolute) {
+            return Ok(Some(*stat));
+        }
+        if self.external_deletions.contains(absolute) {
+            return Ok(None);
+        }
+        if let Some(stat) = self.external_stat_cache.get(absolute) {
+            return Ok(Some(*stat));
+        }
+        let Some((mount, _)) = self.resolve_external_path(absolute) else {
+            return Ok(None);
+        };
+        let dir_prefix = if absolute == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", absolute)
+        };
+        if self
+            .external_preloaded
+            .keys()
+            .any(|entry| entry.starts_with(&dir_prefix))
+            || self
+                .external_stat_cache
+                .keys()
+                .any(|entry| entry.starts_with(&dir_prefix))
+            || absolute == mount.target
+        {
+            return Ok(Some(FileStat {
+                mode: S_IFDIR | 0o755,
+                size: 0,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+            }));
+        }
+        Ok(None)
     }
 
     fn try_open_external(
@@ -3375,6 +3469,56 @@ mod tests {
         vfs.mount_ext4(device.name(), "/", device).unwrap();
 
         assert!(matches!(vfs.access("/", "/test.txt"), Err(super::ENOENT)));
+    }
+
+    #[test]
+    fn stat_path_cached_only_reports_ext4_hits_and_misses_without_fs_walks() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        assert!(matches!(
+            vfs.stat_path_cached_only("/", "/bin/not-found"),
+            Err(super::ENOENT)
+        ));
+        assert!(!vfs.external_stat_cache.contains_key("/bin/not-found"));
+
+        let mut file = vfs.open("/", "/bin/hello", 0, 0).unwrap();
+        assert_eq!(vfs.read(&mut file, 32).unwrap(), b"hello from ext4");
+
+        let stat = vfs.stat_path_cached_only("/", "/bin/hello").unwrap();
+        assert_eq!(stat.size, b"hello from ext4".len() as u64);
+    }
+
+    #[test]
+    fn stat_path_open_probe_skips_full_stat_for_missing_localtime() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        assert_eq!(
+            vfs.stat_path_open_probe("/", "/etc/localtime", super::O_RDONLY),
+            None
+        );
+        assert!(!vfs.external_stat_cache.contains_key("/etc/localtime"));
+    }
+
+    #[test]
+    fn stat_path_nofollow_reports_symlink_mode() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file_with_mode("/", "/tmp/target.txt", b"", 0o644)
+            .unwrap();
+        vfs.create_symlink("/", "/tmp/link.txt", "/tmp/target.txt")
+            .unwrap();
+
+        let stat = vfs.stat_path_nofollow("/", "/tmp/link.txt").unwrap();
+        assert_eq!(stat.mode & 0o170000, super::S_IFLNK);
     }
 
     #[test]

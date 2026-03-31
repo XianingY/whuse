@@ -119,6 +119,7 @@ const OSCOMP_PROFILE_PATH: &str = "/whuse-oscomp-profile";
 const OSCOMP_RUNTIME_FILTER_PATH: &str = "/whuse-oscomp-runtime-filter";
 const OSCOMP_STAGE2_LOCAL_ENV_PATH: &str = "/musl/.whuse_stage2_local.env";
 const OSCOMP_PROFILE_DEFAULT_PLACEHOLDER: &str = "__WHUSE_OSCOMP_PROFILE_DEFAULT__";
+const OSCOMP_RUNTIME_FILTER_DEFAULT_PLACEHOLDER: &str = "__WHUSE_OSCOMP_RUNTIME_FILTER_DEFAULT__";
 const OSCOMP_FULL_MAX_GROUP_PLACEHOLDER: &str = "__WHUSE_STAGE2_FULL_MAX_GROUP__";
 const OSCOMP_IOZONE_PROFILE_PLACEHOLDER: &str = "__WHUSE_STAGE2_IOZONE_PROFILE__";
 const OSCOMP_BASIC_PROFILE_PLACEHOLDER: &str = "__WHUSE_STAGE2_BASIC_PROFILE__";
@@ -1076,6 +1077,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "WHUSE_STAGE2_LIBCBENCH_SCOPE=${WHUSE_STAGE2_LIBCBENCH_SCOPE:-__WHUSE_STAGE2_LIBCBENCH_SCOPE__}\n",
     "WHUSE_STAGE2_LMBENCH_SCOPE=${WHUSE_STAGE2_LMBENCH_SCOPE:-__WHUSE_STAGE2_LMBENCH_SCOPE__}\n",
     "WHUSE_OSCOMP_PROFILE=${WHUSE_OSCOMP_PROFILE:-__WHUSE_OSCOMP_PROFILE_DEFAULT__}\n",
+    "WHUSE_OSCOMP_RUNTIME_FILTER=${WHUSE_OSCOMP_RUNTIME_FILTER:-__WHUSE_OSCOMP_RUNTIME_FILTER_DEFAULT__}\n",
     "KCONFIG_SKIP_CHECK=${KCONFIG_SKIP_CHECK:-1}\n",
     "case \"$WHUSE_OSCOMP_PROFILE\" in\n",
     "    full|basic|busybox|iozone|libctest|libc-bench|lmbench|lua|ltp|unixbench|netperf|iperf|cyclic) ;;\n",
@@ -1250,7 +1252,6 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        esac\n",
     "        ;;\n",
     "    musl:./iozone_testcode.sh|glibc:/glibc/iozone_testcode.sh)\n",
-    "        echo whuse-la-iozone-call:before:$runtime:$script_path\n",
     "        iozone_script=\"$script_path\"\n",
     "        case \"$runtime\" in\n",
     "        musl) iozone_script=\"/musl/iozone_testcode.sh\" ;;\n",
@@ -1267,7 +1268,6 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "            ;;\n",
     "        esac\n",
     "        rc=$?\n",
-    "        echo whuse-la-iozone-call:after:$runtime:rc=$rc\n",
     "        ;;\n",
     "    *)\n",
     "        run_script_with_timeout \"$timeout_s\" \"$script_path\"\n",
@@ -1308,7 +1308,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        /musl/busybox timeout \"$timeout_s\" \"$brk_path\"\n",
     "    else\n",
     "        \"$brk_path\"\n",
-    "    fi",
+    "    fi\n",
     "    rc=$?\n",
     "    if [ \"$runtime\" = \"musl\" ] && [ \"$rc\" = \"0\" ]; then\n",
     "        echo \"Testing sleep :\"\n",
@@ -1370,7 +1370,10 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    fi\n",
     "}\n",
     "read_local_runtime_filter() {\n",
-    "    WHUSE_LOCAL_RUNTIME_FILTER=both\n",
+    "    case \"${WHUSE_OSCOMP_RUNTIME_FILTER:-}\" in\n",
+    "        musl|glibc|both) WHUSE_LOCAL_RUNTIME_FILTER=\"$WHUSE_OSCOMP_RUNTIME_FILTER\" ;;\n",
+    "        *) WHUSE_LOCAL_RUNTIME_FILTER=both ;;\n",
+    "    esac\n",
     "}\n",
     "runtime_selected() {\n",
     "    runtime=\"$1\"\n",
@@ -1706,6 +1709,12 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    fi\n",
     "    return 0\n",
     "}\n",
+    "WHUSE_OSCOMP_PROFILE=${WHUSE_OSCOMP_PROFILE:-__WHUSE_OSCOMP_PROFILE_DEFAULT__}\n",
+    "case \"$WHUSE_OSCOMP_PROFILE\" in\n",
+    "    full|basic|busybox|iozone|libctest|libc-bench|lmbench|lua|ltp|unixbench|netperf|iperf|cyclic) ;;\n",
+    "    *) WHUSE_OSCOMP_PROFILE=full ;;\n",
+    "esac\n",
+    "WHUSE_OSCOMP_RUNTIME_FILTER=${WHUSE_OSCOMP_RUNTIME_FILTER:-__WHUSE_OSCOMP_RUNTIME_FILTER_DEFAULT__}\n",
     "WHUSE_LOCAL_RUNTIME_FILTER=both\n",
     "read_local_runtime_filter\n",
     "run_selected_profile() {\n",
@@ -2967,55 +2976,161 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs, time_test_present: bool) {
     ] {
         let _ = vfs.mkdir("/", dir, 0o755);
     }
-    install_busybox_exec_alias(vfs, "/musl/ls", "ls");
-    install_busybox_exec_alias(vfs, "/musl/which", "which");
-    install_busybox_exec_alias(vfs, "/musl/sleep", "sleep");
-    install_busybox_exec_alias(vfs, "/musl/basename", "basename");
-    install_busybox_exec_alias(vfs, "/musl/dirname", "dirname");
-    install_busybox_exec_alias(vfs, "/musl/awk", "awk");
-    install_busybox_exec_alias(vfs, "/musl/sed", "sed");
-    install_busybox_exec_alias(vfs, "/musl/grep", "grep");
-    install_busybox_exec_alias(vfs, "/musl/[", "[");
-    install_busybox_exec_alias(vfs, "/musl/test", "test");
-    install_busybox_exec_alias(vfs, "/musl/cut", "cut");
-    install_busybox_exec_alias(vfs, "/musl/head", "head");
-    install_busybox_exec_alias(vfs, "/musl/tail", "tail");
-    install_busybox_exec_alias(vfs, "/musl/tr", "tr");
-    install_busybox_exec_alias(vfs, "/musl/xargs", "xargs");
-    install_busybox_exec_alias(vfs, "/musl/readlink", "readlink");
+    for (path, applet) in [
+        ("/musl/[", "["),
+        ("/musl/awk", "awk"),
+        ("/musl/basename", "basename"),
+        ("/musl/cal", "cal"),
+        ("/musl/cat", "cat"),
+        ("/musl/clear", "clear"),
+        ("/musl/cp", "cp"),
+        ("/musl/cut", "cut"),
+        ("/musl/date", "date"),
+        ("/musl/df", "df"),
+        ("/musl/dirname", "dirname"),
+        ("/musl/dmesg", "dmesg"),
+        ("/musl/du", "du"),
+        ("/musl/expr", "expr"),
+        ("/musl/false", "false"),
+        ("/musl/find", "find"),
+        ("/musl/free", "free"),
+        ("/musl/grep", "grep"),
+        ("/musl/head", "head"),
+        ("/musl/hexdump", "hexdump"),
+        ("/musl/hwclock", "hwclock"),
+        ("/musl/kill", "kill"),
+        ("/musl/ls", "ls"),
+        ("/musl/md5sum", "md5sum"),
+        ("/musl/mkdir", "mkdir"),
+        ("/musl/more", "more"),
+        ("/musl/mv", "mv"),
+        ("/musl/od", "od"),
+        ("/musl/printf", "printf"),
+        ("/musl/ps", "ps"),
+        ("/musl/pwd", "pwd"),
+        ("/musl/readlink", "readlink"),
+        ("/musl/rm", "rm"),
+        ("/musl/rmdir", "rmdir"),
+        ("/musl/sed", "sed"),
+        ("/musl/sleep", "sleep"),
+        ("/musl/sort", "sort"),
+        ("/musl/stat", "stat"),
+        ("/musl/strings", "strings"),
+        ("/musl/tail", "tail"),
+        ("/musl/test", "test"),
+        ("/musl/touch", "touch"),
+        ("/musl/tr", "tr"),
+        ("/musl/true", "true"),
+        ("/musl/uname", "uname"),
+        ("/musl/uniq", "uniq"),
+        ("/musl/uptime", "uptime"),
+        ("/musl/wc", "wc"),
+        ("/musl/which", "which"),
+        ("/musl/xargs", "xargs"),
+    ] {
+        install_busybox_exec_alias(vfs, path, applet);
+    }
     for (path, target) in [
         ("/bin/busybox", "/musl/busybox"),
         ("/bin/sh", "/musl/busybox"),
         ("/bin/bash", "/musl/busybox"),
+        ("/bin/cal", "/musl/cal"),
+        ("/bin/cat", "/musl/cat"),
+        ("/bin/clear", "/musl/clear"),
+        ("/bin/cp", "/musl/cp"),
         ("/bin/ls", "/musl/ls"),
         ("/bin/which", "/musl/which"),
         ("/bin/sleep", "/musl/sleep"),
         ("/bin/basename", "/musl/basename"),
+        ("/bin/date", "/musl/date"),
+        ("/bin/df", "/musl/df"),
         ("/bin/dirname", "/musl/dirname"),
+        ("/bin/dmesg", "/musl/dmesg"),
+        ("/bin/du", "/musl/du"),
+        ("/bin/expr", "/musl/expr"),
+        ("/bin/false", "/musl/false"),
+        ("/bin/find", "/musl/find"),
+        ("/bin/free", "/musl/free"),
         ("/bin/awk", "/musl/awk"),
         ("/bin/sed", "/musl/sed"),
         ("/bin/grep", "/musl/grep"),
         ("/bin/cut", "/musl/cut"),
         ("/bin/head", "/musl/head"),
+        ("/bin/hexdump", "/musl/hexdump"),
+        ("/bin/hwclock", "/musl/hwclock"),
+        ("/bin/kill", "/musl/kill"),
+        ("/bin/md5sum", "/musl/md5sum"),
+        ("/bin/mkdir", "/musl/mkdir"),
+        ("/bin/more", "/musl/more"),
+        ("/bin/mv", "/musl/mv"),
+        ("/bin/od", "/musl/od"),
+        ("/bin/printf", "/musl/printf"),
+        ("/bin/ps", "/musl/ps"),
+        ("/bin/pwd", "/musl/pwd"),
         ("/bin/tail", "/musl/tail"),
         ("/bin/tr", "/musl/tr"),
         ("/bin/xargs", "/musl/xargs"),
         ("/bin/readlink", "/musl/readlink"),
+        ("/bin/rm", "/musl/rm"),
+        ("/bin/rmdir", "/musl/rmdir"),
+        ("/bin/sort", "/musl/sort"),
+        ("/bin/stat", "/musl/stat"),
+        ("/bin/strings", "/musl/strings"),
+        ("/bin/touch", "/musl/touch"),
+        ("/bin/true", "/musl/true"),
+        ("/bin/uname", "/musl/uname"),
+        ("/bin/uniq", "/musl/uniq"),
+        ("/bin/uptime", "/musl/uptime"),
+        ("/bin/wc", "/musl/wc"),
         ("/busybox", "/musl/busybox"),
+        ("/usr/bin/cal", "/musl/cal"),
+        ("/usr/bin/cat", "/musl/cat"),
+        ("/usr/bin/clear", "/musl/clear"),
+        ("/usr/bin/cp", "/musl/cp"),
+        ("/usr/bin/date", "/musl/date"),
+        ("/usr/bin/df", "/musl/df"),
         ("/usr/bin/ls", "/musl/ls"),
         ("/usr/bin/which", "/musl/which"),
         ("/usr/bin/sleep", "/musl/sleep"),
         ("/usr/bin/basename", "/musl/basename"),
         ("/usr/bin/dirname", "/musl/dirname"),
+        ("/usr/bin/dmesg", "/musl/dmesg"),
+        ("/usr/bin/du", "/musl/du"),
+        ("/usr/bin/expr", "/musl/expr"),
+        ("/usr/bin/false", "/musl/false"),
+        ("/usr/bin/find", "/musl/find"),
+        ("/usr/bin/free", "/musl/free"),
         ("/usr/bin/awk", "/musl/awk"),
         ("/usr/bin/sed", "/musl/sed"),
         ("/usr/bin/grep", "/musl/grep"),
         ("/usr/bin/cut", "/musl/cut"),
         ("/usr/bin/head", "/musl/head"),
+        ("/usr/bin/hexdump", "/musl/hexdump"),
+        ("/usr/bin/hwclock", "/musl/hwclock"),
+        ("/usr/bin/kill", "/musl/kill"),
+        ("/usr/bin/md5sum", "/musl/md5sum"),
+        ("/usr/bin/mkdir", "/musl/mkdir"),
+        ("/usr/bin/more", "/musl/more"),
+        ("/usr/bin/mv", "/musl/mv"),
+        ("/usr/bin/od", "/musl/od"),
+        ("/usr/bin/printf", "/musl/printf"),
+        ("/usr/bin/ps", "/musl/ps"),
+        ("/usr/bin/pwd", "/musl/pwd"),
         ("/usr/bin/tail", "/musl/tail"),
         ("/usr/bin/tr", "/musl/tr"),
         ("/usr/bin/xargs", "/musl/xargs"),
         ("/usr/bin/readlink", "/musl/readlink"),
+        ("/usr/bin/rm", "/musl/rm"),
+        ("/usr/bin/rmdir", "/musl/rmdir"),
+        ("/usr/bin/sort", "/musl/sort"),
+        ("/usr/bin/stat", "/musl/stat"),
+        ("/usr/bin/strings", "/musl/strings"),
+        ("/usr/bin/touch", "/musl/touch"),
+        ("/usr/bin/true", "/musl/true"),
+        ("/usr/bin/uname", "/musl/uname"),
+        ("/usr/bin/uniq", "/musl/uniq"),
+        ("/usr/bin/uptime", "/musl/uptime"),
+        ("/usr/bin/wc", "/musl/wc"),
         ("/usr/bin/env", "/musl/busybox"),
         ("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so"),
         ("/lib/ld-musl-loongarch64.so.1", "/musl/lib/libc.so"),
@@ -3367,9 +3482,25 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
     ok
 }
 
-fn select_oscomp_suite_script(vfs: &mut KernelVfs, _time_test_present: bool) -> String {
-    let _ = vfs;
-    OSCOMP_SUITE_SCRIPT_MINIMAL_SELECTED.to_string()
+fn select_oscomp_suite_script(vfs: &mut KernelVfs, time_test_present: bool) -> String {
+    let profile_default = read_oscomp_profile_default(vfs);
+    let runtime_filter_default = read_oscomp_runtime_filter_default(vfs);
+    let overrides = read_oscomp_stage2_overrides(vfs);
+    if profile_default == "full" {
+        render_oscomp_official_suite_script(
+            profile_default,
+            runtime_filter_default,
+            time_test_present,
+            overrides,
+        )
+    } else {
+        render_selected_oscomp_suite_script(
+            profile_default,
+            runtime_filter_default,
+            time_test_present,
+            overrides,
+        )
+    }
 }
 
 fn normalize_oscomp_profile_value(raw: &str) -> &'static str {
@@ -3399,6 +3530,37 @@ fn read_oscomp_profile_default(vfs: &mut KernelVfs) -> &'static str {
         return "full";
     };
     normalize_oscomp_profile_value(text)
+}
+
+fn normalize_oscomp_runtime_filter_value(raw: &str) -> &'static str {
+    match raw.trim() {
+        "musl" => "musl",
+        "glibc" => "glibc",
+        _ => "both",
+    }
+}
+
+fn read_oscomp_runtime_filter_default(vfs: &mut KernelVfs) -> &'static str {
+    if let Ok(bytes) = vfs.read_file_all("/", OSCOMP_RUNTIME_FILTER_PATH) {
+        if let Ok(text) = core::str::from_utf8(&bytes) {
+            return normalize_oscomp_runtime_filter_value(text);
+        }
+    }
+    let Ok(bytes) = vfs.read_file_all("/", OSCOMP_STAGE2_LOCAL_ENV_PATH) else {
+        return "both";
+    };
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        return "both";
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "WHUSE_OSCOMP_RUNTIME_FILTER" {
+            return normalize_oscomp_runtime_filter_value(value);
+        }
+    }
+    "both"
 }
 
 #[derive(Clone, Copy)]
@@ -3523,11 +3685,16 @@ fn read_oscomp_stage2_overrides(vfs: &mut KernelVfs) -> OscompStage2Overrides {
 
 fn render_oscomp_official_suite_script(
     profile_default: &str,
+    runtime_filter_default: &str,
     time_test_present: bool,
     overrides: OscompStage2Overrides,
 ) -> String {
     OSCOMP_OFFICIAL_SUITE_SCRIPT
         .replace(OSCOMP_PROFILE_DEFAULT_PLACEHOLDER, profile_default)
+        .replace(
+            OSCOMP_RUNTIME_FILTER_DEFAULT_PLACEHOLDER,
+            runtime_filter_default,
+        )
         .replace(OSCOMP_FULL_MAX_GROUP_PLACEHOLDER, overrides.full_max_group)
         .replace(OSCOMP_IOZONE_PROFILE_PLACEHOLDER, overrides.iozone_profile)
         .replace(OSCOMP_BASIC_PROFILE_PLACEHOLDER, overrides.basic_profile)
@@ -3550,84 +3717,18 @@ fn render_oscomp_official_suite_script(
         )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::OSCOMP_OFFICIAL_SUITE_SCRIPT;
-
-    #[test]
-    fn oscomp_official_suite_supports_local_stage2_overrides() {
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("WHUSE_STAGE2_FULL_MAX_GROUP=${WHUSE_STAGE2_FULL_MAX_GROUP:-__WHUSE_STAGE2_FULL_MAX_GROUP__}"),
-            "official suite script should carry a render-time full max group placeholder"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-real-max-group:$WHUSE_STAGE2_FULL_MAX_GROUP"),
-            "official suite script should log the effective full max group"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-basic-profile:$WHUSE_STAGE2_BASIC_PROFILE"),
-            "official suite script should log the effective basic profile"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-busybox-profile:$WHUSE_STAGE2_BUSYBOX_PROFILE"),
-            "official suite script should log the effective busybox profile"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-libctest-scope:$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE"),
-            "official suite script should log the effective libctest scope"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains(
-                "WHUSE_STAGE2_LIBCBENCH_SCOPE=${WHUSE_STAGE2_LIBCBENCH_SCOPE:-__WHUSE_STAGE2_LIBCBENCH_SCOPE__}"
-            ),
-            "official suite script should carry a render-time libc-bench scope placeholder"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-libcbench-scope:$WHUSE_STAGE2_LIBCBENCH_SCOPE"),
-            "official suite script should log the effective libc-bench scope"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains(
-                "WHUSE_STAGE2_LMBENCH_SCOPE=${WHUSE_STAGE2_LMBENCH_SCOPE:-__WHUSE_STAGE2_LMBENCH_SCOPE__}"
-            ),
-            "official suite script should carry a render-time lmbench scope placeholder"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-lmbench-scope:$WHUSE_STAGE2_LMBENCH_SCOPE"),
-            "official suite script should log the effective lmbench scope"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("basic:*|full:smoke)"),
-            "official suite script should allow full profile runs to reuse the basic smoke path"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-step-skip:glibc/busybox_testcode.sh:busybox-smoke-fast-path"),
-            "official suite script should expose the local full-smoke busybox fast-path skip marker"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-step-skip:glibc/libctest_testcode.sh:libctest-smoke-fast-path"),
-            "official suite script should expose the local full-smoke libctest fast-path skip marker"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-step-skip:glibc/libcbench_testcode.sh:libcbench-smoke-fast-path"),
-            "official suite script should expose the local full-smoke libc-bench fast-path skip marker"
-        );
-        assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT
-                .contains("whuse-oscomp-step-skip:glibc/lmbench_testcode.sh:lmbench-smoke-fast-path"),
-            "official suite script should expose the local full-smoke lmbench fast-path skip marker"
-        );
-    }
+fn render_selected_oscomp_suite_script(
+    profile_default: &str,
+    runtime_filter_default: &str,
+    time_test_present: bool,
+    overrides: OscompStage2Overrides,
+) -> String {
+    render_oscomp_official_suite_script(
+        profile_default,
+        runtime_filter_default,
+        time_test_present,
+        overrides,
+    )
 }
 
 fn ext4_path_readable(device: &'static dyn hal_api::HalBlockDevice, path: &str) -> bool {
@@ -3796,10 +3897,86 @@ fn log_block_probe_span(device: &'static dyn hal_api::HalBlockDevice, start: usi
 #[cfg(test)]
 mod tests {
     use super::{
-        select_oscomp_suite_script, OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_RUNTIME_FILTER_PATH,
+        select_oscomp_suite_script, OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH,
+        OSCOMP_RUNTIME_FILTER_PATH,
     };
     use std::{fs, process::Command};
     use vfs::KernelVfs;
+
+    #[test]
+    fn oscomp_official_suite_supports_local_stage2_overrides() {
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("WHUSE_STAGE2_FULL_MAX_GROUP=${WHUSE_STAGE2_FULL_MAX_GROUP:-__WHUSE_STAGE2_FULL_MAX_GROUP__}"),
+            "official suite script should carry a render-time full max group placeholder"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-real-max-group:$WHUSE_STAGE2_FULL_MAX_GROUP"),
+            "official suite script should log the effective full max group"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-basic-profile:$WHUSE_STAGE2_BASIC_PROFILE"),
+            "official suite script should log the effective basic profile"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-busybox-profile:$WHUSE_STAGE2_BUSYBOX_PROFILE"),
+            "official suite script should log the effective busybox profile"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-libctest-scope:$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE"),
+            "official suite script should log the effective libctest scope"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains(
+                "WHUSE_STAGE2_LIBCBENCH_SCOPE=${WHUSE_STAGE2_LIBCBENCH_SCOPE:-__WHUSE_STAGE2_LIBCBENCH_SCOPE__}"
+            ),
+            "official suite script should carry a render-time libc-bench scope placeholder"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-libcbench-scope:$WHUSE_STAGE2_LIBCBENCH_SCOPE"),
+            "official suite script should log the effective libc-bench scope"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains(
+                "WHUSE_STAGE2_LMBENCH_SCOPE=${WHUSE_STAGE2_LMBENCH_SCOPE:-__WHUSE_STAGE2_LMBENCH_SCOPE__}"
+            ),
+            "official suite script should carry a render-time lmbench scope placeholder"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-lmbench-scope:$WHUSE_STAGE2_LMBENCH_SCOPE"),
+            "official suite script should log the effective lmbench scope"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("basic:*|full:smoke)"),
+            "official suite script should allow full profile runs to reuse the basic smoke path"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-step-skip:glibc/busybox_testcode.sh:busybox-smoke-fast-path"),
+            "official suite script should expose the local full-smoke busybox fast-path skip marker"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-step-skip:glibc/libctest_testcode.sh:libctest-smoke-fast-path"),
+            "official suite script should expose the local full-smoke libctest fast-path skip marker"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-step-skip:glibc/libcbench_testcode.sh:libcbench-smoke-fast-path"),
+            "official suite script should expose the local full-smoke libc-bench fast-path skip marker"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("whuse-oscomp-step-skip:glibc/lmbench_testcode.sh:lmbench-smoke-fast-path"),
+            "official suite script should expose the local full-smoke lmbench fast-path skip marker"
+        );
+    }
 
     #[test]
     fn official_suite_reads_busybox_cases_via_dedicated_fd() {
@@ -3826,6 +4003,50 @@ mod tests {
         assert!(
             !OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("filter=\"$(read_local_runtime_filter)\""),
             "LoongArch official suite should not depend on command substitution for runtime filter"
+        );
+    }
+
+    #[test]
+    fn loongarch_full_profile_renders_official_suite_and_runtime_filter() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file("/", OSCOMP_PROFILE_PATH, b"full")
+            .expect("write profile");
+        vfs.create_file("/", OSCOMP_RUNTIME_FILTER_PATH, b"glibc")
+            .expect("write runtime filter");
+
+        let script = select_oscomp_suite_script(&mut vfs, false);
+
+        assert!(
+            script.contains("whuse-oscomp-real-max-group:"),
+            "LoongArch full profile should render the official full suite instead of the minimal selected template"
+        );
+        assert!(
+            script.contains("WHUSE_LOCAL_RUNTIME_FILTER=glibc\n"),
+            "LoongArch full profile should bake the requested runtime filter into the rendered suite"
+        );
+    }
+
+    #[test]
+    fn loongarch_busybox_profile_renders_selected_suite_with_runtime_filter() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file("/", OSCOMP_PROFILE_PATH, b"busybox")
+            .expect("write profile");
+        vfs.create_file("/", OSCOMP_RUNTIME_FILTER_PATH, b"musl")
+            .expect("write runtime filter");
+
+        let script = select_oscomp_suite_script(&mut vfs, false);
+
+        assert!(
+            script.contains("WHUSE_LOCAL_RUNTIME_FILTER=musl\n"),
+            "LoongArch focused busybox runs should preserve the selected runtime filter"
+        );
+        assert!(
+            script.contains("WHUSE_OSCOMP_PROFILE=${WHUSE_OSCOMP_PROFILE:-busybox}\n"),
+            "LoongArch focused busybox runs should bake the selected profile into the rendered suite"
+        );
+        assert!(
+            script.contains("busybox) run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh"),
+            "LoongArch focused busybox runs should dispatch busybox_testcode.sh directly"
         );
     }
 

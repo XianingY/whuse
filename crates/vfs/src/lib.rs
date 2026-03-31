@@ -1738,6 +1738,9 @@ impl KernelVfs {
         if depth >= 16 {
             return Err(ELOOP);
         }
+        if should_use_statless_external_stat(absolute) {
+            return self.stat_path_follow_cached_only(absolute, depth);
+        }
         if let Some(stat) = self.external_stat_path(absolute)? {
             if iozone_probe {
                 iozone_probe_log(&format!(
@@ -2075,7 +2078,7 @@ impl KernelVfs {
                     size: 0,
                     nlink: 1,
                 },
-                None,
+                Some(Arc::new(Vec::new())),
             )));
         }
         let stat = match cached {
@@ -3143,28 +3146,24 @@ fn should_use_statless_external_open(absolute: &str, flags: u32) -> bool {
     if (flags & O_DIRECTORY) != 0 {
         return false;
     }
-    if absolute == "/etc/localtime" {
-        return true;
-    }
-    if absolute.ends_with("/basic/test_echo") {
+    if is_compat_metadata_fallback_path(absolute) {
         return true;
     }
     if is_libctest_probe_path(absolute) {
         return true;
     }
+    false
+}
 
-    if !(absolute.starts_with("/lib/")
-        || absolute.starts_with("/lib64/")
-        || absolute.starts_with("/glibc/lib/")
-        || absolute.starts_with("/musl/lib/"))
-    {
-        return false;
-    }
+fn should_use_statless_external_stat(absolute: &str) -> bool {
+    is_compat_metadata_fallback_path(absolute)
+}
 
-    absolute.contains("ld-linux")
-        || absolute.contains("ld-musl")
-        || absolute.ends_with(".so")
-        || absolute.contains(".so.")
+fn is_compat_metadata_fallback_path(absolute: &str) -> bool {
+    matches!(
+        absolute,
+        "/etc/localtime" | "/etc/passwd" | "/etc/group" | "/etc/TZ"
+    )
 }
 
 fn is_libctest_probe_path(path: &str) -> bool {
@@ -3507,6 +3506,95 @@ mod tests {
             None
         );
         assert!(!vfs.external_stat_cache.contains_key("/etc/localtime"));
+    }
+
+    #[test]
+    fn stat_path_skips_full_stat_for_missing_localtime() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        assert_eq!(
+            vfs.stat_path("/", "/etc/localtime"),
+            Err(super::ENOENT)
+        );
+        assert!(!vfs.external_stat_cache.contains_key("/etc/localtime"));
+    }
+
+    #[test]
+    fn read_file_all_returns_empty_for_missing_compat_metadata_files() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        for path in ["/etc/passwd", "/etc/group", "/etc/TZ"] {
+            assert_eq!(vfs.read_file_all("/", path), Ok(Vec::new()), "path={path}");
+            assert!(!vfs.external_stat_cache.contains_key(path), "path={path}");
+        }
+    }
+
+    #[test]
+    fn open_and_read_missing_compat_metadata_files_returns_eof() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        for path in ["/etc/passwd", "/etc/group", "/etc/TZ"] {
+            let mut handle = vfs.open("/", path, super::O_RDONLY, 0).expect(path);
+            assert_eq!(vfs.read(&mut handle, 32), Ok(Vec::new()), "path={path}");
+        }
+    }
+
+    #[test]
+    fn stat_path_skips_full_stat_for_missing_compat_metadata_files() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        for path in ["/etc/passwd", "/etc/group", "/etc/TZ"] {
+            assert_eq!(vfs.stat_path("/", path), Err(super::ENOENT), "path={path}");
+            assert!(!vfs.external_stat_cache.contains_key(path), "path={path}");
+        }
+    }
+
+    #[test]
+    fn shared_library_paths_do_not_use_statless_external_open() {
+        assert!(!super::should_use_statless_external_open(
+            "/musl/lib/libc.so",
+            super::O_RDONLY
+        ));
+        assert!(!super::should_use_statless_external_open(
+            "/glibc/lib/libc.so",
+            super::O_RDONLY
+        ));
+        assert!(!super::should_use_statless_external_open(
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            super::O_RDONLY
+        ));
+        assert!(!super::should_use_statless_external_open(
+            "/lib64/ld-musl-loongarch-lp64d.so.1",
+            super::O_RDONLY
+        ));
+        assert!(!super::should_use_statless_external_open(
+            "/musl/basic/test_echo",
+            super::O_RDONLY
+        ));
+        assert!(super::should_use_statless_external_open(
+            "/etc/localtime",
+            super::O_RDONLY
+        ));
     }
 
     #[test]

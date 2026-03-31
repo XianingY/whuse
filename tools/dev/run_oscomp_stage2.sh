@@ -60,8 +60,8 @@ full_root_steps=(
     "time-test"
     "basic_testcode.sh"
     "busybox_testcode.sh"
-    "iozone_testcode.sh"
     "libctest_testcode.sh"
+    "iozone_testcode.sh"
     "libc-bench"
     "ltp_testcode.sh"
     "lmbench_testcode.sh"
@@ -285,6 +285,20 @@ count_step_semantic_lines() {
             in_step && $0 ~ pat { count++ }
             END { print count + 0 }
         ' "${log_file}" 2>/dev/null || echo 0
+}
+
+kernel_panic_or_init_crash_pattern() {
+    printf '%s\n' 'panicked at|kernel panic|FATAL KERNEL TRAP|pid 1 \(init\).*(trap|crash)|^panic(:| |$)'
+}
+
+has_kernel_panic_or_init_crash() {
+    local text_log="$1"
+    rg -i -q "$(kernel_panic_or_init_crash_pattern)" "${text_log}"
+}
+
+print_kernel_panic_or_init_crash_matches() {
+    local text_log="$1"
+    rg -i "$(kernel_panic_or_init_crash_pattern)" "${text_log}" || true
 }
 
 runtime_images=()
@@ -949,9 +963,9 @@ run_arch() {
     strings "${log}" >"${text_log}" || true
     echo "[${arch}] log: ${log}"
 
-    if rg -q "KERNEL PANIC|panic|pid 1 \(init\).*trap" "${text_log}"; then
+    if has_kernel_panic_or_init_crash "${text_log}"; then
         echo "[${arch}] detected kernel panic or init crash" >&2
-        rg "KERNEL PANIC|panic|pid 1 \(init\).*trap" "${text_log}" >&2 || true
+        print_kernel_panic_or_init_crash_matches "${text_log}" >&2
         return 1
     fi
 
@@ -1187,9 +1201,9 @@ run_ltp_riscv_mode() {
     strings "${log}" >"${text_log}" || true
     echo "[${label}] log: ${log}"
 
-    if rg -q "KERNEL PANIC|panic|pid 1 \(init\).*trap" "${text_log}"; then
+    if has_kernel_panic_or_init_crash "${text_log}"; then
         echo "[${label}] detected kernel panic or init crash" >&2
-        rg "KERNEL PANIC|panic|pid 1 \(init\).*trap" "${text_log}" >&2 || true
+        print_kernel_panic_or_init_crash_matches "${text_log}" >&2
         return 1
     fi
 

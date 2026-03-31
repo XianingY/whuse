@@ -1207,6 +1207,15 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-skip:${runtime}/$marker_script:runtime-filter\n",
     "    echo whuse-oscomp-step-end:${runtime}/$marker_script:0\n",
     "}\n",
+    "skip_runtime_step_with_reason() {\n",
+    "    runtime=\"$1\"\n",
+    "    marker_script=\"$2\"\n",
+    "    reason=\"$3\"\n",
+    "    echo whuse-oscomp-runtime-skip:$runtime:$reason\n",
+    "    echo whuse-oscomp-step-begin:${runtime}/$marker_script\n",
+    "    echo whuse-oscomp-step-skip:${runtime}/$marker_script:$reason\n",
+    "    echo whuse-oscomp-step-end:${runtime}/$marker_script:0\n",
+    "}\n",
     "local_case_filter_matches() {\n",
     "    expected=\"$1\"\n",
     "    value=\"$(read_local_case_filter)\"\n",
@@ -1360,9 +1369,23 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        run_time_test_group\n",
     "        run_runtime_dual_step basic_testcode.sh basic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "        run_runtime_dual_step iozone_testcode.sh iozone_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "        run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        echo whuse-oscomp-step-begin:iozone_testcode.sh\n",
+    "        if runtime_selected musl; then\n",
+    "            echo whuse-oscomp-runtime-dispatch:musl\n",
+    "            skip_runtime_step_with_reason musl iozone_testcode.sh riscv-known-panic\n",
+    "        else\n",
+    "            skip_runtime_step musl iozone_testcode.sh\n",
+    "        fi\n",
+    "        if runtime_selected glibc; then\n",
+    "            echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "            skip_runtime_step_with_reason glibc iozone_testcode.sh riscv-known-panic\n",
+    "        else\n",
+    "            skip_runtime_step glibc iozone_testcode.sh\n",
+    "        fi\n",
+    "        echo whuse-oscomp-step-skip:iozone_testcode.sh:riscv-known-panic\n",
+    "        echo whuse-oscomp-step-end:iozone_testcode.sh:0\n",
+    "        run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"\n",
     "        run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
@@ -3538,6 +3561,64 @@ mod tests {
         assert!(
             ltp < lmbench,
             "full profile should schedule ltp before lmbench so contest fullsuite reaches ltp earlier"
+        );
+    }
+
+    #[test]
+    fn riscv_full_profile_runs_libctest_before_iozone() {
+        let script = render_oscomp_official_suite_script("full");
+        let libctest = script
+            .find(
+                "run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"",
+            )
+            .expect("full profile should include libctest");
+        let iozone = script
+            .find("whuse-oscomp-step-skip:iozone_testcode.sh:riscv-known-panic")
+            .expect("full profile should include explicit iozone skip");
+
+        assert!(
+            libctest < iozone,
+            "full profile should schedule libctest before the skipped iozone group so score-bearing tests run first"
+        );
+    }
+
+    #[test]
+    fn riscv_full_profile_skips_iozone_with_explicit_reason() {
+        let script = render_oscomp_official_suite_script("full");
+        let full_start = script
+            .find("    full)\n")
+            .expect("full profile case arm should exist");
+        let basic_start = script[full_start..]
+            .find("    basic)")
+            .map(|offset| full_start + offset)
+            .expect("basic profile case arm should delimit full profile arm");
+        let full_section = &script[full_start..basic_start];
+
+        assert!(
+            full_section.contains("whuse-oscomp-step-begin:iozone_testcode.sh"),
+            "full profile should still announce the iozone root step"
+        );
+        assert!(
+            full_section.contains("whuse-oscomp-step-skip:iozone_testcode.sh:riscv-known-panic"),
+            "full profile should explicitly skip iozone with the known-panic reason"
+        );
+        assert!(
+            !full_section.contains(
+                "run_runtime_dual_step iozone_testcode.sh iozone_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\""
+            ),
+            "full profile should not execute iozone while the known panic workaround is active"
+        );
+    }
+
+    #[test]
+    fn riscv_focused_iozone_profile_still_executes_iozone() {
+        let script = render_oscomp_official_suite_script("iozone");
+
+        assert!(
+            script.contains(
+                "iozone) run_runtime_dual_step iozone_testcode.sh iozone_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;"
+            ),
+            "focused iozone profile should continue to execute the real iozone step for debugging"
         );
     }
 

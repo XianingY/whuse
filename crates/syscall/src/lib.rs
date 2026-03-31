@@ -404,6 +404,15 @@ fn wake_process_group_threads(
     woke
 }
 
+fn current_process_has_pipe_or_socket_fd(procs: &ProcessTable, vfs: &KernelVfs) -> bool {
+    procs.current().ok().is_some_and(|process| {
+        process
+            .fd_table()
+            .values()
+            .any(|handle| vfs.is_pipe(handle) || vfs.is_socket(handle))
+    })
+}
+
 #[inline]
 fn stage2_openat_debug_enabled() -> bool {
     matches!(option_env!("WHUSE_DEBUG_STAGE2_OPENAT"), Some("1"))
@@ -1869,6 +1878,7 @@ impl SyscallDispatcher {
         vfs: &mut KernelVfs,
         exit_group: bool,
     ) -> Result<usize, i32> {
+        let wake_blocked_after_exit = current_process_has_pipe_or_socket_fd(procs, vfs);
         let libcbench_leader = procs
             .current()
             .ok()
@@ -1975,6 +1985,9 @@ impl SyscallDispatcher {
                 "whuse: released fcntl locks for tgid={}",
                 exit.tgid
             ));
+        }
+        if wake_blocked_after_exit {
+            let _ = scheduler.wake_all_blocked();
         }
         Ok(0)
     }
@@ -2512,12 +2525,8 @@ impl SyscallDispatcher {
                     path, interp_path
                 ));
                 let mut interp_loaded: Option<(String, Vec<u8>)> = None;
-                for candidate in [
-                    interp_path.as_str(),
-                    "/musl/lib/libc.so",
-                    "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
-                    "/lib/ld-linux-riscv64-lp64d.so.1",
-                ] {
+                for candidate in exec_interp_candidates(display_path.as_str(), interp_path.as_str())
+                {
                     if execve_iozone_probe {
                         log_always(&format!(
                             "whuse-la-iozone:execve-interp-candidate path={} candidate={}",
@@ -2528,7 +2537,7 @@ impl SyscallDispatcher {
                         "whuse: execve stage interp-candidate-try path={} candidate={}",
                         path, candidate
                     ));
-                    match read_exec_file_image(vfs, "/", candidate) {
+                    match read_exec_file_image(vfs, "/", candidate.as_str()) {
                         Ok(image) => {
                             if execve_iozone_probe {
                                 log_always(&format!(
@@ -2544,7 +2553,7 @@ impl SyscallDispatcher {
                                 candidate,
                                 image.len()
                             ));
-                            interp_loaded = Some((candidate.to_string(), image));
+                            interp_loaded = Some((candidate, image));
                             break;
                         }
                         Err(err) => {
@@ -7209,6 +7218,21 @@ fn parse_elf_interp(data: &[u8]) -> Option<String> {
     None
 }
 
+fn exec_interp_candidates(display_path: &str, interp_path: &str) -> Vec<String> {
+    let mut ordered = Vec::new();
+    if display_path.starts_with("/musl/") {
+        ordered.push("/musl/lib/libc.so".to_string());
+        ordered.push(interp_path.to_string());
+    } else {
+        ordered.push(interp_path.to_string());
+        ordered.push("/musl/lib/libc.so".to_string());
+    }
+    ordered.push("/glibc/lib/ld-linux-loongarch-lp64d.so.1".to_string());
+    ordered.push("/lib/ld-linux-riscv64-lp64d.so.1".to_string());
+    ordered.dedup();
+    ordered
+}
+
 fn read_exec_file_image(vfs: &mut KernelVfs, cwd: &str, path: &str) -> Result<Vec<u8>, i32> {
     if path.contains("busybox") {
         if let Some(bytes) = busybox_image_cache() {
@@ -7893,14 +7917,15 @@ fn statx_bytes(stat: FileStat) -> [u8; 256] {
 #[cfg(test)]
 mod tests {
     use super::{
-        SyscallArgs, SyscallDispatcher, SYS_ACCEPT, SYS_BIND, SYS_CLOCK_GETRES, SYS_CLONE,
-        SYS_CLOSE, SYS_CONNECT, SYS_COPY_FILE_RANGE, SYS_DUP3, SYS_EPOLL_CREATE1, SYS_EPOLL_CTL,
-        SYS_EPOLL_PWAIT, SYS_EVENTFD2, SYS_FACCESSAT2, SYS_FALLOCATE, SYS_FCHDIR, SYS_FCHMOD,
-        SYS_FCHMODAT, SYS_FCHOWN, SYS_FCHOWNAT, SYS_FDATASYNC, SYS_FLOCK, SYS_FSTAT, SYS_FSTATAT,
-        SYS_FSTATFS, SYS_FSYNC, SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER,
-        SYS_GETPRIORITY, SYS_GETSID, SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTIMEOFDAY,
-        SYS_GET_ROBUST_LIST, SYS_LINKAT, SYS_LISTEN, SYS_LSEEK, SYS_MEMBARRIER, SYS_MEMFD_CREATE,
-        SYS_MKDIR, SYS_MLOCK, SYS_MLOCK2, SYS_MSYNC, SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN,
+        exec_interp_candidates, SyscallArgs, SyscallDispatcher, SYS_ACCEPT, SYS_BIND,
+        SYS_CLOCK_GETRES, SYS_CLONE, SYS_CLOSE, SYS_CONNECT, SYS_COPY_FILE_RANGE, SYS_DUP3,
+        SYS_EPOLL_CREATE1, SYS_EPOLL_CTL, SYS_EPOLL_PWAIT, SYS_EVENTFD2, SYS_EXIT_GROUP,
+        SYS_FACCESSAT2, SYS_FALLOCATE, SYS_FCHDIR, SYS_FCHMOD, SYS_FCHMODAT, SYS_FCHOWN,
+        SYS_FCHOWNAT, SYS_FDATASYNC, SYS_FLOCK, SYS_FSTAT, SYS_FSTATAT, SYS_FSTATFS, SYS_FSYNC,
+        SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER, SYS_GETPRIORITY, SYS_GETSID,
+        SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTIMEOFDAY, SYS_GET_ROBUST_LIST, SYS_LINKAT,
+        SYS_LISTEN, SYS_LSEEK, SYS_MEMBARRIER, SYS_MEMFD_CREATE, SYS_MKDIR, SYS_MLOCK,
+        SYS_MLOCK2, SYS_MSYNC, SYS_OPENAT, SYS_PIDFD_GETFD, SYS_PIDFD_OPEN,
         SYS_PIDFD_SEND_SIGNAL, SYS_PIPE, SYS_PPOLL, SYS_PRCTL, SYS_PREAD64, SYS_PREADV,
         SYS_PREADV2, SYS_PRLIMIT64, SYS_PSELECT6, SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2,
         SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RENAMEAT, SYS_RENAMEAT2, SYS_RISCV_FLUSH_ICACHE,
@@ -8159,6 +8184,27 @@ mod tests {
     }
 
     #[test]
+    fn musl_exec_interp_candidates_prefer_musl_loader_first() {
+        let candidates =
+            exec_interp_candidates("/musl/basic/brk", "/lib/ld-linux-riscv64-lp64d.so.1");
+        assert_eq!(candidates.first().map(String::as_str), Some("/musl/lib/libc.so"));
+        assert_eq!(
+            candidates.get(1).map(String::as_str),
+            Some("/lib/ld-linux-riscv64-lp64d.so.1")
+        );
+    }
+
+    #[test]
+    fn glibc_exec_interp_candidates_keep_declared_interp_first() {
+        let candidates =
+            exec_interp_candidates("/glibc/basic/brk", "/lib/ld-linux-riscv64-lp64d.so.1");
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some("/lib/ld-linux-riscv64-lp64d.so.1")
+        );
+    }
+
+    #[test]
     fn extended_syscall_smoke() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
@@ -8323,6 +8369,77 @@ mod tests {
             dispatcher.dispatch(
                 SYS_READ,
                 SyscallArgs([read_fd, 0x7200, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn exit_group_wakes_sibling_pipe_reader_waiting_for_eof() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let shell = procs.spawn_init("sh", 0x1000);
+        let reader = procs.spawn("/musl/busybox", Some(shell), 0x2000);
+        let writer = procs.spawn("/musl/busybox", Some(shell), 0x3000);
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("uniq", reader, reader);
+        scheduler.spawn("sort", writer, writer);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+        let (read_end, write_end) = vfs.create_pipe().unwrap();
+        let read_fd = procs.find_by_tid_mut(reader).unwrap().add_fd(read_end).unwrap();
+        let _write_fd = procs
+            .find_by_tid_mut(writer)
+            .unwrap()
+            .add_fd(write_end)
+            .unwrap();
+
+        procs.set_current(reader).unwrap();
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x8100, &[0; 1]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_READ,
+                SyscallArgs([read_fd as usize, 0x8100, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EAGAIN as isize)
+        );
+        assert!(scheduler.is_blocked(reader));
+        assert_eq!(scheduler.current_thread_id(), Some(writer));
+
+        procs.set_current(writer).unwrap();
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_EXIT_GROUP,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        assert!(
+            scheduler.is_ready(reader),
+            "reader should be woken when the last writer exits"
+        );
+        assert_eq!(scheduler.ensure_current(), Some(reader));
+
+        procs.set_current(reader).unwrap();
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_READ,
+                SyscallArgs([read_fd as usize, 0x8100, 1, 0, 0, 0]),
                 &mut procs,
                 &mut scheduler,
                 &mut vfs

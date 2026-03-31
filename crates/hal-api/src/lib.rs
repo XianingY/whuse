@@ -25,6 +25,12 @@ pub enum PlatformArch {
     LoongArch64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownReason {
+    Success,
+    Failure,
+}
+
 impl Timespec {
     pub const fn from_nanos(total_nanos: u64) -> Self {
         Self {
@@ -182,6 +188,7 @@ pub trait HalPlatform: Send + Sync {
 pub trait HalPlatformLifecycle: Send + Sync {
     fn supports_userspace(&self) -> bool;
     fn idle(&self) -> !;
+    fn shutdown(&self, reason: ShutdownReason) -> !;
 }
 
 pub struct HalBundle {

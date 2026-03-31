@@ -188,9 +188,9 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
 fn panic(info: &PanicInfo<'_>) -> ! {
     let mut console = hal_api::ConsoleWriter;
     let _ = core::fmt::Write::write_fmt(&mut console, format_args!("whuse: PANIC {}\n", info));
-    loop {
-        core::hint::spin_loop();
-    }
+    hal_api::hal()
+        .lifecycle
+        .shutdown(hal_api::ShutdownReason::Failure)
 }
 
 #[cfg(not(target_os = "none"))]

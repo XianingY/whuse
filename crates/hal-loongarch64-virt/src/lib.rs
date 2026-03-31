@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering
 use hal_api::{
     register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
     HalNetDevice, HalPlatform, HalPlatformLifecycle, HalTimer, MemoryRegion, PlatformArch,
-    Timespec, TrapFrame, VmSpaceToken,
+    ShutdownReason, Timespec, TrapFrame, VmSpaceToken,
 };
 use hal_virtio::{
     parse_loongarch_virtio_discovery, virtio_error_to_errno, LoongArchInterruptConfig,
@@ -59,6 +59,8 @@ const ECFG_TI: usize = 1 << 11;
 
 // LoongArch timer frequency (100 MHz on QEMU virt)
 const LA_TIMER_FREQ_HZ: u64 = 100_000_000;
+const LOONGARCH_VIRT_GED_REG_BASE: usize = 0x100e001c;
+const LOONGARCH_VIRT_GED_S5_SLEEP_CTL: u8 = 0x34;
 
 #[cfg(target_arch = "loongarch64")]
 global_asm!(
@@ -493,6 +495,10 @@ impl HalPlatformLifecycle for VirtLifecycle {
         loop {
             core::hint::spin_loop();
         }
+    }
+
+    fn shutdown(&self, reason: ShutdownReason) -> ! {
+        shutdown(reason)
     }
 }
 
@@ -1147,5 +1153,48 @@ fn qemu_virt_fallback() -> LoongArchVirtioDiscovery {
             pch_pic_base: 0x1000_0000,
             pch_pic_size: 0x1000,
         }),
+    }
+}
+
+fn shutdown(reason: ShutdownReason) -> ! {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        unsafe {
+            write_volatile(
+                loongarch_shutdown_register_base() as *mut u8,
+                loongarch_shutdown_byte(reason),
+            );
+        }
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    panic!("shutdown requested on host stub: {:?}", reason);
+}
+
+fn loongarch_shutdown_register_base() -> usize {
+    LOONGARCH_VIRT_GED_REG_BASE
+}
+
+fn loongarch_shutdown_byte(_reason: ShutdownReason) -> u8 {
+    LOONGARCH_VIRT_GED_S5_SLEEP_CTL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{loongarch_shutdown_byte, loongarch_shutdown_register_base};
+    use hal_api::ShutdownReason;
+
+    #[test]
+    fn qemu_virt_poweroff_register_matches_acpi_ged_layout() {
+        assert_eq!(loongarch_shutdown_register_base(), 0x100e001c);
+        assert_eq!(loongarch_shutdown_byte(ShutdownReason::Success), 0x34);
+    }
+
+    #[test]
+    fn failure_shutdown_uses_same_poweroff_sequence() {
+        assert_eq!(loongarch_shutdown_byte(ShutdownReason::Failure), 0x34);
     }
 }

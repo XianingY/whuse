@@ -7974,6 +7974,10 @@ mod tests {
         fn idle(&self) -> ! {
             panic!("test lifecycle idle should never be entered");
         }
+
+        fn shutdown(&self, reason: hal_api::ShutdownReason) -> ! {
+            panic!("test lifecycle shutdown should never be entered: {:?}", reason);
+        }
     }
 
     impl HalInterrupt for TestInterrupt {

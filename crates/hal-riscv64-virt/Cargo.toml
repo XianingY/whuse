@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fdt.workspace = true
 hal-api = { path = "../hal-api" }
 hal-virtio = { path = "../hal-virtio" }
 spin.workspace = true

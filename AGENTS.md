@@ -112,6 +112,16 @@ Use `strings` first — QEMU log output is binary-mixed; plain `grep` will repor
 TIMEOUT_SECS=2400 WHUSE_LTP_PROFILE=score tools/dev/run_oscomp_stage2.sh ltp-riscv
 ```
 
+### 3.6 Raw exit verification (contest-style)
+
+```bash
+TIMEOUT_SECS=2400 tools/dev/run_oscomp_stage2.sh riscv-raw-exit
+TIMEOUT_SECS=2400 tools/dev/run_oscomp_stage2.sh loongarch-raw-exit
+```
+
+These modes disable helper-side `suite-done` termination and require the guest
+to print the shutdown marker and let QEMU exit on its own.
+
 ## 4) Current Flow (可复现现状 / Default Today)
 
 Current recommended default for validation is real execution (`WHUSE_OSCOMP_COMPAT=0`) and contest-mode QEMU:
@@ -157,16 +167,18 @@ Failure handling:
 The suite script order is:
 
 1. `time-test` (missing file -> explicit skip marker)
-2. `busybox_testcode.sh` (compat script when `WHUSE_OSCOMP_COMPAT=1`)
-3. `iozone_testcode.sh`
-4. `libctest_testcode.sh`
-5. `libc-bench`
-6. `lmbench_testcode.sh`
-7. `lua_testcode.sh`
-8. `unixbench_testcode.sh`
-9. `netperf_testcode.sh`
-10. `iperf_testcode.sh`
-11. `cyclic_testcode.sh` (or fallback to `cyclictest_testcode.sh`)
+2. `basic_testcode.sh`
+3. `busybox_testcode.sh` (compat script when `WHUSE_OSCOMP_COMPAT=1`)
+4. `iozone_testcode.sh`
+5. `libctest_testcode.sh`
+6. `libc-bench`
+7. `ltp_testcode.sh`
+8. `lmbench_testcode.sh`
+9. `lua_testcode.sh`
+10. `unixbench_testcode.sh`
+11. `netperf_testcode.sh`
+12. `iperf_testcode.sh`
+13. `cyclic_testcode.sh` (or fallback to `cyclictest_testcode.sh`)
 
 ### 4.3 Current known status (as of 2026-03-30)
 
@@ -267,6 +279,9 @@ Use these checks for any run log:
 # required suite closure
 strings /tmp/rv-*.log | grep "whuse-oscomp-suite-done"
 
+# raw-exit closure marker (required for contest-style exit validation)
+strings /tmp/rv-*.log | grep "whuse: contest shutdown requested reason="
+
 # crash signatures (must be empty)
 strings /tmp/rv-*.log | grep "panic\|pid 1 (init).*trap\|trapped with scause"
 
@@ -277,6 +292,7 @@ strings /tmp/rv-*.log | grep "whuse-oscomp-step-begin\|whuse-oscomp-step-end\|wh
 Pass/Fail policy:
 
 - PASS (flow): reaches `whuse-oscomp-suite-done` and no kernel panic/init-crash.
+- PASS (raw-exit): reaches `whuse-oscomp-suite-done`, prints `whuse: contest shutdown requested reason=...`, and QEMU exits without helper-side kill.
 - FAIL (flow): missing suite-done, or panic/init-crash present.
 - QUALITY score: count `testcase .* fail|error` lines per group for trend tracking.
 

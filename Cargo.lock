@@ -83,6 +83,7 @@ dependencies = [
 name = "hal-riscv64-virt"
 version = "0.1.0"
 dependencies = [
+ "fdt",
  "hal-api",
  "hal-virtio",
  "spin",

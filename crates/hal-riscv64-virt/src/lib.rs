@@ -10,10 +10,11 @@ use core::ptr::NonNull;
 #[cfg(target_arch = "riscv64")]
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use fdt::Fdt;
 use hal_api::{
     register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
     HalNetDevice, HalPlatform, HalPlatformLifecycle, HalTimer, MemoryRegion, PlatformArch,
-    Timespec, TrapFrame, VmSpaceToken,
+    ShutdownReason, Timespec, TrapFrame, VmSpaceToken,
 };
 use hal_virtio::{
     parse_riscv_virtio_discovery, virtio_error_to_errno, RiscvVirtioDiscovery, VirtioBlockConfig,
@@ -43,6 +44,9 @@ const RISCV_TIMEBASE_HZ: u64 = 10_000_000;
 const SBI_EXT_TIME: usize = 0x5449_4d45;
 const SBI_FID_SET_TIMER: usize = 0;
 const SBI_EXT_LEGACY_SET_TIMER: usize = 0x00;
+const SBI_EXT_SRST: usize = 0x5352_5354;
+const SBI_FID_SYSTEM_RESET: usize = 0;
+const SBI_SRST_RESET_TYPE_SHUTDOWN: usize = 0;
 
 static CPU: VirtCpu = VirtCpu::new();
 static INTERRUPT: VirtInterruptController = VirtInterruptController::new();
@@ -56,6 +60,16 @@ static VIRTIO_NET: VirtioNetStub = VirtioNetStub;
 static BLOCK_DEVS: [&'static dyn HalBlockDevice; 1] = [&VIRTIO_BLK];
 static NET_DEVS: [&'static dyn HalNetDevice; 1] = [&VIRTIO_NET];
 static DMA_ARENA: VirtioDmaArena<DMA_ARENA_BYTES, DMA_ARENA_WORDS> = VirtioDmaArena::new();
+static SHUTDOWN_BASE: AtomicUsize = AtomicUsize::new(0);
+static SHUTDOWN_OFFSET: AtomicUsize = AtomicUsize::new(0);
+static SHUTDOWN_VALUE: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ShutdownConfig {
+    base: usize,
+    offset: usize,
+    value: usize,
+}
 
 #[cfg(target_arch = "riscv64")]
 #[no_mangle]
@@ -376,6 +390,9 @@ static mut MEMORY_MAP: [MemoryRegion; 2] = [
 
 pub fn bootstrap(dtb_pa: usize) {
     if dtb_pa != 0 {
+        if let Some(config) = parse_syscon_shutdown_config_from_ptr(dtb_pa as *const u8) {
+            cache_shutdown_config(config);
+        }
         if let Some(discovery) = parse_riscv_virtio_discovery(dtb_pa) {
             INTERRUPT.configure(discovery.plic);
             VIRTIO_BLK.bootstrap(&discovery);
@@ -467,6 +484,10 @@ impl HalPlatformLifecycle for VirtLifecycle {
             #[cfg(not(target_arch = "riscv64"))]
             core::hint::spin_loop();
         }
+    }
+
+    fn shutdown(&self, reason: ShutdownReason) -> ! {
+        shutdown(reason)
     }
 }
 
@@ -757,6 +778,30 @@ fn nanos_to_time_ticks(nanos: u64) -> u64 {
     nanos.saturating_mul(RISCV_TIMEBASE_HZ) / 1_000_000_000
 }
 
+fn shutdown(reason: ShutdownReason) -> ! {
+    #[cfg(target_arch = "riscv64")]
+    {
+        if sbi_system_shutdown(reason) != 0 {
+            if let Some(config) = cached_shutdown_config() {
+                unsafe {
+                    write_volatile(
+                        (config.base + config.offset) as *mut u32,
+                        config.value as u32,
+                    );
+                }
+            }
+        }
+        loop {
+            unsafe {
+                core::arch::asm!("wfi");
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    panic!("shutdown requested on host stub: {:?}", reason);
+}
+
 #[cfg(target_arch = "riscv64")]
 fn sbi_set_timer_v02(timer_ticks: u64) -> isize {
     let error: isize;
@@ -789,6 +834,123 @@ fn sbi_set_timer_legacy(timer_ticks: u64) -> isize {
         );
     }
     error
+}
+
+#[cfg(target_arch = "riscv64")]
+fn sbi_system_shutdown(reason: ShutdownReason) -> isize {
+    let error: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") SBI_SRST_RESET_TYPE_SHUTDOWN => error,
+            inlateout("a1") sbi_shutdown_reason_code(reason) => _,
+            in("a6") SBI_FID_SYSTEM_RESET,
+            in("a7") SBI_EXT_SRST,
+            lateout("a2") _,
+            lateout("a3") _,
+            lateout("a4") _,
+            lateout("a5") _,
+        );
+    }
+    error
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn sbi_system_shutdown(_reason: ShutdownReason) -> isize {
+    -1
+}
+
+fn sbi_shutdown_reason_code(reason: ShutdownReason) -> usize {
+    match reason {
+        ShutdownReason::Success => 0,
+        ShutdownReason::Failure => 1,
+    }
+}
+
+fn cache_shutdown_config(config: ShutdownConfig) {
+    SHUTDOWN_BASE.store(config.base, Ordering::Relaxed);
+    SHUTDOWN_OFFSET.store(config.offset, Ordering::Relaxed);
+    SHUTDOWN_VALUE.store(config.value, Ordering::Relaxed);
+}
+
+fn cached_shutdown_config() -> Option<ShutdownConfig> {
+    let base = SHUTDOWN_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    Some(ShutdownConfig {
+        base,
+        offset: SHUTDOWN_OFFSET.load(Ordering::Relaxed),
+        value: SHUTDOWN_VALUE.load(Ordering::Relaxed),
+    })
+}
+
+fn parse_syscon_shutdown_config_from_ptr(dtb: *const u8) -> Option<ShutdownConfig> {
+    let fdt = unsafe { Fdt::from_ptr_unaligned(dtb).ok()? };
+    let mut regmap_phandle = None;
+    let mut offset = None;
+    let mut value = None;
+
+    for (_depth, node) in fdt.all_nodes() {
+        let Some(compatible) = node.raw_property("compatible") else {
+            continue;
+        };
+        if !compatible_contains(compatible.value, b"syscon-poweroff") {
+            continue;
+        }
+        regmap_phandle = first_u32(node.raw_property("regmap")?.value);
+        offset = first_u32(node.raw_property("offset")?.value).map(|value| value as usize);
+        value = first_u32(node.raw_property("value")?.value).map(|value| value as usize);
+        break;
+    }
+
+    let regmap_phandle = regmap_phandle?;
+
+    for (_depth, node) in fdt.all_nodes() {
+        let Some(phandle) = node.raw_property("phandle") else {
+            continue;
+        };
+        if first_u32(phandle.value)? != regmap_phandle {
+            continue;
+        }
+        return Some(ShutdownConfig {
+            base: first_u64(node.raw_property("reg")?.value)?,
+            offset: offset?,
+            value: value?,
+        });
+    }
+    None
+}
+
+fn parse_syscon_shutdown_config_from_dtb(dtb: &[u8]) -> Option<ShutdownConfig> {
+    if dtb.is_empty() {
+        return None;
+    }
+    parse_syscon_shutdown_config_from_ptr(dtb.as_ptr())
+}
+
+fn compatible_contains(value: &[u8], needle: &[u8]) -> bool {
+    value.split(|byte| *byte == 0).any(|part| part == needle)
+}
+
+fn first_u32(bytes: &[u8]) -> Option<u32> {
+    bytes.get(..4).map(read_be_u32)
+}
+
+fn first_u64(bytes: &[u8]) -> Option<usize> {
+    bytes.get(..8).map(read_be_u64).map(|value| value as usize)
+}
+
+fn read_be_u32(bytes: &[u8]) -> u32 {
+    let mut out = [0u8; 4];
+    out.copy_from_slice(&bytes[..4]);
+    u32::from_be_bytes(out)
+}
+
+fn read_be_u64(bytes: &[u8]) -> u64 {
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&bytes[..8]);
+    u64::from_be_bytes(out)
 }
 
 impl HalTimer for VirtTimer {
@@ -1099,5 +1261,32 @@ unsafe impl VirtioHal for RiscvVirtioHal {
             }
         }
         let _ = DMA_ARENA.dealloc(paddr, pages);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_syscon_shutdown_config_from_dtb, sbi_shutdown_reason_code, ShutdownConfig,
+    };
+    use hal_api::ShutdownReason;
+
+    #[test]
+    fn parses_syscon_poweroff_from_qemu_fixture_dtb() {
+        let dtb = include_bytes!("../../../vendor/fdt/dtb/test.dtb");
+        assert_eq!(
+            parse_syscon_shutdown_config_from_dtb(dtb),
+            Some(ShutdownConfig {
+                base: 0x0010_0000,
+                offset: 0,
+                value: 0x5555,
+            })
+        );
+    }
+
+    #[test]
+    fn maps_shutdown_reason_to_sbi_reason_code() {
+        assert_eq!(sbi_shutdown_reason_code(ShutdownReason::Success), 0);
+        assert_eq!(sbi_shutdown_reason_code(ShutdownReason::Failure), 1);
     }
 }

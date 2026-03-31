@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
 use fs_ext4::Ext4Mount;
-use hal_api::{hal, ConsoleWriter, PlatformArch};
+use hal_api::{hal, ConsoleWriter, PlatformArch, ShutdownReason};
 use mm::MemoryManager;
 use mm::{BinaryLoader, ElfBinaryLoader};
 use proc::ProcessTable;
@@ -46,6 +46,20 @@ pub struct Kernel {
     watchdog_bench_window_until_ns: u64,
     watchdog_libcbench_dumped_at: BTreeMap<usize, u64>,
     timer_irq_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelIdleOutcome {
+    WaitForInterrupt,
+    Shutdown,
+}
+
+fn idle_outcome_for_process_count(process_count: usize) -> KernelIdleOutcome {
+    if process_count == 0 {
+        KernelIdleOutcome::Shutdown
+    } else {
+        KernelIdleOutcome::WaitForInterrupt
+    }
 }
 
 const USER_INIT_BASE: usize = 0x0040_0000;
@@ -1563,6 +1577,14 @@ impl Kernel {
                 continue;
             }
             if self.scheduler.ensure_current().is_none() {
+                let live_process_count = self.processes.process_count();
+                if idle_outcome_for_process_count(live_process_count) == KernelIdleOutcome::Shutdown
+                {
+                    logln(format_args!(
+                        "whuse: contest shutdown requested reason=success live_processes=0"
+                    ));
+                    hal().lifecycle.shutdown(ShutdownReason::Success);
+                }
                 let has_non_init = self
                     .processes
                     .process_snapshots()
@@ -3366,8 +3388,9 @@ fn log_block_probe_span(device: &'static dyn hal_api::HalBlockDevice, start: usi
 #[cfg(test)]
 mod tests {
     use super::{
-        render_oscomp_official_suite_script, render_selected_oscomp_suite_script,
-        select_oscomp_suite_script, OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH,
+        idle_outcome_for_process_count, render_oscomp_official_suite_script,
+        render_selected_oscomp_suite_script, select_oscomp_suite_script, KernelIdleOutcome,
+        OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH,
     };
     use vfs::KernelVfs;
 
@@ -3515,6 +3538,26 @@ mod tests {
         assert!(
             ltp < lmbench,
             "full profile should schedule ltp before lmbench so contest fullsuite reaches ltp earlier"
+        );
+    }
+
+    #[test]
+    fn idle_without_live_processes_requests_shutdown() {
+        assert_eq!(
+            idle_outcome_for_process_count(0),
+            KernelIdleOutcome::Shutdown
+        );
+    }
+
+    #[test]
+    fn idle_with_live_processes_keeps_waiting() {
+        assert_eq!(
+            idle_outcome_for_process_count(1),
+            KernelIdleOutcome::WaitForInterrupt
+        );
+        assert_eq!(
+            idle_outcome_for_process_count(3),
+            KernelIdleOutcome::WaitForInterrupt
         );
     }
 }

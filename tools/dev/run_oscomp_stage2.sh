@@ -32,6 +32,7 @@ export WHUSE_OSCOMP_COMPAT="${WHUSE_OSCOMP_COMPAT:-0}"
 export WHUSE_QEMU_MODE="${WHUSE_QEMU_MODE:-contest}"
 export WHUSE_STAGE2_USE_IMAGE_COPY="${WHUSE_STAGE2_USE_IMAGE_COPY:-0}"
 export WHUSE_STAGE2_STOP_ON_SUITE_DONE="${WHUSE_STAGE2_STOP_ON_SUITE_DONE:-1}"
+export WHUSE_STAGE2_REQUIRE_GUEST_SHUTDOWN="${WHUSE_STAGE2_REQUIRE_GUEST_SHUTDOWN:-0}"
 export WHUSE_STAGE2_CLEAN_QEMU="${WHUSE_STAGE2_CLEAN_QEMU:-1}"
 export WHUSE_OSCOMP_PROFILE="${WHUSE_OSCOMP_PROFILE:-}"
 export WHUSE_OSCOMP_CASE_FILTER="${WHUSE_OSCOMP_CASE_FILTER:-}"
@@ -364,13 +365,13 @@ check_image_complete() {
 ensure_oscomp_images() {
     local requested_arches=()
     case "${MODE}" in
-    riscv) requested_arches=("rv") ;;
-    loongarch) requested_arches=("la") ;;
+    riscv | riscv-raw-exit) requested_arches=("rv") ;;
+    loongarch | loongarch-raw-exit) requested_arches=("la") ;;
     ltp-riscv) requested_arches=("rv") ;;
     ltp-riscv-curated) requested_arches=("rv") ;;
-    both) requested_arches=("rv" "la") ;;
+    both | both-raw-exit) requested_arches=("rv" "la") ;;
     *)
-        echo "usage: $0 [riscv|loongarch|ltp-riscv|ltp-riscv-curated|both]" >&2
+        echo "usage: $0 [riscv|riscv-raw-exit|loongarch|loongarch-raw-exit|ltp-riscv|ltp-riscv-curated|both|both-raw-exit]" >&2
         exit 2
         ;;
     esac
@@ -475,7 +476,12 @@ write_runtime_image_text_file() {
 inject_oscomp_profile() {
     local image="$1"
     local profile="$2"
+    local known
+    for known in full basic busybox iozone libctest libc-bench lmbench lua ltp unixbench netperf iperf cyclic; do
+        debugfs -w -R "rm /whuse-oscomp-profile.${known}" "${image}" >/dev/null 2>&1 || true
+    done
     write_runtime_image_config "${image}" "/whuse-oscomp-profile" "${profile}"
+    write_runtime_image_config "${image}" "/whuse-oscomp-profile.${profile}" ""
 }
 
 inject_oscomp_runtime_filter() {
@@ -845,6 +851,7 @@ run_arch() {
     local runtime_image
     local suite_done_seen=0
     local terminated_by_suite_done=0
+    local runner_status=0
     local effective_profile
     prepare_runtime_image "${arch}" "${image}"
     runtime_image="${prepared_runtime_image}"
@@ -882,9 +889,9 @@ run_arch() {
             fi
             sleep 1
         done
-        wait "${runner_pid}" || true
+        wait "${runner_pid}" || runner_status=$?
     else
-        timeout "${TIMEOUT_SECS}s" env WHUSE_DISK_IMAGE="${runtime_image}" "${XTASK_CMD[@]}" "${xtask_cmd}" >"${log}" 2>&1 || true
+        timeout "${TIMEOUT_SECS}s" env WHUSE_DISK_IMAGE="${runtime_image}" "${XTASK_CMD[@]}" "${xtask_cmd}" >"${log}" 2>&1 || runner_status=$?
     fi
     strings "${log}" >"${text_log}" || true
     echo "[${arch}] log: ${log}"
@@ -921,6 +928,19 @@ run_arch() {
             ok=1
         fi
     done
+
+    if [[ "${WHUSE_STAGE2_REQUIRE_GUEST_SHUTDOWN}" == "1" ]]; then
+        if rg -q "whuse: contest shutdown requested reason=" "${text_log}"; then
+            echo "[${arch}] guest shutdown marker ok"
+        else
+            echo "[${arch}] missing guest shutdown marker" >&2
+            ok=1
+        fi
+        if [[ "${runner_status}" -ne 0 ]]; then
+            echo "[${arch}] raw-exit runner did not exit cleanly (status=${runner_status})" >&2
+            ok=1
+        fi
+    fi
 
     if [[ "${effective_profile}" == "basic" ]]; then
         if case_filter_matches_profile "basic"; then
@@ -1012,6 +1032,26 @@ run_arch() {
     echo "[${arch}] quality summary: step-timeout=${timeout_count} testcase-fail=${fail_count} testcase-error=${error_count} bench-watchdog-timeout=${bench_watchdog_count} suite_done_seen=${suite_done_seen} terminated_by_suite_done=${terminated_by_suite_done}"
 
     return "${ok}"
+}
+
+run_arch_raw_exit() {
+    local arch="$1"
+    local image="$2"
+    local xtask_cmd="$3"
+    local prev_stop_on_suite_done="${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"
+    local prev_require_guest_shutdown="${WHUSE_STAGE2_REQUIRE_GUEST_SHUTDOWN}"
+    local rc=0
+
+    export WHUSE_STAGE2_STOP_ON_SUITE_DONE=0
+    export WHUSE_STAGE2_REQUIRE_GUEST_SHUTDOWN=1
+    if run_arch "${arch}" "${image}" "${xtask_cmd}"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    export WHUSE_STAGE2_STOP_ON_SUITE_DONE="${prev_stop_on_suite_done}"
+    export WHUSE_STAGE2_REQUIRE_GUEST_SHUTDOWN="${prev_require_guest_shutdown}"
+    return "${rc}"
 }
 
 run_ltp_riscv_mode() {
@@ -1147,8 +1187,14 @@ case "${MODE}" in
 riscv)
     run_arch "rv" "${RV_IMG}" "qemu-riscv"
     ;;
+riscv-raw-exit)
+    run_arch_raw_exit "rv" "${RV_IMG}" "qemu-riscv"
+    ;;
 loongarch)
     run_arch "la" "${LA_IMG}" "qemu-loongarch"
+    ;;
+loongarch-raw-exit)
+    run_arch_raw_exit "la" "${LA_IMG}" "qemu-loongarch"
     ;;
 ltp-riscv)
     run_ltp_riscv
@@ -1160,8 +1206,12 @@ both)
     run_arch "rv" "${RV_IMG}" "qemu-riscv"
     run_arch "la" "${LA_IMG}" "qemu-loongarch"
     ;;
+both-raw-exit)
+    run_arch_raw_exit "rv" "${RV_IMG}" "qemu-riscv"
+    run_arch_raw_exit "la" "${LA_IMG}" "qemu-loongarch"
+    ;;
 *)
-    echo "usage: $0 [riscv|loongarch|ltp-riscv|ltp-riscv-curated|both]" >&2
+    echo "usage: $0 [riscv|riscv-raw-exit|loongarch|loongarch-raw-exit|ltp-riscv|ltp-riscv-curated|both|both-raw-exit]" >&2
     exit 2
     ;;
 esac

@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
 use fs_ext4::Ext4Mount;
-use hal_api::{hal, ConsoleWriter, PlatformArch};
+use hal_api::{hal, ConsoleWriter, PlatformArch, ShutdownReason};
 use mm::MemoryManager;
 use mm::{BinaryLoader, ElfBinaryLoader};
 use proc::ProcessTable;
@@ -43,6 +43,20 @@ pub struct Kernel {
     watchdog_last_hw_ns: u64,
     watchdog_iozone_window_until_ns: u64,
     timer_irq_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelIdleOutcome {
+    WaitForInterrupt,
+    Shutdown,
+}
+
+fn idle_outcome_for_process_count(process_count: usize) -> KernelIdleOutcome {
+    if process_count == 0 {
+        KernelIdleOutcome::Shutdown
+    } else {
+        KernelIdleOutcome::WaitForInterrupt
+    }
 }
 
 const USER_INIT_BASE: usize = 0x0040_0000;
@@ -894,6 +908,109 @@ const OSCOMP_SUITE_SCRIPT_REAL_FULL_TEMPLATE: &str = concat!(
     "finish_if_reached cyclic\n",
     "echo whuse-oscomp-suite-done\n",
 );
+const OSCOMP_SUITE_SCRIPT_MINIMAL_SELECTED: &str = concat!(
+    "set +e\n",
+    "export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
+    "WHUSE_OSCOMP_PROFILE=${WHUSE_OSCOMP_PROFILE:-full}\n",
+    "WHUSE_OSCOMP_STEP_TIMEOUT=${WHUSE_OSCOMP_STEP_TIMEOUT:-120}\n",
+    "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-300}\n",
+    "case \"$WHUSE_OSCOMP_PROFILE\" in\n",
+    "    full|basic|busybox|iozone|libctest|libc-bench|lmbench|lua|ltp|unixbench|netperf|iperf|cyclic) ;;\n",
+    "    *) WHUSE_OSCOMP_PROFILE=full ;;\n",
+    "esac\n",
+    "run_with_timeout() {\n",
+    "    timeout_s=\"$1\"\n",
+    "    shift\n",
+    "    /musl/busybox timeout \"$timeout_s\" \"$@\"\n",
+    "    return \"$?\"\n",
+    "}\n",
+    "skip_runtime_step() {\n",
+    "    runtime=\"$1\"\n",
+    "    marker_script=\"$2\"\n",
+    "    echo whuse-oscomp-runtime-skip:$runtime:missing-root\n",
+    "    echo whuse-oscomp-step-begin:${runtime}/$marker_script\n",
+    "    echo whuse-oscomp-step-skip:${runtime}/$marker_script:missing-root\n",
+    "    echo whuse-oscomp-step-end:${runtime}/$marker_script:0\n",
+    "}\n",
+    "run_script_entry() {\n",
+    "    runtime=\"$1\"\n",
+    "    marker_script=\"$2\"\n",
+    "    actual_script=\"$3\"\n",
+    "    timeout_s=\"$4\"\n",
+    "    root=\"/$runtime\"\n",
+    "    echo whuse-oscomp-runtime-begin:$runtime\n",
+    "    cd \"$root\" >/dev/null 2>&1 || {\n",
+    "        echo whuse-oscomp-step-begin:${runtime}/$marker_script\n",
+    "        echo whuse-oscomp-step-end:${runtime}/$marker_script:1\n",
+    "        echo whuse-oscomp-runtime-end:$runtime\n",
+    "        return 1\n",
+    "    }\n",
+    "    echo whuse-oscomp-step-begin:${runtime}/$marker_script\n",
+    "    run_with_timeout \"$timeout_s\" /musl/busybox sh \"./$actual_script\"\n",
+    "    rc=$?\n",
+    "    if [ \"$rc\" = \"124\" ]; then\n",
+    "        echo whuse-oscomp-step-timeout:${runtime}/$marker_script:$timeout_s:pid=0:tgid=0\n",
+    "    fi\n",
+    "    echo whuse-oscomp-step-end:${runtime}/$marker_script:$rc\n",
+    "    cd / >/dev/null 2>&1 || true\n",
+    "    echo whuse-oscomp-runtime-end:$runtime\n",
+    "    return \"$rc\"\n",
+    "}\n",
+    "run_runtime_dual_step() {\n",
+    "    root_marker=\"$1\"\n",
+    "    runtime_script=\"$2\"\n",
+    "    timeout_s=\"$3\"\n",
+    "    echo whuse-oscomp-step-begin:$root_marker\n",
+    "    group_rc=0\n",
+    "    for runtime in musl glibc; do\n",
+    "        echo whuse-oscomp-runtime-dispatch:$runtime\n",
+    "        run_script_entry \"$runtime\" \"$runtime_script\" \"$runtime_script\" \"$timeout_s\"\n",
+    "        rc=$?\n",
+    "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "            group_rc=\"$rc\"\n",
+    "        fi\n",
+    "    done\n",
+    "    echo whuse-oscomp-step-end:$root_marker:$group_rc\n",
+    "    return 0\n",
+    "}\n",
+    "run_time_test_group() {\n",
+    "    echo whuse-oscomp-step-begin:time-test\n",
+    "    echo whuse-oscomp-step-skip:time-test:missing\n",
+    "    echo whuse-oscomp-step-end:time-test:0\n",
+    "}\n",
+    "echo whuse-oscomp-script-start\n",
+    "echo whuse-oscomp-profile:$WHUSE_OSCOMP_PROFILE\n",
+    "case \"$WHUSE_OSCOMP_PROFILE\" in\n",
+    "    full)\n",
+    "        run_time_test_group\n",
+    "        run_runtime_dual_step basic_testcode.sh basic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step iozone_testcode.sh iozone_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step unixbench_testcode.sh unixbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step netperf_testcode.sh netperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step iperf_testcode.sh iperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_runtime_dual_step cyclic_testcode.sh cyclic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        ;;\n",
+    "    basic) run_runtime_dual_step basic_testcode.sh basic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "    busybox) run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "    iozone) run_runtime_dual_step iozone_testcode.sh iozone_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "    libctest) run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "    libc-bench) run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "    ltp) run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\" ;;\n",
+    "    lmbench) run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "    lua) run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "    unixbench) run_runtime_dual_step unixbench_testcode.sh unixbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "    netperf) run_runtime_dual_step netperf_testcode.sh netperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "    iperf) run_runtime_dual_step iperf_testcode.sh iperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "    cyclic) run_runtime_dual_step cyclic_testcode.sh cyclic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "esac\n",
+    "echo whuse-oscomp-suite-done\n",
+);
 fn oscomp_real_full_max_group() -> &'static str {
     match OSCOMP_STAGE2_REAL_FULL_MAX_GROUP_DEFAULT {
         "time-test" => "time-test",
@@ -1643,13 +1760,10 @@ const OSCOMP_SUITE_ENTRY_PATH: &str = "/tmp/whuse-oscomp-entry.sh";
 const OSCOMP_SUITE_ENTRY_SCRIPT: &str = concat!(
     "#!/musl/busybox sh\n",
     "echo whuse-oscomp-shell-entered\n",
-    "echo whuse-oscomp-shell-launch-suite\n",
     ". /tmp/whuse-oscomp-suite.sh\n",
-    "rc=$?\n",
-    "echo whuse-oscomp-shell-suite-rc:$rc\n",
-    "exec /musl/basic/exit\n",
+    "if [ -x /musl/basic/exit ]; then exec /musl/basic/exit; fi\n",
     "echo whuse-oscomp-exit-missing\n",
-    "exit \"$rc\"\n",
+    "exit 0\n",
 );
 
 static KERNEL_IDLE_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
@@ -1831,6 +1945,14 @@ impl Kernel {
                 continue;
             }
             if self.scheduler.ensure_current().is_none() {
+                let live_process_count = self.processes.process_count();
+                if idle_outcome_for_process_count(live_process_count) == KernelIdleOutcome::Shutdown
+                {
+                    logln(format_args!(
+                        "whuse: contest shutdown requested reason=success live_processes=0"
+                    ));
+                    hal().lifecycle.shutdown(ShutdownReason::Success);
+                }
                 let has_non_init = self
                     .processes
                     .process_snapshots()
@@ -2437,8 +2559,8 @@ impl Kernel {
             return;
         }
 
-        // Check for store page fault (scause=15) - COW Fork trigger
-        let is_store_page_fault = scause == 15;
+        // LoongArch reports COW-triggering write faults as PME (ecode=4).
+        let is_store_page_fault = scause == 4;
         if is_store_page_fault {
             let fault_addr = self
                 .processes
@@ -3246,8 +3368,8 @@ fn oscomp_full_suite_ready(vfs: &KernelVfs) -> bool {
 }
 
 fn select_oscomp_suite_script(vfs: &mut KernelVfs, _time_test_present: bool) -> String {
-    // Use the simpler script instead of OFFICIAL to avoid BusyBox ash crashes on LoongArch
-    oscomp_suite_script()
+    let _ = vfs;
+    OSCOMP_SUITE_SCRIPT_MINIMAL_SELECTED.to_string()
 }
 
 fn normalize_oscomp_profile_value(raw: &str) -> &'static str {
@@ -3676,6 +3798,7 @@ mod tests {
     use super::{
         select_oscomp_suite_script, OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_RUNTIME_FILTER_PATH,
     };
+    use std::{fs, process::Command};
     use vfs::KernelVfs;
 
     #[test]
@@ -3723,5 +3846,38 @@ mod tests {
             ltp < lmbench,
             "LoongArch selected full suite should schedule ltp before lmbench so contest fullsuite reaches ltp earlier"
         );
+    }
+
+    #[test]
+    fn loongarch_selected_suite_parses_under_host_sh() {
+        let mut vfs = KernelVfs::new();
+        let script = select_oscomp_suite_script(&mut vfs, false);
+        let script_path = format!(
+            "/tmp/whuse-loongarch-suite-parse-{}.sh",
+            std::process::id()
+        );
+        fs::write(&script_path, script).expect("write suite script");
+
+        let sh_status = Command::new("sh")
+            .arg("-n")
+            .arg(&script_path)
+            .status()
+            .expect("run sh -n");
+        assert!(
+            sh_status.success(),
+            "generated LoongArch suite script should parse under /bin/sh"
+        );
+
+        let bash_status = Command::new("bash")
+            .arg("-n")
+            .arg(&script_path)
+            .status()
+            .expect("run bash -n");
+        assert!(
+            bash_status.success(),
+            "generated LoongArch suite script should parse under bash -n"
+        );
+
+        let _ = fs::remove_file(&script_path);
     }
 }

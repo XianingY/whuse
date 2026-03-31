@@ -309,11 +309,9 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     }
     let mut console = hal_api::ConsoleWriter;
     let _ = core::fmt::Write::write_fmt(&mut console, format_args!("{}\n", info));
-    loop {
-        unsafe {
-            core::arch::asm!("wfi");
-        }
-    }
+    hal_api::hal()
+        .lifecycle
+        .shutdown(hal_api::ShutdownReason::Failure)
 }
 
 #[cfg(not(target_os = "none"))]

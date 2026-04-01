@@ -881,8 +881,10 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        return 0\n",
     "    fi\n",
     "    echo whuse-oscomp-step-begin:$step\n",
+    "    emit_runtime_group_begin \"$(runtime_group_name_for musl \"$step\")\"\n",
     "    run_ltp_body \"$timeout_s\"\n",
     "    rc=$?\n",
+    "    emit_runtime_group_end \"$(runtime_group_name_for musl \"$step\")\"\n",
     "    echo whuse-oscomp-step-end:$step:$rc\n",
     "    return \"$rc\"\n",
     "}\n",
@@ -1148,6 +1150,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    if [ -z \"$actual_script\" ]; then\n",
     "        actual_script=\"$marker_script\"\n",
     "    fi\n",
+    "    runtime_group=\"$(runtime_group_name_for \"$runtime\" \"$marker_script\")\"\n",
     "    echo whuse-oscomp-runtime-begin:$runtime\n",
     "    cd \"$root\" || {\n",
     "        echo whuse-oscomp-step-begin:${runtime}/$marker_script\n",
@@ -1156,6 +1159,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        return 1\n",
     "    }\n",
     "    echo whuse-oscomp-step-begin:${runtime}/$marker_script\n",
+    "    emit_runtime_group_begin \"$runtime_group\"\n",
     "    if [ \"$WHUSE_OSCOMP_PROFILE\" = \"basic\" ] && [ \"$marker_script\" = \"basic_testcode.sh\" ]; then\n",
     "        if [ \"$runtime\" = \"glibc\" ]; then\n",
     "            if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
@@ -1193,6 +1197,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    if [ \"$rc\" = \"124\" ]; then\n",
     "        echo whuse-oscomp-step-timeout:${runtime}/$marker_script:$timeout_s:pid=0:tgid=0\n",
     "    fi\n",
+    "    emit_runtime_group_end \"$runtime_group\"\n",
     "    echo whuse-oscomp-step-end:${runtime}/$marker_script:$rc\n",
     "    cd / || return 1\n",
     "    echo whuse-oscomp-runtime-end:$runtime\n",
@@ -1218,6 +1223,25 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        \"$runtime\") return 0 ;;\n",
     "        *) return 1 ;;\n",
     "    esac\n",
+    "}\n",
+    "runtime_group_name_for() {\n",
+    "    runtime=\"$1\"\n",
+    "    marker_script=\"$2\"\n",
+    "    case \"$marker_script\" in\n",
+    "        libctest_testcode.sh) echo \"libctest-$runtime\" ;;\n",
+    "        ltp_testcode.sh) echo \"ltp-$runtime\" ;;\n",
+    "        *) echo \"\" ;;\n",
+    "    esac\n",
+    "}\n",
+    "emit_runtime_group_begin() {\n",
+    "    group=\"$1\"\n",
+    "    [ -n \"$group\" ] || return 0\n",
+    "    echo \"#### OS COMP TEST GROUP START $group ####\"\n",
+    "}\n",
+    "emit_runtime_group_end() {\n",
+    "    group=\"$1\"\n",
+    "    [ -n \"$group\" ] || return 0\n",
+    "    echo \"#### OS COMP TEST GROUP END $group ####\"\n",
     "}\n",
     "skip_runtime_step() {\n",
     "    runtime=\"$1\"\n",
@@ -1379,7 +1403,9 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    fi\n",
     "    if runtime_selected glibc; then\n",
     "        echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "        emit_runtime_group_begin \"$(runtime_group_name_for glibc \"$step\")\"\n",
     "        skip_runtime_step_with_reason glibc \"$step\" glibc-libctest-known-oom\n",
+    "        emit_runtime_group_end \"$(runtime_group_name_for glibc \"$step\")\"\n",
     "    else\n",
     "        skip_runtime_step glibc \"$step\"\n",
     "    fi\n",
@@ -1393,8 +1419,10 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    group_rc=0\n",
     "    if runtime_selected musl; then\n",
     "        echo whuse-oscomp-runtime-dispatch:musl\n",
+    "        emit_runtime_group_begin \"$(runtime_group_name_for musl \"$step\")\"\n",
     "        run_ltp_body \"$timeout_s\"\n",
     "        rc=$?\n",
+    "        emit_runtime_group_end \"$(runtime_group_name_for musl \"$step\")\"\n",
     "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
     "            group_rc=\"$rc\"\n",
     "        fi\n",
@@ -1403,7 +1431,9 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    fi\n",
     "    if runtime_selected glibc; then\n",
     "        echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "        emit_runtime_group_begin \"$(runtime_group_name_for glibc \"$step\")\"\n",
     "        skip_runtime_step_with_reason glibc \"$step\" glibc-ltp-not-scored\n",
+    "        emit_runtime_group_end \"$(runtime_group_name_for glibc \"$step\")\"\n",
     "    else\n",
     "        skip_runtime_step glibc \"$step\"\n",
     "    fi\n",
@@ -3335,6 +3365,27 @@ fn render_selected_oscomp_suite_script(profile_default: &str) -> String {
 
 fn render_oscomp_internal_ltp_suite_script() -> String {
     const OSCOMP_LEGACY_SUITE_ENTRY_MARKER: &str = "echo whuse-oscomp-script-start\n";
+    const RUNTIME_GROUP_HELPERS: &str = concat!(
+        "runtime_group_name_for() {\n",
+        "    runtime=\"$1\"\n",
+        "    marker_script=\"$2\"\n",
+        "    case \"$marker_script\" in\n",
+        "        libctest_testcode.sh) echo \"libctest-$runtime\" ;;\n",
+        "        ltp_testcode.sh) echo \"ltp-$runtime\" ;;\n",
+        "        *) echo \"\" ;;\n",
+        "    esac\n",
+        "}\n",
+        "emit_runtime_group_begin() {\n",
+        "    group=\"$1\"\n",
+        "    [ -n \"$group\" ] || return 0\n",
+        "    echo \"#### OS COMP TEST GROUP START $group ####\"\n",
+        "}\n",
+        "emit_runtime_group_end() {\n",
+        "    group=\"$1\"\n",
+        "    [ -n \"$group\" ] || return 0\n",
+        "    echo \"#### OS COMP TEST GROUP END $group ####\"\n",
+        "}\n",
+    );
 
     let (prefix, _) = OSCOMP_SUITE_SCRIPT
         .split_once(OSCOMP_LEGACY_SUITE_ENTRY_MARKER)
@@ -3342,6 +3393,7 @@ fn render_oscomp_internal_ltp_suite_script() -> String {
     let mut script = String::from(prefix);
     script.push_str(OSCOMP_LEGACY_SUITE_ENTRY_MARKER);
     script.push_str("cd /musl || exit 1\n");
+    script.push_str(RUNTIME_GROUP_HELPERS);
     script.push_str("run_ltp_step ltp_testcode.sh \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\"\n");
     script.push_str("echo whuse-oscomp-suite-done\n");
     script
@@ -3636,6 +3688,24 @@ mod tests {
     }
 
     #[test]
+    fn ltp_selected_suite_includes_runtime_group_helpers() {
+        let script = render_selected_oscomp_suite_script("ltp");
+
+        assert!(
+            script.contains("runtime_group_name_for()"),
+            "ltp selected suite should include the runtime-group helper used by run_ltp_step"
+        );
+        assert!(
+            script.contains("emit_runtime_group_begin \"$(runtime_group_name_for musl \"$step\")\""),
+            "ltp selected suite should wrap the musl ltp runner with a runtime group marker"
+        );
+        assert!(
+            script.contains("emit_runtime_group_end \"$(runtime_group_name_for musl \"$step\")\""),
+            "ltp selected suite should close the musl ltp runtime group marker"
+        );
+    }
+
+    #[test]
     fn riscv_full_profile_runs_ltp_before_lmbench() {
         let script = render_oscomp_official_suite_script("full");
         let ltp = script
@@ -3834,6 +3904,58 @@ mod tests {
         assert!(
             helper.contains("run_ltp_body \"$timeout_s\""),
             "full ltp helper should execute the internal score runner"
+        );
+    }
+
+    #[test]
+    fn riscv_full_profile_wraps_libctest_runtime_output_with_group_markers() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            script.contains("runtime_group_name_for()"),
+            "full render should define the runtime group helper"
+        );
+        assert!(
+            script.contains("libctest_testcode.sh) echo \"libctest-$runtime\" ;;"),
+            "runtime group helper should map libctest to runtime-specific site markers"
+        );
+        assert!(
+            script.contains("echo \"#### OS COMP TEST GROUP START $group ####\""),
+            "runtime group helper should emit group-start markers"
+        );
+        assert!(
+            script.contains("emit_runtime_group_begin \"$(runtime_group_name_for glibc \"$step\")\""),
+            "full libctest wrapper should emit a glibc runtime group even when skipped"
+        );
+        assert!(
+            script.contains("emit_runtime_group_end \"$(runtime_group_name_for glibc \"$step\")\""),
+            "full libctest wrapper should close the glibc runtime group even when skipped"
+        );
+    }
+
+    #[test]
+    fn riscv_full_profile_wraps_ltp_runtime_output_with_group_markers() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            script.contains("ltp_testcode.sh) echo \"ltp-$runtime\" ;;"),
+            "runtime group helper should map ltp to runtime-specific site markers"
+        );
+        assert!(
+            script.contains("emit_runtime_group_begin \"$(runtime_group_name_for musl \"$step\")\""),
+            "full ltp wrapper should emit a musl runtime group around the score runner"
+        );
+        assert!(
+            script.contains("emit_runtime_group_end \"$(runtime_group_name_for musl \"$step\")\""),
+            "full ltp wrapper should close the musl runtime group around the score runner"
+        );
+        assert!(
+            script.contains("emit_runtime_group_begin \"$(runtime_group_name_for glibc \"$step\")\""),
+            "full ltp wrapper should emit a glibc runtime group even when skipped"
+        );
+        assert!(
+            script.contains("emit_runtime_group_end \"$(runtime_group_name_for glibc \"$step\")\""),
+            "full ltp wrapper should close the glibc runtime group even when skipped"
         );
     }
 

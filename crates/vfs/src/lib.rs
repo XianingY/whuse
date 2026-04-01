@@ -3146,13 +3146,7 @@ fn should_use_statless_external_open(absolute: &str, flags: u32) -> bool {
     if (flags & O_DIRECTORY) != 0 {
         return false;
     }
-    if is_compat_metadata_fallback_path(absolute) {
-        return true;
-    }
-    if is_libctest_probe_path(absolute) {
-        return true;
-    }
-    false
+    is_compat_metadata_fallback_path(absolute)
 }
 
 fn should_use_statless_external_stat(absolute: &str) -> bool {
@@ -3589,6 +3583,26 @@ mod tests {
         ));
         assert!(!super::should_use_statless_external_open(
             "/musl/basic/test_echo",
+            super::O_RDONLY
+        ));
+        assert!(!super::should_use_statless_external_open(
+            "/musl/run-static.sh",
+            super::O_RDONLY
+        ));
+        assert!(!super::should_use_statless_external_open(
+            "/musl/run-dynamic.sh",
+            super::O_RDONLY
+        ));
+        assert!(!super::should_use_statless_external_open(
+            "/musl/runtest.exe",
+            super::O_RDONLY
+        ));
+        assert!(!super::should_use_statless_external_open(
+            "/musl/entry-static.exe",
+            super::O_RDONLY
+        ));
+        assert!(!super::should_use_statless_external_open(
+            "/musl/entry-dynamic.exe",
             super::O_RDONLY
         ));
         assert!(super::should_use_statless_external_open(

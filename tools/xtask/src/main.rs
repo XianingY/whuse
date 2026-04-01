@@ -1924,6 +1924,28 @@ fn validate_oscomp_full_image(image: &PathBuf, arch: &str) -> bool {
         );
         return false;
     }
+    let musl_libctest_script = match debugfs_read_to_string(image, "/musl/libctest_testcode.sh") {
+        Ok(script) => script,
+        Err(err) => {
+            eprintln!(
+                "oscomp image {} ({}) is missing readable /musl/libctest_testcode.sh ({err})",
+                arch,
+                image.display()
+            );
+            return false;
+        }
+    };
+    if let Err(err) =
+        validate_real_libctest_launcher(&musl_libctest_script, "/musl/libctest_testcode.sh")
+    {
+        eprintln!(
+            "oscomp image {} ({}) has invalid musl libctest launcher: {}",
+            arch,
+            image.display(),
+            err
+        );
+        return false;
+    }
     true
 }
 
@@ -2088,10 +2110,23 @@ fn detect_qemu_disk_holder(disk: &PathBuf) -> Option<(u32, String)> {
     None
 }
 
+fn validate_real_libctest_launcher(script: &str, path: &str) -> Result<(), String> {
+    if script.contains("pthread_cancel livelock issue") || script.contains("libctest skipped") {
+        return Err(format!("{path} is a stubbed libctest launcher"));
+    }
+    if !script.contains("run-static.sh") || !script.contains("run-dynamic.sh") {
+        return Err(format!(
+            "{path} does not invoke both run-static.sh and run-dynamic.sh"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_qemu_loongarch_contest_args, build_qemu_riscv_args, validate_oscomp_profile_value,
+        validate_real_libctest_launcher,
     };
     use std::path::{Path, PathBuf};
 
@@ -2155,5 +2190,19 @@ mod tests {
         assert!(validate_oscomp_profile_value("").is_err());
         assert!(validate_oscomp_profile_value("nope").is_err());
         assert!(validate_oscomp_profile_value("basic_testcode.sh").is_err());
+    }
+
+    #[test]
+    fn accepts_real_libctest_launcher_content() {
+        let script = "#!/bin/sh\n./busybox echo \"#### OS COMP TEST GROUP START libctest ####\"\n./run-static.sh\n./run-dynamic.sh\n./busybox echo \"#### OS COMP TEST GROUP END libctest ####\"\n";
+        assert!(validate_real_libctest_launcher(script, "/musl/libctest_testcode.sh").is_ok());
+    }
+
+    #[test]
+    fn rejects_stubbed_libctest_launcher_content() {
+        let script = "#!/bin/sh\n./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"\n./busybox echo \"libctest skipped due to pthread_cancel livelock issue\"\n./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\"\n";
+        let err = validate_real_libctest_launcher(script, "/musl/libctest_testcode.sh")
+            .expect_err("stubbed launcher should be rejected");
+        assert!(err.contains("stubbed libctest launcher"));
     }
 }

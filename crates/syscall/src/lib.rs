@@ -432,6 +432,17 @@ fn is_busybox_testfile_probe_path(path: &str) -> bool {
     matches!(path, "test.txt" | "/test.txt")
 }
 
+fn busybox_applet_name_for_tgid(tgid: usize) -> Option<String> {
+    BUSYBOX_APPLETS.lock().get(&tgid).cloned()
+}
+
+fn is_busybox_bracket_probe(process: &Process) -> bool {
+    process.name.ends_with("/busybox")
+        && busybox_applet_name_for_tgid(process.tgid)
+            .as_deref()
+            .is_some_and(|applet| applet == "[")
+}
+
 fn cancel_debug_enabled() -> bool {
     match option_env!("WHUSE_DEBUG_CANCEL") {
         Some("1") => true,
@@ -1053,6 +1064,7 @@ impl SyscallDispatcher {
             vfs,
         };
         let mut iozone_trace_process: Option<(usize, String)> = None;
+        let mut busybox_bracket_trace_process: Option<(usize, usize)> = None;
         if syscall_trace_enabled() {
             if let Ok(process) = ctx.procs.current() {
                 trace_line(&format!(
@@ -1070,6 +1082,21 @@ impl SyscallDispatcher {
             }
         }
         if let Ok(process) = ctx.procs.current() {
+            if is_busybox_bracket_probe(process) {
+                busybox_bracket_trace_process = Some((process.tid, process.tgid));
+                log_always(&format!(
+                    "whuse-busybox:bracket-syscall-enter tid={} tgid={} sysno={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    process.tid,
+                    process.tgid,
+                    sysno,
+                    args.0[0],
+                    args.0[1],
+                    args.0[2],
+                    args.0[3],
+                    args.0[4],
+                    args.0[5]
+                ));
+            }
             if is_iozone_task_name(&process.name) {
                 iozone_trace_process = Some((process.tgid, process.name.clone()));
                 iozone_debug(&format!(
@@ -1135,6 +1162,12 @@ impl SyscallDispatcher {
             iozone_debug(&format!(
                 "whuse-iozone-syscall-exit tgid={} name={} sysno={} res={:#x}",
                 tgid, name, sysno, res
+            ));
+        }
+        if let Some((tid, tgid)) = busybox_bracket_trace_process {
+            log_always(&format!(
+                "whuse-busybox:bracket-syscall-exit tid={} tgid={} sysno={} res={:#x}",
+                tid, tgid, sysno, res
             ));
         }
         res
@@ -2388,7 +2421,10 @@ impl SyscallDispatcher {
                     .lock()
                     .insert(procs.current_tgid().unwrap_or(0), argv[1].clone());
             }
-            let file_data = read_exec_file_image(vfs, &cwd, &path)?;
+            let file_data = match read_exec_file_image(vfs, &cwd, &path) {
+                Ok(data) => data,
+                Err(err) => return Err(err),
+            };
             if file_data.is_empty() {
                 trace_line(&format!("whuse: execve stage empty-image path={}", path));
                 return Err(EFAULT);

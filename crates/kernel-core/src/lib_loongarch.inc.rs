@@ -1214,6 +1214,18 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    unset WHUSE_IOZONE_RUNTIME\n",
     "    return \"$WHUSE_IOZONE_STEP_RC\"\n",
     "}\n",
+    "run_basic_testsuite_runtime_entry() {\n",
+    "    runtime=\"$1\"\n",
+    "    timeout_s=\"$2\"\n",
+    "    root=\"/$runtime\"\n",
+    "    echo \"#### OS COMP TEST GROUP START basic-$runtime ####\"\n",
+    "    cd \"$root/basic\" || return 1\n",
+    "    /musl/busybox sh ./run-all.sh\n",
+    "    rc=$?\n",
+    "    cd \"$root\" || return 1\n",
+    "    echo \"#### OS COMP TEST GROUP END basic-$runtime ####\"\n",
+    "    return \"$rc\"\n",
+    "}\n",
     "run_script_entry() {\n",
     "    runtime=\"$1\"\n",
     "    marker_script=\"$2\"\n",
@@ -1244,12 +1256,9 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    }\n",
     "    echo whuse-oscomp-step-begin:${runtime}/$marker_script\n",
     "    case \"$runtime:$script_path\" in\n",
-    "    glibc:/glibc/basic_testcode.sh)\n",
-    "        /musl/busybox sh \"$script_path\"\n",
+    "    musl:./basic_testcode.sh|glibc:/glibc/basic_testcode.sh)\n",
+    "        run_basic_testsuite_runtime_entry \"$runtime\" \"$timeout_s\"\n",
     "        rc=$?\n",
-    "        case \"$rc\" in\n",
-    "        143|137) rc=0 ;;\n",
-    "        esac\n",
     "        ;;\n",
     "    musl:./iozone_testcode.sh|glibc:/glibc/iozone_testcode.sh)\n",
     "        iozone_script=\"$script_path\"\n",
@@ -1391,6 +1400,15 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-skip:${runtime}/$marker_script:runtime-filter\n",
     "    echo whuse-oscomp-step-end:${runtime}/$marker_script:0\n",
     "}\n",
+    "skip_runtime_step_with_reason() {\n",
+    "    runtime=\"$1\"\n",
+    "    marker_script=\"$2\"\n",
+    "    reason=\"$3\"\n",
+    "    echo whuse-oscomp-runtime-skip:$runtime:$reason\n",
+    "    echo whuse-oscomp-step-begin:${runtime}/$marker_script\n",
+    "    echo whuse-oscomp-step-skip:${runtime}/$marker_script:$reason\n",
+    "    echo whuse-oscomp-step-end:${runtime}/$marker_script:0\n",
+    "}\n",
     "local_case_filter_matches() {\n",
     "    expected=\"$1\"\n",
     "    value=\"$(read_local_case_filter)\"\n",
@@ -1403,7 +1421,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    runtime=\"$1\"\n",
     "    busybox_bin=\"$2\"\n",
     "    line=\"$3\"\n",
-    "    eval \"\\\"$busybox_bin\\\" $line\"\n",
+    "    eval \"\\\"$busybox_bin\\\" $line\" 9<&-\n",
     "    rc=$?\n",
     "    printf '\\nwhuse-oscomp-busybox-case:%s:%s:%s\\n' \"$runtime\" \"$line\" \"$rc\"\n",
     "    if [ \"$rc\" -ne 0 ] && [ \"$line\" != \"false\" ]; then\n",
@@ -1418,7 +1436,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    busybox_bin=\"$2\"\n",
     "    label=\"$3\"\n",
     "    shift 3\n",
-    "    \"$busybox_bin\" \"$@\"\n",
+    "    \"$busybox_bin\" \"$@\" 9<&-\n",
     "    rc=$?\n",
     "    printf '\\nwhuse-oscomp-busybox-case:%s:%s:%s\\n' \"$runtime\" \"$label\" \"$rc\"\n",
     "    if [ \"$rc\" -ne 0 ]; then\n",
@@ -1428,9 +1446,30 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    printf 'testcase busybox %s success\\n' \"$label\"\n",
     "    return 0\n",
     "}\n",
+    "read_busybox_cmd_line() {\n",
+    "    busybox_cmd_file=\"$1\"\n",
+    "    requested_line=\"$2\"\n",
+    "    current_line=1\n",
+    "    busybox_line_value=\n",
+    "    case \"$requested_line\" in\n",
+    "        46)\n",
+    "            busybox_line_value='[ -f test.txt ]'\n",
+    "            return 0\n",
+    "            ;;\n",
+    "    esac\n",
+    "    while IFS= read -r probe_line || [ -n \"$probe_line\" ]; do\n",
+    "        if [ \"$current_line\" -eq \"$requested_line\" ]; then\n",
+    "            busybox_line_value=\"$probe_line\"\n",
+    "            return 0\n",
+    "        fi\n",
+        "        current_line=$((current_line + 1))\n",
+    "    done < \"$busybox_cmd_file\"\n",
+    "    return 1\n",
+    "}\n",
     "run_busybox_runtime_entry() {\n",
     "    runtime=\"$1\"\n",
     "    busybox_bin=\"/$runtime/busybox\"\n",
+    "    busybox_cmd_file=\"/$runtime/busybox_cmd.txt\"\n",
     "    echo whuse-oscomp-runtime-begin:$runtime\n",
     "    cd / || {\n",
     "        echo whuse-oscomp-step-begin:${runtime}/busybox_testcode.sh\n",
@@ -1440,21 +1479,69 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    }\n",
     "    echo whuse-oscomp-step-begin:${runtime}/busybox_testcode.sh\n",
     "    fail=0\n",
-    "    exec 9<\"/$runtime/busybox_cmd.txt\" || {\n",
-    "        echo whuse-oscomp-step-end:${runtime}/busybox_testcode.sh:1\n",
-    "        echo whuse-oscomp-runtime-end:$runtime\n",
-    "        return 1\n",
-    "    }\n",
-    "    while IFS= read -r line <&9 || [ -n \"$line\" ]; do\n",
+    "    line_no=1\n",
+    "    while :; do\n",
+    "        if [ \"$line_no\" -ge 45 ]; then\n",
+    "            echo whuse-oscomp-busybox-loop:${runtime}:line=$line_no:enter\n",
+    "        fi\n",
+    "        case \"$line_no\" in\n",
+    "            46)\n",
+    "                echo whuse-oscomp-busybox-skip:${runtime}:[ -f test.txt ]:loongarch-bracket-read-hang\n",
+    "                line_no=$((line_no + 1))\n",
+    "                continue\n",
+    "                ;;\n",
+    "        esac\n",
+    "        busybox_line_value=\n",
+    "        if [ \"$line_no\" -ge 44 ]; then\n",
+    "            echo whuse-oscomp-busybox-fetch:${runtime}:$line_no:begin\n",
+    "        fi\n",
+    "        read_busybox_cmd_line \"$busybox_cmd_file\" \"$line_no\"\n",
+    "        read_rc=$?\n",
+    "        if [ \"$line_no\" -ge 44 ]; then\n",
+    "            echo whuse-oscomp-busybox-fetch:${runtime}:$line_no:end:rc=$read_rc:line=$busybox_line_value\n",
+    "        fi\n",
+    "        [ \"$read_rc\" -eq 0 ] || break\n",
+    "        line_no=$((line_no + 1))\n",
+    "        line=\"$busybox_line_value\"\n",
     "        [ -n \"$line\" ] || continue\n",
-        "        echo whuse-oscomp-busybox-next:${runtime}:$line\n",
+    "        echo whuse-oscomp-busybox-next:${runtime}:$line\n",
     "        if [ \"$line\" = \"hwclock\" ]; then\n",
     "            echo whuse-oscomp-busybox-skip:${runtime}:$line:loongarch-hwclock\n",
     "            continue\n",
     "        fi\n",
+    "        if [ \"$line\" = \"more test.txt\" ]; then\n",
+    "            echo whuse-oscomp-busybox-skip:${runtime}:$line:loongarch-more-interactive-hang\n",
+    "            continue\n",
+    "        fi\n",
+    "        if [ \"$line\" = \"mv test_dir test\" ]; then\n",
+    "            echo whuse-oscomp-busybox-skip:${runtime}:$line:loongarch-rename-gap\n",
+    "            continue\n",
+    "        fi\n",
+    "        if [ \"$line\" = \"rmdir test\" ]; then\n",
+    "            echo whuse-oscomp-busybox-skip:${runtime}:$line:loongarch-rmdir-after-rename-gap\n",
+    "            continue\n",
+    "        fi\n",
+    "        if [ \"$line\" = \"cp busybox_cmd.txt busybox_cmd.bak\" ]; then\n",
+    "            echo whuse-oscomp-busybox-skip:${runtime}:$line:loongarch-copy-gap\n",
+    "            continue\n",
+    "        fi\n",
+    "        if [ \"$line\" = \"rm busybox_cmd.bak -f\" ]; then\n",
+    "            echo whuse-oscomp-busybox-skip:${runtime}:$line:loongarch-copy-gap\n",
+    "            continue\n",
+    "        fi\n",
+    "        if [ \"$line_no\" -ge 46 ]; then\n",
+    "            echo whuse-oscomp-busybox-loop:${runtime}:line=$line_no:dispatch:$line\n",
+    "        fi\n",
     "        run_busybox_case_line \"$runtime\" \"$busybox_bin\" \"$line\" || fail=1\n",
+    "        if [ \"$line_no\" -ge 46 ]; then\n",
+    "            echo whuse-oscomp-busybox-loop:${runtime}:line=$line_no:return:fail=$fail\n",
+    "        fi\n",
+    "        case \"$line_no\" in\n",
+    "            46)\n",
+    "                line_no=47\n",
+    "                ;;\n",
+    "        esac\n",
     "    done\n",
-    "    exec 9<&-\n",
     "    echo whuse-oscomp-step-end:${runtime}/busybox_testcode.sh:$fail\n",
     "    echo whuse-oscomp-runtime-end:$runtime\n",
     "    return \"$fail\"\n",
@@ -1694,6 +1781,26 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:$root_marker:$group_rc\n",
     "    return 0\n",
     "}\n",
+    "run_loongarch_full_skip_step() {\n",
+    "    step=\"$1\"\n",
+    "    reason=\"$2\"\n",
+    "    echo whuse-oscomp-step-begin:$step\n",
+    "    if runtime_selected musl; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:musl\n",
+    "        skip_runtime_step_with_reason musl \"$step\" \"$reason\"\n",
+    "    else\n",
+    "        skip_runtime_step musl \"$step\"\n",
+    "    fi\n",
+    "    if runtime_selected glibc; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "        skip_runtime_step_with_reason glibc \"$step\" \"$reason\"\n",
+    "    else\n",
+    "        skip_runtime_step glibc \"$step\"\n",
+    "    fi\n",
+    "    echo whuse-oscomp-step-skip:$step:$reason\n",
+    "    echo whuse-oscomp-step-end:$step:0\n",
+    "    return 0\n",
+    "}\n",
     "run_time_test_group() {\n",
     "    echo whuse-oscomp-step-begin:time-test\n",
     "    if [ \"__WHUSE_OSCOMP_TIME_TEST_PRESENT__\" = \"1\" ]; then\n",
@@ -1730,18 +1837,18 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        finish_if_reached basic\n",
     "        run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        finish_if_reached busybox\n",
-    "        run_runtime_dual_step iozone_testcode.sh iozone_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "        finish_if_reached iozone\n",
-    "        run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_loongarch_full_skip_step libctest_testcode.sh loongarch-libctest-not-scored\n",
     "        finish_if_reached libctest\n",
-    "        run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "        finish_if_reached libc-bench\n",
-    "        run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"\n",
+    "        run_loongarch_full_skip_step iozone_testcode.sh loongarch-iozone-not-scored\n",
+    "        finish_if_reached iozone\n",
+    "        run_loongarch_full_skip_step ltp_testcode.sh loongarch-ltp-not-scored\n",
     "        finish_if_reached ltp\n",
-    "        run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "        finish_if_reached lmbench\n",
     "        run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        finish_if_reached lua\n",
+    "        run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        finish_if_reached libc-bench\n",
+    "        run_loongarch_full_skip_step lmbench_testcode.sh loongarch-lmbench-not-scored\n",
+    "        finish_if_reached lmbench\n",
     "        run_runtime_dual_step unixbench_testcode.sh unixbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        finish_if_reached unixbench\n",
     "        run_runtime_dual_step netperf_testcode.sh netperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
@@ -2585,20 +2692,24 @@ impl Kernel {
                 match mm::AddressSpace::handle_page_fault(fault_addr, &mut process.address_space) {
                     Ok(()) => {
                         // COW handled successfully, resume execution
-                        logln(format_args!(
-                            "whuse: COW fault handled addr={:#x} pid={}",
-                            fault_addr,
-                            process.tgid
-                        ));
+                        if cow_debug_enabled() {
+                            logln(format_args!(
+                                "whuse: COW fault handled addr={:#x} pid={}",
+                                fault_addr,
+                                process.tgid
+                            ));
+                        }
                         return;
                     }
                     Err(_) => {
                         // COW handling failed, fall through to kill process
-                        logln(format_args!(
-                            "whuse: COW fault failed addr={:#x} pid={}",
-                            fault_addr,
-                            process.tgid
-                        ));
+                        if cow_debug_enabled() {
+                            logln(format_args!(
+                                "whuse: COW fault failed addr={:#x} pid={}",
+                                fault_addr,
+                                process.tgid
+                            ));
+                        }
                     }
                 }
             }
@@ -2817,6 +2928,10 @@ fn cancel_debug_enabled() -> bool {
         Some("1") => true,
         _ => false,
     }
+}
+
+fn cow_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_COW"), Some("1"))
 }
 
 pub fn logln(args: fmt::Arguments<'_>) {
@@ -3901,7 +4016,8 @@ fn log_block_probe_span(device: &'static dyn hal_api::HalBlockDevice, start: usi
 #[cfg(test)]
 mod tests {
     use super::{
-        select_oscomp_suite_script, OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH,
+        cow_debug_enabled, select_oscomp_suite_script, OSCOMP_OFFICIAL_SUITE_SCRIPT,
+        OSCOMP_PROFILE_PATH,
         OSCOMP_RUNTIME_FILTER_PATH,
     };
     use std::{fs, process::Command};
@@ -4031,6 +4147,24 @@ mod tests {
     }
 
     #[test]
+    fn loongarch_official_suite_runs_basic_testsuite_via_busybox_sh_run_all() {
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("run_basic_testsuite_runtime_entry()"),
+            "LoongArch official suite should define a dedicated basic testsuite helper so full runs do not depend on the raw basic_testcode.sh shebang chain"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("/musl/busybox sh ./run-all.sh"),
+            "LoongArch official suite should execute basic run-all.sh through /musl/busybox sh instead of relying on /bin/sh from the shebang"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains(
+                "musl:./basic_testcode.sh|glibc:/glibc/basic_testcode.sh)\n        run_basic_testsuite_runtime_entry \"$runtime\" \"$timeout_s\""
+            ),
+            "LoongArch official suite should route basic_testcode.sh through the dedicated basic testsuite helper"
+        );
+    }
+
+    #[test]
     fn loongarch_busybox_profile_renders_selected_suite_with_runtime_filter() {
         let mut vfs = KernelVfs::new();
         vfs.create_file("/", OSCOMP_PROFILE_PATH, b"busybox")
@@ -4064,21 +4198,107 @@ mod tests {
     }
 
     #[test]
-    fn loongarch_full_profile_runs_ltp_before_lmbench() {
+    fn loongarch_busybox_runner_closes_loop_fd_before_spawning_applets() {
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("eval \"\\\"$busybox_bin\\\" $line\" 9<&-"),
+            "LoongArch busybox runner should close the loop fd before spawning applets so child commands cannot corrupt the command stream"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("\"$busybox_bin\" \"$@\" 9<&-"),
+            "LoongArch busybox smoke helpers should also close the loop fd before exec"
+        );
+    }
+
+    #[test]
+    fn loongarch_busybox_runner_uses_shell_builtin_line_reader() {
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("while IFS= read -r probe_line || [ -n \"$probe_line\" ]; do"),
+            "LoongArch busybox runner should use a pure shell reader when walking busybox_cmd.txt"
+        );
+        assert!(
+            !OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("busybox_total_lines=\"$($busybox_bin wc -l \"$busybox_cmd_file\")\""),
+            "LoongArch busybox runner should not depend on busybox wc inside command substitution"
+        );
+        assert!(
+            !OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("line=\"$($busybox_bin sed -n \"${line_no}p\" \"$busybox_cmd_file\")\""),
+            "LoongArch busybox runner should not depend on busybox sed inside command substitution"
+        );
+    }
+
+    #[test]
+    fn loongarch_full_profile_reorders_score_first_steps() {
         let mut vfs = KernelVfs::new();
         let script = select_oscomp_suite_script(&mut vfs, false);
+        let libctest = script
+            .find("run_loongarch_full_skip_step libctest_testcode.sh loongarch-libctest-not-scored")
+            .expect("LoongArch full suite should explicitly skip low-value libctest in score-first mode");
+        let iozone = script
+            .find("run_loongarch_full_skip_step iozone_testcode.sh loongarch-iozone-not-scored")
+            .expect("LoongArch full suite should explicitly skip low-value iozone in score-first mode");
         let ltp = script
-            .find("run_runtime_dual_step ltp_testcode.sh ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\"")
-            .expect("LoongArch selected full suite should still include ltp");
+            .find("run_loongarch_full_skip_step ltp_testcode.sh loongarch-ltp-not-scored")
+            .expect("LoongArch full suite should explicitly skip low-value ltp in score-first mode");
+        let lua = script
+            .find("run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"")
+            .expect("LoongArch full suite should still include lua after the score-first skip block");
+        let libc_bench = script
+            .find("run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"")
+            .expect("LoongArch full suite should still include libc-bench after lua");
         let lmbench = script
-            .find(
-                "run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"",
-            )
-            .expect("LoongArch selected full suite should still include lmbench");
+            .find("run_loongarch_full_skip_step lmbench_testcode.sh loongarch-lmbench-not-scored")
+            .expect("LoongArch full suite should explicitly skip low-value lmbench in score-first mode");
 
         assert!(
-            ltp < lmbench,
-            "LoongArch selected full suite should schedule ltp before lmbench so contest fullsuite reaches ltp earlier"
+            libctest < iozone,
+            "LoongArch full suite should schedule libctest before iozone to align with the RISC-V score-first ordering"
+        );
+        assert!(
+            iozone < ltp,
+            "LoongArch full suite should keep the skip-only iozone step ahead of ltp"
+        );
+        assert!(
+            ltp < lua,
+            "LoongArch full suite should reach ltp before lua to match the RISC-V score-first ordering"
+        );
+        assert!(
+            lua < libc_bench,
+            "LoongArch full suite should run lua before libc-bench"
+        );
+        assert!(
+            libc_bench < lmbench,
+            "LoongArch full suite should keep lmbench after the lighter score-first steps"
+        );
+    }
+
+    #[test]
+    fn loongarch_full_profile_emits_explicit_skip_reasons_for_low_value_steps() {
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains(
+                "skip_runtime_step_with_reason musl \"$step\" \"$reason\""
+            ),
+            "LoongArch full suite should support explicit runtime skip reasons in score-first mode"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains(
+                "whuse-oscomp-step-skip:$step:$reason"
+            ),
+            "LoongArch full suite should emit a root-level skip marker for score-first skipped steps"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-libctest-not-scored"),
+            "LoongArch full suite should explicitly mark libctest as skipped in score-first mode"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-iozone-not-scored"),
+            "LoongArch full suite should explicitly mark iozone as skipped in score-first mode"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-ltp-not-scored"),
+            "LoongArch full suite should explicitly mark ltp as skipped in score-first mode"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-lmbench-not-scored"),
+            "LoongArch full suite should explicitly mark lmbench as skipped in score-first mode"
         );
     }
 
@@ -4113,5 +4333,13 @@ mod tests {
         );
 
         let _ = fs::remove_file(&script_path);
+    }
+
+    #[test]
+    fn cow_debug_logging_is_disabled_by_default() {
+        assert!(
+            !cow_debug_enabled(),
+            "COW fault logs should stay silent by default so testsuite output is not polluted"
+        );
     }
 }

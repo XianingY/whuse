@@ -670,13 +670,11 @@ impl AddressSpace {
         let mut mappings = BTreeMap::new();
         for (start, segment) in &inner.mappings {
             let storage = match &segment.storage {
-                SegmentStorage::Owned { ptr, .. } => {
-                    // Create COW reference instead of eager copy
-                    let bytes = alloc::sync::Arc::new(Mutex::new(unsafe {
-                        core::slice::from_raw_parts(*ptr as *const u8, segment.area.len).to_vec()
-                    }));
-                    SegmentStorage::CowParent { bytes, ptr: *ptr }
-                }
+                SegmentStorage::Owned { ptr, .. } => create_cow_storage(
+                    *start,
+                    unsafe { core::slice::from_raw_parts(*ptr as *const u8, segment.area.len) }
+                        .to_vec(),
+                ),
                 SegmentStorage::Shared { bytes, ptr } => SegmentStorage::Shared {
                     bytes: bytes.clone(),
                     ptr: *ptr,
@@ -1524,15 +1522,33 @@ fn promote_cow_segment(segment: &mut Segment) -> KernelResult<()> {
     }
 
     let current_data = match &segment.storage {
-        SegmentStorage::CowParent { bytes, .. } => {
-            let shared = bytes.lock();
-            shared.clone()
-        }
+        SegmentStorage::CowParent { ptr, .. } => unsafe {
+            core::slice::from_raw_parts(*ptr as *const u8, segment.area.len).to_vec()
+        },
         _ => return Err(EFAULT),
     };
 
     segment.storage = create_owned_storage(segment.area.start, current_data);
     Ok(())
+}
+
+fn create_cow_storage(addr: usize, mut data: Vec<u8>) -> SegmentStorage {
+    if data.is_empty() {
+        data.push(0);
+    }
+    let len = data.len();
+    let page_offset = addr & (PAGE_SIZE - 1);
+    let map_len = align_up(page_offset + len, PAGE_SIZE);
+    let total = map_len + PAGE_SIZE;
+    let mut bytes = vec![0u8; total];
+    let raw_ptr = bytes.as_mut_ptr() as usize;
+    let aligned_base = align_up(raw_ptr, PAGE_SIZE);
+    let ptr = aligned_base + page_offset;
+    unsafe {
+        ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, len);
+    }
+    let bytes = alloc::sync::Arc::new(Mutex::new(bytes));
+    SegmentStorage::CowParent { bytes, ptr }
 }
 
 fn create_owned_storage(addr: usize, mut data: Vec<u8>) -> SegmentStorage {
@@ -2173,6 +2189,20 @@ mod tests {
             child.inner.lock().mappings.get(&0x5000).unwrap().storage,
             SegmentStorage::Owned { .. }
         ));
+    }
+
+    #[test]
+    fn child_cow_reads_survive_parent_unmap() {
+        let parent = AddressSpace::new_user();
+        parent
+            .map_fixed_bytes(0x5000, b"./brk\0arg0\0", PAGE_SIZE, 0b011)
+            .unwrap();
+        let child = parent.clone_private();
+
+        parent.unmap(0x5000, PAGE_SIZE).unwrap();
+
+        assert_eq!(child.read_cstr(0x5000).unwrap(), "./brk");
+        assert_eq!(child.read_cstr(0x5006).unwrap(), "arg0");
     }
 
     #[test]

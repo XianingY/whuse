@@ -1781,6 +1781,38 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-step-end:$root_marker:$group_rc\n",
     "    return 0\n",
     "}\n",
+    "run_loongarch_full_selective_step() {\n",
+    "    step=\"$1\"\n",
+    "    timeout_s=\"$2\"\n",
+    "    glibc_skip_reason=\"$3\"\n",
+    "    echo whuse-oscomp-step-begin:$step\n",
+    "    group_rc=0\n",
+    "    if runtime_selected musl; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:musl\n",
+    "        case \"$step\" in\n",
+    "        busybox_testcode.sh)\n",
+    "            run_busybox_runtime_entry musl\n",
+    "            ;;\n",
+    "        *)\n",
+    "            run_script_entry musl \"$step\" \"\" \"$timeout_s\"\n",
+    "            ;;\n",
+    "        esac\n",
+    "        rc=$?\n",
+    "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
+    "            group_rc=\"$rc\"\n",
+    "        fi\n",
+    "    else\n",
+    "        skip_runtime_step musl \"$step\"\n",
+    "    fi\n",
+    "    if runtime_selected glibc; then\n",
+    "        echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "        skip_runtime_step_with_reason glibc \"$step\" \"$glibc_skip_reason\"\n",
+    "    else\n",
+    "        skip_runtime_step glibc \"$step\"\n",
+    "    fi\n",
+    "    echo whuse-oscomp-step-end:$step:$group_rc\n",
+    "    return 0\n",
+    "}\n",
     "run_loongarch_full_skip_step() {\n",
     "    step=\"$1\"\n",
     "    reason=\"$2\"\n",
@@ -1835,27 +1867,27 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        finish_if_reached time-test\n",
     "        run_runtime_dual_step basic_testcode.sh basic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        finish_if_reached basic\n",
-    "        run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_loongarch_full_selective_step busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" glibc-busybox-not-priority\n",
     "        finish_if_reached busybox\n",
-    "        run_loongarch_full_skip_step libctest_testcode.sh loongarch-libctest-not-scored\n",
+    "        run_loongarch_full_selective_step libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" glibc-libctest-not-scored\n",
     "        finish_if_reached libctest\n",
-    "        run_loongarch_full_skip_step iozone_testcode.sh loongarch-iozone-not-scored\n",
-    "        finish_if_reached iozone\n",
-    "        run_loongarch_full_skip_step ltp_testcode.sh loongarch-ltp-not-scored\n",
-    "        finish_if_reached ltp\n",
     "        run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        finish_if_reached lua\n",
     "        run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "        finish_if_reached libc-bench\n",
+    "        run_loongarch_full_selective_step ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\" glibc-ltp-not-scored\n",
+    "        finish_if_reached ltp\n",
+    "        run_loongarch_full_skip_step iozone_testcode.sh loongarch-iozone-not-scored\n",
+    "        finish_if_reached iozone\n",
     "        run_loongarch_full_skip_step lmbench_testcode.sh loongarch-lmbench-not-scored\n",
     "        finish_if_reached lmbench\n",
-    "        run_runtime_dual_step unixbench_testcode.sh unixbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_loongarch_full_skip_step unixbench_testcode.sh loongarch-unixbench-not-priority\n",
     "        finish_if_reached unixbench\n",
-    "        run_runtime_dual_step netperf_testcode.sh netperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_loongarch_full_skip_step netperf_testcode.sh loongarch-netperf-not-priority\n",
     "        finish_if_reached netperf\n",
-    "        run_runtime_dual_step iperf_testcode.sh iperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_loongarch_full_skip_step iperf_testcode.sh loongarch-iperf-not-priority\n",
     "        finish_if_reached iperf\n",
-    "        run_runtime_dual_step cyclic_testcode.sh cyclic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_loongarch_full_skip_step cyclic_testcode.sh loongarch-cyclic-not-priority\n",
     "        finish_if_reached cyclic\n",
     "        ;;\n",
     "    basic) run_runtime_dual_step basic_testcode.sh basic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
@@ -4229,44 +4261,61 @@ mod tests {
     fn loongarch_full_profile_reorders_score_first_steps() {
         let mut vfs = KernelVfs::new();
         let script = select_oscomp_suite_script(&mut vfs, false);
+        let busybox = script
+            .find(
+                "run_loongarch_full_selective_step busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" glibc-busybox-not-priority",
+            )
+            .expect(
+                "LoongArch full suite should run musl busybox and skip glibc busybox in score-first mode",
+            );
         let libctest = script
-            .find("run_loongarch_full_skip_step libctest_testcode.sh loongarch-libctest-not-scored")
-            .expect("LoongArch full suite should explicitly skip low-value libctest in score-first mode");
-        let iozone = script
-            .find("run_loongarch_full_skip_step iozone_testcode.sh loongarch-iozone-not-scored")
-            .expect("LoongArch full suite should explicitly skip low-value iozone in score-first mode");
-        let ltp = script
-            .find("run_loongarch_full_skip_step ltp_testcode.sh loongarch-ltp-not-scored")
-            .expect("LoongArch full suite should explicitly skip low-value ltp in score-first mode");
+            .find(
+                "run_loongarch_full_selective_step libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" glibc-libctest-not-scored",
+            )
+            .expect(
+                "LoongArch full suite should run musl libctest and skip glibc libctest in score-first mode",
+            );
         let lua = script
             .find("run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"")
-            .expect("LoongArch full suite should still include lua after the score-first skip block");
+            .expect("LoongArch full suite should still include lua after libctest");
         let libc_bench = script
             .find("run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"")
             .expect("LoongArch full suite should still include libc-bench after lua");
+        let ltp = script
+            .find(
+                "run_loongarch_full_selective_step ltp_testcode.sh \"$WHUSE_LTP_STEP_TIMEOUT\" glibc-ltp-not-scored",
+            )
+            .expect("LoongArch full suite should run musl ltp and skip glibc ltp in score-first mode");
+        let iozone = script
+            .find("run_loongarch_full_skip_step iozone_testcode.sh loongarch-iozone-not-scored")
+            .expect("LoongArch full suite should explicitly skip low-value iozone in score-first mode");
         let lmbench = script
             .find("run_loongarch_full_skip_step lmbench_testcode.sh loongarch-lmbench-not-scored")
             .expect("LoongArch full suite should explicitly skip low-value lmbench in score-first mode");
 
         assert!(
-            libctest < iozone,
-            "LoongArch full suite should schedule libctest before iozone to align with the RISC-V score-first ordering"
+            busybox < libctest,
+            "LoongArch full suite should schedule busybox before libctest"
         );
         assert!(
-            iozone < ltp,
-            "LoongArch full suite should keep the skip-only iozone step ahead of ltp"
-        );
-        assert!(
-            ltp < lua,
-            "LoongArch full suite should reach ltp before lua to match the RISC-V score-first ordering"
+            libctest < lua,
+            "LoongArch full suite should schedule libctest before lua"
         );
         assert!(
             lua < libc_bench,
             "LoongArch full suite should run lua before libc-bench"
         );
         assert!(
-            libc_bench < lmbench,
-            "LoongArch full suite should keep lmbench after the lighter score-first steps"
+            libc_bench < ltp,
+            "LoongArch full suite should reach ltp after libc-bench"
+        );
+        assert!(
+            ltp < iozone,
+            "LoongArch full suite should delay iozone until after ltp"
+        );
+        assert!(
+            iozone < lmbench,
+            "LoongArch full suite should keep lmbench after the earlier score-first groups"
         );
     }
 
@@ -4285,20 +4334,40 @@ mod tests {
             "LoongArch full suite should emit a root-level skip marker for score-first skipped steps"
         );
         assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-libctest-not-scored"),
-            "LoongArch full suite should explicitly mark libctest as skipped in score-first mode"
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("glibc-busybox-not-priority"),
+            "LoongArch full suite should explicitly mark glibc busybox as skipped in score-first mode"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("glibc-libctest-not-scored"),
+            "LoongArch full suite should explicitly mark glibc libctest as skipped in score-first mode"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("glibc-ltp-not-scored"),
+            "LoongArch full suite should explicitly mark glibc ltp as skipped in score-first mode"
         );
         assert!(
             OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-iozone-not-scored"),
             "LoongArch full suite should explicitly mark iozone as skipped in score-first mode"
         );
         assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-ltp-not-scored"),
-            "LoongArch full suite should explicitly mark ltp as skipped in score-first mode"
-        );
-        assert!(
             OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-lmbench-not-scored"),
             "LoongArch full suite should explicitly mark lmbench as skipped in score-first mode"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-unixbench-not-priority"),
+            "LoongArch full suite should explicitly mark unixbench as skipped in score-first mode"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-netperf-not-priority"),
+            "LoongArch full suite should explicitly mark netperf as skipped in score-first mode"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-iperf-not-priority"),
+            "LoongArch full suite should explicitly mark iperf as skipped in score-first mode"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("loongarch-cyclic-not-priority"),
+            "LoongArch full suite should explicitly mark cyclic as skipped in score-first mode"
         );
     }
 

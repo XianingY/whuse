@@ -1,6 +1,8 @@
 use std::env;
 
 fn main() {
+    println!("cargo:rerun-if-changed=src/lib_riscv.inc.rs");
+    println!("cargo:rerun-if-changed=src/lib_loongarch.inc.rs");
     println!("cargo:rerun-if-env-changed=WHUSE_STAGE2_TIMEOUT_PROFILE");
     println!("cargo:rerun-if-env-changed=WHUSE_STAGE2_REAL_PHASE");
     println!("cargo:rerun-if-env-changed=WHUSE_STAGE2_GATE_LIBCTEST_SCOPE");
@@ -15,7 +17,6 @@ fn main() {
         "chain-fast" => "chain-fast",
         _ => "real",
     };
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let default_real_phase = "full";
     let real_phase = match env::var("WHUSE_STAGE2_REAL_PHASE")
         .unwrap_or_else(|_| default_real_phase.to_string())

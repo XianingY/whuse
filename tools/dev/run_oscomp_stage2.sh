@@ -46,6 +46,13 @@ export WHUSE_LTP_CURATED_BLACKLIST="${WHUSE_LTP_CURATED_BLACKLIST:-${LTP_CURATED
 export WHUSE_LTP_STEP_TIMEOUT="${WHUSE_LTP_STEP_TIMEOUT:-1800}"
 export WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT:-45}"
 export WHUSE_LTP_APPLY_CANDIDATES="${WHUSE_LTP_APPLY_CANDIDATES:-0}"
+export WHUSE_STAGE2_FULL_MAX_GROUP="${WHUSE_STAGE2_FULL_MAX_GROUP:-all}"
+export WHUSE_STAGE2_IOZONE_PROFILE="${WHUSE_STAGE2_IOZONE_PROFILE:-full}"
+export WHUSE_STAGE2_BASIC_PROFILE="${WHUSE_STAGE2_BASIC_PROFILE:-full}"
+export WHUSE_STAGE2_BUSYBOX_PROFILE="${WHUSE_STAGE2_BUSYBOX_PROFILE:-full}"
+export WHUSE_STAGE2_GATE_LIBCTEST_SCOPE="${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE:-full}"
+export WHUSE_STAGE2_LIBCBENCH_SCOPE="${WHUSE_STAGE2_LIBCBENCH_SCOPE:-full}"
+export WHUSE_STAGE2_LMBENCH_SCOPE="${WHUSE_STAGE2_LMBENCH_SCOPE:-full}"
 WHUSE_STAGE2_IMAGE_POLICY="${WHUSE_STAGE2_IMAGE_POLICY:-auto}"
 
 RV_IMG="${REPO_ROOT}/target/oscomp/sdcard-rv.img"
@@ -56,7 +63,7 @@ if [[ "${WHUSE_OSCOMP_COMPAT}" != "0" ]]; then
     exit 1
 fi
 
-full_root_steps=(
+riscv_full_root_steps=(
     "time-test"
     "basic_testcode.sh"
     "busybox_testcode.sh"
@@ -65,6 +72,22 @@ full_root_steps=(
     "libctest_testcode.sh"
     "lua_testcode.sh"
     "libc-bench"
+    "lmbench_testcode.sh"
+    "unixbench_testcode.sh"
+    "netperf_testcode.sh"
+    "iperf_testcode.sh"
+    "cyclic_testcode.sh"
+)
+
+loongarch_full_root_steps=(
+    "time-test"
+    "basic_testcode.sh"
+    "busybox_testcode.sh"
+    "libctest_testcode.sh"
+    "lua_testcode.sh"
+    "libc-bench"
+    "ltp_testcode.sh"
+    "iozone_testcode.sh"
     "lmbench_testcode.sh"
     "unixbench_testcode.sh"
     "netperf_testcode.sh"
@@ -210,8 +233,16 @@ profile_root_step() {
 
 resolve_expected_root_steps() {
     local profile="${1:-full}"
+    local arch="${2:-}"
     if [[ -z "${profile}" || "${profile}" == "full" ]]; then
-        printf '%s\n' "${full_root_steps[@]}"
+        case "${arch}" in
+        loongarch)
+            printf '%s\n' "${loongarch_full_root_steps[@]}"
+            ;;
+        *)
+            printf '%s\n' "${riscv_full_root_steps[@]}"
+            ;;
+        esac
         return 0
     fi
     profile_root_step "${profile}"
@@ -557,10 +588,30 @@ inject_oscomp_runtime_filter() {
     verify_runtime_image_config "${image}" "/whuse-oscomp-runtime-filter" "${runtime_filter}"
 }
 
-inject_oscomp_runtime_filter_env() {
+build_stage2_local_env() {
+    cat <<EOF
+WHUSE_STAGE2_FULL_MAX_GROUP=${WHUSE_STAGE2_FULL_MAX_GROUP}
+WHUSE_STAGE2_IOZONE_PROFILE=${WHUSE_STAGE2_IOZONE_PROFILE}
+WHUSE_STAGE2_BASIC_PROFILE=${WHUSE_STAGE2_BASIC_PROFILE}
+WHUSE_STAGE2_BUSYBOX_PROFILE=${WHUSE_STAGE2_BUSYBOX_PROFILE}
+WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE}
+WHUSE_STAGE2_LIBCBENCH_SCOPE=${WHUSE_STAGE2_LIBCBENCH_SCOPE}
+WHUSE_STAGE2_LMBENCH_SCOPE=${WHUSE_STAGE2_LMBENCH_SCOPE}
+WHUSE_OSCOMP_RUNTIME_FILTER=${WHUSE_OSCOMP_RUNTIME_FILTER}
+EOF
+}
+
+inject_stage2_local_env() {
     local image="$1"
-    local runtime_filter="$2"
-    write_runtime_image_config "${image}" "/musl/.whuse_stage2_local.env" "WHUSE_OSCOMP_RUNTIME_FILTER=${runtime_filter}"
+    local content actual
+    content="$(build_stage2_local_env)"
+    write_runtime_image_text_file "${image}" "/musl/.whuse_stage2_local.env" "${content}"$'\n'
+    actual="$(read_runtime_image_config "${image}" "/musl/.whuse_stage2_local.env")"
+    actual="${actual%$'\n'}"
+    if [[ "${actual}" != "${content}" ]]; then
+        echo "runtime config verification failed for /musl/.whuse_stage2_local.env in ${image}" >&2
+        return 1
+    fi
 }
 
 resolve_busybox_case_lines_for_image() {
@@ -927,9 +978,9 @@ run_arch() {
     fi
     effective_profile="$(effective_oscomp_profile)"
     validate_oscomp_profile "${effective_profile}"
+    inject_stage2_local_env "${runtime_image}"
     if [[ "${WHUSE_OSCOMP_RUNTIME_FILTER}" != "both" ]]; then
         inject_oscomp_runtime_filter "${runtime_image}" "${WHUSE_OSCOMP_RUNTIME_FILTER}"
-        inject_oscomp_runtime_filter_env "${runtime_image}" "${WHUSE_OSCOMP_RUNTIME_FILTER}"
     fi
     inject_case_filter_files "${runtime_image}" "${effective_profile}"
 
@@ -980,7 +1031,7 @@ run_arch() {
     fi
 
     local -a expected_steps=()
-    mapfile -t expected_steps < <(resolve_expected_root_steps "${effective_profile}")
+    mapfile -t expected_steps < <(resolve_expected_root_steps "${effective_profile}" "${arch}")
     for step in "${expected_steps[@]}"; do
         if rg -q "whuse-oscomp-step-begin:${step}" "${text_log}"; then
             echo "[${arch}] step-begin ok: ${step}"
@@ -1103,6 +1154,25 @@ run_arch() {
                 echo "[${arch}] busybox profile semantic check ok: runtime-filter=${WHUSE_OSCOMP_RUNTIME_FILTER}, musl testcase busybox=${musl_busybox_cases}, glibc testcase busybox=${glibc_busybox_cases}"
             fi
         fi
+    fi
+
+    if [[ "${arch}" == "rv" && "${effective_profile}" == "ltp" ]]; then
+        local pass_candidates
+        local bad_candidates
+        local candidate_target_whitelist=""
+        local candidate_target_blacklist=""
+        pass_candidates="/tmp/rv-ltp-generic-${WHUSE_LTP_PROFILE}-pass-candidates-${RUN_ID}.txt"
+        bad_candidates="/tmp/rv-ltp-generic-${WHUSE_LTP_PROFILE}-bad-candidates-${RUN_ID}.txt"
+        generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}"
+        echo "[${arch}] pass-candidates: ${pass_candidates} ($(wc -l < "${pass_candidates}"))"
+        echo "[${arch}] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
+        case "${WHUSE_LTP_PROFILE}" in
+        full | curated)
+            candidate_target_whitelist="${WHUSE_LTP_CURATED_WHITELIST}"
+            candidate_target_blacklist="${WHUSE_LTP_CURATED_BLACKLIST}"
+            apply_ltp_candidate_lists "${arch}" "${pass_candidates}" "${bad_candidates}" "${candidate_target_whitelist}" "${candidate_target_blacklist}"
+            ;;
+        esac
     fi
 
     echo "[${arch}] marker summary:"

@@ -131,145 +131,123 @@ Current recommended default for validation is real execution (`WHUSE_OSCOMP_COMP
 
 Host quick mode remains available via `WHUSE_QEMU_MODE=host`.
 
-### 4.1 Current RISC-V/LoongArch full run (repro baseline)
+### 4.1 Current best scored baseline (2026-04-01, commit `9ad5123`)
 
-Preconditions:
+Current public best result comes from site submission `9ad512346bbdcb1c688a2311961b977ec239f422`.
 
-- `cargo xtask oscomp-images` succeeded, and `$RV_IMG` / `$LA_IMG` exist.
-- QEMU binary is available.
+- Total score: **884.0**
+- Primary score source: **musl-rv = 513.0**
+- Current direction is validated: RISC-V score-first sequencing plus scorer-compatible `libctest` / `ltp` output works on the site.
 
-Commands:
+Score highlights from [assist_docs/9ad512346bbdcb1c688a2311961b977ec239f422/代码执行结果.md](assist_docs/9ad512346bbdcb1c688a2311961b977ec239f422/代码执行结果.md):
 
-```bash
-timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$RV_IMG" cargo xtask oscomp-riscv > /tmp/rv-current.log 2>&1
-timeout 3600s env WHUSE_QEMU_MODE=contest WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$LA_IMG" cargo xtask oscomp-loongarch > /tmp/la-current.log 2>&1
-```
+| Test | glibc-la | glibc-rv | musl-la | musl-rv | Total |
+|---|---:|---:|---:|---:|---:|
+| basic | 98 | 101 | 98 | 99 | 396 |
+| busybox | 0 | 54 | 11 | 54 | 119 |
+| libctest | - | - | 0 | 201 | 201 |
+| ltp | 0 | 0 | 0 | 133 | 133 |
+| libcbench | 0 | 0 | 0 | 17 | 17 |
+| lua | 0 | 9 | 0 | 9 | 18 |
 
-Acceptance markers:
+### 4.2 Current code per-arch full order
 
-- Must contain:
-  - `whuse-oscomp-script-start`
-  - `whuse-oscomp-step-begin:busybox_testcode.sh`
-  - `whuse-oscomp-step-end:busybox_testcode.sh:*`
-  - `whuse-oscomp-suite-done`
-- Compat mode often contains (expected only if `WHUSE_OSCOMP_COMPAT=1`):
-  - `whuse-oscomp-step-skip:*:compat-hang`
+RISC-V committed `full` order at `9ad5123`:
 
-Failure handling:
-
-- If image lock appears (`disk image ... is currently in use by pid ...`):
-  - stop prior QEMU process, rerun.
-- If kernel panic or `pid 1 (init)` crash appears:
-  - mark run as invalid, collect trap context, move to kernel semantic debugging.
-
-### 4.2 Current default step order (documented behavior)
-
-The suite script order is:
-
-1. `time-test` (missing file -> explicit skip marker)
+1. `time-test`
 2. `basic_testcode.sh`
-3. `busybox_testcode.sh` (compat script when `WHUSE_OSCOMP_COMPAT=1`)
-4. `iozone_testcode.sh`
-5. `libctest_testcode.sh`
-6. `libc-bench`
-7. `ltp_testcode.sh`
-8. `lmbench_testcode.sh`
-9. `lua_testcode.sh`
+3. `busybox_testcode.sh`
+4. `iozone_testcode.sh` — explicit skip (`riscv-known-panic`)
+5. `ltp_testcode.sh` — `musl` runs internal score-mode LTP; `glibc` skipped
+6. `libctest_testcode.sh` — `musl` real runner; `glibc` skipped
+7. `lua_testcode.sh`
+8. `libc-bench`
+9. `lmbench_testcode.sh`
 10. `unixbench_testcode.sh`
 11. `netperf_testcode.sh`
 12. `iperf_testcode.sh`
-13. `cyclic_testcode.sh` (or fallback to `cyclictest_testcode.sh`)
+13. `cyclic_testcode.sh`
 
-### 4.3 Current known status (as of 2026-03-30)
+LoongArch current code `full` order:
 
-**Branch**: `dev` at commit `023004e`
+1. `time-test`
+2. `basic_testcode.sh`
+3. `busybox_testcode.sh`
+4. `libctest_testcode.sh` — `musl` real execution; `glibc` explicit skip (`glibc-libctest-not-scored`)
+5. `lua_testcode.sh`
+6. `libc-bench`
+7. `ltp_testcode.sh` — `musl` real execution; `glibc` explicit skip (`glibc-ltp-not-scored`)
+8. `iozone_testcode.sh` — explicit skip (`loongarch-iozone-not-scored`)
+9. `lmbench_testcode.sh` — explicit skip (`loongarch-lmbench-not-scored`)
+10. `unixbench_testcode.sh`
+11. `netperf_testcode.sh`
+12. `iperf_testcode.sh`
+13. `cyclic_testcode.sh`
 
-**RISC-V musl-rv Test Results** (verified 2026-03-30):
-- ✅ `time-test` — skip (missing binary, expected)
-- ✅ `basic_testcode.sh` — completes with exit 0
-- ✅ `busybox_testcode.sh` — completes with exit 0
-- ✅ `iozone_testcode.sh` — completes with exit 0
-- ✅ `libctest_testcode.sh` — completes with exit 0
-- ✅ `libc-bench` — completes with exit 0
-- ✅ `lua_testcode.sh` — completes with exit 0
-- ❌ `lmbench_testcode.sh` — starts but times out (no COW fork optimization)
-- ⏭️ `netperf_testcode.sh` — skipped (per user request)
-- ⏭️ `iperf_testcode.sh` — skipped (per user request)  
-- ⏭️ `cyclictest_testcode.sh` — skipped (per user request)
+### 4.3 Scorer-sensitive output contracts
 
-**Score**: ~525 points (lmbench not passing)
+The site judge is not only syscall/semantic-sensitive; it is also output-contract-sensitive.
 
-**Key Issues**:
+- `basic`: keep default builds free of `COW fault handled` / `COW promote failed` noise. The `pipe` / `wait` / `waitpid` / `yield` scorers are line-sensitive.
+- `libctest`: must emit judge-visible `START entry-static.exe`, `START entry-dynamic.exe`, and `Pass!`.
+- `ltp`: must emit `RUN LTP CASE <case>` and `FAIL LTP CASE <case> : <ret>`. `whuse-ltp-case-result:*` is auxiliary diagnostics, not the primary scoring contract.
 
-1. **COW Fork Not Implemented**: `clone_private()` in `crates/mm/src/lib.rs` does eager copy of all memory pages on fork(). This is correct but slow, causing lmbench to timeout.
+### 4.4 Site-proven vs current code state
 
-2. **COW Fork Attempt Failed**: Previous attempt to implement COW (Copy-On-Write) fork failed because:
-   - Page fault handler (scause=15) couldn't find faulting address in segment mappings
-   - Segment lookup returned `None` for stack pages
-   - Would require careful debugging of the segment boundary checking logic
+Current site-proven best is still `9ad5123`, but the current code baseline is already ahead of that on the LoongArch control plane.
 
-3. **EINTR Livelock Fix**: `023004e` includes EINTR counter to detect and force-exit pthread_cancel livelocks.
+- Site-proven baseline:
+  - RISC-V score-first sequencing and scorer-compatible `libctest` / `ltp` output are confirmed by `9ad5123`
+  - LoongArch score remains low in the site result because that submission still used the older `full` control plane
+- Current code baseline:
+  - stage2 helper tracks per-arch `full` order instead of one shared `full_root_steps`
+  - LoongArch `full` is now score-first, with selective `glibc` skips for `busybox/libctest/ltp`
+  - low-yield LoongArch groups (`iozone/lmbench/unixbench/netperf/iperf/cyclic`) are explicit skips
+- Current earliest blocker:
+  - `loongarch full -> musl/libctest` after `basic -> busybox` is already reachable
 
-### 4.4 Scoring Summary
+## 5) Next Focus (Post-`9ad5123`)
 
-| Test | musl-rv | glibc-rv | musl-la | glibc-la |
-|------|----------|----------|----------|----------|
-| basic | ✅ | ✅ | ✅ | ✅ |
-| busybox | ✅ | ✅ | ✅ | ✅ |
-| iozone | ✅ | ✅ | ✅ | ✅ |
-| libctest | ✅ | N/A | ✅ | N/A |
-| libc-bench | ✅ | ✅ | ✅ | ✅ |
-| lua | ✅ | ✅ | ✅ | ✅ |
-| lmbench | ❌ timeout | ❌ | ❌ | ❌ |
-| netperf | ⏭️ | ⏭️ | ⏭️ | ⏭️ |
-| iperf | ⏭️ | ⏭️ | ⏭️ | ⏭️ |
-| cyclictest | ⏭️ | ⏭️ | ⏭️ | ⏭️ |
+Next stage remains **LoongArch full-chain scoring**, with RISC-V LTP expansion handled as a secondary local-only track.
 
-- ✅ = passes with exit 0
-- ❌ = fails/times out
-- ⏭️ = skipped per user request
-- N/A = not scored per contest rules
+### 5.1 Immediate engineering goal
 
-## 5) Target Flow (理想真实执行 / Real Execution)
+- Keep the committed RISC-V score path unchanged and use it only as a regression guard.
+- Keep the current LoongArch score-first `full` ordering and selective runtime/step skips intact.
+- Make `full -> musl/libctest` the only active LoongArch blocker to debug.
+- Expand `musl-rv` LTP locally through curated-first discovery; do not switch the site path away from 48-case score mode.
+- Treat full-discovery as candidate generation only. Promote to curated first; keep score whitelist conservative.
 
-Target policy: disable compat-by-default semantics during verification runs.
+### 5.2 Next validation path
 
-### 5.1 Real execution run (no compat shortcuts)
-
-Preconditions:
-
-- Same as current flow.
-- Explicitly disable compat for this run.
-
-Commands:
+Primary LoongArch validation sequence:
 
 ```bash
-timeout 3600s env WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$RV_IMG" cargo xtask qemu-riscv > /tmp/rv-target.log 2>&1
-timeout 3600s env WHUSE_OSCOMP_COMPAT=0 WHUSE_DISK_IMAGE="$LA_IMG" cargo xtask qemu-loongarch > /tmp/la-target.log 2>&1
+TIMEOUT_SECS=240 WHUSE_STAGE2_IMAGE_POLICY=never WHUSE_STAGE2_USE_IMAGE_COPY=1 WHUSE_OSCOMP_PROFILE=full WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh loongarch
+TIMEOUT_SECS=240 WHUSE_STAGE2_IMAGE_POLICY=never WHUSE_STAGE2_USE_IMAGE_COPY=1 WHUSE_OSCOMP_PROFILE=libctest WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh loongarch
 ```
 
-Acceptance markers:
+Acceptance goals:
 
-- Must contain:
-  - begin/end markers for each suite step
-  - `whuse-oscomp-suite-done`
-- Must NOT contain:
-  - `panic`
-  - `pid 1 (init)` crash signature
-  - "fake timeout without real execution" style behavior
+- `basic -> busybox` must remain reachable in `loongarch full`
+- determine whether `musl/libctest` is:
+  - a true semantic stall
+  - only too slow for the current window
+  - or missing scorer-visible output
+- if `libctest` becomes passable or skippable without losing more score than it blocks, the next target is `lua` then `libc-bench`
 
-Failure handling:
+RISC-V guardrail:
 
-- If blocked at one group:
-  - inspect top failing syscall patterns (`ENOSYS/EINVAL`) + process name + group marker.
-- If loader/map failures (e.g., ld-musl traps):
-  - prioritize `mmap/mprotect/munmap/brk` + dynamic loader path.
+```bash
+TIMEOUT_SECS=240 WHUSE_STAGE2_IMAGE_POLICY=never WHUSE_STAGE2_USE_IMAGE_COPY=1 WHUSE_OSCOMP_PROFILE=full WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh riscv
+```
 
-### 5.2 Throughput objective (after stable completion)
+Must still show:
 
-- Phase 1: full sequence completes and system stays alive.
-- Phase 2: reduce `basic/busybox/lua` fail/error toward zero.
-- Phase 3: reduce failures in heavy groups (`iozone/libctest/lmbench/unixbench/netperf/iperf/cyclictest`).
+- `basic_testcode.sh:0`
+- `busybox_testcode.sh:0`
+- `RUN LTP CASE ...`
+- `FAIL LTP CASE ... : 0`
 
 ## 6) Validation Rules (Machine-Readable)
 
@@ -304,6 +282,8 @@ Pass/Fail policy:
 | `whuse-oscomp-step-skip:*:compat-hang` | check `WHUSE_OSCOMP_COMPAT` | compat default enabled | rerun with `WHUSE_OSCOMP_COMPAT=0` for real execution |
 | `ld-musl-*.so.1` trap or early user trap | inspect surrounding step/process markers | loader/memory mapping semantics gap | prioritize `mmap/mprotect/munmap/brk` path |
 | flow stalls around busybox large-tree ops | inspect step timeout + process name | heavy directory traversal or syscall semantics | profile hot syscalls; optimize VFS/ext4 read/stat path |
+| `ltp` ran but scored `0` | inspect log for `RUN LTP CASE` and `FAIL LTP CASE ... : <ret>` | scorer contract mismatch | restore official LTP output contract before changing kernel semantics |
+| `libctest` ran but scored `0` | inspect log for `START entry-static.exe`, `START entry-dynamic.exe`, `Pass!` | stubbed runner or scorer-visible lines missing | run the real musl libctest launcher and verify image content is not stubbed |
 | preflight missing `/musl/...` file | inspect `oscomp preflight missing required path` logs | incomplete image content | rebuild testsuits image / validate with `cargo xtask oscomp-images` |
 | `grep` reports "binary file matches" on log | use `strings /tmp/rv-*.log \| grep ...` instead | QEMU log contains binary escape sequences | always pipe through `strings` before grepping |
 | `make build-riscv` reports `Finished (0.0Xs)` but changes not reflected | `touch` modified `.rs` files then rebuild | cargo incremental cache not invalidated | `touch crates/*/src/lib.rs && make build-riscv` |

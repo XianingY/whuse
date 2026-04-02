@@ -41,6 +41,7 @@ pub enum ProcessState {
     Ready,
     Running,
     Blocked,
+    Stopped,
     Exited,
 }
 
@@ -172,6 +173,7 @@ pub struct Process {
     pub robust_list: Option<(usize, usize)>,
     pub signal_mask: u64,
     pub pending_signals: u64,
+    pub wait_status_pending: Option<i32>,
     pub sigaltstack: Option<(usize, usize, u32)>,
     pub signal_actions: BTreeMap<usize, SigAction>,
     pub sleep_deadline_ns: Option<u64>,
@@ -259,6 +261,7 @@ impl Process {
             clear_child_tid: None,
             robust_list: None,
             pending_signals: 0,
+            wait_status_pending: None,
             sigaltstack: None,
             signal_actions: BTreeMap::new(),
             signal_mask: 0,
@@ -465,6 +468,7 @@ impl Process {
         self.state = ProcessState::Ready;
         self.exit_code = None;
         self.pending_signals = 0;
+        self.wait_status_pending = None;
         self.signal_mask = 0;
         self.signal_actions.clear();
         self.sigaltstack = None;
@@ -536,6 +540,7 @@ impl Process {
             robust_list: self.robust_list,
             signal_mask: self.signal_mask,
             pending_signals: 0,
+            wait_status_pending: None,
             sigaltstack: self.sigaltstack,
             signal_actions: self.signal_actions.clone(),
             sleep_deadline_ns: None,
@@ -597,6 +602,7 @@ impl Process {
             robust_list: self.robust_list,
             signal_mask: self.signal_mask,
             pending_signals: 0,
+            wait_status_pending: None,
             sigaltstack: self.sigaltstack,
             signal_actions: self.signal_actions.clone(),
             sleep_deadline_ns: None,
@@ -669,6 +675,7 @@ impl Process {
             robust_list: None,
             signal_mask: self.signal_mask,
             pending_signals: 0,
+            wait_status_pending: None,
             sigaltstack: self.sigaltstack,
             signal_actions: self.signal_actions.clone(),
             sleep_deadline_ns: None,
@@ -864,8 +871,11 @@ impl ProcessTable {
         &mut self,
         parent_tgid: usize,
         selector: WaitSelector,
-        _options: u32,
+        options: u32,
     ) -> KernelResult<(usize, i32)> {
+        const WUNTRACED: u32 = 2;
+        const WCONTINUED: u32 = 8;
+
         let child_tid = self
             .processes
             .values()
@@ -877,6 +887,44 @@ impl ProcessTable {
             .map(|process| process.tgid);
 
         let Some(child_tid) = child_tid else {
+            if (options & WUNTRACED) != 0 {
+                if let Some((child_tid, status)) = self
+                    .processes
+                    .values_mut()
+                    .filter(|process| !process.is_thread)
+                    .filter(|process| process.parent == Some(parent_tgid))
+                    .filter(|process| selector_matches(selector, process))
+                    .find_map(|process| {
+                        (process.state == ProcessState::Stopped)
+                            .then(|| process.wait_status_pending.take().map(|status| (process.tgid, status)))
+                            .flatten()
+                    })
+                {
+                    return Ok((child_tid, status));
+                }
+            }
+
+            if (options & WCONTINUED) != 0 {
+                if let Some((child_tid, status)) = self
+                    .processes
+                    .values_mut()
+                    .filter(|process| !process.is_thread)
+                    .filter(|process| process.parent == Some(parent_tgid))
+                    .filter(|process| selector_matches(selector, process))
+                    .find_map(|process| {
+                        (process.state != ProcessState::Exited)
+                            .then(|| {
+                                (process.wait_status_pending == Some(WAIT_STATUS_CONTINUED))
+                                    .then(|| process.wait_status_pending.take().map(|status| (process.tgid, status)))
+                                    .flatten()
+                            })
+                            .flatten()
+                    })
+                {
+                    return Ok((child_tid, status));
+                }
+            }
+
             let has_any_child = self.processes.values().any(|process| {
                 !process.is_thread
                     && process.parent == Some(parent_tgid)
@@ -900,6 +948,30 @@ impl ProcessTable {
         };
         self.reap_thread_group(child_tid);
         Ok((child_tid, status))
+    }
+
+    pub fn mark_stopped_by_signal(
+        &mut self,
+        tid: usize,
+        signal: usize,
+    ) -> KernelResult<Option<usize>> {
+        let process = self.processes.get_mut(&tid).ok_or(ESRCH)?;
+        if process.state == ProcessState::Exited {
+            return Err(ESRCH);
+        }
+        process.state = ProcessState::Stopped;
+        process.wait_status_pending = Some(wait_status_from_stop_signal(signal));
+        Ok(process.parent)
+    }
+
+    pub fn resume_stopped_by_signal(&mut self, tid: usize) -> KernelResult<bool> {
+        let process = self.processes.get_mut(&tid).ok_or(ESRCH)?;
+        if process.state != ProcessState::Stopped {
+            return Ok(false);
+        }
+        process.state = ProcessState::Ready;
+        process.wait_status_pending = Some(WAIT_STATUS_CONTINUED);
+        Ok(true)
     }
 
     pub fn wait_child_snapshot(
@@ -1257,6 +1329,11 @@ impl ProcessTable {
         if process.state == ProcessState::Exited {
             return Err(ESRCH);
         }
+        if signal == 18 && process.state == ProcessState::Stopped {
+            process.state = ProcessState::Ready;
+            process.wait_status_pending = Some(WAIT_STATUS_CONTINUED);
+            return Ok(target_tid);
+        }
         process.pending_signals |= 1u64 << (signal - 1);
         Ok(target_tid)
     }
@@ -1270,6 +1347,11 @@ impl ProcessTable {
             return Err(ESRCH);
         }
         if signal == 0 {
+            return Ok(tid);
+        }
+        if signal == 18 && process.state == ProcessState::Stopped {
+            process.state = ProcessState::Ready;
+            process.wait_status_pending = Some(WAIT_STATUS_CONTINUED);
             return Ok(tid);
         }
         process.pending_signals |= 1u64 << (signal - 1);
@@ -1309,6 +1391,11 @@ impl ProcessTable {
         }
         for tid in &targets {
             if let Some(process) = self.processes.get_mut(tid) {
+                if signal == 18 && process.state == ProcessState::Stopped {
+                    process.state = ProcessState::Ready;
+                    process.wait_status_pending = Some(WAIT_STATUS_CONTINUED);
+                    continue;
+                }
                 process.pending_signals |= 1u64 << (signal - 1);
             }
         }
@@ -1343,6 +1430,11 @@ impl ProcessTable {
         }
         for tid in &targets {
             if let Some(process) = self.processes.get_mut(tid) {
+                if signal == 18 && process.state == ProcessState::Stopped {
+                    process.state = ProcessState::Ready;
+                    process.wait_status_pending = Some(WAIT_STATUS_CONTINUED);
+                    continue;
+                }
                 process.pending_signals |= 1u64 << (signal - 1);
             }
         }
@@ -2058,6 +2150,12 @@ fn wait_status_from_signal(signum: usize) -> i32 {
     (signum as i32 & 0x7f) | if core { 0x80 } else { 0 }
 }
 
+pub const WAIT_STATUS_CONTINUED: i32 = 0xffff;
+
+fn wait_status_from_stop_signal(signum: usize) -> i32 {
+    ((signum as i32) << 8) | 0x7f
+}
+
 fn selector_matches(selector: WaitSelector, process: &Process) -> bool {
     match selector {
         WaitSelector::Any => true,
@@ -2198,6 +2296,45 @@ mod tests {
             .unwrap();
         assert_eq!(waited, child);
         assert_eq!(status, 7 << 8);
+    }
+
+    #[test]
+    fn stopped_child_reports_wuntraced_once_and_continued_once() {
+        const WUNTRACED: u32 = 2;
+        const WCONTINUED: u32 = 8;
+
+        let mut table = ProcessTable::new();
+        let leader = table.spawn_init("init", 0x1000);
+        table.set_current(leader).unwrap();
+        let child = table.fork_process_from_current().unwrap();
+
+        let parent = table.mark_stopped_by_signal(child, 19).unwrap();
+        assert_eq!(parent, Some(leader));
+
+        let (waited, status) = table
+            .wait_child(leader, WaitSelector::Pid(child), WUNTRACED)
+            .unwrap();
+        assert_eq!(waited, child);
+        assert_eq!(status, super::wait_status_from_stop_signal(19));
+
+        assert_eq!(
+            table.wait_child(leader, WaitSelector::Pid(child), WUNTRACED)
+                .unwrap(),
+            (0, 0)
+        );
+
+        assert!(table.resume_stopped_by_signal(child).unwrap());
+        let (waited, status) = table
+            .wait_child(leader, WaitSelector::Pid(child), WCONTINUED)
+            .unwrap();
+        assert_eq!(waited, child);
+        assert_eq!(status, super::WAIT_STATUS_CONTINUED);
+
+        assert_eq!(
+            table.wait_child(leader, WaitSelector::Pid(child), WCONTINUED)
+                .unwrap(),
+            (0, 0)
+        );
     }
 
     #[test]

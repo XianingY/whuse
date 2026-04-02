@@ -1,0 +1,14 @@
+pipe08
+pipe13
+pipe2_02
+pipe2_04
+link04
+lseek02
+unlinkat01
+open06
+open10
+open12
+read02
+read03
+write02
+write04

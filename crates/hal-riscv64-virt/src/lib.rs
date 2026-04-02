@@ -41,6 +41,7 @@ const ENODEV: i32 = 19;
 const EINVAL: i32 = 22;
 const EROFS: i32 = 30;
 const RISCV_TIMEBASE_HZ: u64 = 10_000_000;
+const RISCV_NANOS_PER_TICK: u64 = 100;
 const SBI_EXT_TIME: usize = 0x5449_4d45;
 const SBI_FID_SET_TIMER: usize = 0;
 const SBI_EXT_LEGACY_SET_TIMER: usize = 0x00;
@@ -775,7 +776,7 @@ fn read_time_ticks() -> u64 {
 
 #[cfg(target_arch = "riscv64")]
 fn nanos_to_time_ticks(nanos: u64) -> u64 {
-    nanos.saturating_mul(RISCV_TIMEBASE_HZ) / 1_000_000_000
+    nanos / RISCV_NANOS_PER_TICK
 }
 
 fn shutdown(reason: ShutdownReason) -> ! {
@@ -960,7 +961,7 @@ impl HalTimer for VirtTimer {
 
     fn monotonic_nanos(&self) -> u64 {
         let ticks = read_time_ticks();
-        ticks.saturating_mul(1_000_000_000) / RISCV_TIMEBASE_HZ
+        ticks.saturating_mul(RISCV_NANOS_PER_TICK)
     }
 
     fn program_oneshot(&self, deadline_nanos: u64) {
@@ -1268,6 +1269,7 @@ unsafe impl VirtioHal for RiscvVirtioHal {
 mod tests {
     use super::{
         parse_syscon_shutdown_config_from_dtb, sbi_shutdown_reason_code, ShutdownConfig,
+        RISCV_NANOS_PER_TICK,
     };
     use hal_api::ShutdownReason;
 
@@ -1288,5 +1290,13 @@ mod tests {
     fn maps_shutdown_reason_to_sbi_reason_code() {
         assert_eq!(sbi_shutdown_reason_code(ShutdownReason::Success), 0);
         assert_eq!(sbi_shutdown_reason_code(ShutdownReason::Failure), 1);
+    }
+
+    #[test]
+    fn riscv_timebase_uses_exact_100ns_ticks() {
+        assert_eq!(RISCV_NANOS_PER_TICK, 100);
+        assert_eq!(0 / RISCV_NANOS_PER_TICK, 0);
+        assert_eq!(100 / RISCV_NANOS_PER_TICK, 1);
+        assert_eq!(12_300 / RISCV_NANOS_PER_TICK, 123);
     }
 }

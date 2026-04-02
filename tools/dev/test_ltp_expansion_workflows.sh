@@ -6,6 +6,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 LTP_DIR="${REPO_ROOT}/tools/oscomp/ltp"
 REFRESHER="${REPO_ROOT}/tools/dev/refresh_ltp_reference_seeds.py"
 ROUND_HELPER="${REPO_ROOT}/tools/dev/run_ltp_rv_batch_round.sh"
+IMAGE_REFRESHER="${REPO_ROOT}/tools/dev/refresh_ltp_image_bins.py"
+IMAGE_ROUND_GENERATOR="${REPO_ROOT}/tools/dev/generate_ltp_image_rounds.py"
 
 assert_file_exists() {
     local path="$1"
@@ -49,6 +51,8 @@ assert_line_count_ge() {
 
 assert_file_exists "${REFRESHER}"
 assert_file_exists "${ROUND_HELPER}"
+assert_file_exists "${IMAGE_REFRESHER}"
+assert_file_exists "${IMAGE_ROUND_GENERATOR}"
 
 assert_contains "${REFRESHER}" "musl_rv_seed_ref_undefined.txt"
 assert_contains "${REFRESHER}" "musl_rv_seed_ref_nighthawk.txt"
@@ -56,6 +60,13 @@ assert_contains "${REFRESHER}" "musl_rv_seed_ref_starry_mix.txt"
 assert_contains "${REFRESHER}" "runltp_rvml"
 assert_contains "${REFRESHER}" "ltp_testlist"
 assert_contains "${REFRESHER}" "all_testcases"
+assert_contains "${IMAGE_REFRESHER}" "ltp/testcases/bin"
+assert_contains "${IMAGE_REFRESHER}" "debugfs"
+assert_contains "${IMAGE_ROUND_GENERATOR}" "musl_rv_seed_image_bins.txt"
+assert_contains "${IMAGE_ROUND_GENERATOR}" "musl_rv_seed_ref_nighthawk.txt"
+assert_contains "${IMAGE_ROUND_GENERATOR}" "musl_rv_curated_whitelist.txt"
+assert_contains "${IMAGE_ROUND_GENERATOR}" "musl_rv_curated_blacklist.txt"
+assert_contains "${IMAGE_ROUND_GENERATOR}" "musl_rv_flaky_score_cases.txt"
 
 assert_contains "${ROUND_HELPER}" "stable-pass.txt"
 assert_contains "${ROUND_HELPER}" "stable-bad.txt"
@@ -66,10 +77,15 @@ assert_contains "${ROUND_HELPER}" "ltp-riscv-curated"
 assert_file_exists "${LTP_DIR}/musl_rv_seed_ref_undefined.txt"
 assert_file_exists "${LTP_DIR}/musl_rv_seed_ref_nighthawk.txt"
 assert_file_exists "${LTP_DIR}/musl_rv_seed_ref_starry_mix.txt"
+assert_file_exists "${LTP_DIR}/musl_rv_seed_image_bins.txt"
+assert_file_exists "${LTP_DIR}/musl_rv_flaky_score_cases.txt"
 
 assert_line_count_ge "${LTP_DIR}/musl_rv_seed_ref_undefined.txt" 300
 assert_line_count_ge "${LTP_DIR}/musl_rv_seed_ref_nighthawk.txt" 500
 assert_line_count_ge "${LTP_DIR}/musl_rv_seed_ref_starry_mix.txt" 300
+assert_line_count_ge "${LTP_DIR}/musl_rv_seed_image_bins.txt" 2500
+assert_contains "${LTP_DIR}/musl_rv_flaky_score_cases.txt" "epoll_pwait01"
+assert_contains "${LTP_DIR}/musl_rv_flaky_score_cases.txt" "epoll_wait04"
 
 for round_file in \
     "${LTP_DIR}/musl_rv_round1_sync.txt" \
@@ -77,12 +93,48 @@ for round_file in \
     "${LTP_DIR}/musl_rv_round1_open_io.txt" \
     "${LTP_DIR}/musl_rv_round1_file_syscalls.txt" \
     "${LTP_DIR}/musl_rv_round1_sync_phase2.txt" \
-    "${LTP_DIR}/musl_rv_round1_open_io_phase1.txt"
+    "${LTP_DIR}/musl_rv_round1_open_io_phase1.txt" \
+    "${LTP_DIR}/musl_rv_score_wave1_ab_tail.txt" \
+    "${LTP_DIR}/musl_rv_score_wave2_vector_tail.txt"
 do
     assert_file_exists "${round_file}"
     if [[ -s "${round_file}" || "${round_file}" == *"open_io_phase1.txt" ]]; then
         assert_line_count_ge "${round_file}" 1
     fi
+done
+
+assert_contains "${LTP_DIR}/musl_rv_score_wave1_ab_tail.txt" "pipe08"
+assert_contains "${LTP_DIR}/musl_rv_score_wave1_ab_tail.txt" "write04"
+assert_contains "${LTP_DIR}/musl_rv_score_wave2_vector_tail.txt" "openat02"
+assert_contains "${LTP_DIR}/musl_rv_score_wave2_vector_tail.txt" "writev02"
+
+for image_round in \
+    "${LTP_DIR}/musl_rv_image_round_fs_path.txt" \
+    "${LTP_DIR}/musl_rv_image_round_open_io.txt" \
+    "${LTP_DIR}/musl_rv_image_round_process_signal.txt" \
+    "${LTP_DIR}/musl_rv_image_round_socket_basic.txt" \
+    "${LTP_DIR}/musl_rv_image_round_time.txt"
+do
+    assert_file_exists "${image_round}"
+    assert_line_count_ge "${image_round}" 1
+done
+
+for image_phase1 in \
+    "${LTP_DIR}/musl_rv_image_round_fs_path_phase1.txt" \
+    "${LTP_DIR}/musl_rv_image_round_open_io_phase1.txt" \
+    "${LTP_DIR}/musl_rv_image_round_process_signal_phase1.txt"
+do
+    assert_file_exists "${image_phase1}"
+    assert_line_count_ge "${image_phase1}" 1
+done
+
+for image_phase2 in \
+    "${LTP_DIR}/musl_rv_image_round_fs_path_phase2.txt" \
+    "${LTP_DIR}/musl_rv_image_round_open_io_phase2.txt" \
+    "${LTP_DIR}/musl_rv_image_round_process_signal_phase2.txt"
+do
+    assert_file_exists "${image_phase2}"
+    assert_line_count_ge "${image_phase2}" 1
 done
 
 assert_file_exists "${LTP_DIR}/musl_rv_blacklist_review_round1.txt"

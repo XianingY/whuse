@@ -1,0 +1,16 @@
+waitid02
+waitid03
+waitid09
+waitid10
+waitid11
+clone02
+execl01
+execle01
+execlp01
+execv01
+execve01
+execve05
+execvp01
+getsid01
+getsid02
+kill07

@@ -1,0 +1,16 @@
+signal02
+signal03
+signal04
+signal05
+sigpending02
+tgkill03
+wait01
+wait02
+wait402
+waitid05
+waitid06
+waitpid01
+waitpid03
+waitpid04
+clone302
+fork04

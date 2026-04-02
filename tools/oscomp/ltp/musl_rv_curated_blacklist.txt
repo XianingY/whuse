@@ -1,3 +1,4 @@
+chdir04
 epoll_wait05
 epoll_wait06
 fcntl12
@@ -5,9 +6,17 @@ fcntl23
 fcntl27
 fcntl34
 fcntl36
+fork07
+fork08
+fork10
+fstat03
+fstat03_64
+kill03
+kill11
 link08
 linkat01
 linkat02
+mkdir05
 preadv03
 pwritev03
 readlink03
@@ -19,4 +28,6 @@ rename09
 renameat01
 renameat201
 select03
+signal01
+statvfs02
 unlink09

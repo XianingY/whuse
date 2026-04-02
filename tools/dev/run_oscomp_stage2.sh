@@ -27,6 +27,11 @@ fi
 if [[ -v WHUSE_LTP_BLACKLIST ]]; then
     LTP_BLACKLIST_WAS_SET=1
 fi
+if [[ -v WHUSE_STAGE2_USE_IMAGE_COPY ]]; then
+    STAGE2_USE_IMAGE_COPY_WAS_SET=1
+else
+    STAGE2_USE_IMAGE_COPY_WAS_SET=0
+fi
 
 export WHUSE_OSCOMP_DOCKER_IMAGE="${WHUSE_OSCOMP_DOCKER_IMAGE:-docker.educg.net/cg/os-contest:20260104}"
 export WHUSE_OSCOMP_COMPAT="${WHUSE_OSCOMP_COMPAT:-0}"
@@ -496,6 +501,16 @@ prepare_runtime_image() {
     prepared_runtime_image="${dst}"
 }
 
+prepare_ltp_runtime_image() {
+    local src="$1"
+    local saved_use_image_copy="${WHUSE_STAGE2_USE_IMAGE_COPY}"
+    if [[ "${STAGE2_USE_IMAGE_COPY_WAS_SET}" != "1" ]]; then
+        WHUSE_STAGE2_USE_IMAGE_COPY=1
+    fi
+    prepare_runtime_image "rv" "${src}"
+    WHUSE_STAGE2_USE_IMAGE_COPY="${saved_use_image_copy}"
+}
+
 runtime_image_path_exists() {
     local image="$1"
     local target="$2"
@@ -853,12 +868,11 @@ apply_ltp_candidate_lists() {
     echo "[${label}] applied candidate lists to ${target_whitelist} and ${target_blacklist}"
 }
 
-inject_ltp_runtime_config() {
+inject_ltp_runtime_files() {
     local image="$1"
     local ltp_profile="$2"
     local ltp_whitelist_path="$3"
     local ltp_blacklist_path="$4"
-    inject_oscomp_profile "${image}" "ltp"
     write_runtime_image_config "${image}" "/musl/.whuse_ltp_profile" "${ltp_profile}"
     if [[ -n "${ltp_whitelist_path}" && -f "${ltp_whitelist_path}" ]]; then
         write_runtime_image_file "${image}" "/musl/ltp_score_whitelist.host.txt" "${ltp_whitelist_path}"
@@ -880,6 +894,15 @@ inject_ltp_runtime_config() {
     if [[ -n "${WHUSE_LTP_CASE_TIMEOUT:-}" ]]; then
         write_runtime_image_config "${image}" "/musl/.whuse_ltp_case_timeout" "${WHUSE_LTP_CASE_TIMEOUT}"
     fi
+}
+
+inject_ltp_runtime_config() {
+    local image="$1"
+    local ltp_profile="$2"
+    local ltp_whitelist_path="$3"
+    local ltp_blacklist_path="$4"
+    inject_oscomp_profile "${image}" "ltp"
+    inject_ltp_runtime_files "${image}" "${ltp_profile}" "${ltp_whitelist_path}" "${ltp_blacklist_path}"
 }
 
 generate_ltp_candidate_lists() {
@@ -979,6 +1002,11 @@ run_arch() {
     effective_profile="$(effective_oscomp_profile)"
     validate_oscomp_profile "${effective_profile}"
     inject_stage2_local_env "${runtime_image}"
+    if [[ "${arch}" == "rv" ]]; then
+        if [[ "${effective_profile}" == "full" || "${effective_profile}" == "ltp" ]]; then
+            inject_ltp_runtime_files "${runtime_image}" "${WHUSE_LTP_PROFILE}" "${WHUSE_LTP_WHITELIST}" "${WHUSE_LTP_BLACKLIST}"
+        fi
+    fi
     if [[ "${WHUSE_OSCOMP_RUNTIME_FILTER}" != "both" ]]; then
         inject_oscomp_runtime_filter "${runtime_image}" "${WHUSE_OSCOMP_RUNTIME_FILTER}"
     fi
@@ -1226,7 +1254,7 @@ run_ltp_riscv_mode() {
     ltp_profile="${ltp_config[0]}"
     ltp_whitelist="${ltp_config[1]}"
     ltp_blacklist="${ltp_config[2]}"
-    prepare_runtime_image "rv" "${RV_IMG}"
+    prepare_ltp_runtime_image "${RV_IMG}"
     runtime_image="${prepared_runtime_image}"
     inject_ltp_runtime_config "${runtime_image}" "${ltp_profile}" "${ltp_whitelist}" "${ltp_blacklist}"
 

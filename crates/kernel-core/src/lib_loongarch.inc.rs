@@ -1920,13 +1920,25 @@ const OSCOMP_SUITE_ENTRY_SCRIPT: &str = concat!(
 
 static KERNEL_IDLE_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
+fn idle_timer_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_IDLE_TIMER"), Some("1"))
+}
+
+fn sched_tick_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_SCHED_TICK"), Some("1"))
+}
+
+fn timer_preemption_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_TIMER_PREEMPT"), Some("1"))
+}
+
 fn kernel_idle_timer_cb() {
     let count = KERNEL_IDLE_TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     let now = hal().timer.monotonic_nanos();
     hal()
         .timer
         .program_oneshot(now.saturating_add(SCHED_TIME_SLICE_NS));
-    if count <= 5 || count % 100 == 0 {
+    if idle_timer_debug_enabled() && (count <= 5 || count % 100 == 0) {
         logln(format_args!("[IDLE-TMR:{}]", count));
     }
 }
@@ -2525,19 +2537,30 @@ impl Kernel {
         if is_timer_interrupt {
             self.timer_irq_count = self.timer_irq_count.saturating_add(1);
 
-            if self.timer_irq_count >= 6 && self.timer_irq_count <= 20 {
+            if timer_preemption_debug_enabled()
+                && self.timer_irq_count >= 6
+                && self.timer_irq_count <= 20
+            {
                 logln(format_args!("[TMR-EVERY:{}]", self.timer_irq_count));
             }
 
-            if self.timer_irq_count >= 10 && self.timer_irq_count <= 50 {
+            if timer_preemption_debug_enabled()
+                && self.timer_irq_count >= 10
+                && self.timer_irq_count <= 50
+            {
                 logln(format_args!("[TMR:{}]", self.timer_irq_count));
             }
 
-            if self.timer_irq_count >= 190 && self.timer_irq_count <= 250 {
+            if timer_preemption_debug_enabled()
+                && self.timer_irq_count >= 190
+                && self.timer_irq_count <= 250
+            {
                 logln(format_args!("[TMR-LATE:{}]", self.timer_irq_count));
             }
 
-            if self.timer_irq_count <= 5 || self.timer_irq_count % 1024 == 0 {
+            if timer_preemption_debug_enabled()
+                && (self.timer_irq_count <= 5 || self.timer_irq_count % 1024 == 0)
+            {
                 logln(format_args!(
                     "whuse: timer interrupt preemption active count={}",
                     self.timer_irq_count
@@ -2596,7 +2619,7 @@ impl Kernel {
                 let _ = self.scheduler.wake_task(tid);
             }
 
-            if self.timer_irq_count % 100 == 0 {
+            if sched_tick_debug_enabled() && self.timer_irq_count % 100 == 0 {
                 let bc = self.scheduler.blocked_count();
                 let rc = self.scheduler.ready_count();
 
@@ -4052,8 +4075,8 @@ fn should_restart_blocked_syscall(sysno: usize, result: isize, task_blocked: boo
 #[cfg(test)]
 mod tests {
     use super::{
-        cow_debug_enabled, select_oscomp_suite_script, OSCOMP_OFFICIAL_SUITE_SCRIPT,
-        OSCOMP_PROFILE_PATH,
+        cow_debug_enabled, select_oscomp_suite_script, timer_preemption_debug_enabled,
+        OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH,
         OSCOMP_RUNTIME_FILTER_PATH,
     };
     use std::{fs, process::Command};
@@ -4437,6 +4460,14 @@ mod tests {
         assert!(
             !cow_debug_enabled(),
             "COW fault logs should stay silent by default so testsuite output is not polluted"
+        );
+    }
+
+    #[test]
+    fn timer_preemption_debug_logging_is_disabled_by_default() {
+        assert!(
+            !timer_preemption_debug_enabled(),
+            "timer preemption logs should stay silent by default so micro-timing tests are not polluted"
         );
     }
 }

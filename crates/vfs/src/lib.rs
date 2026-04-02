@@ -406,6 +406,11 @@ fn stage2_openat_debug_enabled() -> bool {
 }
 
 #[inline]
+fn ltp_create_probe_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_LTP_PATH"), Some("1"))
+}
+
+#[inline]
 fn is_shell_token_path(absolute: &str) -> bool {
     matches!(absolute, "/[" | "/]")
 }
@@ -489,6 +494,7 @@ impl KernelVfs {
         let _ = vfs.mkdir("/", "/proc/sys/kernel", 0o755);
         let _ = vfs.mkdir("/", "/proc/sys/kernel/keys", 0o755);
         let _ = vfs.create_proc_file("/proc/sys/user/max_user_namespaces", b"1024\n");
+        let _ = vfs.create_proc_file("/proc/sys/kernel/pid_max", b"4194304\n");
         let _ = vfs.create_proc_file("/proc/sys/kernel/tainted", b"0\n");
         let _ = vfs.create_proc_file("/proc/key-users", b"");
         let _ = vfs.create_proc_file("/proc/sys/kernel/keys/gc_delay", b"1\n");
@@ -3659,10 +3665,11 @@ fn should_use_statless_external_stat(absolute: &str) -> bool {
 }
 
 fn is_ltp_create_probe_path(path: &str) -> bool {
-    path.ends_with("/close01_testfile")
-        || path.ends_with("/dupfile")
-        || path == "close01_testfile"
-        || path == "dupfile"
+    ltp_create_probe_debug_enabled()
+        && (path.ends_with("/close01_testfile")
+            || path.ends_with("/dupfile")
+            || path == "close01_testfile"
+            || path == "dupfile")
 }
 
 fn is_compat_metadata_fallback_path(absolute: &str) -> bool {

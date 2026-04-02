@@ -1,7 +1,7 @@
 use crate::{
     DispatchContext, SyscallArgs, SYS_CLONE, SYS_CLONE3, SYS_EXECVE, SYS_EXIT, SYS_EXIT_GROUP,
     SYS_GETPGID, SYS_GETPID, SYS_GETPPID, SYS_GETSID, SYS_GETTID, SYS_POWER_OFF, SYS_SCHED_YIELD,
-    SYS_SETPGID, SYS_SETSID, SYS_SET_TID_ADDRESS, SYS_WAIT,
+    SYS_SETPGID, SYS_SETSID, SYS_SET_TID_ADDRESS, SYS_WAIT, SYS_WAITID,
 };
 
 pub(crate) fn dispatch(
@@ -26,6 +26,7 @@ pub(crate) fn dispatch(
             .dispatcher
             .sys_execve(args, ctx.procs, ctx.scheduler, ctx.vfs),
         SYS_WAIT => ctx.dispatcher.sys_wait(args, ctx.procs, ctx.scheduler),
+        SYS_WAITID => ctx.dispatcher.sys_waitid(args, ctx.procs, ctx.scheduler),
         SYS_SETPGID => ctx.dispatcher.sys_setpgid(args, ctx.procs),
         SYS_GETPGID => ctx.dispatcher.sys_getpgid(args, ctx.procs),
         SYS_GETSID => ctx.dispatcher.sys_getsid(args, ctx.procs),

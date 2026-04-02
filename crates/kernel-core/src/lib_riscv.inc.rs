@@ -64,7 +64,7 @@ fn idle_outcome_for_process_count(process_count: usize) -> KernelIdleOutcome {
 
 const USER_INIT_BASE: usize = 0x0040_0000;
 const EAGAIN_RET: isize = -11;
-const SCHED_TIME_SLICE_NS: u64 = 1_000_000;
+const SCHED_TIME_SLICE_NS: u64 = 10_000_000;
 const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
 const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
@@ -1686,13 +1686,25 @@ const OSCOMP_SUITE_ENTRY_SCRIPT: &str = concat!(
 
 static KERNEL_IDLE_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
+fn idle_timer_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_IDLE_TIMER"), Some("1"))
+}
+
+fn sched_tick_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_SCHED_TICK"), Some("1"))
+}
+
+fn timer_preemption_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_TIMER_PREEMPT"), Some("1"))
+}
+
 fn kernel_idle_timer_cb() {
     let count = KERNEL_IDLE_TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     let now = hal().timer.monotonic_nanos();
     hal()
         .timer
         .program_oneshot(now.saturating_add(SCHED_TIME_SLICE_NS));
-    if count <= 5 || count % 100 == 0 {
+    if idle_timer_debug_enabled() && (count <= 5 || count % 100 == 0) {
         logln(format_args!("[IDLE-TMR:{}]", count));
     }
 }
@@ -2373,19 +2385,30 @@ impl Kernel {
         if is_timer_interrupt {
             self.timer_irq_count = self.timer_irq_count.saturating_add(1);
 
-            if self.timer_irq_count >= 6 && self.timer_irq_count <= 20 {
+            if timer_preemption_debug_enabled()
+                && self.timer_irq_count >= 6
+                && self.timer_irq_count <= 20
+            {
                 logln(format_args!("[TMR-EVERY:{}]", self.timer_irq_count));
             }
 
-            if self.timer_irq_count >= 10 && self.timer_irq_count <= 50 {
+            if timer_preemption_debug_enabled()
+                && self.timer_irq_count >= 10
+                && self.timer_irq_count <= 50
+            {
                 logln(format_args!("[TMR:{}]", self.timer_irq_count));
             }
 
-            if self.timer_irq_count >= 190 && self.timer_irq_count <= 250 {
+            if timer_preemption_debug_enabled()
+                && self.timer_irq_count >= 190
+                && self.timer_irq_count <= 250
+            {
                 logln(format_args!("[TMR-LATE:{}]", self.timer_irq_count));
             }
 
-            if self.timer_irq_count <= 5 || self.timer_irq_count % 1024 == 0 {
+            if timer_preemption_debug_enabled()
+                && (self.timer_irq_count <= 5 || self.timer_irq_count % 1024 == 0)
+            {
                 logln(format_args!(
                     "whuse: timer interrupt preemption active count={}",
                     self.timer_irq_count
@@ -2433,7 +2456,7 @@ impl Kernel {
                 let _ = self.scheduler.wake_task(tid);
             }
 
-            if self.timer_irq_count % 100 == 0 {
+            if sched_tick_debug_enabled() && self.timer_irq_count % 100 == 0 {
                 let bc = self.scheduler.blocked_count();
                 let rc = self.scheduler.ready_count();
 
@@ -2495,20 +2518,20 @@ impl Kernel {
                 if let Ok(process) = self.processes.find_by_tid_mut(tid) {
                     let blocked_restart =
                         should_restart_blocked_syscall(sysno, result, self.scheduler.is_blocked(tid));
-                    if !blocked_restart {
+                    if should_advance_sepc_after_syscall(sysno, result, blocked_restart) {
                         process.trap_frame.set_retval(result as usize);
-                        if sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN {
-                            process.trap_frame.sepc = sepc + 4;
-                        }
+                        process.trap_frame.sepc = sepc + 4;
+                    } else if !blocked_restart {
+                        process.trap_frame.set_retval(result as usize);
                     }
                 }
             } else if let Ok(process) = self.processes.current_mut() {
                 let blocked_restart = should_restart_blocked_syscall(sysno, result, false);
-                if !blocked_restart {
+                if should_advance_sepc_after_syscall(sysno, result, blocked_restart) {
                     process.trap_frame.set_retval(result as usize);
-                    if sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN {
-                        process.trap_frame.sepc = sepc + 4;
-                    }
+                    process.trap_frame.sepc = sepc + 4;
+                } else if !blocked_restart {
+                    process.trap_frame.set_retval(result as usize);
                 }
             }
             self.dispatch_pending_signals();
@@ -2669,6 +2692,19 @@ impl Kernel {
         process.pending_signals &= !(1u64 << (signum - 1));
 
         if action.handler == 0 {
+            if matches!(signum, 19 | 20 | 21 | 22) {
+                let tid = process.tid;
+                let parent_tgid = process.parent;
+                let _ = process;
+                if self.processes.mark_stopped_by_signal(tid, signum).is_ok() {
+                    let _ = self.scheduler.block_current();
+                    if let Some(parent_tgid) = parent_tgid {
+                        let _ = self.processes.deliver_signal(parent_tgid, 17);
+                        let _ = self.wake_process_group_threads(parent_tgid);
+                    }
+                }
+                return;
+            }
             if signum != 17 && signum != 23 && signum != 28 {
                 {
                     let tid = process.tid;
@@ -3508,6 +3544,19 @@ fn should_restart_blocked_syscall(sysno: usize, result: isize, task_blocked: boo
         )
 }
 
+fn should_advance_sepc_after_syscall(sysno: usize, result: isize, blocked_restart: bool) -> bool {
+    if blocked_restart {
+        return false;
+    }
+    if sysno == SYS_RT_SIGRETURN {
+        return false;
+    }
+    if sysno == SYS_EXECVE && result >= 0 {
+        return false;
+    }
+    true
+}
+
 fn render_oscomp_official_suite_script(profile_default: &str) -> String {
     const LTP_HELPER_START: &str = "whuse_ltp_list_has_entries() {\n";
     const LTP_HELPER_END: &str = "step_name_for() {\n";
@@ -3730,8 +3779,9 @@ fn log_block_probe_span(device: &'static dyn hal_api::HalBlockDevice, start: usi
 mod tests {
     use super::{
         cow_debug_enabled, idle_outcome_for_process_count, render_oscomp_official_suite_script,
-        render_selected_oscomp_suite_script, select_oscomp_suite_script, KernelIdleOutcome,
-        OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH,
+        render_selected_oscomp_suite_script, select_oscomp_suite_script,
+        timer_preemption_debug_enabled, KernelIdleOutcome, OSCOMP_OFFICIAL_SUITE_SCRIPT,
+        OSCOMP_PROFILE_PATH, SCHED_TIME_SLICE_NS,
     };
     use vfs::KernelVfs;
 
@@ -4408,6 +4458,22 @@ mod tests {
     }
 
     #[test]
+    fn riscv_advances_sepc_for_failed_execve_but_not_success_or_sigreturn() {
+        assert!(
+            !super::should_advance_sepc_after_syscall(syscall::SYS_EXECVE, 0, false),
+            "successful execve should replace the image and keep sepc unchanged"
+        );
+        assert!(
+            super::should_advance_sepc_after_syscall(syscall::SYS_EXECVE, -14, false),
+            "failed execve must advance sepc so user mode does not retry the same faulting instruction forever"
+        );
+        assert!(
+            !super::should_advance_sepc_after_syscall(syscall::SYS_RT_SIGRETURN, 0, false),
+            "rt_sigreturn should keep the restored sepc"
+        );
+    }
+
+    #[test]
     fn riscv_libctest_uses_real_musl_runner_body() {
         let script = render_oscomp_official_suite_script("full");
 
@@ -4470,6 +4536,22 @@ mod tests {
         assert!(
             !cow_debug_enabled(),
             "COW fault logs should stay silent by default so testsuite output is not polluted"
+        );
+    }
+
+    #[test]
+    fn timer_preemption_debug_logging_is_disabled_by_default() {
+        assert!(
+            !timer_preemption_debug_enabled(),
+            "timer preemption logs should stay silent by default so micro-timing LTP cases are not polluted"
+        );
+    }
+
+    #[test]
+    fn riscv_sched_time_slice_is_10ms_or_longer() {
+        assert!(
+            SCHED_TIME_SLICE_NS >= 10_000_000,
+            "RISC-V timer preemption slice should stay at least 10ms so zero-timeout micro-timing LTP cases are not dominated by scheduler interrupts"
         );
     }
 }

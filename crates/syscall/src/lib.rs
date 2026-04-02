@@ -26,8 +26,9 @@ use spin::Mutex;
 use task::Scheduler;
 use user_init::builtin_program;
 use vfs::{
-    FileHandle, FileStat, KernelObject, KernelVfs, ObjectKind, HANDLE_FLAG_CLOEXEC, O_APPEND,
-    O_CREAT, O_DIRECTORY, O_EXCL, O_NOATIME, O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    EpollWatch, FileHandle, FileStat, KernelObject, KernelVfs, ObjectKind,
+    HANDLE_FLAG_CLOEXEC, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NOATIME, O_NOFOLLOW,
+    O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
 };
 
 const EAFNOSUPPORT: i32 = 97;
@@ -190,6 +191,7 @@ pub const SYS_SYNC: usize = 81;
 pub const SYS_FSYNC: usize = 82;
 pub const SYS_FDATASYNC: usize = 83;
 pub const SYS_UTIMENSAT: usize = 88;
+pub const SYS_WAITID: usize = 95;
 pub const SYS_SET_TID_ADDRESS: usize = 96;
 pub const SYS_UNSHARE: usize = 97;
 pub const SYS_FUTEX: usize = 98;
@@ -208,6 +210,8 @@ pub const SYS_SIGALTSTACK: usize = 132;
 pub const SYS_RT_SIGSUSPEND: usize = 133;
 pub const SYS_SIGACTION: usize = 134;
 pub const SYS_SIGPROCMASK: usize = 135;
+pub const SYS_RT_SIGACTION: usize = SYS_SIGACTION;
+pub const SYS_RT_SIGPROCMASK: usize = SYS_SIGPROCMASK;
 pub const SYS_RT_SIGPENDING: usize = 136;
 pub const SYS_RT_SIGTIMEDWAIT: usize = 137;
 pub const SYS_RT_SIGRETURN: usize = 139;
@@ -423,6 +427,16 @@ fn stage2_openat_debug_enabled() -> bool {
     matches!(option_env!("WHUSE_DEBUG_STAGE2_OPENAT"), Some("1"))
 }
 
+#[inline]
+fn ltp_path_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_LTP_PATH"), Some("1"))
+}
+
+#[inline]
+fn busybox_probe_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_BUSYBOX_PROBES"), Some("1"))
+}
+
 fn stage2_openat_debug(line: &str) {
     if stage2_openat_debug_enabled() {
         log_always(line);
@@ -437,7 +451,7 @@ fn parse_nonnegative_rw_offset(raw: usize) -> Result<usize, i32> {
 }
 
 fn is_busybox_testfile_probe_task(name: &str, cwd: &str) -> bool {
-    name.ends_with("/busybox") && cwd == "/"
+    busybox_probe_debug_enabled() && name.ends_with("/busybox") && cwd == "/"
 }
 
 fn is_busybox_testfile_probe_path(path: &str) -> bool {
@@ -456,14 +470,64 @@ fn is_busybox_bracket_probe(process: &Process) -> bool {
 }
 
 fn is_busybox_cp_probe_tgid(tgid: usize, name: &str) -> bool {
-    name.ends_with("/busybox")
+    busybox_probe_debug_enabled()
+        && name.ends_with("/busybox")
         && busybox_applet_name_for_tgid(tgid)
             .as_deref()
             .is_some_and(|applet| applet == "cp")
 }
 
+fn is_execve03_probe(process: &Process) -> bool {
+    process.name == "execve03" || process.name.ends_with("/execve03")
+}
+
+#[inline]
+fn execve03_setup_trace_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_EXECVE03_SETUP"), Some("1"))
+}
+
+fn is_execve03_setup_syscall(sysno: usize) -> bool {
+    matches!(
+        sysno,
+        SYS_OPENAT
+            | SYS_CLOSE
+            | SYS_READ
+            | SYS_GETCWD
+            | SYS_MKDIRAT
+            | SYS_CHDIR
+            | SYS_FCHOWNAT
+            | SYS_FSTATAT
+            | SYS_SETGID
+            | SYS_UMASK
+            | SYS_CLONE
+            | SYS_CLONE3
+            | SYS_EXECVE
+    )
+}
+
+fn execve03_setup_syscall_name(sysno: usize) -> &'static str {
+    match sysno {
+        SYS_OPENAT => "openat",
+        SYS_CLOSE => "close",
+        SYS_READ => "read",
+        SYS_GETCWD => "getcwd",
+        SYS_MKDIRAT => "mkdirat",
+        SYS_CHDIR => "chdir",
+        SYS_FCHOWNAT => "fchownat",
+        SYS_FSTATAT => "fstatat",
+        SYS_SETGID => "setgid",
+        SYS_UMASK => "umask",
+        SYS_CLONE => "clone",
+        SYS_CLONE3 => "clone3",
+        SYS_EXECVE => "execve",
+        _ => "?",
+    }
+}
+
 fn is_busybox_resource_copy_probe(name: &str, path: &str) -> bool {
-    name.ends_with("/busybox") && (matches!(path, "." | "./") || path.contains("pipe2_02_child"))
+    busybox_probe_debug_enabled()
+        && name.ends_with("/busybox")
+        && (matches!(path, "." | "./") || path.contains("pipe2_02_child"))
 }
 
 fn is_pipe2_02_copy_command(path: &str, display_path: &str, argv: &[String]) -> bool {
@@ -548,6 +612,7 @@ fn signal_frame_debug(line: &str) {
 
 static LIBCBENCH_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(4096);
 static IOZONE_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(512);
+static EXECVE03_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(512);
 
 fn is_libcbench_task(process: &proc::Process) -> bool {
     process.name.contains("libc-bench")
@@ -587,7 +652,31 @@ fn iozone_debug(line: &str) {
     }
 }
 
+fn execve03_debug(line: &str) {
+    if EXECVE03_TRACE_BUDGET
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            if remaining > 0 {
+                Some(remaining - 1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+    {
+        log_always(line);
+    }
+}
+
+fn execve03_setup_debug(line: &str) {
+    if execve03_setup_trace_enabled() {
+        log_always(line);
+    }
+}
+
 fn log_user_path_fault(process: &proc::Process, syscall: &str, path_ptr: usize) {
+    if !ltp_path_debug_enabled() {
+        return;
+    }
     log_always(&format!(
         "whuse-ltp:path-fault syscall={} tgid={} tid={} name={} cwd={} ptr={:#x} addr={}",
         syscall,
@@ -601,7 +690,8 @@ fn log_user_path_fault(process: &proc::Process, syscall: &str, path_ptr: usize) 
 }
 
 fn is_ltp_path_debug_task(name: &str) -> bool {
-    matches!(
+    ltp_path_debug_enabled()
+        && matches!(
         name,
         "readlink01" | "readlinkat02" | "fchownat02" | "link04" | "close01" | "dup01"
     )
@@ -1123,6 +1213,8 @@ impl SyscallDispatcher {
         };
         let mut iozone_trace_process: Option<(usize, String)> = None;
         let mut busybox_bracket_trace_process: Option<(usize, usize)> = None;
+        let mut execve03_trace_process: Option<(usize, String)> = None;
+        let mut execve03_setup_trace_process: Option<(usize, String, String)> = None;
         if syscall_trace_enabled() {
             if let Ok(process) = ctx.procs.current() {
                 trace_line(&format!(
@@ -1140,12 +1232,47 @@ impl SyscallDispatcher {
             }
         }
         if let Ok(process) = ctx.procs.current() {
+            if execve03_setup_trace_enabled() && is_execve03_setup_syscall(sysno) {
+                execve03_setup_trace_process = Some((
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                ));
+                execve03_setup_debug(&format!(
+                    "whuse-execve03-setup:syscall-enter tgid={} name={} cwd={} syscall={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    process.tgid,
+                    process.name,
+                    process.cwd,
+                    execve03_setup_syscall_name(sysno),
+                    args.0[0],
+                    args.0[1],
+                    args.0[2],
+                    args.0[3],
+                    args.0[4],
+                    args.0[5]
+                ));
+            }
             if is_busybox_bracket_probe(process) {
                 busybox_bracket_trace_process = Some((process.tid, process.tgid));
                 log_always(&format!(
                     "whuse-busybox:bracket-syscall-enter tid={} tgid={} sysno={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
                     process.tid,
                     process.tgid,
+                    sysno,
+                    args.0[0],
+                    args.0[1],
+                    args.0[2],
+                    args.0[3],
+                    args.0[4],
+                    args.0[5]
+                ));
+            }
+            if is_execve03_probe(process) {
+                execve03_trace_process = Some((process.tgid, process.name.clone()));
+                execve03_debug(&format!(
+                    "whuse-execve03:syscall-enter tgid={} name={} sysno={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    process.tgid,
+                    process.name,
                     sysno,
                     args.0[0],
                     args.0[1],
@@ -1226,6 +1353,22 @@ impl SyscallDispatcher {
             log_always(&format!(
                 "whuse-busybox:bracket-syscall-exit tid={} tgid={} sysno={} res={:#x}",
                 tid, tgid, sysno, res
+            ));
+        }
+        if let Some((tgid, name)) = execve03_trace_process {
+            execve03_debug(&format!(
+                "whuse-execve03:syscall-exit tgid={} name={} sysno={} res={:#x}",
+                tgid, name, sysno, res
+            ));
+        }
+        if let Some((tgid, name, cwd)) = execve03_setup_trace_process {
+            execve03_setup_debug(&format!(
+                "whuse-execve03-setup:syscall-exit tgid={} name={} cwd={} syscall={} res={:#x}",
+                tgid,
+                name,
+                cwd,
+                execve03_setup_syscall_name(sysno),
+                res
             ));
         }
         res
@@ -2569,6 +2712,9 @@ impl SyscallDispatcher {
             .current()?
             .read_user_cstr(args.0[0])
             .map_err(|_| EFAULT)?;
+        if path_is_too_long(&path) {
+            return Err(ENAMETOOLONG);
+        }
         let execve_iozone_probe = is_iozone_binary_probe_path(path.as_str());
         if execve_iozone_probe {
             log_always(&format!(
@@ -2688,13 +2834,24 @@ impl SyscallDispatcher {
                     .lock()
                     .insert(procs.current_tgid().unwrap_or(0), argv[1].clone());
             }
+            let stat = vfs.stat_path(&cwd, &path)?;
+            let mode = stat.mode & 0o170000;
+            if mode == 0o040000 {
+                return Err(EACCES);
+            }
+            if mode != 0o100000 {
+                return Err(EACCES);
+            }
+            if (stat.mode & 0o111) == 0 {
+                return Err(EACCES);
+            }
             let file_data = match read_exec_file_image(vfs, &cwd, &path) {
                 Ok(data) => data,
                 Err(err) => return Err(err),
             };
             if file_data.is_empty() {
                 trace_line(&format!("whuse: execve stage empty-image path={}", path));
-                return Err(EFAULT);
+                return Err(ENOEXEC);
             }
             trace_line(&format!(
                 "whuse: execve stage image-loaded path={} bytes={}",
@@ -3198,7 +3355,7 @@ impl SyscallDispatcher {
                 process.cwd.clone(),
             )
         };
-        let selector = selector_from_wait(wait_pid, procs.getpgid(0)?);
+        let selector = selector_from_wait(wait_pid, procs.getpgid(0)?)?;
         if wait_debug {
             log_always(&format!(
                 "whuse-ltp:wait-enter tgid={} name={} cwd={} wait_pid={} status_ptr={:#x} options={:#x}",
@@ -3227,6 +3384,9 @@ impl SyscallDispatcher {
         };
         if child_pid == 0 {
             if options & WNOHANG != 0 {
+                if scheduler.ready_count() != 0 {
+                    let _ = scheduler.yield_now();
+                }
                 if wait_debug {
                     log_always(&format!(
                         "whuse-ltp:wait-return-wnohang tgid={} name={} cwd={} child=0",
@@ -4360,6 +4520,10 @@ impl SyscallDispatcher {
         let sig = args.0[0];
         let new = args.0[1];
         let old = args.0[2];
+        let sigset_size = args.0[3];
+        if sigset_size != 0 && sigset_size != 8 {
+            return Err(EINVAL);
+        }
         if old != 0 {
             let current = procs.sigaction(sig)?;
             procs
@@ -5473,9 +5637,6 @@ impl SyscallDispatcher {
         vfs: &mut KernelVfs,
         scheduler: &mut Scheduler,
     ) -> Result<usize, i32> {
-        const EPOLLIN: u32 = 0x0001;
-        const EPOLLOUT: u32 = 0x0004;
-        const EPOLLONESHOT: u32 = 1u32 << 30;
         let epfd = args.0[0] as i32;
         let events_ptr = args.0[1];
         let maxevents_signed = args.0[2] as isize;
@@ -5492,7 +5653,7 @@ impl SyscallDispatcher {
             process.epoll_pwait_saved_mask = Some(process.signal_mask);
             process.signal_mask = new_mask;
         }
-        if procs.current()?.pending_signals & !procs.current()?.signal_mask != 0 {
+        if interrupting_pending_signals(procs.current()?) != 0 {
             let process = procs.current_mut()?;
             process.epoll_wait_deadline_ns = None;
             restore_epoll_pwait_mask(process);
@@ -5503,45 +5664,18 @@ impl SyscallDispatcher {
             let epoll = process.fd(epfd)?;
             vfs.epoll_watches(epoll)?
         };
-        let mut ready = Vec::new();
-        let mut oneshot_fds = Vec::new();
-        for watch in watches {
-            let process = procs.current()?;
-            let Ok(handle) = process.fd(watch.fd) else {
-                continue;
-            };
-            if watch.events == 0 {
-                continue;
-            }
-            let readable = vfs.is_read_ready(handle);
-            let writable = vfs.is_write_ready(handle);
-            let mut ready_events = 0u32;
-            if readable {
-                ready_events |= watch.events & EPOLLIN;
-            }
-            if writable {
-                ready_events |= watch.events & EPOLLOUT;
-            }
-            if ready_events != 0 {
-                ready.push(EpollEvent {
-                    events: ready_events,
-                    _pad: 0,
-                    data: watch.fd as u64,
-                });
-                if (watch.events & EPOLLONESHOT) != 0 {
-                    oneshot_fds.push(watch.fd);
-                }
-                if ready.len() == maxevents {
-                    break;
-                }
-            }
-        }
+        let (ready, oneshot_fds) = collect_ready_epoll_events(
+            &watches,
+            maxevents,
+            |fd| procs.current().ok()?.fd(fd).ok().map(|handle| vfs.is_read_ready(handle)),
+            |fd| procs.current().ok()?.fd(fd).ok().map(|handle| vfs.is_write_ready(handle)),
+        );
         if !oneshot_fds.is_empty() {
             let process = procs.current_mut()?;
             let epoll = process.fd_mut(epfd)?;
             vfs.epoll_disarm_oneshot(epoll, &oneshot_fds)?;
         }
-        if events_ptr != 0 {
+        if !ready.is_empty() && events_ptr != 0 {
             procs
                 .current_mut()?
                 .write_user_bytes(events_ptr, &epoll_events_to_bytes(&ready))
@@ -6294,11 +6428,84 @@ impl SyscallDispatcher {
     }
 
     fn sys_rt_sigpending(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
-        let pending = procs.pending_signals()?;
+        let pending = procs.current()?.pending_signals;
         procs
             .current_mut()?
             .write_user_bytes(args.0[0], &mask_to_bytes(pending, args.0[1].max(8)))
             .map_err(|_| EFAULT)?;
+        Ok(0)
+    }
+
+    fn sys_waitid(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        scheduler: &mut Scheduler,
+    ) -> Result<usize, i32> {
+        const P_ALL: usize = 0;
+        const P_PID: usize = 1;
+        const P_PGID: usize = 2;
+        const WNOHANG: u32 = 1;
+        const WEXITED: u32 = 4;
+
+        let idtype = args.0[0];
+        let id = args.0[1];
+        let info_ptr = args.0[2];
+        let options = args.0[3] as u32;
+
+        if (options & WEXITED) == 0 || (options & !(WNOHANG | WEXITED)) != 0 {
+            return Err(EINVAL);
+        }
+
+        let selector = match idtype {
+            P_ALL => WaitSelector::Any,
+            P_PID => WaitSelector::Pid(id),
+            P_PGID => {
+                let pgid = if id == 0 { procs.getpgid(0)? } else { id };
+                WaitSelector::Pgid(pgid)
+            }
+            _ => return Err(EINVAL),
+        };
+
+        let parent_pid = procs.current_pid()?;
+        let (child_pid, status) = match procs.wait_child(parent_pid, selector, options) {
+            Ok(pair) => pair,
+            Err(err) => return Err(err),
+        };
+
+        if child_pid == 0 {
+            if info_ptr != 0 {
+                procs
+                    .current_mut()?
+                    .write_user_bytes(info_ptr, &[0u8; 128])
+                    .map_err(|_| EFAULT)?;
+            }
+            if (options & WNOHANG) != 0 {
+                return Ok(0);
+            }
+            let _ = scheduler.block_current();
+            return Err(EAGAIN);
+        }
+
+        if info_ptr != 0 {
+            let mut info = [0u8; 128];
+            let code = if (status & 0x7f) == 0 { 1i32 } else { 2i32 };
+            let status_field = if (status & 0x7f) == 0 {
+                (status >> 8) as i32
+            } else {
+                (status & 0x7f) as i32
+            };
+            info[0..4].copy_from_slice(&(SIGCHLD as i32).to_le_bytes());
+            info[8..12].copy_from_slice(&code.to_le_bytes());
+            info[16..20].copy_from_slice(&(child_pid as i32).to_le_bytes());
+            info[20..24].copy_from_slice(&(procs.current()?.uid as i32).to_le_bytes());
+            info[24..28].copy_from_slice(&status_field.to_le_bytes());
+            procs
+                .current_mut()?
+                .write_user_bytes(info_ptr, &info)
+                .map_err(|_| EFAULT)?;
+        }
+
         Ok(0)
     }
 
@@ -7670,6 +7877,50 @@ fn epoll_events_to_bytes(events: &[EpollEvent]) -> Vec<u8> {
     out
 }
 
+fn collect_ready_epoll_events<FReadReady, FWriteReady>(
+    watches: &[EpollWatch],
+    maxevents: usize,
+    mut read_ready: FReadReady,
+    mut write_ready: FWriteReady,
+) -> (Vec<EpollEvent>, Vec<i32>)
+where
+    FReadReady: FnMut(i32) -> Option<bool>,
+    FWriteReady: FnMut(i32) -> Option<bool>,
+{
+    const EPOLLIN: u32 = 0x0001;
+    const EPOLLOUT: u32 = 0x0004;
+    const EPOLLONESHOT: u32 = 1u32 << 30;
+
+    let mut ready = Vec::new();
+    let mut oneshot_fds = Vec::new();
+    for watch in watches {
+        if watch.events == 0 {
+            continue;
+        }
+        let mut ready_events = 0u32;
+        if (watch.events & EPOLLIN) != 0 && read_ready(watch.fd).unwrap_or(false) {
+            ready_events |= EPOLLIN;
+        }
+        if (watch.events & EPOLLOUT) != 0 && write_ready(watch.fd).unwrap_or(false) {
+            ready_events |= EPOLLOUT;
+        }
+        if ready_events != 0 {
+            ready.push(EpollEvent {
+                events: ready_events,
+                _pad: 0,
+                data: watch.fd as u64,
+            });
+            if (watch.events & EPOLLONESHOT) != 0 {
+                oneshot_fds.push(watch.fd);
+            }
+            if ready.len() == maxevents {
+                break;
+            }
+        }
+    }
+    (ready, oneshot_fds)
+}
+
 fn epoll_target_supported(handle: &FileHandle) -> bool {
     matches!(
         handle.object_kind(),
@@ -7731,6 +7982,25 @@ fn restore_epoll_pwait_mask(process: &mut proc::Process) {
     if let Some(old_mask) = process.epoll_pwait_saved_mask.take() {
         process.signal_mask = old_mask;
     }
+}
+
+fn is_default_ignored_standard_signal(process: &proc::Process, signal: usize) -> bool {
+    let action = process
+        .signal_actions
+        .get(&signal)
+        .copied()
+        .unwrap_or_default();
+    action.handler == 0 && matches!(signal, 17 | 23 | 28)
+}
+
+fn interrupting_pending_signals(process: &proc::Process) -> u64 {
+    let mut pending = process.pending_signals & !process.signal_mask;
+    for signum in [17usize, 23, 28] {
+        if is_default_ignored_standard_signal(process, signum) {
+            pending &= !(1u64 << (signum - 1));
+        }
+    }
+    pending
 }
 
 fn signal_is_masked(mask: u64, signal: usize) -> bool {
@@ -7838,15 +8108,17 @@ fn read_string_vector(process: &proc::Process, addr: usize) -> Result<Vec<String
     Ok(out)
 }
 
-fn selector_from_wait(pid: i32, current_pgid: usize) -> WaitSelector {
+fn selector_from_wait(pid: i32, current_pgid: usize) -> Result<WaitSelector, i32> {
     if pid == -1 {
-        WaitSelector::Any
+        Ok(WaitSelector::Any)
     } else if pid == 0 {
-        WaitSelector::Pgid(current_pgid)
+        Ok(WaitSelector::Pgid(current_pgid))
     } else if pid > 0 {
-        WaitSelector::Pid(pid as usize)
+        Ok(WaitSelector::Pid(pid as usize))
+    } else if pid == i32::MIN {
+        Err(ESRCH)
     } else {
-        WaitSelector::Pgid((-pid) as usize)
+        Ok(WaitSelector::Pgid((-pid) as usize))
     }
 }
 
@@ -8239,7 +8511,7 @@ fn read_exec_file_image(vfs: &mut KernelVfs, cwd: &str, path: &str) -> Result<Ve
         "whuse: execve open image cwd={} path={}",
         cwd, path
     ));
-    let mut handle = vfs.open(cwd, path, O_RDONLY, 0).map_err(|_| ENOENT)?;
+    let mut handle = vfs.open(cwd, path, O_RDONLY, 0)?;
     if loader_probe {
         log_always(&format!(
             "whuse-la-iozone:loader-open-ok resolved={} off={}",
@@ -9005,11 +9277,12 @@ mod tests {
     use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     use super::{
-        exec_interp_candidates, pollfds_to_bytes, PollFd, SyscallArgs, SyscallDispatcher,
-        SYS_ACCEPT, SYS_BIND, SYS_CHDIR, SYS_CLOCK_GETRES, SYS_CLONE, SYS_CLOSE, SYS_CONNECT,
-        SYS_COPY_FILE_RANGE, SYS_DUP3, SYS_EPOLL_CREATE1, SYS_EPOLL_CTL, SYS_EPOLL_PWAIT,
-        SYS_EVENTFD2, SYS_EXIT_GROUP, SYS_FACCESSAT2, SYS_FALLOCATE, SYS_FCHDIR, SYS_FCHMOD,
-        SYS_FCHMODAT, SYS_FCHMODAT2, SYS_FCHOWN, SYS_FCNTL,
+        collect_ready_epoll_events, exec_interp_candidates, pollfds_to_bytes, PollFd,
+        SyscallArgs, SyscallDispatcher, SYS_ACCEPT, SYS_BIND, SYS_CHDIR, SYS_CLOCK_GETRES,
+        SYS_CLONE, SYS_CLOSE, SYS_CONNECT, SYS_COPY_FILE_RANGE, SYS_DUP3, SYS_EPOLL_CREATE1,
+        SYS_EPOLL_CTL, SYS_EPOLL_PWAIT, SYS_EVENTFD2, SYS_EXIT_GROUP, SYS_FACCESSAT2,
+        SYS_FALLOCATE, SYS_FCHDIR, SYS_FCHMOD, SYS_FCHMODAT, SYS_FCHMODAT2, SYS_FCHOWN,
+        SYS_FCNTL,
         SYS_FCHOWNAT, SYS_FDATASYNC, SYS_FLOCK, SYS_FSTAT, SYS_FSTATAT, SYS_FSTATFS, SYS_FSYNC,
         SYS_FUTEX, SYS_GETCWD, SYS_GETGROUPS, SYS_GETITIMER, SYS_GETPRIORITY, SYS_GETSID,
         SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTIMEOFDAY, SYS_GET_ROBUST_LIST, SYS_LINKAT,
@@ -9025,7 +9298,8 @@ mod tests {
         SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET, SYS_SHUTDOWN, SYS_SIGACTION, SYS_SIGALTSTACK,
         SYS_SIGPROCMASK, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SPLICE, SYS_STATX, SYS_SYMLINKAT,
         SYS_TIMES, SYS_TRUNCATE, SYS_UMASK, SYS_UNAME, SYS_UNLINKAT, SYS_UTIMENSAT, SYS_WAIT,
-        SYS_WRITE, SYS_WRITEV,
+        SYS_WAITID,
+        SYS_WRITE, SYS_WRITEV, SYS_EXECVE,
     };
     use hal_api::{
         register_hal, HalBlockDevice, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory,
@@ -9035,7 +9309,7 @@ mod tests {
     use proc::ProcessTable;
     use spin::Once;
     use task::Scheduler;
-    use vfs::KernelVfs;
+    use vfs::{EpollWatch, KernelVfs};
 
     struct TestCpu;
     struct TestMemory;
@@ -9200,6 +9474,14 @@ mod tests {
 
     fn advance_test_monotonic_nanos(delta: u64) {
         TEST_NOW_NS.fetch_add(delta, AtomicOrdering::Relaxed);
+    }
+
+    fn install_usize_words(process: &mut proc::Process, addr: usize, words: &[usize]) {
+        let mut bytes = Vec::with_capacity(words.len() * core::mem::size_of::<usize>());
+        for word in words {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        process.address_space.install_bytes(addr, &bytes);
     }
 
     #[test]
@@ -10587,6 +10869,115 @@ mod tests {
             .unwrap();
         assert_eq!(waited, child);
         assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn execve03_errno_matrix_matches_linux() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("execve03", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("execve03", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        if let Err(err) = vfs.mkdir("/", "/tmp", 0o777) {
+            assert_eq!(err, super::EEXIST);
+        }
+        if let Err(err) = vfs.mkdir("/tmp", "execve03", 0o777) {
+            assert_eq!(err, super::EEXIST);
+        }
+
+        vfs.create_file_with_mode("/", "/tmp/execve03/noexec", b"", 0o444)
+            .unwrap();
+        vfs.create_file_with_mode("/", "/tmp/execve03/zero", b"", 0o755)
+            .unwrap();
+        vfs.create_file_with_mode("/", "/tmp/execve03/notdir", b"", 0o644)
+            .unwrap();
+
+        let current = procs.current_mut().unwrap();
+        let mut long_path = format!("/{}", "a".repeat(256)).into_bytes();
+        long_path.push(0);
+        current.address_space.install_bytes(0xb000, &long_path);
+        current
+            .address_space
+            .install_bytes(0xb800, b"/tmp/execve03/missing\0");
+        current
+            .address_space
+            .install_bytes(0xb900, b"/tmp/execve03/notdir/fake\0");
+        current
+            .address_space
+            .install_bytes(0xba00, b"/tmp/execve03/noexec\0");
+        current
+            .address_space
+            .install_bytes(0xbb00, b"/tmp/execve03/zero\0");
+        install_usize_words(current, 0xc000, &[0xb000, 0]);
+        install_usize_words(current, 0xc100, &[0xb800, 0]);
+        install_usize_words(current, 0xc200, &[0xb900, 0]);
+        install_usize_words(current, 0xc300, &[0xdead0000, 0]);
+        install_usize_words(current, 0xc400, &[0xba00, 0]);
+        install_usize_words(current, 0xc500, &[0xbb00, 0]);
+        let run_execve = |path_ptr: usize,
+                          argv_ptr: usize,
+                          procs: &mut ProcessTable,
+                          scheduler: &mut Scheduler,
+                          vfs: &mut KernelVfs| {
+            dispatcher.dispatch(
+                SYS_EXECVE,
+                SyscallArgs([path_ptr, argv_ptr, 0, 0, 0, 0]),
+                procs,
+                scheduler,
+                vfs,
+            )
+        };
+
+        assert_eq!(
+            run_execve(0xb000, 0xc000, &mut procs, &mut scheduler, &mut vfs),
+            -(super::ENAMETOOLONG as isize)
+        );
+        assert_eq!(
+            run_execve(0xb800, 0xc100, &mut procs, &mut scheduler, &mut vfs),
+            -(super::ENOENT as isize)
+        );
+        assert_eq!(
+            run_execve(0xb900, 0xc200, &mut procs, &mut scheduler, &mut vfs),
+            -(super::ENOTDIR as isize)
+        );
+        assert_eq!(
+            run_execve(0xdead0000, 0xc300, &mut procs, &mut scheduler, &mut vfs),
+            -(super::EFAULT as isize)
+        );
+        assert_eq!(
+            run_execve(0xba00, 0xc400, &mut procs, &mut scheduler, &mut vfs),
+            -(super::EACCES as isize)
+        );
+        assert_eq!(
+            run_execve(0xbb00, 0xc500, &mut procs, &mut scheduler, &mut vfs),
+            -(super::ENOEXEC as isize)
+        );
+    }
+
+    #[test]
+    fn selector_from_wait_rejects_int_min_with_esrch() {
+        assert_eq!(
+            super::selector_from_wait(-1, 77).unwrap(),
+            proc::WaitSelector::Any
+        );
+        assert_eq!(
+            super::selector_from_wait(0, 77).unwrap(),
+            proc::WaitSelector::Pgid(77)
+        );
+        assert_eq!(
+            super::selector_from_wait(123, 77).unwrap(),
+            proc::WaitSelector::Pid(123)
+        );
+        assert_eq!(
+            super::selector_from_wait(-123, 77).unwrap(),
+            proc::WaitSelector::Pgid(123)
+        );
+        assert_eq!(super::selector_from_wait(i32::MIN, 77), Err(super::ESRCH));
     }
 
     #[test]
@@ -14198,6 +14589,56 @@ mod tests {
     }
 
     #[test]
+    fn collect_ready_epoll_events_skips_unrequested_write_probe() {
+        let watches = [EpollWatch { fd: 3, events: 0x0001 }];
+        let read_probes = core::cell::Cell::new(0usize);
+        let write_probes = core::cell::Cell::new(0usize);
+
+        let (ready, oneshot) = collect_ready_epoll_events(
+            &watches,
+            1,
+            |_| {
+                read_probes.set(read_probes.get() + 1);
+                Some(false)
+            },
+            |_| {
+                write_probes.set(write_probes.get() + 1);
+                Some(false)
+            },
+        );
+
+        assert!(ready.is_empty());
+        assert!(oneshot.is_empty());
+        assert_eq!(read_probes.get(), 1);
+        assert_eq!(write_probes.get(), 0);
+    }
+
+    #[test]
+    fn collect_ready_epoll_events_skips_unrequested_read_probe() {
+        let watches = [EpollWatch { fd: 4, events: 0x0004 }];
+        let read_probes = core::cell::Cell::new(0usize);
+        let write_probes = core::cell::Cell::new(0usize);
+
+        let (ready, oneshot) = collect_ready_epoll_events(
+            &watches,
+            1,
+            |_| {
+                read_probes.set(read_probes.get() + 1);
+                Some(false)
+            },
+            |_| {
+                write_probes.set(write_probes.get() + 1);
+                Some(false)
+            },
+        );
+
+        assert!(ready.is_empty());
+        assert!(oneshot.is_empty());
+        assert_eq!(read_probes.get(), 0);
+        assert_eq!(write_probes.get(), 1);
+    }
+
+    #[test]
     fn epoll_pwait_temp_sigmask_blocks_signal_until_ready_and_restores_mask() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
@@ -14508,6 +14949,221 @@ mod tests {
     }
 
     #[test]
+    fn epoll_pwait2_masked_signal_still_returns_ready_event_after_socket_write() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        let mut vfs = KernelVfs::new();
+
+        let epfd = dispatcher.dispatch(
+            SYS_EPOLL_CREATE1,
+            SyscallArgs([0, 0, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        ) as usize;
+        procs.current_mut().unwrap().address_space.install_bytes(0xa240, &[0u8; 8]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SOCKETPAIR,
+                SyscallArgs([1, 1, 0, 0xa240, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        let pair = procs.current().unwrap().read_user_bytes(0xa240, 8).unwrap();
+        let left = i32::from_le_bytes(pair[..4].try_into().unwrap()) as usize;
+        let right = i32::from_le_bytes(pair[4..8].try_into().unwrap()) as usize;
+
+        let mut read_event = [0u8; 16];
+        read_event[..4].copy_from_slice(&1u32.to_le_bytes());
+        read_event[8..16].copy_from_slice(&(right as u64).to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xa250, &read_event);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_EPOLL_CTL,
+                SyscallArgs([epfd, 1, right, 0xa250, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+
+        let blocked_mask = 1u64 << (10 - 1);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xa260, &blocked_mask.to_le_bytes());
+        procs.current_mut().unwrap().address_space.install_bytes(0xa270, &[0u8; 16]);
+        {
+            let process = procs.current_mut().unwrap();
+            process.pending_signals = 0;
+            process.signal_mask = 0;
+        }
+
+        procs.current_mut().unwrap().address_space.install_bytes(0xa280, b"x");
+        let sender = procs.fork_process_from_current().unwrap();
+
+        scheduler.spawn("init", init, init);
+        scheduler.spawn("sender", sender, sender);
+        scheduler.start();
+
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_EPOLL_PWAIT2,
+                SyscallArgs([epfd, 0xa270, 1, 0, 0xa260, 8]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EAGAIN as isize)
+        );
+        assert!(scheduler.is_blocked(init));
+
+        assert_eq!(scheduler.ensure_current(), Some(sender));
+        procs.set_current(sender).unwrap();
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_TGKILL,
+                SyscallArgs([init, init, 10, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert!(scheduler.is_blocked(init));
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SENDTO,
+                SyscallArgs([left, 0xa280, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            1
+        );
+
+        assert!(
+            scheduler.is_ready(init) || scheduler.ensure_current() == Some(init),
+            "init should be runnable after socket write: state={} ready={} blocked={}",
+            scheduler.task_state_label(init),
+            scheduler.ready_count(),
+            scheduler.blocked_count()
+        );
+
+        if scheduler.ensure_current() != Some(init) {
+            let _ = scheduler.yield_now();
+        }
+        assert_eq!(scheduler.ensure_current(), Some(init));
+        procs.set_current(init).unwrap();
+
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_EPOLL_PWAIT2,
+                SyscallArgs([epfd, 0xa270, 1, 0, 0xa260, 8]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            1
+        );
+        assert_eq!(procs.current().unwrap().signal_mask, 0);
+    }
+
+    #[test]
+    fn epoll_pwait2_ignores_default_ignored_sigchld_when_event_is_ready() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let epfd = dispatcher.dispatch(
+            SYS_EPOLL_CREATE1,
+            SyscallArgs([0, 0, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        ) as usize;
+        procs.current_mut().unwrap().address_space.install_bytes(0xa290, &[0u8; 8]);
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_PIPE2,
+                SyscallArgs([0xa290, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        let pipe_fds = procs.current().unwrap().read_user_bytes(0xa290, 8).unwrap();
+        let read_fd = i32::from_le_bytes(pipe_fds[..4].try_into().unwrap()) as usize;
+        let write_fd = i32::from_le_bytes(pipe_fds[4..8].try_into().unwrap()) as usize;
+
+        let mut read_event = [0u8; 16];
+        read_event[..4].copy_from_slice(&1u32.to_le_bytes());
+        read_event[8..16].copy_from_slice(&(read_fd as u64).to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xa2a0, &read_event);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_EPOLL_CTL,
+                SyscallArgs([epfd, 1, read_fd, 0xa2a0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+
+        procs.current_mut().unwrap().address_space.install_bytes(0xa2b0, b"q");
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_WRITE,
+                SyscallArgs([write_fd, 0xa2b0, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            1
+        );
+        procs.current_mut().unwrap().address_space.install_bytes(0xa2c0, &[0u8; 16]);
+        procs.current_mut().unwrap().pending_signals = 1u64 << (super::SIGCHLD - 1);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_EPOLL_PWAIT2,
+                SyscallArgs([epfd, 0xa2c0, 1, 0, 0, 8]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            1,
+            "default-ignored SIGCHLD should not interrupt ready epoll_pwait2"
+        );
+    }
+
+    #[test]
     fn clone_wait_signal_and_futex_semantics() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
@@ -14641,6 +15297,140 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn rt_sigaction_rejects_invalid_sigsetsize() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SIGACTION,
+                SyscallArgs([10, 0, 0, usize::MAX, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EINVAL as isize
+        );
+    }
+
+    #[test]
+    fn rt_sigpending_reports_blocked_pending_signal_bits() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let blocked = 1u64 << (10 - 1);
+        {
+            let process = procs.current_mut().unwrap();
+            process.pending_signals = blocked;
+            process.signal_mask = blocked;
+            process.address_space.install_bytes(0xa340, &[0u8; 8]);
+        }
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_RT_SIGPENDING,
+                SyscallArgs([0xa340, 8, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        let pending = u64::from_le_bytes(
+            procs
+                .current()
+                .unwrap()
+                .read_user_bytes(0xa340, 8)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(pending & blocked, blocked);
+    }
+
+    #[test]
+    fn waitid_wnohang_zeroes_siginfo_when_no_child_exited() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let child = procs.fork_process_from_current().unwrap();
+        scheduler.spawn("child", child, child);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xa380, &[0xff; 128]);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_WAITID,
+                SyscallArgs([0, child, 0xa380, 1 | 4, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            procs
+                .current()
+                .unwrap()
+                .read_user_bytes(0xa380, 128)
+                .unwrap(),
+            vec![0u8; 128]
+        );
+    }
+
+    #[test]
+    fn wait_wnohang_yields_to_ready_child_when_no_child_has_exited() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let child = procs.fork_process_from_current().unwrap();
+
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.spawn("waitpid07_child", child, child);
+        assert_eq!(scheduler.start(), Some(init));
+        let mut vfs = KernelVfs::new();
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_WAIT,
+                SyscallArgs([usize::MAX, 0, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(scheduler.current_thread_id(), Some(child));
     }
 
     #[test]

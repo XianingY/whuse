@@ -64,7 +64,7 @@ fn idle_outcome_for_process_count(process_count: usize) -> KernelIdleOutcome {
 
 const USER_INIT_BASE: usize = 0x0040_0000;
 const EAGAIN_RET: isize = -11;
-const SCHED_TIME_SLICE_NS: u64 = 10_000_000;
+const SCHED_TIME_SLICE_NS: u64 = 1_000_000;
 const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
 const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
@@ -527,12 +527,30 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    [ -f \"$file\" ] || return 1\n",
     "    /musl/busybox grep -Fqx \"$needle\" \"$file\"\n",
     "}\n",
+    "whuse_ltp_case_blocked() {\n",
+    "    case_name=\"$1\"\n",
+    "    case_rel=\"$2\"\n",
+    "    case \"$case_name\" in\n",
+    "        add_ipv6addr|acct02_helper) return 0 ;;\n",
+    "    esac\n",
+    "    if [ -f \"$WHUSE_LTP_BLACKLIST\" ] && ( /musl/busybox grep -Fqx \"$case_name\" \"$WHUSE_LTP_BLACKLIST\" || /musl/busybox grep -Fqx \"$case_rel\" \"$WHUSE_LTP_BLACKLIST\" ); then\n",
+    "        return 0\n",
+    "    fi\n",
+    "    return 1\n",
+    "}\n",
     "whuse_ltp_write_busybox_wrapper() {\n",
-    "    wrap_dir=\"/tmp/whuse-ltp-bin\"\n",
-    "    /musl/busybox mkdir -p \"$wrap_dir\" >/dev/null 2>&1 || true\n",
-    "    {\n",
+    "    wrap_dir=\"${WHUSE_LTP_WRAPPER_DIR:-${WHUSE_LTP_RUNROOT:-${WHUSE_LTP_TMPDIR:-/musl/ltp-tmp}}/debug}\"\n",
+    "    if [ ! -d \"$wrap_dir\" ]; then\n",
+    "        /musl/busybox mkdir -p \"$wrap_dir\" >/dev/null 2>&1 || true\n",
+    "    fi\n",
+    "    if [ ! -d \"$wrap_dir\" ]; then\n",
+    "        echo whuse-oscomp-ltp-marker:busybox-wrapper-mkdir-failed:$wrap_dir\n",
+    "        /musl/busybox ls -ld \"${WHUSE_LTP_RUNROOT:-${WHUSE_LTP_TMPDIR:-/musl/ltp-tmp}}\" \"$wrap_dir\" 2>&1 || true\n",
+    "        return 1\n",
+    "    fi\n",
+    "    if ! {\n",
     "        echo '#!/musl/busybox sh'\n",
-    "        echo 'cmd=$(/musl/busybox basename \"$0\")'\n",
+    "        echo 'cmd=\"${0##*/}\"'\n",
     "        echo 'if [ \"$cmd\" = \"busybox\" ]; then'\n",
     "        echo '    cmd=\"${1:-}\"'\n",
     "        echo '    [ $# -gt 0 ] && shift'\n",
@@ -553,12 +571,17 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        echo '    keyctl) exec /musl/keyctl \"$@\" ;;'\n",
     "        echo '    rsh) exec /musl/rsh \"$@\" ;;'\n",
     "        echo 'esac'\n",
-    "        echo 'exec /musl/busybox \"$@\"'\n",
-    "    } > \"$wrap_dir/busybox\"\n",
+    "        echo 'exec /musl/busybox \"$cmd\" \"$@\"'\n",
+    "    } > \"$wrap_dir/busybox\"; then\n",
+    "        echo whuse-oscomp-ltp-marker:busybox-wrapper-write-failed\n",
+    "        return 1\n",
+    "    fi\n",
     "    /musl/busybox chmod 755 \"$wrap_dir/busybox\" >/dev/null 2>&1 || true\n",
     "    for applet in useradd userdel groupdel locale keyctl rsh cat grep ar ip mktemp chmod id acct02_helper; do\n",
     "        /musl/busybox ln -sf busybox \"$wrap_dir/$applet\" >/dev/null 2>&1 || true\n",
     "    done\n",
+    "    echo whuse-oscomp-ltp-marker:busybox-wrapper-ready\n",
+    "    return 0\n",
     "}\n",
     "whuse_ltp_enable_busybox_compat() {\n",
     "    return 0\n",
@@ -569,14 +592,11 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "whuse_ltp_case_allowed() {\n",
     "    case_name=\"$1\"\n",
     "    case_rel=\"$2\"\n",
-    "    case \"$case_name\" in\n",
-    "        add_ipv6addr|acct02_helper) return 1 ;;\n",
-    "    esac\n",
+    "    if whuse_ltp_case_blocked \"$case_name\" \"$case_rel\"; then\n",
+    "        return 1\n",
+    "    fi\n",
     "    if [ \"$WHUSE_LTP_PROFILE\" = \"full\" ]; then\n",
     "        return 0\n",
-    "    fi\n",
-    "    if [ -f \"$WHUSE_LTP_BLACKLIST\" ] && ( /musl/busybox grep -Fqx \"$case_name\" \"$WHUSE_LTP_BLACKLIST\" || /musl/busybox grep -Fqx \"$case_rel\" \"$WHUSE_LTP_BLACKLIST\" ); then\n",
-    "        return 1\n",
     "    fi\n",
     "    if whuse_ltp_list_has_entries \"$WHUSE_LTP_WHITELIST\"; then\n",
     "        /musl/busybox grep -Fqx \"$case_name\" \"$WHUSE_LTP_WHITELIST\" || /musl/busybox grep -Fqx \"$case_rel\" \"$WHUSE_LTP_WHITELIST\"\n",
@@ -587,36 +607,85 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "whuse_ltp_case_prepare_stdin() {\n",
     "    case_name=\"$1\"\n",
     "    stdin_path=\"$2\"\n",
+    "    [ \"$stdin_path\" = \"/dev/null\" ] && return 0\n",
+    "    case \"$stdin_path\" in\n",
+    "        */*) stdin_dir=\"${stdin_path%/*}\" ;;\n",
+    "        *) stdin_dir=. ;;\n",
+    "    esac\n",
+    "    /musl/busybox mkdir -p \"$stdin_dir\" >/dev/null 2>&1 || true\n",
     "    /musl/busybox rm -f \"$stdin_path\" >/dev/null 2>&1 || true\n",
     "    case \"$case_name\" in\n",
     "        assign_password.sh|ask_password.sh)\n",
-    "            /musl/busybox printf '123456\\n123456\\n123456\\n123456\\n' > \"$stdin_path\"\n",
+    "            {\n",
+    "                /musl/busybox echo '123456'\n",
+    "                /musl/busybox echo '123456'\n",
+    "                /musl/busybox echo '123456'\n",
+    "                /musl/busybox echo '123456'\n",
+    "            } | /musl/busybox tee \"$stdin_path\" >/dev/null 2>&1 || {\n",
+    "                echo whuse-oscomp-ltp-marker:stdin-create-failed:$case_name\n",
+    "                return 1\n",
+    "            }\n",
     "            ;;\n",
     "        *)\n",
-    "            : > \"$stdin_path\"\n",
+    "            return 0\n",
     "            ;;\n",
     "    esac\n",
+    "    return 0\n",
     "}\n",
-    "whuse_ltp_count_token() {\n",
+    "whuse_ltp_normalize_case_log() {\n",
+    "    file=\"$1\"\n",
+    "    out=\"$2\"\n",
+    "    [ -f \"$file\" ] || {\n",
+    "        : > \"$out\"\n",
+    "        return 0\n",
+    "    }\n",
+    "    /musl/busybox cat \"$file\" 2>/dev/null | /musl/busybox tr '\\000\\033' '\\n\\n' > \"$out\" 2>/dev/null || : > \"$out\"\n",
+    "}\n",
+    "whuse_ltp_token_seen() {\n",
     "    token=\"$1\"\n",
     "    file=\"$2\"\n",
-    "    count=0\n",
-    "    while IFS= read -r line || [ -n \"$line\" ]\n",
-    "    do\n",
-    "        case \"$line\" in\n",
-    "            *\"$token\"*) count=$((count + 1)) ;;\n",
-    "        esac\n",
-    "    done < \"$file\"\n",
-    "    echo \"$count\"\n",
+    "    [ -f \"$file\" ] || return 1\n",
+    "    case \"$token\" in\n",
+    "        TPASS)\n",
+    "            /musl/busybox grep -Eq 'TPASS|passed[[:space:]]+[1-9][0-9]*([[:space:]]|$)' \"$file\"\n",
+    "            return $?\n",
+    "            ;;\n",
+    "        TFAIL)\n",
+    "            /musl/busybox grep -Eq 'TFAIL|failed[[:space:]]+[1-9][0-9]*([[:space:]]|$)' \"$file\"\n",
+    "            return $?\n",
+    "            ;;\n",
+    "        TBROK)\n",
+    "            /musl/busybox grep -Eq 'TBROK|broken[[:space:]]+[1-9][0-9]*([[:space:]]|$)' \"$file\"\n",
+    "            return $?\n",
+    "            ;;\n",
+    "        TCONF)\n",
+    "            /musl/busybox grep -Eq 'TCONF|skipped[[:space:]]+[1-9][0-9]*([[:space:]]|$)' \"$file\"\n",
+    "            return $?\n",
+    "            ;;\n",
+    "        *) return 1 ;;\n",
+    "    esac\n",
+    "}\n",
+    "whuse_ltp_update_epoch() {\n",
+    "    epoch_file=\"${WHUSE_LTP_RUNROOT:-${WHUSE_LTP_TMPDIR:-/musl/ltp-tmp}}/.whuse-ltp-epoch.$$\"\n",
+    "    /musl/busybox date +%s > \"$epoch_file\" 2>/dev/null || echo 0 > \"$epoch_file\"\n",
+    "    if ! IFS= read -r whuse_ltp_epoch < \"$epoch_file\"; then\n",
+    "        whuse_ltp_epoch=0\n",
+    "    fi\n",
+    "    /musl/busybox rm -f \"$epoch_file\" >/dev/null 2>&1 || true\n",
     "}\n",
     "whuse_ltp_cleanup_case_tree() {\n",
     "    case_pid=\"$1\"\n",
+    "    cleanup_group=\"$2\"\n",
     "    [ \"$case_pid\" -gt 1 ] 2>/dev/null || return 0\n",
     "    echo whuse-ltp-case-cleanup-start:pid=$case_pid\n",
-    "    /musl/busybox kill -TERM \"-$case_pid\" >/dev/null 2>&1 || true\n",
+    "    if [ \"$cleanup_group\" = \"1\" ]; then\n",
+    "        /musl/busybox kill -TERM \"-$case_pid\" >/dev/null 2>&1 || true\n",
+    "    fi\n",
     "    /musl/busybox kill -TERM \"$case_pid\" >/dev/null 2>&1 || true\n",
     "    /musl/busybox sleep 1\n",
-    "    /musl/busybox kill -KILL \"-$case_pid\" >/dev/null 2>&1 || true\n",
+    "    if [ \"$cleanup_group\" = \"1\" ]; then\n",
+    "        /musl/busybox kill -KILL \"-$case_pid\" >/dev/null 2>&1 || true\n",
+    "    fi\n",
     "    /musl/busybox kill -KILL \"$case_pid\" >/dev/null 2>&1 || true\n",
     "    echo whuse-ltp-case-cleanup-end:pid=$case_pid\n",
     "}\n",
@@ -632,15 +701,19 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        return 0\n",
     "    fi\n",
     "    /musl/busybox rm -f \"$case_log\" >/dev/null 2>&1 || true\n",
-    "    whuse_ltp_case_prepare_stdin \"$case_name\" \"$case_stdin\"\n",
+    "    if ! whuse_ltp_case_prepare_stdin \"$case_name\" \"$case_stdin\"; then\n",
+    "        echo whuse-ltp-case-result:$case_name:rc=125:tpass=0:tfail=0:tbrok=1:tconf=0:class=prepare\n",
+    "        echo FAIL LTP CASE $case_name : 125\n",
+    "        return 0\n",
+    "    fi\n",
     "    exec_case_path=\"$case_path\"\n",
     "    patched_case_path=\"$case_log.patched\"\n",
     "    env_case_path=\"$case_log.env\"\n",
+    "    case_default_run_env=\n",
     "    /musl/busybox rm -f \"$patched_case_path\" >/dev/null 2>&1 || true\n",
     "    /musl/busybox rm -f \"$env_case_path\" >/dev/null 2>&1 || true\n",
-    "    first_line=$(/musl/busybox head -n 1 \"$case_path\" 2>/dev/null || true)\n",
-    "    case \"$first_line\" in\n",
-    "        '#!'*)\n",
+    "    case \"$case_path\" in\n",
+    "        *.sh)\n",
     "            if /musl/busybox grep -q 'busybox wait\\|/musl/busybox wait\\|busybox locale\\|/musl/busybox locale\\|busybox useradd\\|/musl/busybox useradd\\|busybox userdel\\|/musl/busybox userdel' \"$case_path\" 2>/dev/null; then\n",
     "                if /musl/busybox sed \\\n",
     "                    -e 's#/musl/busybox wait#wait#g' \\\n",
@@ -658,6 +731,7 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "                fi\n",
     "            fi\n",
     "            if /musl/busybox grep -q 'tst_run' \"$exec_case_path\" 2>/dev/null; then\n",
+    "                case_default_run_env=\"TST_NO_DEFAULT_RUN=1\"\n",
     "                if /musl/busybox sed -e '1a TST_NO_DEFAULT_RUN=1' -e '2i TST_NET_IPV6_ENABLED=1' -e '3i set -x' -e 's/if ! grep -q tst_run \"$TST_TEST_PATH\"; then/if false; then/' \"$exec_case_path\" > \"$env_case_path\"; then\n",
     "                    /musl/busybox chmod 755 \"$env_case_path\" >/dev/null 2>&1 || true\n",
     "                    exec_case_path=\"$env_case_path\"\n",
@@ -666,28 +740,20 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "            ;;\n",
     "    esac\n",
     "    echo RUN LTP CASE $case_name\n",
-    "    direct_exec=0\n",
     "    case_extra_env=\n",
     "    case \"$case_name\" in\n",
     "        add_key05) case_extra_env=\"LTP_TIMEOUT_MUL=4\" ;;\n",
     "    esac\n",
-    "    case \"$exec_case_path\" in\n",
-    "        *.sh) direct_exec=1 ;;\n",
-    "    esac\n",
-    "    if [ \"${WHUSE_HAVE_SETSID:-0}\" = \"1\" ]; then\n",
-    "        if [ \"$direct_exec\" = \"1\" ]; then\n",
-    "            /musl/busybox setsid /musl/busybox env TST_NO_DEFAULT_RUN=1 $case_extra_env \"$exec_case_path\" <\"$case_stdin\" >\"$case_log\" 2>&1 &\n",
-    "        else\n",
-    "            /musl/busybox setsid /musl/busybox env TST_NO_DEFAULT_RUN=1 $case_extra_env /musl/busybox sh -c \"exec \\\"$exec_case_path\\\"\" <\"$case_stdin\" >\"$case_log\" 2>&1 &\n",
-    "        fi\n",
-    "    else\n",
-    "        if [ \"$direct_exec\" = \"1\" ]; then\n",
-    "            /musl/busybox env TST_NO_DEFAULT_RUN=1 $case_extra_env \"$exec_case_path\" <\"$case_stdin\" >\"$case_log\" 2>&1 &\n",
-    "        else\n",
-    "            /musl/busybox env TST_NO_DEFAULT_RUN=1 $case_extra_env /musl/busybox sh -c \"exec \\\"$exec_case_path\\\"\" <\"$case_stdin\" >\"$case_log\" 2>&1 &\n",
-    "        fi\n",
-    "    fi\n",
+    "    case_cleanup_group=0\n",
+    "    case_status=\"$case_log.status\"\n",
+    "    /musl/busybox rm -f \"$case_status\" >/dev/null 2>&1 || true\n",
+    "    (\n",
+    "        /musl/busybox env $case_default_run_env $case_extra_env \"$exec_case_path\" <\"$case_stdin\" >\"$case_log\" 2>&1\n",
+    "        echo $? > \"$case_status\"\n",
+    "    ) &\n",
     "    case_pid=$!\n",
+    "    case_wait_err=\"$case_log.waiterr\"\n",
+    "    /musl/busybox rm -f \"$case_wait_err\" >/dev/null 2>&1 || true\n",
     "    case_timeout=\"${WHUSE_LTP_CASE_TIMEOUT:-45}\"\n",
     "    case \"$case_name\" in\n",
     "        ar01.sh) case_timeout=\"${WHUSE_LTP_AR01_TIMEOUT:-180}\" ;;\n",
@@ -695,33 +761,49 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    esac\n",
     "    elapsed=0\n",
     "    timeout_hit=0\n",
-    "    while /musl/busybox kill -0 \"$case_pid\" >/dev/null 2>&1\n",
+    "    while [ ! -f \"$case_status\" ]\n",
     "    do\n",
     "        if [ \"$elapsed\" -ge \"$case_timeout\" ]; then\n",
     "            timeout_hit=1\n",
     "            echo whuse-ltp-case-timeout:$case_name:pid=$case_pid:timeout=$case_timeout\n",
-    "            whuse_ltp_cleanup_case_tree \"$case_pid\"\n",
+    "            whuse_ltp_cleanup_case_tree \"$case_pid\" \"$case_cleanup_group\"\n",
     "            break\n",
     "        fi\n",
     "        /musl/busybox sleep 1\n",
     "        elapsed=$((elapsed + 1))\n",
     "    done\n",
     "    if [ \"$timeout_hit\" -eq 1 ]; then\n",
-    "        wait \"$case_pid\" >/dev/null 2>&1 || true\n",
+    "        wait \"$case_pid\" 2>\"$case_wait_err\" >/dev/null || true\n",
     "        case_rc=124\n",
     "    else\n",
-    "        wait \"$case_pid\"\n",
-    "        case_rc=$?\n",
+    "        if IFS= read -r case_rc < \"$case_status\"; then\n",
+    "            :\n",
+    "        else\n",
+    "            case_rc=255\n",
+    "        fi\n",
+    "        wait \"$case_pid\" 2>\"$case_wait_err\" >/dev/null || true\n",
+    "    fi\n",
+    "    case_wait_alive=0\n",
+    "    [ -d \"/proc/$case_pid\" ] && case_wait_alive=1\n",
+    "    if [ -s \"$case_wait_err\" ] || [ \"$case_rc\" -eq 255 ] || [ \"$case_wait_alive\" -eq 1 ]; then\n",
+    "        echo whuse-ltp-case-wait:case=$case_name:pid=$case_pid:rc=$case_rc:alive=$case_wait_alive\n",
+    "        if [ -s \"$case_wait_err\" ]; then\n",
+    "            echo whuse-ltp-case-wait-stderr-begin:$case_name\n",
+    "            /musl/busybox cat \"$case_wait_err\" 2>/dev/null || true\n",
+    "            echo whuse-ltp-case-wait-stderr-end:$case_name\n",
+    "        fi\n",
     "    fi\n",
     "    [ -f \"$case_log\" ] && /musl/busybox cat \"$case_log\"\n",
-    "    tpass=$(whuse_ltp_count_token 'TPASS' \"$case_log\")\n",
-    "    tfail=$(whuse_ltp_count_token 'TFAIL' \"$case_log\")\n",
-    "    tbrok=$(whuse_ltp_count_token 'TBROK' \"$case_log\")\n",
-    "    tconf=$(whuse_ltp_count_token 'TCONF' \"$case_log\")\n",
-    "    [ -n \"$tpass\" ] || tpass=0\n",
-    "    [ -n \"$tfail\" ] || tfail=0\n",
-    "    [ -n \"$tbrok\" ] || tbrok=0\n",
-    "    [ -n \"$tconf\" ] || tconf=0\n",
+    "    case_tokens=\"$case_log.tokens\"\n",
+    "    whuse_ltp_normalize_case_log \"$case_log\" \"$case_tokens\"\n",
+    "    tpass=0\n",
+    "    tfail=0\n",
+    "    tbrok=0\n",
+    "    tconf=0\n",
+    "    whuse_ltp_token_seen 'TPASS' \"$case_tokens\" && tpass=1\n",
+    "    whuse_ltp_token_seen 'TFAIL' \"$case_tokens\" && tfail=1\n",
+    "    whuse_ltp_token_seen 'TBROK' \"$case_tokens\" && tbrok=1\n",
+    "    whuse_ltp_token_seen 'TCONF' \"$case_tokens\" && tconf=1\n",
     "    if [ \"$case_rc\" -eq 32 ] && [ \"$tpass\" -eq 0 ] && [ \"$tfail\" -eq 0 ] && [ \"$tbrok\" -eq 0 ]; then\n",
     "        [ \"$tconf\" -gt 0 ] || tconf=1\n",
     "        case_rc=0\n",
@@ -778,7 +860,20 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "        class=no-tests\n",
     "    fi\n",
     "    echo whuse-ltp-case-result:$case_name:rc=$case_rc:tpass=$tpass:tfail=$tfail:tbrok=$tbrok:tconf=$tconf:class=$class\n",
-    "    /musl/busybox rm -f \"$case_log\" \"$case_stdin\" \"$patched_case_path\" >/dev/null 2>&1 || true\n",
+    "    case \"$case_name\" in\n",
+    "        mmap10|mmap11|mmap12|brk01|brk02|close01|close02|dup01|dup02)\n",
+    "            debug_dir=\"${WHUSE_LTP_RUNROOT:-${WHUSE_LTP_TMPDIR:-/musl/ltp-tmp}}/debug\"\n",
+    "            /musl/busybox mkdir -p \"$debug_dir\" >/dev/null 2>&1 || true\n",
+    "            /musl/busybox cp \"$case_log\" \"$debug_dir/$case_name.raw\" >/dev/null 2>&1 || true\n",
+    "            /musl/busybox cp \"$case_tokens\" \"$debug_dir/$case_name.tokens\" >/dev/null 2>&1 || true\n",
+    "            if [ \"$case_rc\" -ne 0 ]; then\n",
+    "                echo whuse-oscomp-ltp-marker:case-log-begin:$case_name\n",
+    "                /musl/busybox cat \"$case_log\" 2>/dev/null || true\n",
+    "                echo whuse-oscomp-ltp-marker:case-log-end:$case_name\n",
+    "            fi\n",
+    "            ;;\n",
+    "    esac\n",
+    "    /musl/busybox rm -f \"$case_log\" \"$case_stdin\" \"$patched_case_path\" \"$case_tokens\" \"$case_wait_err\" \"$case_status\" >/dev/null 2>&1 || true\n",
     "    if [ \"$case_rc\" -eq 0 ] || [ \"$case_rc\" -eq 124 ] || [ \"$case_rc\" -eq 255 ]; then\n",
     "        return 0\n",
     "    fi\n",
@@ -789,7 +884,8 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    ltp_dir=\"/musl/ltp/testcases/bin\"\n",
     "    [ -d \"$ltp_dir\" ] || return 127\n",
     "    rc=0\n",
-    "    step_start_ts=$(/musl/busybox date +%s)\n",
+    "    whuse_ltp_update_epoch\n",
+    "    step_start_ts=\"$whuse_ltp_epoch\"\n",
     "    if [ \"$WHUSE_LTP_PROFILE\" != \"full\" ] && whuse_ltp_list_has_entries \"$WHUSE_LTP_WHITELIST\"; then\n",
     "        while IFS= read -r wanted_case\n",
     "        do\n",
@@ -798,19 +894,24 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "            case_path=\"$ltp_dir/$case_name\"\n",
     "            [ -f \"$case_path\" ] || continue\n",
     "            case_rel=\"ltp/testcases/bin/$case_name\"\n",
-    "            if ! whuse_ltp_case_allowed \"$case_name\" \"$case_rel\"; then\n",
+    "            if whuse_ltp_case_blocked \"$case_name\" \"$case_rel\"; then\n",
     "                echo whuse-ltp-skip-case:$case_rel:filtered\n",
     "                continue\n",
     "            fi\n",
-    "            now_ts=$(/musl/busybox date +%s)\n",
-    "            elapsed_step=$((now_ts - step_start_ts))\n",
+    "            whuse_ltp_update_epoch\n",
+    "            elapsed_step=$((whuse_ltp_epoch - step_start_ts))\n",
     "            if [ \"$timeout_s\" -gt 0 ] && [ \"$elapsed_step\" -ge \"$timeout_s\" ]; then\n",
     "                echo whuse-oscomp-step-timeout:ltp_testcode.sh:$timeout_s:pid=0:tgid=0\n",
     "                rc=124\n",
     "                break\n",
     "            fi\n",
-    "            case_log=\"/tmp/whuse-ltp-case-${case_name}.$$.log\"\n",
-    "            case_stdin=\"/tmp/whuse-ltp-case-${case_name}.$$.stdin\"\n",
+    "            case_tmp_dir=\"${WHUSE_LTP_RUNROOT:-${WHUSE_LTP_TMPDIR:-/musl/ltp-tmp}}/cases\"\n",
+    "            /musl/busybox mkdir -p \"$case_tmp_dir\" >/dev/null 2>&1 || true\n",
+    "            case_log=\"$case_tmp_dir/whuse-ltp-case-${case_name}.$$.log\"\n",
+    "            case_stdin=/dev/null\n",
+    "            case \"$case_name\" in\n",
+    "                ask_password.sh|assign_password.sh) case_stdin=\"$case_tmp_dir/whuse-ltp-case-${case_name}.$$.stdin\" ;;\n",
+    "            esac\n",
     "            whuse_ltp_run_single_case \"$case_name\" \"$case_rel\" \"$case_path\" \"$case_log\" \"$case_stdin\"\n",
     "            case_exec_rc=$?\n",
     "            if [ \"$case_exec_rc\" -ne 0 ] && [ \"$rc\" -eq 0 ]; then\n",
@@ -822,21 +923,26 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    for case_path in \"$ltp_dir\"/*\n",
     "    do\n",
     "        [ -f \"$case_path\" ] || continue\n",
-    "        case_name=\"$(/musl/busybox basename \"$case_path\")\"\n",
+    "        case_name=\"${case_path##*/}\"\n",
     "        case_rel=\"ltp/testcases/bin/$case_name\"\n",
     "        if ! whuse_ltp_case_allowed \"$case_name\" \"$case_rel\"; then\n",
     "            echo whuse-ltp-skip-case:$case_rel:filtered\n",
     "            continue\n",
     "        fi\n",
-    "        now_ts=$(/musl/busybox date +%s)\n",
-    "        elapsed_step=$((now_ts - step_start_ts))\n",
+    "        whuse_ltp_update_epoch\n",
+    "        elapsed_step=$((whuse_ltp_epoch - step_start_ts))\n",
     "        if [ \"$timeout_s\" -gt 0 ] && [ \"$elapsed_step\" -ge \"$timeout_s\" ]; then\n",
     "            echo whuse-oscomp-step-timeout:ltp_testcode.sh:$timeout_s:pid=0:tgid=0\n",
     "            rc=124\n",
     "            break\n",
     "        fi\n",
-    "        case_log=\"/tmp/whuse-ltp-case-${case_name}.$$.log\"\n",
-    "        case_stdin=\"/tmp/whuse-ltp-case-${case_name}.$$.stdin\"\n",
+    "        case_tmp_dir=\"${WHUSE_LTP_RUNROOT:-${WHUSE_LTP_TMPDIR:-/musl/ltp-tmp}}/cases\"\n",
+    "        /musl/busybox mkdir -p \"$case_tmp_dir\" >/dev/null 2>&1 || true\n",
+    "        case_log=\"$case_tmp_dir/whuse-ltp-case-${case_name}.$$.log\"\n",
+    "        case_stdin=/dev/null\n",
+    "        case \"$case_name\" in\n",
+    "            ask_password.sh|assign_password.sh) case_stdin=\"$case_tmp_dir/whuse-ltp-case-${case_name}.$$.stdin\" ;;\n",
+    "        esac\n",
     "        whuse_ltp_run_single_case \"$case_name\" \"$case_rel\" \"$case_path\" \"$case_log\" \"$case_stdin\"\n",
     "        case_exec_rc=$?\n",
     "        if [ \"$case_exec_rc\" -ne 0 ] && [ \"$rc\" -eq 0 ]; then\n",
@@ -849,14 +955,24 @@ const OSCOMP_SUITE_SCRIPT: &str = concat!(
     "    timeout_s=\"$1\"\n",
     "    echo whuse-oscomp-ltp-marker:runner-start:profile=$WHUSE_LTP_PROFILE\n",
     "    old_path=\"$PATH\"\n",
+    "    export WHUSE_LTP_TMPDIR=\"${WHUSE_LTP_TMPDIR:-/musl/ltp-tmp}\"\n",
+    "    export WHUSE_LTP_RUNROOT=\"${WHUSE_LTP_RUNROOT:-$WHUSE_LTP_TMPDIR/run.$$}\"\n",
+    "    /musl/busybox rm -rf \"$WHUSE_LTP_RUNROOT\" >/dev/null 2>&1 || true\n",
+    "    /musl/busybox mkdir -p \"$WHUSE_LTP_RUNROOT/cases\" \"$WHUSE_LTP_RUNROOT/debug\" >/dev/null 2>&1 || true\n",
+    "    export WHUSE_LTP_WRAPPER_DIR=\"$WHUSE_LTP_RUNROOT/debug\"\n",
     "    if ! whuse_ltp_enable_busybox_compat; then\n",
-    "        echo whuse-oscomp-ltp-marker:busybox-compat-enable-failed\n",
+        "        echo whuse-oscomp-ltp-marker:busybox-compat-enable-failed\n",
     "    fi\n",
-    "    whuse_ltp_write_busybox_wrapper\n",
-    "    export PATH=/tmp/whuse-ltp-bin:/musl/ltp/testcases/bin:/musl/ltp/testcases/lib:/musl/ltp/runtest:/musl/ltp/testscripts:$PATH\n",
+    "    if ! whuse_ltp_write_busybox_wrapper; then\n",
+    "        echo whuse-oscomp-ltp-marker:busybox-wrapper-create-failed\n",
+    "    fi\n",
+    "    export LTPROOT=/musl/ltp\n",
+    "    export LTP_VIRT_OVERRIDE=\"${LTP_VIRT_OVERRIDE:-kvm}\"\n",
+    "    export TMPDIR=\"$WHUSE_LTP_TMPDIR\"\n",
+    "    export PATH=/musl/ltp/testcases/bin:${WHUSE_LTP_WRAPPER_DIR}:/musl/ltp/testcases/lib:/musl/ltp/runtest:/musl/ltp/testscripts:$PATH\n",
     "    if [ \"$WHUSE_LTP_PROFILE\" = \"full\" ]; then\n",
-    "        WHUSE_LTP_WHITELIST=/dev/null\n",
-    "        WHUSE_LTP_BLACKLIST=/dev/null\n",
+        "        WHUSE_LTP_WHITELIST=/dev/null\n",
+        "        WHUSE_LTP_BLACKLIST=/dev/null\n",
     "    fi\n",
     "    echo whuse-oscomp-command-begin:ltp_testcode.sh:$WHUSE_LTP_PROFILE\n",
     "    whuse_ltp_run_loop \"$timeout_s\"\n",
@@ -1824,6 +1940,8 @@ impl Kernel {
                     self.scheduler.remove_task(exit.tid);
                     if exit.group_exited {
                         self.scheduler.exit_group(exit.tgid);
+                    } else {
+                        let _ = self.processes.reap_exited_thread(exit.tid);
                     }
                     if let Some(parent_tgid) = exit.parent_tgid {
                         let _ = self.processes.deliver_signal(parent_tgid, 17);
@@ -2366,26 +2484,17 @@ impl Kernel {
                 &mut self.scheduler,
                 &mut self.vfs,
             );
+            let exit_like_syscall = matches!(sysno, syscall::SYS_EXIT | syscall::SYS_EXIT_GROUP);
+            if exit_like_syscall {
+                if self.scheduler.current_thread_id().is_none() && self.scheduler.ready_count() > 0 {
+                    let _ = self.scheduler.yield_now();
+                }
+                return;
+            }
             if let Some(tid) = trap_tid {
                 if let Ok(process) = self.processes.find_by_tid_mut(tid) {
-                    let blocked_restart = result == EAGAIN_RET
-                        && matches!(
-                            sysno,
-                            SYS_WAIT
-                                | SYS_READ
-                                | SYS_READV
-                                | syscall::SYS_ACCEPT
-                                | syscall::SYS_ACCEPT4
-                                | SYS_RT_SIGSUSPEND
-                                | SYS_RT_SIGTIMEDWAIT
-                                | SYS_FUTEX
-                                | SYS_PPOLL
-                                | SYS_PSELECT6
-                                | SYS_EPOLL_PWAIT
-                                | SYS_EPOLL_PWAIT2
-                                | SYS_NANOSLEEP
-                                | SYS_CLOCK_NANOSLEEP
-                        );
+                    let blocked_restart =
+                        should_restart_blocked_syscall(sysno, result, self.scheduler.is_blocked(tid));
                     if !blocked_restart {
                         process.trap_frame.set_retval(result as usize);
                         if sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN {
@@ -2394,24 +2503,7 @@ impl Kernel {
                     }
                 }
             } else if let Ok(process) = self.processes.current_mut() {
-                let blocked_restart = result == EAGAIN_RET
-                    && matches!(
-                        sysno,
-                        SYS_WAIT
-                            | SYS_READ
-                            | SYS_READV
-                            | syscall::SYS_ACCEPT
-                            | syscall::SYS_ACCEPT4
-                            | SYS_RT_SIGSUSPEND
-                            | SYS_RT_SIGTIMEDWAIT
-                            | SYS_FUTEX
-                            | SYS_PPOLL
-                            | SYS_PSELECT6
-                            | SYS_EPOLL_PWAIT
-                            | SYS_EPOLL_PWAIT2
-                            | SYS_NANOSLEEP
-                            | SYS_CLOCK_NANOSLEEP
-                    );
+                let blocked_restart = should_restart_blocked_syscall(sysno, result, false);
                 if !blocked_restart {
                     process.trap_frame.set_retval(result as usize);
                     if sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN {
@@ -2589,6 +2681,8 @@ impl Kernel {
                     self.scheduler.remove_task(exit.tid);
                     if exit.group_exited {
                         self.scheduler.exit_group(exit.tgid);
+                    } else {
+                        let _ = self.processes.reap_exited_thread(exit.tid);
                     }
                     if let Some(parent_tgid) = exit.parent_tgid {
                         let _ = self.processes.deliver_signal(parent_tgid, 17);
@@ -2927,6 +3021,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
     install_busybox_exec_alias(vfs, "/musl/awk", "awk");
     install_busybox_exec_alias(vfs, "/musl/sed", "sed");
     install_busybox_exec_alias(vfs, "/musl/grep", "grep");
+    install_busybox_exec_alias(vfs, "/musl/cp", "cp");
     install_busybox_exec_alias(vfs, "/musl/[", "[");
     install_busybox_exec_alias(vfs, "/musl/test", "test");
     install_busybox_exec_alias(vfs, "/musl/ar", "ar");
@@ -2959,6 +3054,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         ("/bin/awk", "/musl/awk"),
         ("/bin/sed", "/musl/sed"),
         ("/bin/grep", "/musl/grep"),
+        ("/bin/cp", "/musl/cp"),
         ("/bin/ar", "/musl/ar"),
         ("/bin/ip", "/musl/ip"),
         ("/bin/mktemp", "/musl/mktemp"),
@@ -2988,6 +3084,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         ("/usr/bin/awk", "/musl/awk"),
         ("/usr/bin/sed", "/musl/sed"),
         ("/usr/bin/grep", "/musl/grep"),
+        ("/usr/bin/cp", "/musl/cp"),
         ("/usr/bin/ar", "/musl/ar"),
         ("/usr/bin/ip", "/musl/ip"),
         ("/usr/bin/mktemp", "/musl/mktemp"),
@@ -3385,6 +3482,30 @@ fn should_dispatch_pending_signals_after_syscall(unmasked: u64, blocked_restart:
         return true;
     }
     unmasked != SIGCANCEL_MASK
+}
+
+fn should_restart_blocked_syscall(sysno: usize, result: isize, task_blocked: bool) -> bool {
+    result == EAGAIN_RET
+        && task_blocked
+        && matches!(
+            sysno,
+            SYS_WAIT
+                | SYS_READ
+                | syscall::SYS_WRITE
+                | SYS_READV
+                | syscall::SYS_WRITEV
+                | syscall::SYS_ACCEPT
+                | syscall::SYS_ACCEPT4
+                | SYS_RT_SIGSUSPEND
+                | SYS_RT_SIGTIMEDWAIT
+                | SYS_FUTEX
+                | SYS_PPOLL
+                | SYS_PSELECT6
+                | SYS_EPOLL_PWAIT
+                | SYS_EPOLL_PWAIT2
+                | SYS_NANOSLEEP
+                | SYS_CLOCK_NANOSLEEP
+        )
 }
 
 fn render_oscomp_official_suite_script(profile_default: &str) -> String {
@@ -4035,6 +4156,255 @@ mod tests {
             !script.contains("echo PASS LTP CASE $case_name : 0"),
             "ltp runner should not emit custom PASS-case lines that the site scorer may ignore"
         );
+    }
+
+    #[test]
+    fn riscv_ltp_path_prefers_real_ltp_binaries_before_busybox_overrides() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            script.contains(
+                "export PATH=/musl/ltp/testcases/bin:${WHUSE_LTP_WRAPPER_DIR}:/musl/ltp/testcases/lib:/musl/ltp/runtest:/musl/ltp/testscripts:$PATH"
+            ),
+            "ltp PATH should prefer real testcase binaries before the busybox compatibility wrapper"
+        );
+    }
+
+    #[test]
+    fn riscv_ltp_explicit_whitelist_loop_does_not_recheck_whitelist_membership() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            script.contains("if whuse_ltp_case_blocked \"$case_name\" \"$case_rel\"; then"),
+            "explicit whitelist loop should only apply hard exclusions and blacklist filtering"
+        );
+    }
+
+    #[test]
+    fn riscv_ltp_runner_defaults_virtualization_override_for_timer_tests() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            script.contains("export LTP_VIRT_OVERRIDE=\"${LTP_VIRT_OVERRIDE:-kvm}\""),
+            "ltp runner should default LTP_VIRT_OVERRIDE in QEMU so timer tests avoid external virt probes"
+        );
+    }
+
+    #[test]
+    fn riscv_ltp_runner_uses_rootfs_backed_tmpdir_for_mount_device_cases() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            script.contains("export WHUSE_LTP_TMPDIR=\"${WHUSE_LTP_TMPDIR:-/musl/ltp-tmp}\""),
+            "ltp runner should use a stable rootfs-backed tmpdir override"
+        );
+        assert!(
+            script.contains("export WHUSE_LTP_RUNROOT=\"${WHUSE_LTP_RUNROOT:-$WHUSE_LTP_TMPDIR/run.$$}\""),
+            "ltp runner should isolate each run under a unique root to avoid stale wrapper or stdin collisions"
+        );
+        assert!(
+            script.contains("/musl/busybox mkdir -p \"$WHUSE_LTP_RUNROOT/cases\" \"$WHUSE_LTP_RUNROOT/debug\" >/dev/null 2>&1 || true"),
+            "ltp runner should precreate the run-scoped case and debug directories"
+        );
+        assert!(
+            script.contains("export WHUSE_LTP_WRAPPER_DIR=\"$WHUSE_LTP_RUNROOT/debug\""),
+            "ltp runner should place busybox compatibility wrappers in the already-proven debug directory"
+        );
+        assert!(
+            script.contains("export TMPDIR=\"$WHUSE_LTP_TMPDIR\""),
+            "ltp runner should export TMPDIR so tst_device avoids small special-mount /tmp"
+        );
+    }
+
+    #[test]
+    fn riscv_ltp_runner_counts_tokens_robustly_across_binary_noise() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            script.contains("/musl/busybox tr '\\000\\033' '\\n\\n' > \"$out\""),
+            "ltp token normalization should strip NUL and ANSI escape bytes before classifying case output"
+        );
+        assert!(
+            script.contains("/musl/busybox grep -Eq 'TFAIL|failed[[:space:]]+[1-9][0-9]*([[:space:]]|$)' \"$file\""),
+            "ltp token detection should classify normalized logs with line-oriented regex matching"
+        );
+    }
+
+    #[test]
+    fn riscv_ltp_runner_does_not_treat_failed_zero_summary_as_tfail() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            !script.contains("*failed*[1-9]*"),
+            "ltp token detection should not use shell globs that misclassify 'failed 0' summaries as tfail"
+        );
+        assert!(
+            !script.contains("*passed*[1-9]*"),
+            "ltp token detection should not use shell globs that depend on unrelated later digits in the log"
+        );
+    }
+
+    #[test]
+    fn riscv_ltp_runner_avoids_command_substitution_in_case_hot_path() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            !script.contains("stdin_dir=$(/musl/busybox dirname \"$stdin_path\")"),
+            "ltp runner should not use dirname command substitution in per-case stdin setup"
+        );
+        assert!(
+            !script.contains("first_line=$(/musl/busybox head -n 1 \"$case_path\" 2>/dev/null || true)"),
+            "ltp runner should not read binary testcase headers through command substitution"
+        );
+        assert!(
+            !script.contains("step_start_ts=$(/musl/busybox date +%s)"),
+            "ltp runner should not use command substitution for step start timestamps"
+        );
+        assert!(
+            !script.contains("now_ts=$(/musl/busybox date +%s)"),
+            "ltp runner should not use command substitution for per-case timestamps"
+        );
+        assert!(
+            !script.contains(": > \"$stdin_path\""),
+            "ltp runner should not rely on shell builtin redirection to create per-case stdin files"
+        );
+        assert!(
+            script.contains("[ \"$stdin_path\" = \"/dev/null\" ] && return 0"),
+            "non-interactive ltp cases should not depend on creating per-case stdin files"
+        );
+        assert!(
+            script.contains("case_stdin=/dev/null"),
+            "ltp runner should default non-interactive cases to /dev/null stdin"
+        );
+    }
+
+    #[test]
+    fn riscv_ltp_runner_does_not_background_cases_through_busybox_setsid_applet() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            !script.contains("/musl/busybox setsid /musl/busybox env TST_NO_DEFAULT_RUN=1"),
+            "ltp runner should not background cases through the busybox setsid applet because that can detach the real testcase from the waited pid"
+        );
+        assert!(
+            script.contains("/musl/busybox env "),
+            "ltp runner should still launch cases through the busybox env wrapper"
+        );
+    }
+
+    #[test]
+    fn riscv_ltp_runner_limits_tst_no_default_run_to_shell_cases() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            script.contains("case_default_run_env="),
+            "ltp runner should model shell-only default-run overrides explicitly"
+        );
+        assert!(
+            script.contains("case_default_run_env=\"TST_NO_DEFAULT_RUN=1\""),
+            "ltp runner should keep TST_NO_DEFAULT_RUN only for shell testcase launchers"
+        );
+        assert!(
+            script.contains("/musl/busybox env $case_default_run_env $case_extra_env"),
+            "ltp runner should launch binaries through env without hardcoding TST_NO_DEFAULT_RUN"
+        );
+        assert!(
+            !script.contains("/musl/busybox env TST_NO_DEFAULT_RUN=1 $case_extra_env \"$exec_case_path\""),
+            "ltp runner should not force TST_NO_DEFAULT_RUN onto compiled testcase binaries"
+        );
+    }
+
+    #[test]
+    fn riscv_ltp_runner_captures_case_exit_status_via_status_file() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            script.contains("case_status=\"$case_log.status\""),
+            "ltp runner should allocate a per-case status file so shell wait races do not erase testcase exit codes"
+        );
+        assert!(
+            script.contains("echo $? > \"$case_status\""),
+            "ltp runner wrapper should persist the real testcase exit code before the wrapper shell exits"
+        );
+        assert!(
+            script.contains("while [ ! -f \"$case_status\" ]"),
+            "ltp runner should poll for testcase completion via the status file instead of kill -0 plus delayed wait"
+        );
+        assert!(
+            script.contains("if IFS= read -r case_rc < \"$case_status\"; then"),
+            "ltp runner should restore the testcase exit code from the status file on the non-timeout path"
+        );
+    }
+
+    #[test]
+    fn riscv_ltp_busybox_wrapper_preserves_generic_applet_name() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            script.contains("echo 'exec /musl/busybox \"$cmd\" \"$@\"'"),
+            "ltp busybox wrapper should forward unknown applets with the original applet name"
+        );
+        assert!(
+            !script.contains("echo 'exec /musl/busybox \"$@\"'"),
+            "ltp busybox wrapper should not drop the applet name for generic fall-through execution"
+        );
+        assert!(
+            script.contains("echo 'cmd=\"${0##*/}\"'"),
+            "ltp busybox wrapper should derive the invoked applet name with shell expansion instead of basename substitution"
+        );
+    }
+
+    #[test]
+    fn riscv_ltp_runner_exports_ltproot_for_resource_files() {
+        let script = render_oscomp_official_suite_script("full");
+
+        assert!(
+            script.contains("export LTPROOT=/musl/ltp"),
+            "ltp runner should export LTPROOT so resource_files helpers can copy companion binaries from testcases/bin"
+        );
+    }
+
+    #[test]
+    fn riscv_restarts_read_on_eagain_only_when_task_is_blocked() {
+        assert!(super::should_restart_blocked_syscall(
+            syscall::SYS_READ,
+            super::EAGAIN_RET,
+            true
+        ));
+        assert!(!super::should_restart_blocked_syscall(
+            syscall::SYS_READ,
+            super::EAGAIN_RET,
+            false
+        ));
+        assert!(!super::should_restart_blocked_syscall(
+            syscall::SYS_READ,
+            -1,
+            true
+        ));
+    }
+
+    #[test]
+    fn riscv_restarts_blocking_pipe_writes_on_eagain_only_when_task_is_blocked() {
+        assert!(super::should_restart_blocked_syscall(
+            syscall::SYS_WRITE,
+            super::EAGAIN_RET,
+            true
+        ));
+        assert!(!super::should_restart_blocked_syscall(
+            syscall::SYS_WRITE,
+            super::EAGAIN_RET,
+            false
+        ));
+        assert!(super::should_restart_blocked_syscall(
+            syscall::SYS_WRITEV,
+            super::EAGAIN_RET,
+            true
+        ));
+        assert!(!super::should_restart_blocked_syscall(
+            syscall::SYS_WRITEV,
+            -1,
+            true
+        ));
     }
 
     #[test]

@@ -17,15 +17,19 @@ pub type KernelResult<T> = Result<T, i32>;
 pub const O_CREAT: u32 = 0o100;
 pub const O_EXCL: u32 = 0o200;
 pub const O_TRUNC: u32 = 0o1000;
+pub const O_APPEND: u32 = 0o2000;
 pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_DIRECTORY: u32 = 0o200000;
 pub const O_NOATIME: u32 = 0o1000000;
+pub const O_NONBLOCK: u32 = 0x0000_0800;
 pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const HANDLE_FLAG_CLOEXEC: u32 = 1 << 31;
 
 const ENOENT: i32 = 2;
+const ENXIO: i32 = 6;
+const EPERM: i32 = 1;
 const EEXIST: i32 = 17;
 const EAGAIN: i32 = 11;
 const ENOTSOCK: i32 = 88;
@@ -37,6 +41,7 @@ const ENOSPC: i32 = 28;
 const ENOMEM: i32 = 12;
 const EOPNOTSUPP: i32 = 95;
 const EPIPE: i32 = 32;
+const ESPIPE: i32 = 29;
 const EROFS: i32 = 30;
 const ENOTEMPTY: i32 = 39;
 const EADDRINUSE: i32 = 98;
@@ -58,6 +63,8 @@ const PROC_VERSION: &[u8] = b"Linux version 6.8.0-whuse (whuse@localdomain) #1 S
 const PROC_SELF_STAT: &[u8] = b"1 (self) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 1 4096 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
 const PROC_SELF_MAPS: &[u8] = b"50000000-50080000 r-xp 00000000 00:00 0 /proc/self/exe\n";
 const EXT4_DIR_STAT_CACHE_MAX_SIZE: u64 = 512 * 1024;
+const PIPE_CAPACITY: usize = 16 * 4096;
+const PIPE_MIN_CAPACITY: usize = 4096;
 static CONSOLE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 fn write_console_bytes(bytes: &[u8]) {
@@ -222,6 +229,7 @@ struct PipeState {
     buf: VecDeque<u8>,
     readers: usize,
     writers: usize,
+    capacity: usize,
 }
 
 struct RawSocketState {
@@ -234,9 +242,123 @@ struct RawSocketState {
     inbox: VecDeque<Vec<u8>>,
 }
 
+#[derive(Clone, Default)]
+struct SparseFileState {
+    size: usize,
+    chunks: BTreeMap<usize, Vec<u8>>,
+}
+
+impl SparseFileState {
+    fn from_dense(buf: Vec<u8>) -> Self {
+        if buf.is_empty() {
+            return Self::default();
+        }
+        let mut chunks = BTreeMap::new();
+        let size = buf.len();
+        chunks.insert(0, buf);
+        Self { size, chunks }
+    }
+
+    fn clear(&mut self) {
+        self.size = 0;
+        self.chunks.clear();
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.size = len;
+        let overlaps: Vec<(usize, Vec<u8>)> = self
+            .chunks
+            .range(..len)
+            .filter_map(|(&chunk_start, chunk)| {
+                let chunk_end = chunk_start.saturating_add(chunk.len());
+                if chunk_end > len {
+                    Some((chunk_start, chunk.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (chunk_start, chunk) in overlaps {
+            self.chunks.remove(&chunk_start);
+            let kept = len.saturating_sub(chunk_start).min(chunk.len());
+            if kept > 0 {
+                self.chunks.insert(chunk_start, chunk[..kept].to_vec());
+            }
+        }
+        let remove_keys: Vec<usize> = self.chunks.range(len..).map(|(&start, _)| start).collect();
+        for start in remove_keys {
+            self.chunks.remove(&start);
+        }
+    }
+
+    fn read_range(&self, offset: usize, len: usize) -> Vec<u8> {
+        let start = offset.min(self.size);
+        let end = start.saturating_add(len).min(self.size);
+        if end <= start {
+            return Vec::new();
+        }
+        let mut out = vec![0; end - start];
+        for (&chunk_start, chunk) in self.chunks.range(..end) {
+            let chunk_end = chunk_start.saturating_add(chunk.len());
+            if chunk_end <= start {
+                continue;
+            }
+            let copy_start = chunk_start.max(start);
+            let copy_end = chunk_end.min(end);
+            let src_start = copy_start - chunk_start;
+            let src_end = copy_end - chunk_start;
+            let dst_start = copy_start - start;
+            let dst_end = copy_end - start;
+            out[dst_start..dst_end].copy_from_slice(&chunk[src_start..src_end]);
+        }
+        out
+    }
+
+    fn remove_range(&mut self, start: usize, end: usize) {
+        let overlaps: Vec<(usize, Vec<u8>)> = self
+            .chunks
+            .range(..end)
+            .filter_map(|(&chunk_start, chunk)| {
+                let chunk_end = chunk_start.saturating_add(chunk.len());
+                if chunk_end <= start || chunk_start >= end {
+                    None
+                } else {
+                    Some((chunk_start, chunk.clone()))
+                }
+            })
+            .collect();
+        for (chunk_start, chunk) in overlaps {
+            self.chunks.remove(&chunk_start);
+            let chunk_end = chunk_start + chunk.len();
+            if chunk_start < start {
+                let kept = start - chunk_start;
+                self.chunks.insert(chunk_start, chunk[..kept].to_vec());
+            }
+            if chunk_end > end {
+                let tail_start = end;
+                let tail_offset = end - chunk_start;
+                self.chunks
+                    .insert(tail_start, chunk[tail_offset..].to_vec());
+            }
+        }
+    }
+
+    fn write_at(&mut self, offset: usize, data: &[u8]) -> KernelResult<usize> {
+        let end = offset.checked_add(data.len()).ok_or(ENOSPC)?;
+        self.size = self.size.max(end);
+        if data.is_empty() {
+            return Ok(0);
+        }
+        self.remove_range(offset, end);
+        self.chunks.insert(offset, data.to_vec());
+        Ok(data.len())
+    }
+}
+
 enum NodeData {
     Directory(BTreeMap<String, Arc<Node>>),
     File(Vec<u8>),
+    SparseFile(SparseFileState),
     Ext4File(Ext4FileState),
     Ext4Dir(Ext4DirState),
     CharDevice,
@@ -410,6 +532,28 @@ impl KernelVfs {
                 );
                 Ok(())
             }
+            S_IFIFO => {
+                self.create_node(
+                    &absolute,
+                    NodeKind::Pipe,
+                    Some(NodeData::Pipe(PipeState {
+                        buf: VecDeque::new(),
+                        readers: 0,
+                        writers: 0,
+                        capacity: PIPE_CAPACITY,
+                    })),
+                )?;
+                self.mem_meta.insert(
+                    absolute,
+                    InodeMeta {
+                        mode: S_IFIFO | (mode & 0o7777),
+                        nlink: 1,
+                        uid,
+                        gid,
+                    },
+                );
+                Ok(())
+            }
             _ => Err(EINVAL),
         }
     }
@@ -494,7 +638,14 @@ impl KernelVfs {
         gid: u32,
     ) -> KernelResult<FileHandle> {
         let absolute = normalize_path(cwd, path);
-        let existed = self.path_exists(&absolute).is_ok();
+        let existed = self.stat_path_open_probe(cwd, path, flags).is_some();
+        let inherited_gid = if !existed && (flags & O_CREAT) != 0 {
+            let (parent_path, _) = split_parent(&absolute)?;
+            let parent_stat = self.stat_path("/", &parent_path)?;
+            ((parent_stat.mode & 0o2000) != 0).then_some(parent_stat.gid)
+        } else {
+            None
+        };
         let handle = self.open(cwd, path, flags, mode)?;
         if !existed && (flags & O_CREAT) != 0 {
             let stat = self.stat_handle(&handle)?;
@@ -504,7 +655,7 @@ impl KernelVfs {
                     mode: stat.mode,
                     nlink: stat.nlink,
                     uid,
-                    gid,
+                    gid: inherited_gid.unwrap_or(gid),
                 },
             );
         }
@@ -519,6 +670,13 @@ impl KernelVfs {
         mode: u32,
     ) -> KernelResult<FileHandle> {
         let absolute = normalize_path(cwd, path);
+        let ltp_create_probe = is_ltp_create_probe_path(path);
+        if ltp_create_probe {
+            write_console_line(&format!(
+                "whuse-ltp:vfs-open-enter cwd={} path={} absolute={} flags={:#x} mode={:#o}",
+                cwd, path, absolute, flags, mode
+            ));
+        }
         let iozone_probe = is_iozone_probe_path(absolute.as_str());
         if iozone_probe {
             iozone_probe_log(&format!(
@@ -541,10 +699,24 @@ impl KernelVfs {
                 absolute
             ));
         }
-        self.open_mem(&absolute, flags, mode)
+        let result = self.open_mem(&absolute, flags, mode);
+        if ltp_create_probe {
+            match &result {
+                Ok(handle) => write_console_line(&format!(
+                    "whuse-ltp:vfs-open-exit absolute={} resolved={} flags={:#x}",
+                    absolute, handle.path, flags
+                )),
+                Err(err) => write_console_line(&format!(
+                    "whuse-ltp:vfs-open-err absolute={} flags={:#x} err={}",
+                    absolute, flags, err
+                )),
+            }
+        }
+        result
     }
 
     fn open_mem(&mut self, absolute: &str, flags: u32, mode: u32) -> KernelResult<FileHandle> {
+        let ltp_create_probe = is_ltp_create_probe_path(absolute);
         let mut resolved = absolute.to_string();
         let node = match self.lookup_abs(&resolved) {
             Ok(node) => {
@@ -554,7 +726,21 @@ impl KernelVfs {
                 node
             }
             Err(err) if err == ENOENT && (flags & O_CREAT) != 0 => {
-                self.create_file_with_mode("/", &resolved, b"", mode)?;
+                if ltp_create_probe {
+                    write_console_line(&format!(
+                        "whuse-ltp:vfs-open-mem-create absolute={} mode={:#o}",
+                        resolved, mode
+                    ));
+                }
+                if let Err(err) = self.create_file_with_mode("/", &resolved, b"", mode) {
+                    if ltp_create_probe {
+                        write_console_line(&format!(
+                            "whuse-ltp:vfs-open-mem-create-err absolute={} err={}",
+                            resolved, err
+                        ));
+                    }
+                    return Err(err);
+                }
                 self.lookup_abs(&resolved)?
             }
             Err(err) => return Err(err),
@@ -592,18 +778,40 @@ impl KernelVfs {
         }
 
         if (flags & O_TRUNC) != 0 {
-            if let NodeData::File(buf) = &mut *node.data.lock() {
-                buf.clear();
+            match &mut *node.data.lock() {
+                NodeData::File(buf) => buf.clear(),
+                NodeData::SparseFile(state) => state.clear(),
+                _ => {}
             }
         }
 
-        Ok(FileHandle {
+        if node.kind == NodeKind::Pipe
+            && (flags & O_NONBLOCK) != 0
+            && (flags & 0b11) == O_WRONLY
+            && matches!(&*node.data.lock(), NodeData::Pipe(state) if state.readers == 0)
+        {
+            return Err(ENXIO);
+        }
+
+        let pipe_end = if node.kind == NodeKind::Pipe {
+            match flags & 0b11 {
+                O_WRONLY => PipeEnd::Write,
+                O_RDWR => PipeEnd::None,
+                _ => PipeEnd::Read,
+            }
+        } else {
+            PipeEnd::None
+        };
+
+        let handle = FileHandle {
             node,
             offset: 0,
             flags,
             path: resolved,
-            pipe_end: PipeEnd::None,
-        })
+            pipe_end,
+        };
+        handle.adjust_pipe_refcount(1);
+        Ok(handle)
     }
 
     pub fn read(&self, handle: &mut FileHandle, len: usize) -> KernelResult<Vec<u8>> {
@@ -665,6 +873,10 @@ impl KernelVfs {
 
     pub fn seek(&self, handle: &mut FileHandle, offset: isize, whence: u32) -> KernelResult<usize> {
         handle.seek_object(offset, whence)
+    }
+
+    pub fn fcntl(&self, handle: &mut FileHandle, cmd: usize, arg: usize) -> KernelResult<usize> {
+        handle.fcntl_object(cmd, arg)
     }
 
     pub fn getdents(&mut self, handle: &mut FileHandle, max_len: usize) -> KernelResult<Vec<u8>> {
@@ -742,6 +954,50 @@ impl KernelVfs {
         }
         handle.offset = handle.offset.saturating_add(emitted);
         Ok(out)
+    }
+
+    pub fn refresh_proc_self_fd_dir<I>(&mut self, fds: I) -> KernelResult<()>
+    where
+        I: IntoIterator<Item = (i32, String)>,
+    {
+        match self.mkdir("/", "/proc/self/fd", 0o755) {
+            Ok(()) | Err(EEXIST) => {}
+            Err(err) => return Err(err),
+        }
+        let node = self.lookup_abs("/proc/self/fd")?;
+        let NodeData::Directory(entries) = &mut *node.data.lock() else {
+            return Err(ENOTDIR);
+        };
+        entries.clear();
+        for (fd, target) in fds {
+            entries.insert(
+                fd.to_string(),
+                Arc::new(Node::symlink(
+                    &fd.to_string(),
+                    NodeData::Symlink(target),
+                )),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn bytes_available_to_read(&self, handle: &FileHandle) -> KernelResult<usize> {
+        match &*handle.node.data.lock() {
+            NodeData::File(buf) | NodeData::ProcFile(buf) => {
+                Ok(buf.len().saturating_sub(handle.offset))
+            }
+            NodeData::SparseFile(state) => Ok(state.size.saturating_sub(handle.offset)),
+            NodeData::Ext4File(state) => Ok((state.size as usize).saturating_sub(handle.offset)),
+            NodeData::Pipe(state) => Ok(state.buf.len()),
+            NodeData::Event(counter) => Ok((*counter != 0) as usize * 8),
+            NodeData::SocketPending(_) => Err(EINVAL),
+            NodeData::SocketConnected { channel, side, .. } => {
+                let guard = channel.lock();
+                Ok(guard.inbox[*side].len())
+            }
+            NodeData::SocketRaw(state) => Ok(state.inbox.len()),
+            _ => Err(EINVAL),
+        }
     }
 
     pub fn stat_path(&self, cwd: &str, path: &str) -> KernelResult<FileStat> {
@@ -826,11 +1082,7 @@ impl KernelVfs {
         };
         let node = entries.get(name).ok_or(ENOENT)?;
         if node.kind == NodeKind::Directory {
-            if let NodeData::Directory(children) = &*node.data.lock() {
-                if !children.is_empty() {
-                    return Err(ENOTEMPTY);
-                }
-            }
+            return Err(EISDIR);
         }
         let removed = node.clone();
         entries.remove(name);
@@ -849,10 +1101,46 @@ impl KernelVfs {
         Ok(())
     }
 
+    pub fn rmdir(&mut self, cwd: &str, path: &str) -> KernelResult<()> {
+        let absolute = normalize_path(cwd, path);
+        let (parent_path, name) = split_parent(&absolute)?;
+        let parent = self.lookup_abs(&parent_path)?;
+        let mut guard = parent.data.lock();
+        let NodeData::Directory(entries) = &mut *guard else {
+            return Err(ENOTDIR);
+        };
+        let node = entries.get(name).ok_or(ENOENT)?;
+        if node.kind != NodeKind::Directory {
+            return Err(ENOTDIR);
+        }
+        let child_empty = {
+            let child_guard = node.data.lock();
+            match &*child_guard {
+                NodeData::Directory(child_entries) => child_entries.is_empty(),
+                _ => false,
+            }
+        };
+        if !child_empty {
+            return Err(ENOTEMPTY);
+        }
+        entries.remove(name);
+        drop(guard);
+        self.mem_meta.remove(&absolute);
+        self.external_preloaded.remove(&absolute);
+        self.external_stat_cache.remove(&absolute);
+        if self.resolve_external_path(&absolute).is_some() {
+            self.external_deletions.insert(absolute);
+        }
+        Ok(())
+    }
+
     pub fn link(&mut self, cwd: &str, old_path: &str, new_path: &str) -> KernelResult<()> {
         let old_absolute = normalize_path(cwd, old_path);
         let new_absolute = normalize_path(cwd, new_path);
         let node = self.lookup_abs(&old_absolute)?;
+        if node.kind == NodeKind::Directory {
+            return Err(EPERM);
+        }
         let (parent_path, name) = split_parent(&new_absolute)?;
         let parent = self.lookup_abs(&parent_path)?;
         let mut guard = parent.data.lock();
@@ -984,15 +1272,20 @@ impl KernelVfs {
 
     pub fn read_link(&self, cwd: &str, path: &str) -> KernelResult<String> {
         let absolute = normalize_path(cwd, path);
+        match self.lookup_abs(&absolute) {
+            Ok(node) => {
+                return match &*node.data.lock() {
+                    NodeData::Symlink(target) => Ok(target.clone()),
+                    _ => Err(EINVAL),
+                };
+            }
+            Err(ENOENT) => {}
+            Err(err) => return Err(err),
+        }
         if let Some((mount, fs_path)) = self.resolve_external_path(&absolute) {
             return mount.ext4.read_link(&fs_path);
         }
-        let node = self.lookup_abs(&absolute)?;
-        let result = match &*node.data.lock() {
-            NodeData::Symlink(target) => Ok(target.clone()),
-            _ => Err(EINVAL),
-        };
-        result
+        Err(ENOENT)
     }
 
     pub fn rename(&mut self, cwd: &str, old_path: &str, new_path: &str) -> KernelResult<()> {
@@ -1076,6 +1369,27 @@ impl KernelVfs {
         Ok(())
     }
 
+    pub fn chown_path_nofollow(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> KernelResult<()> {
+        let absolute = normalize_path(cwd, path);
+        let stat = self.stat_path_nofollow("/", &absolute)?;
+        self.mem_meta.insert(
+            absolute,
+            InodeMeta {
+                mode: stat.mode,
+                nlink: stat.nlink,
+                uid: uid.unwrap_or(stat.uid),
+                gid: gid.unwrap_or(stat.gid),
+            },
+        );
+        Ok(())
+    }
+
     pub fn chown_handle(
         &mut self,
         handle: &FileHandle,
@@ -1096,9 +1410,24 @@ impl KernelVfs {
     }
 
     pub fn truncate(&mut self, handle: &mut FileHandle, len: usize) -> KernelResult<()> {
-        match &mut *handle.node.data.lock() {
+        let mut guard = handle.node.data.lock();
+        match &mut *guard {
             NodeData::File(buf) | NodeData::ProcFile(buf) => {
-                ensure_file_size(buf, len)?;
+                if len > INMEM_FILE_SIZE_LIMIT {
+                    let dense = core::mem::take(buf);
+                    let mut sparse = SparseFileState::from_dense(dense);
+                    sparse.truncate(len);
+                    *guard = NodeData::SparseFile(sparse);
+                } else if len >= buf.len() {
+                    ensure_file_size(buf, len)?;
+                } else {
+                    buf.truncate(len);
+                }
+                handle.offset = handle.offset.min(len);
+                Ok(())
+            }
+            NodeData::SparseFile(state) => {
+                state.truncate(len);
                 handle.offset = handle.offset.min(len);
                 Ok(())
             }
@@ -1135,10 +1464,22 @@ impl KernelVfs {
         offset: usize,
         len: usize,
     ) -> KernelResult<()> {
-        match &mut *handle.node.data.lock() {
+        let size = offset.saturating_add(len);
+        let mut guard = handle.node.data.lock();
+        match &mut *guard {
             NodeData::File(buf) | NodeData::ProcFile(buf) => {
-                let size = offset.saturating_add(len);
-                ensure_file_size(buf, size)?;
+                if size > INMEM_FILE_SIZE_LIMIT {
+                    let dense = core::mem::take(buf);
+                    let mut sparse = SparseFileState::from_dense(dense);
+                    sparse.size = sparse.size.max(size);
+                    *guard = NodeData::SparseFile(sparse);
+                } else {
+                    ensure_file_size(buf, size)?;
+                }
+                Ok(())
+            }
+            NodeData::SparseFile(state) => {
+                state.size = state.size.max(size);
                 Ok(())
             }
             NodeData::Ext4File(_) | NodeData::Ext4Dir(_) => Err(EROFS),
@@ -1209,18 +1550,18 @@ impl KernelVfs {
                 watches.push(EpollWatch { fd, events });
             }
             2 => {
-                let watch = watches
-                    .iter_mut()
-                    .find(|watch| watch.fd == fd)
-                    .ok_or(ENOENT)?;
-                watch.events = events;
-            }
-            3 => {
                 let index = watches
                     .iter()
                     .position(|watch| watch.fd == fd)
                     .ok_or(ENOENT)?;
                 watches.remove(index);
+            }
+            3 => {
+                let watch = watches
+                    .iter_mut()
+                    .find(|watch| watch.fd == fd)
+                    .ok_or(ENOENT)?;
+                watch.events = events;
             }
             _ => return Err(EINVAL),
         }
@@ -1232,6 +1573,22 @@ impl KernelVfs {
             return Err(EINVAL);
         };
         Ok(watches.clone())
+    }
+
+    pub fn epoll_disarm_oneshot(
+        &mut self,
+        handle: &mut FileHandle,
+        ready_fds: &[i32],
+    ) -> KernelResult<()> {
+        let NodeData::Epoll(watches) = &mut *handle.node.data.lock() else {
+            return Err(EINVAL);
+        };
+        for watch in watches.iter_mut() {
+            if ready_fds.iter().any(|fd| *fd == watch.fd) {
+                watch.events = 0;
+            }
+        }
+        Ok(())
     }
 
     pub fn create_memfd(&mut self, name: &str) -> KernelResult<FileHandle> {
@@ -1639,6 +1996,10 @@ impl KernelVfs {
 
     pub fn is_write_ready(&self, handle: &FileHandle) -> bool {
         handle.poll_write_ready()
+    }
+
+    pub fn is_hangup(&self, handle: &FileHandle) -> bool {
+        handle.poll_hangup()
     }
 
     pub fn stat_handle(&self, handle: &FileHandle) -> KernelResult<FileStat> {
@@ -2382,14 +2743,35 @@ impl KernelVfs {
         kind: NodeKind,
         data: Option<NodeData>,
     ) -> KernelResult<()> {
+        let ltp_create_probe = is_ltp_create_probe_path(absolute_path);
         if absolute_path == "/" {
             return Err(EEXIST);
         }
         let (parent_path, name) = split_parent(absolute_path)?;
+        if ltp_create_probe {
+            write_console_line(&format!(
+                "whuse-ltp:vfs-create-node absolute={} parent={} name={}",
+                absolute_path, parent_path, name
+            ));
+        }
         let parent = match self.resolve_mem_path(&parent_path) {
             Ok((_, parent)) => parent,
             Err(err) if err == ENOENT => {
-                self.ensure_memory_dir(&parent_path)?;
+                if ltp_create_probe {
+                    write_console_line(&format!(
+                        "whuse-ltp:vfs-create-node-ensure-parent absolute={} parent={}",
+                        absolute_path, parent_path
+                    ));
+                }
+                if let Err(err) = self.ensure_memory_dir(&parent_path) {
+                    if ltp_create_probe {
+                        write_console_line(&format!(
+                            "whuse-ltp:vfs-create-node-ensure-parent-err absolute={} parent={} err={}",
+                            absolute_path, parent_path, err
+                        ));
+                    }
+                    return Err(err);
+                }
                 self.resolve_mem_path(&parent_path)?.1
             }
             Err(err) => return Err(err),
@@ -2409,7 +2791,17 @@ impl KernelVfs {
             NodeKind::Proc => {
                 Node::proc(name, data.unwrap_or_else(|| NodeData::ProcFile(Vec::new())))
             }
-            NodeKind::Pipe => Node::pipe(name),
+            NodeKind::Pipe => Node::pipe_with_data(
+                name,
+                data.unwrap_or_else(|| {
+                    NodeData::Pipe(PipeState {
+                        buf: VecDeque::new(),
+                        readers: 0,
+                        writers: 0,
+                        capacity: PIPE_CAPACITY,
+                    })
+                }),
+            ),
             NodeKind::Symlink => Node::symlink(
                 name,
                 data.unwrap_or_else(|| NodeData::Symlink(String::new())),
@@ -2428,6 +2820,7 @@ impl KernelVfs {
         let size = match &*guard {
             NodeData::Directory(entries) => entries.len() as u64,
             NodeData::File(buf) | NodeData::ProcFile(buf) => buf.len() as u64,
+            NodeData::SparseFile(state) => state.size as u64,
             NodeData::Ext4File(state) => state.size,
             NodeData::Ext4Dir(state) => state.size,
             NodeData::Pipe(state) => state.buf.len() as u64,
@@ -2506,6 +2899,7 @@ impl FileHandle {
         let size = match &*guard {
             NodeData::Directory(entries) => entries.len() as u64,
             NodeData::File(buf) | NodeData::ProcFile(buf) => buf.len() as u64,
+            NodeData::SparseFile(state) => state.size as u64,
             NodeData::Ext4File(state) => state.size,
             NodeData::Ext4Dir(state) => state.size,
             NodeData::Pipe(state) => state.buf.len() as u64,
@@ -2539,6 +2933,21 @@ impl FileHandle {
             nlink: 1,
             uid: 0,
             gid: 0,
+        }
+    }
+
+    fn poll_hangup(&self) -> bool {
+        match &*self.node.data.lock() {
+            NodeData::Pipe(state) => match self.pipe_end {
+                PipeEnd::Read | PipeEnd::None => state.writers == 0,
+                PipeEnd::Write => state.readers == 0,
+            },
+            NodeData::SocketConnected { channel, side, .. } => {
+                let guard = channel.lock();
+                let peer = 1 - *side;
+                guard.open_sides[peer] == 0
+            }
+            _ => false,
         }
     }
 }
@@ -2592,6 +3001,11 @@ impl KernelObject for FileHandle {
                 let end = (start + len).min(buf.len());
                 self.offset = end;
                 Ok(buf[start..end].to_vec())
+            }
+            NodeData::SparseFile(state) => {
+                let data = state.read_range(self.offset, len);
+                self.offset = self.offset.saturating_add(data.len()).min(state.size);
+                Ok(data)
             }
             NodeData::Ext4File(state) => {
                 if let Some(cached) = &state.cached {
@@ -2696,18 +3110,63 @@ impl KernelObject for FileHandle {
     }
 
     fn write_object(&mut self, data: &[u8]) -> KernelResult<usize> {
-        match &mut *self.node.data.lock() {
+        let mut guard = self.node.data.lock();
+        match &mut *guard {
             NodeData::Directory(_) => Err(EISDIR),
-            NodeData::File(buf) | NodeData::ProcFile(buf) => {
+            NodeData::File(buf) => {
+                if (self.flags & O_APPEND) != 0 {
+                    self.offset = buf.len();
+                }
+                let end = self.offset.checked_add(data.len()).ok_or(ENOSPC)?;
+                if self.offset > INMEM_FILE_SIZE_LIMIT || end > INMEM_FILE_SIZE_LIMIT {
+                    let dense = core::mem::take(buf);
+                    let mut sparse = SparseFileState::from_dense(dense);
+                    if (self.flags & O_APPEND) != 0 {
+                        self.offset = sparse.size;
+                    }
+                    if self.offset > sparse.size {
+                        sparse.size = self.offset;
+                    }
+                    sparse.write_at(self.offset, data)?;
+                    self.offset = end;
+                    *guard = NodeData::SparseFile(sparse);
+                    return Ok(data.len());
+                }
                 if self.offset > buf.len() {
                     ensure_file_size(buf, self.offset)?;
                 }
-                let end = self.offset.saturating_add(data.len());
                 if end > buf.len() {
                     ensure_file_size(buf, end)?;
                 }
                 buf[self.offset..self.offset + data.len()].copy_from_slice(data);
                 self.offset += data.len();
+                Ok(data.len())
+            }
+            NodeData::ProcFile(buf) => {
+                if (self.flags & O_APPEND) != 0 {
+                    self.offset = buf.len();
+                }
+                if self.offset > buf.len() {
+                    ensure_file_size(buf, self.offset)?;
+                }
+                let end = self.offset.checked_add(data.len()).ok_or(ENOSPC)?;
+                if end > buf.len() {
+                    ensure_file_size(buf, end)?;
+                }
+                buf[self.offset..self.offset + data.len()].copy_from_slice(data);
+                self.offset += data.len();
+                Ok(data.len())
+            }
+            NodeData::SparseFile(state) => {
+                if (self.flags & O_APPEND) != 0 {
+                    self.offset = state.size;
+                }
+                let end = self.offset.checked_add(data.len()).ok_or(ENOSPC)?;
+                if self.offset > state.size {
+                    state.size = self.offset;
+                }
+                state.write_at(self.offset, data)?;
+                self.offset = end;
                 Ok(data.len())
             }
             NodeData::Ext4File(_) | NodeData::Ext4Dir(_) => Err(EROFS),
@@ -2721,8 +3180,13 @@ impl KernelObject for FileHandle {
                 if state.readers == 0 {
                     return Err(EPIPE);
                 }
-                state.buf.extend(data.iter().copied());
-                Ok(data.len())
+                let available = state.capacity.saturating_sub(state.buf.len());
+                if available == 0 {
+                    return Err(EAGAIN);
+                }
+                let write_len = available.min(data.len());
+                state.buf.extend(data[..write_len].iter().copied());
+                Ok(write_len)
             }
             NodeData::Symlink(_)
             | NodeData::Epoll(_)
@@ -2762,10 +3226,10 @@ impl KernelObject for FileHandle {
     }
 
     fn seek_object(&mut self, offset: isize, whence: u32) -> KernelResult<usize> {
-        if matches!(
-            self.node.kind,
-            NodeKind::Pipe | NodeKind::Event | NodeKind::Epoll | NodeKind::Socket | NodeKind::PidFd
-        ) {
+        if matches!(self.node.kind, NodeKind::Pipe | NodeKind::Socket) {
+            return Err(ESPIPE);
+        }
+        if matches!(self.node.kind, NodeKind::Event | NodeKind::Epoll | NodeKind::PidFd) {
             return Err(EINVAL);
         }
         let size = self.stat_from_locked().size as isize;
@@ -2787,11 +3251,15 @@ impl KernelObject for FileHandle {
         match &*self.node.data.lock() {
             NodeData::Directory(_) => true,
             NodeData::File(_)
+            | NodeData::SparseFile(_)
             | NodeData::ProcFile(_)
             | NodeData::Ext4File(_)
             | NodeData::Ext4Dir(_)
             | NodeData::CharDevice => true,
-            NodeData::Pipe(state) => !state.buf.is_empty() || state.writers == 0,
+            NodeData::Pipe(state) => match self.pipe_end {
+                PipeEnd::Read | PipeEnd::None => !state.buf.is_empty() || state.writers == 0,
+                PipeEnd::Write => false,
+            },
             NodeData::Symlink(_) => true,
             NodeData::Event(counter) => *counter != 0,
             NodeData::Epoll(_) => true,
@@ -2812,13 +3280,41 @@ impl KernelObject for FileHandle {
             | NodeData::Ext4File(_)
             | NodeData::Ext4Dir(_)
             | NodeData::PidFd(_) => false,
-            NodeData::Pipe(state) => state.readers != 0,
+            NodeData::Pipe(state) => match self.pipe_end {
+                PipeEnd::Write | PipeEnd::None => {
+                    state.readers != 0 && state.buf.len() < state.capacity
+                }
+                PipeEnd::Read => false,
+            },
             _ => true,
         }
     }
 
     fn stat_object(&self) -> KernelResult<FileStat> {
         Ok(self.stat_from_locked())
+    }
+
+    fn fcntl_object(&mut self, cmd: usize, arg: usize) -> KernelResult<usize> {
+        const F_SETPIPE_SZ: usize = 1031;
+        const F_GETPIPE_SZ: usize = 1032;
+
+        match &mut *self.node.data.lock() {
+            NodeData::Pipe(state) => match cmd {
+                F_SETPIPE_SZ => {
+                    let requested = if arg == 0 {
+                        PIPE_MIN_CAPACITY
+                    } else {
+                        arg.next_multiple_of(PIPE_MIN_CAPACITY)
+                    };
+                    let capacity = requested.max(PIPE_MIN_CAPACITY).max(state.buf.len());
+                    state.capacity = capacity;
+                    Ok(capacity)
+                }
+                F_GETPIPE_SZ => Ok(state.capacity),
+                _ => Err(EINVAL),
+            },
+            _ => Err(EINVAL),
+        }
     }
 }
 
@@ -2871,7 +3367,16 @@ impl Node {
                 buf: VecDeque::new(),
                 readers: 1,
                 writers: 1,
+                capacity: PIPE_CAPACITY,
             })),
+        }
+    }
+
+    fn pipe_with_data(name: &str, data: NodeData) -> Self {
+        Self {
+            _name: name.to_string(),
+            kind: NodeKind::Pipe,
+            data: Mutex::new(data),
         }
     }
 
@@ -3153,6 +3658,13 @@ fn should_use_statless_external_stat(absolute: &str) -> bool {
     is_compat_metadata_fallback_path(absolute)
 }
 
+fn is_ltp_create_probe_path(path: &str) -> bool {
+    path.ends_with("/close01_testfile")
+        || path.ends_with("/dupfile")
+        || path == "close01_testfile"
+        || path == "dupfile"
+}
+
 fn is_compat_metadata_fallback_path(absolute: &str) -> bool {
     matches!(
         absolute,
@@ -3181,7 +3693,10 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{KernelObject, KernelVfs, ObjectKind, O_CREAT, O_RDWR};
+    use super::{
+        KernelObject, KernelVfs, ObjectKind, O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
+        INMEM_FILE_SIZE_LIMIT, PIPE_CAPACITY, S_IFIFO,
+    };
 
     struct VecBlockDevice {
         ready: AtomicBool,
@@ -3405,6 +3920,77 @@ mod tests {
     }
 
     #[test]
+    fn regular_file_supports_sparse_large_write() {
+        let mut vfs = KernelVfs::new();
+        let mut file = vfs
+            .open("/", "/tmp/large-hole.bin", O_CREAT | O_RDWR, 0o644)
+            .unwrap();
+
+        let sparse_offset = 4_402_341_478usize;
+        file.seek_object(sparse_offset as isize, 0).unwrap();
+        file.write_object(b"ltp").unwrap();
+
+        let stat = vfs.stat_handle(&file).unwrap();
+        assert_eq!(stat.size, (sparse_offset + 3) as u64);
+
+        file.seek_object((sparse_offset - 1) as isize, 0).unwrap();
+        assert_eq!(file.read_object(4).unwrap(), b"\0ltp");
+
+        file.seek_object(0, 0).unwrap();
+        assert_eq!(file.read_object(8).unwrap(), vec![0; 8]);
+    }
+
+    #[test]
+    fn sparse_large_file_truncate_shrinks_visible_size() {
+        let mut vfs = KernelVfs::new();
+        let mut file = vfs
+            .open("/", "/tmp/large-hole-truncate.bin", O_CREAT | O_RDWR, 0o644)
+            .unwrap();
+
+        let sparse_offset = 4_402_341_478usize;
+        file.seek_object(sparse_offset as isize, 0).unwrap();
+        file.write_object(b"ltp").unwrap();
+        vfs.truncate(&mut file, 2).unwrap();
+
+        let stat = vfs.stat_handle(&file).unwrap();
+        assert_eq!(stat.size, 2);
+        file.seek_object(0, 0).unwrap();
+        assert_eq!(file.read_object(8).unwrap(), vec![0; 2]);
+    }
+
+    #[test]
+    fn fallocate_promotes_large_regular_files_to_sparse_storage() {
+        let mut vfs = KernelVfs::new();
+        let mut file = vfs
+            .open("/", "/tmp/ltp-prealloc.bin", O_CREAT | O_RDWR, 0o644)
+            .unwrap();
+
+        let large_len = (INMEM_FILE_SIZE_LIMIT + 32 * 1024 * 1024) as usize;
+        vfs.fallocate(&mut file, 0, large_len).unwrap();
+
+        let stat = vfs.stat_handle(&file).unwrap();
+        assert_eq!(stat.size, large_len as u64);
+        file.seek_object((large_len - 4) as isize, 0).unwrap();
+        assert_eq!(file.read_object(4).unwrap(), vec![0; 4]);
+    }
+
+    #[test]
+    fn truncate_shrinks_dense_regular_files() {
+        let mut vfs = KernelVfs::new();
+        let mut file = vfs
+            .open("/", "/tmp/dense-truncate.bin", O_CREAT | O_RDWR, 0o644)
+            .unwrap();
+
+        file.write_object(b"abcdef").unwrap();
+        vfs.truncate(&mut file, 2).unwrap();
+
+        let stat = vfs.stat_handle(&file).unwrap();
+        assert_eq!(stat.size, 2);
+        file.seek_object(0, 0).unwrap();
+        assert_eq!(file.read_object(8).unwrap(), b"ab");
+    }
+
+    #[test]
     fn pipe_write_returns_epipe_after_last_reader_close() {
         let mut vfs = KernelVfs::new();
         let (_read_end, mut write_end) = vfs.create_pipe().unwrap();
@@ -3418,6 +4004,75 @@ mod tests {
         let (mut read_end, _write_end) = vfs.create_pipe().unwrap();
         drop(_write_end);
         assert_eq!(vfs.read(&mut read_end, 16).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn named_fifo_nonblocking_empty_read_returns_eagain() {
+        let mut vfs = KernelVfs::new();
+        vfs.mknodat_with_owner("/", "/tmp/test-fifo", S_IFIFO | 0o666, 0, 0)
+            .unwrap();
+
+        let mut read_end = vfs
+            .open("/", "/tmp/test-fifo", O_RDONLY | O_NONBLOCK, 0)
+            .unwrap();
+        let _write_end = vfs
+            .open("/", "/tmp/test-fifo", O_WRONLY | O_NONBLOCK, 0)
+            .unwrap();
+
+        assert_eq!(vfs.read(&mut read_end, 1), Err(super::EAGAIN));
+    }
+
+    #[test]
+    fn named_fifo_nonblocking_write_only_without_reader_returns_enxio() {
+        let mut vfs = KernelVfs::new();
+        vfs.mknodat_with_owner("/", "/tmp/test-fifo-enxio", S_IFIFO | 0o666, 0, 0)
+            .unwrap();
+
+        assert!(matches!(
+            vfs.open("/", "/tmp/test-fifo-enxio", O_WRONLY | O_NONBLOCK, 0),
+            Err(super::ENXIO)
+        ));
+    }
+
+    #[test]
+    fn named_fifo_nonblocking_write_returns_eagain_when_full() {
+        let mut vfs = KernelVfs::new();
+        vfs.mknodat_with_owner("/", "/tmp/test-fifo-full", S_IFIFO | 0o666, 0, 0)
+            .unwrap();
+
+        let _read_end = vfs
+            .open("/", "/tmp/test-fifo-full", O_RDONLY | O_NONBLOCK, 0)
+            .unwrap();
+        let mut write_end = vfs
+            .open("/", "/tmp/test-fifo-full", O_WRONLY | O_NONBLOCK, 0)
+            .unwrap();
+
+        let first = vec![0u8; PIPE_CAPACITY + 4096];
+        assert_eq!(vfs.write(&mut write_end, &first).unwrap(), PIPE_CAPACITY);
+        assert_eq!(vfs.write(&mut write_end, b"x"), Err(super::EAGAIN));
+    }
+
+    #[test]
+    fn open_with_owner_inherits_parent_gid_when_directory_has_setgid() {
+        let mut vfs = KernelVfs::new();
+        vfs.mkdir("/tmp", "sgid-parent", 0o777).unwrap();
+        vfs.chown_path("/", "/tmp/sgid-parent", Some(65534), Some(1))
+            .unwrap();
+        vfs.chmod_path("/", "/tmp/sgid-parent", 0o2777).unwrap();
+
+        let handle = vfs
+            .open_with_owner(
+                "/",
+                "/tmp/sgid-parent/child.txt",
+                O_CREAT | O_RDWR,
+                0o644,
+                65534,
+                65534,
+            )
+            .unwrap();
+        let stat = vfs.stat_handle(&handle).unwrap();
+        assert_eq!(stat.uid, 65534);
+        assert_eq!(stat.gid, 1);
     }
 
     #[test]
@@ -3462,6 +4117,46 @@ mod tests {
         vfs.mount_ext4(device.name(), "/", device).unwrap();
 
         assert!(matches!(vfs.access("/", "/test.txt"), Err(super::ENOENT)));
+    }
+
+    fn parse_dirent_names(bytes: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        while offset + 19 <= bytes.len() {
+            let reclen = u16::from_le_bytes([bytes[offset + 16], bytes[offset + 17]]) as usize;
+            if reclen == 0 || offset + reclen > bytes.len() {
+                break;
+            }
+            let name_start = offset + 19;
+            let name_end = bytes[name_start..offset + reclen]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|idx| name_start + idx)
+                .unwrap_or(offset + reclen);
+            out.push(String::from_utf8_lossy(&bytes[name_start..name_end]).to_string());
+            offset += reclen;
+        }
+        out
+    }
+
+    #[test]
+    fn refresh_proc_self_fd_dir_replaces_entries() {
+        let mut vfs = KernelVfs::new();
+
+        vfs.refresh_proc_self_fd_dir([
+            (0, "/dev/null".to_string()),
+            (3, "/tmp/a".to_string()),
+        ])
+        .unwrap();
+        let mut dir = vfs.open("/", "/proc/self/fd", super::O_DIRECTORY, 0).unwrap();
+        let entries = parse_dirent_names(&vfs.getdents(&mut dir, 4096).unwrap());
+        assert_eq!(entries, vec!["0".to_string(), "3".to_string()]);
+
+        vfs.refresh_proc_self_fd_dir([(1, "/dev/console".to_string())])
+            .unwrap();
+        let mut dir = vfs.open("/", "/proc/self/fd", super::O_DIRECTORY, 0).unwrap();
+        let entries = parse_dirent_names(&vfs.getdents(&mut dir, 4096).unwrap());
+        assert_eq!(entries, vec!["1".to_string()]);
     }
 
     #[test]
@@ -3621,6 +4316,74 @@ mod tests {
 
         let stat = vfs.stat_path_nofollow("/", "/tmp/link.txt").unwrap();
         assert_eq!(stat.mode & 0o170000, super::S_IFLNK);
+    }
+
+    #[test]
+    fn read_link_prefers_memory_overlay_over_ext4_root_mount() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+        if let Err(err) = vfs.mkdir("/", "/tmp", 0o777) {
+            assert_eq!(err, super::EEXIST);
+        }
+        if let Err(err) = vfs.mkdir("/tmp", "ltp-shadow", 0o777) {
+            assert_eq!(err, super::EEXIST);
+        }
+        vfs.create_file_with_mode("/tmp/ltp-shadow", "test_file", b"", 0o644)
+            .unwrap();
+        vfs.create_symlink("/tmp/ltp-shadow", "slink_file", "test_file")
+            .unwrap();
+
+        assert_eq!(
+            vfs.read_link("/tmp/ltp-shadow", "slink_file").unwrap(),
+            "test_file"
+        );
+        assert_eq!(
+            vfs.read_link("/", "/tmp/ltp-shadow/slink_file").unwrap(),
+            "test_file"
+        );
+    }
+
+    #[test]
+    fn open_create_relative_file_under_external_directory_uses_memory_overlay() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        let cwd = vfs.chdir("/", "/bin").unwrap();
+        assert_eq!(cwd, "/bin");
+
+        let mut handle = vfs.open(&cwd, "ltp-created", O_CREAT | O_RDWR, 0o644).unwrap();
+        vfs.write(&mut handle, b"ok").unwrap();
+        vfs.seek(&mut handle, 0, 0).unwrap();
+        assert_eq!(vfs.read(&mut handle, 2).unwrap(), b"ok");
+
+        let mut reopened = vfs.open("/", "/bin/ltp-created", O_RDONLY, 0).unwrap();
+        assert_eq!(vfs.read(&mut reopened, 2).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn open_with_owner_on_external_missing_path_assigns_requested_uid() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        let cwd = vfs.chdir("/", "/bin").unwrap();
+        let handle = vfs
+            .open_with_owner(&cwd, "ltp-owned", O_CREAT | O_RDWR, 0o644, 65534, 0)
+            .unwrap();
+        let stat = vfs.stat_handle(&handle).unwrap();
+        assert_eq!(stat.uid, 65534);
+        assert_eq!(stat.gid, 0);
     }
 
     #[test]

@@ -183,6 +183,7 @@ pub struct Process {
     pub futex_wait_addr: Option<usize>,
     pub futex_wait_deadline_ns: Option<u64>,
     pub epoll_wait_deadline_ns: Option<u64>,
+    pub epoll_pwait_saved_mask: Option<u64>,
     pub sigsuspend_saved_mask: Option<u64>,
     pub is_thread: bool,
     /// Set to true when a signal frame has been dispatched into the thread's
@@ -270,6 +271,7 @@ impl Process {
             futex_wait_addr: None,
             futex_wait_deadline_ns: None,
             epoll_wait_deadline_ns: None,
+            epoll_pwait_saved_mask: None,
             sigsuspend_saved_mask: None,
             is_thread: false,
             signal_frame_pending: false,
@@ -478,6 +480,7 @@ impl Process {
         self.futex_wait_addr = None;
         self.futex_wait_deadline_ns = None;
         self.epoll_wait_deadline_ns = None;
+        self.epoll_pwait_saved_mask = None;
         self.sigsuspend_saved_mask = None;
         self.signal_frame_pending = false;
         self.cancel_signal_seen = false;
@@ -544,6 +547,7 @@ impl Process {
             futex_wait_addr: None,
             futex_wait_deadline_ns: None,
             epoll_wait_deadline_ns: None,
+            epoll_pwait_saved_mask: None,
             sigsuspend_saved_mask: None,
             is_thread: false,
             signal_frame_pending: false,
@@ -604,6 +608,7 @@ impl Process {
             futex_wait_addr: None,
             futex_wait_deadline_ns: None,
             epoll_wait_deadline_ns: None,
+            epoll_pwait_saved_mask: None,
             sigsuspend_saved_mask: None,
             is_thread: false,
             signal_frame_pending: false,
@@ -675,8 +680,9 @@ impl Process {
             futex_wait_addr: None,
             futex_wait_deadline_ns: None,
             epoll_wait_deadline_ns: None,
+            epoll_pwait_saved_mask: None,
             sigsuspend_saved_mask: None,
-            is_thread: false,
+            is_thread: true,
             signal_frame_pending: false,
             cancel_signal_seen: false,
             cancellation_in_progress: false,
@@ -784,6 +790,10 @@ impl ProcessTable {
 
     pub fn find_by_tid_mut(&mut self, tid: usize) -> KernelResult<&mut Process> {
         self.processes.get_mut(&tid).ok_or(ENOENT)
+    }
+
+    pub fn find_by_pid(&self, pid: usize) -> KernelResult<&Process> {
+        self.find_process_by_pid(pid)
     }
 
     pub fn current_frame_mut(&mut self) -> KernelResult<&mut TrapFrame> {
@@ -1542,6 +1552,18 @@ impl ProcessTable {
             parent_tgid,
             vfork_parent_tid,
         })
+    }
+
+    pub fn reap_exited_thread(&mut self, tid: usize) -> bool {
+        let Some(process) = self.processes.get(&tid) else {
+            return false;
+        };
+        if !process.is_thread || process.state != ProcessState::Exited {
+            return false;
+        }
+        self.processes.remove(&tid);
+        self.remove_futex_waiter(tid);
+        true
     }
 
     pub fn process_count(&self) -> usize {
@@ -2340,6 +2362,25 @@ mod tests {
             table.find_process_by_pid(grandchild).unwrap().parent,
             Some(init)
         );
+    }
+
+    #[test]
+    fn exited_thread_can_be_reaped_without_waiting_for_group_exit() {
+        let mut table = ProcessTable::new();
+        let leader = table.spawn_init("init", 0x1000);
+        table.set_current(leader).unwrap();
+        let thread = table.clone_thread_from_current(0, None).unwrap();
+
+        table.set_current(thread).unwrap();
+        let exit = table.exit_current_thread(0).unwrap();
+        assert!(!exit.group_exited);
+        let process = table.find_by_tid_mut(thread).unwrap();
+        assert!(process.is_thread);
+        assert_eq!(process.state, super::ProcessState::Exited);
+
+        assert!(table.reap_exited_thread(thread));
+        assert!(table.find_by_tid_mut(thread).is_err());
+        assert!(table.find_by_tid_mut(leader).is_ok());
     }
 
     #[test]

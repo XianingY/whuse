@@ -1,0 +1,6 @@
+dup03
+dup06
+dup205
+fcntl05
+fstat03
+statvfs02

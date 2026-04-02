@@ -22,7 +22,7 @@ pub(crate) fn dispatch(
         SYS_FCNTL => ctx
             .dispatcher
             .sys_fcntl(args, ctx.procs, ctx.scheduler, ctx.vfs),
-        SYS_IOCTL => ctx.dispatcher.sys_ioctl(args, ctx.procs),
+        SYS_IOCTL => ctx.dispatcher.sys_ioctl(args, ctx.procs, ctx.vfs),
         SYS_FLOCK => ctx.dispatcher.sys_flock(args, ctx.procs),
         SYS_MKNODAT => ctx.dispatcher.sys_mknodat(args, ctx.procs, ctx.vfs),
         SYS_MKDIR => ctx.dispatcher.sys_mkdir(args, ctx.procs, ctx.vfs),
@@ -41,7 +41,9 @@ pub(crate) fn dispatch(
         SYS_FALLOCATE => ctx.dispatcher.sys_fallocate(args, ctx.procs, ctx.vfs),
         SYS_UTIMENSAT => ctx.dispatcher.sys_utimensat(args, ctx.procs, ctx.vfs),
         SYS_FACCESSAT | SYS_FACCESSAT2 => ctx.dispatcher.sys_faccessat(args, ctx.procs, ctx.vfs),
-        SYS_OPENAT => ctx.dispatcher.sys_openat(args, ctx.procs, ctx.vfs),
+        SYS_OPENAT => ctx
+            .dispatcher
+            .sys_openat(args, ctx.procs, ctx.scheduler, ctx.vfs),
         SYS_CLOSE => ctx
             .dispatcher
             .sys_close(args, ctx.procs, ctx.scheduler, ctx.vfs),
@@ -77,7 +79,11 @@ pub(crate) fn dispatch(
         SYS_FCHDIR => ctx.dispatcher.sys_fchdir(args, ctx.procs, ctx.vfs),
         SYS_CHROOT => ctx.dispatcher.sys_chroot(args, ctx.procs, ctx.vfs),
         SYS_FCHMOD => ctx.dispatcher.sys_fchmod(args, ctx.procs, ctx.vfs),
-        SYS_FCHMODAT | SYS_FCHMODAT2 => ctx.dispatcher.sys_fchmodat(args, ctx.procs, ctx.vfs),
+        SYS_FCHMODAT => {
+            let legacy_args = SyscallArgs([args.0[0], args.0[1], args.0[2], 0, args.0[4], args.0[5]]);
+            ctx.dispatcher.sys_fchmodat(legacy_args, ctx.procs, ctx.vfs)
+        }
+        SYS_FCHMODAT2 => ctx.dispatcher.sys_fchmodat(args, ctx.procs, ctx.vfs),
         SYS_FCHOWNAT => ctx.dispatcher.sys_fchownat(args, ctx.procs, ctx.vfs),
         SYS_FCHOWN => ctx.dispatcher.sys_fchown(args, ctx.procs),
         SYS_FSYNC | SYS_FDATASYNC => ctx.dispatcher.sys_fsync(args, ctx.procs),

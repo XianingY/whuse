@@ -1,0 +1,13 @@
+lseek02
+lseek11
+open06
+open10
+open12
+open14
+openat03
+openat201
+openat202
+openat203
+preadv03
+pwritev03
+writev03

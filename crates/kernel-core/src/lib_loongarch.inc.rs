@@ -2194,6 +2194,8 @@ impl Kernel {
                         self.scheduler.remove_task(exit.tid);
                         if exit.group_exited {
                             self.scheduler.exit_group(exit.tgid);
+                        } else {
+                            let _ = self.processes.reap_exited_thread(exit.tid);
                         }
                         if let Some(parent_tgid) = exit.parent_tgid {
                             let _ = self.processes.deliver_signal(parent_tgid, 17);
@@ -2645,24 +2647,17 @@ impl Kernel {
                 &mut self.scheduler,
                 &mut self.vfs,
             );
+            let exit_like_syscall = matches!(sysno, syscall::SYS_EXIT | syscall::SYS_EXIT_GROUP);
+            if exit_like_syscall {
+                if self.scheduler.current_thread_id().is_none() && self.scheduler.ready_count() > 0 {
+                    let _ = self.scheduler.yield_now();
+                }
+                return;
+            }
             if let Some(tid) = trap_tid {
                 if let Ok(process) = self.processes.find_by_tid_mut(tid) {
-                    let blocked_restart = result == EAGAIN_RET
-                        && matches!(
-                            sysno,
-                            SYS_WAIT
-                                | SYS_READ
-                                | SYS_READV
-                                | SYS_RT_SIGSUSPEND
-                                | SYS_RT_SIGTIMEDWAIT
-                                | SYS_FUTEX
-                                | SYS_PPOLL
-                                | SYS_PSELECT6
-                                | SYS_EPOLL_PWAIT
-                                | SYS_EPOLL_PWAIT2
-                                | SYS_NANOSLEEP
-                                | SYS_CLOCK_NANOSLEEP
-                        );
+                    let blocked_restart =
+                        should_restart_blocked_syscall(sysno, result, self.scheduler.is_blocked(tid));
                     if !blocked_restart {
                         process.trap_frame.set_retval(result as usize);
                         if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN) || (result as i32) < 0
@@ -2672,22 +2667,7 @@ impl Kernel {
                     }
                 }
             } else if let Ok(process) = self.processes.current_mut() {
-                let blocked_restart = result == EAGAIN_RET
-                    && matches!(
-                        sysno,
-                        SYS_WAIT
-                            | SYS_READ
-                            | SYS_READV
-                            | SYS_RT_SIGSUSPEND
-                            | SYS_RT_SIGTIMEDWAIT
-                            | SYS_FUTEX
-                            | SYS_PPOLL
-                            | SYS_PSELECT6
-                            | SYS_EPOLL_PWAIT
-                            | SYS_EPOLL_PWAIT2
-                            | SYS_NANOSLEEP
-                            | SYS_CLOCK_NANOSLEEP
-                    );
+                let blocked_restart = should_restart_blocked_syscall(sysno, result, false);
                 if !blocked_restart {
                     process.trap_frame.set_retval(result as usize);
                     if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN) || (result as i32) < 0 {
@@ -2844,6 +2824,8 @@ impl Kernel {
                     self.scheduler.remove_task(exit.tid);
                     if exit.group_exited {
                         self.scheduler.exit_group(exit.tgid);
+                    } else {
+                        let _ = self.processes.reap_exited_thread(exit.tid);
                     }
                     if let Some(parent_tgid) = exit.parent_tgid {
                         let _ = self.processes.deliver_signal(parent_tgid, 17);
@@ -4045,6 +4027,28 @@ fn log_block_probe_span(device: &'static dyn hal_api::HalBlockDevice, start: usi
     }
 }
 
+fn should_restart_blocked_syscall(sysno: usize, result: isize, task_blocked: bool) -> bool {
+    result == EAGAIN_RET
+        && task_blocked
+        && matches!(
+            sysno,
+            SYS_WAIT
+                | SYS_READ
+                | syscall::SYS_WRITE
+                | SYS_READV
+                | syscall::SYS_WRITEV
+                | SYS_RT_SIGSUSPEND
+                | SYS_RT_SIGTIMEDWAIT
+                | SYS_FUTEX
+                | SYS_PPOLL
+                | SYS_PSELECT6
+                | SYS_EPOLL_PWAIT
+                | SYS_EPOLL_PWAIT2
+                | SYS_NANOSLEEP
+                | SYS_CLOCK_NANOSLEEP
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4227,6 +4231,30 @@ mod tests {
                 .contains("whuse-oscomp-busybox-skip:${runtime}:$line:loongarch-hwclock"),
             "LoongArch busybox runner should skip the known hanging hwclock applet instead of blocking the rest of busybox"
         );
+    }
+
+    #[test]
+    fn loongarch_restarts_blocking_pipe_writes_on_eagain_only_when_task_is_blocked() {
+        assert!(super::should_restart_blocked_syscall(
+            syscall::SYS_WRITE,
+            super::EAGAIN_RET,
+            true
+        ));
+        assert!(!super::should_restart_blocked_syscall(
+            syscall::SYS_WRITE,
+            super::EAGAIN_RET,
+            false
+        ));
+        assert!(super::should_restart_blocked_syscall(
+            syscall::SYS_WRITEV,
+            super::EAGAIN_RET,
+            true
+        ));
+        assert!(!super::should_restart_blocked_syscall(
+            syscall::SYS_WRITEV,
+            -1,
+            true
+        ));
     }
 
     #[test]

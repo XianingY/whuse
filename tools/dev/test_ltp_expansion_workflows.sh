@@ -49,6 +49,44 @@ assert_line_count_ge() {
     fi
 }
 
+assert_file_not_exists() {
+    local path="$1"
+    if [[ -e "${path}" ]]; then
+        echo "unexpected file present: ${path}" >&2
+        exit 1
+    fi
+}
+
+assert_image_phase_layout() {
+    local round_name="$1"
+    local chunk_size="$2"
+    local base_file phase1 phase2 total
+    base_file="${LTP_DIR}/musl_rv_image_round_${round_name}.txt"
+    phase1="${LTP_DIR}/musl_rv_image_round_${round_name}_phase1.txt"
+    phase2="${LTP_DIR}/musl_rv_image_round_${round_name}_phase2.txt"
+    assert_file_exists "${base_file}"
+    total="$(wc -l < "${base_file}")"
+    if (( total == 0 )); then
+        assert_file_not_exists "${phase1}"
+        assert_file_not_exists "${phase2}"
+    elif (( total > chunk_size )); then
+        assert_file_exists "${phase1}"
+        assert_line_count_ge "${phase1}" 1
+        assert_file_exists "${phase2}"
+        assert_line_count_ge "${phase2}" 1
+    else
+        assert_file_exists "${phase1}"
+        assert_line_count_ge "${phase1}" 1
+        assert_file_not_exists "${phase2}"
+    fi
+}
+
+IMAGE_PHASE_SIZE="${WHUSE_LTP_IMAGE_PHASE_SIZE:-128}"
+if ! [[ "${IMAGE_PHASE_SIZE}" =~ ^[0-9]+$ ]] || (( IMAGE_PHASE_SIZE <= 0 )); then
+    echo "invalid WHUSE_LTP_IMAGE_PHASE_SIZE=${IMAGE_PHASE_SIZE}" >&2
+    exit 1
+fi
+
 assert_file_exists "${REFRESHER}"
 assert_file_exists "${ROUND_HELPER}"
 assert_file_exists "${IMAGE_REFRESHER}"
@@ -95,7 +133,11 @@ for round_file in \
     "${LTP_DIR}/musl_rv_round1_sync_phase2.txt" \
     "${LTP_DIR}/musl_rv_round1_open_io_phase1.txt" \
     "${LTP_DIR}/musl_rv_score_wave1_ab_tail.txt" \
-    "${LTP_DIR}/musl_rv_score_wave2_vector_tail.txt"
+    "${LTP_DIR}/musl_rv_score_wave2_vector_tail.txt" \
+    "${LTP_DIR}/musl_rv_score_wave3_process_signal_phase2.txt" \
+    "${LTP_DIR}/musl_rv_score_wave4_curated_backlog.txt" \
+    "${LTP_DIR}/musl_rv_score_wave5_image_phase1.txt" \
+    "${LTP_DIR}/musl_rv_score_wave6_image_phase2.txt"
 do
     assert_file_exists "${round_file}"
     if [[ -s "${round_file}" || "${round_file}" == *"open_io_phase1.txt" ]]; then
@@ -107,6 +149,13 @@ assert_contains "${LTP_DIR}/musl_rv_score_wave1_ab_tail.txt" "pipe08"
 assert_contains "${LTP_DIR}/musl_rv_score_wave1_ab_tail.txt" "write04"
 assert_contains "${LTP_DIR}/musl_rv_score_wave2_vector_tail.txt" "openat02"
 assert_contains "${LTP_DIR}/musl_rv_score_wave2_vector_tail.txt" "writev02"
+assert_contains "${LTP_DIR}/musl_rv_score_wave3_process_signal_phase2.txt" "waitpid08"
+assert_contains "${LTP_DIR}/musl_rv_score_wave4_curated_backlog.txt" "access01"
+assert_contains "${LTP_DIR}/musl_rv_score_wave4_curated_backlog.txt" "waitpid09"
+assert_contains "${LTP_DIR}/musl_rv_score_wave5_image_phase1.txt" "signal03"
+assert_contains "${LTP_DIR}/musl_rv_score_wave5_image_phase1.txt" "writev06"
+assert_contains "${LTP_DIR}/musl_rv_score_wave6_image_phase2.txt" "chmod03"
+assert_contains "${LTP_DIR}/musl_rv_score_wave6_image_phase2.txt" "writev06"
 
 for image_round in \
     "${LTP_DIR}/musl_rv_image_round_fs_path.txt" \
@@ -116,26 +165,11 @@ for image_round in \
     "${LTP_DIR}/musl_rv_image_round_time.txt"
 do
     assert_file_exists "${image_round}"
-    assert_line_count_ge "${image_round}" 1
 done
 
-for image_phase1 in \
-    "${LTP_DIR}/musl_rv_image_round_fs_path_phase1.txt" \
-    "${LTP_DIR}/musl_rv_image_round_open_io_phase1.txt" \
-    "${LTP_DIR}/musl_rv_image_round_process_signal_phase1.txt"
-do
-    assert_file_exists "${image_phase1}"
-    assert_line_count_ge "${image_phase1}" 1
-done
-
-for image_phase2 in \
-    "${LTP_DIR}/musl_rv_image_round_fs_path_phase2.txt" \
-    "${LTP_DIR}/musl_rv_image_round_open_io_phase2.txt" \
-    "${LTP_DIR}/musl_rv_image_round_process_signal_phase2.txt"
-do
-    assert_file_exists "${image_phase2}"
-    assert_line_count_ge "${image_phase2}" 1
-done
+assert_image_phase_layout "fs_path" "${IMAGE_PHASE_SIZE}"
+assert_image_phase_layout "open_io" "${IMAGE_PHASE_SIZE}"
+assert_image_phase_layout "process_signal" "${IMAGE_PHASE_SIZE}"
 
 assert_file_exists "${LTP_DIR}/musl_rv_blacklist_review_round1.txt"
 assert_contains "${LTP_DIR}/musl_rv_blacklist_review_round1.txt" "dup03"
@@ -151,6 +185,7 @@ trap 'rm -rf "${tmpdir}"' EXIT
 round_file="${tmpdir}/round.txt"
 pass_file="${tmpdir}/pass.txt"
 bad_file="${tmpdir}/bad.txt"
+conf_file="${tmpdir}/conf.txt"
 count_file="${tmpdir}/count"
 fake_stage2="${tmpdir}/fake-stage2.sh"
 
@@ -166,6 +201,10 @@ cat > "${bad_file}" <<'EOF'
 beta
 EOF
 
+cat > "${conf_file}" <<'EOF'
+gamma
+EOF
+
 cat > "${fake_stage2}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -178,6 +217,7 @@ count=\$((count + 1))
 printf '%s\n' "\${count}" > "\${count_file}"
 echo "[rv-ltp-curated] pass-candidates: ${pass_file} (1)"
 echo "[rv-ltp-curated] bad-candidates:  ${bad_file} (1)"
+echo "[rv-ltp-curated] conf-candidates: ${conf_file} (1)"
 if [[ "\${count}" == "1" ]]; then
     exit 1
 fi
@@ -191,8 +231,10 @@ STAGE2="${fake_stage2}" WHUSE_LTP_ROUNDS=2 WHUSE_LTP_OUTPUT_DIR="${tmpdir}/out" 
 
 assert_file_exists "${tmpdir}/out/stable-pass.txt"
 assert_file_exists "${tmpdir}/out/stable-bad.txt"
+assert_file_exists "${tmpdir}/out/stable-conf.txt"
 assert_contains "${tmpdir}/out/stable-pass.txt" "alpha"
 assert_contains "${tmpdir}/out/stable-bad.txt" "beta"
+assert_contains "${tmpdir}/out/stable-conf.txt" "gamma"
 assert_contains "${helper_log}" "round 2/2"
 
 empty_round="${tmpdir}/empty-round.txt"
@@ -214,10 +256,50 @@ STAGE2="${empty_stage2}" WHUSE_LTP_OUTPUT_DIR="${tmpdir}/empty-out" \
 
 assert_file_exists "${tmpdir}/empty-out/stable-pass.txt"
 assert_file_exists "${tmpdir}/empty-out/stable-bad.txt"
+assert_file_exists "${tmpdir}/empty-out/stable-conf.txt"
 assert_contains "${empty_log}" "no candidate cases"
 if [[ -e "${empty_count_file}" ]]; then
     echo "empty round unexpectedly invoked stage2" >&2
     exit 1
 fi
+
+recover_round="${tmpdir}/recover-round.txt"
+recover_stage2_log="${tmpdir}/recover-stage2.log"
+recover_stage2="${tmpdir}/recover-stage2.sh"
+recover_helper_log="${tmpdir}/recover-helper.log"
+cat > "${recover_round}" <<'EOF'
+alpha
+beta
+gamma
+delta
+EOF
+
+cat > "${recover_stage2_log}" <<'EOF'
+RUN LTP CASE alpha
+whuse-ltp-case-result:alpha:rc=0:tpass=1:tfail=0:tbrok=0:tconf=0:class=pass
+RUN LTP CASE beta
+whuse-ltp-case-result:beta:rc=1:tpass=0:tfail=1:tbrok=0:tconf=0:class=tfail
+RUN LTP CASE gamma
+whuse-ltp-case-result:gamma:rc=0:tpass=0:tfail=0:tbrok=0:tconf=1:class=conf-only
+RUN LTP CASE delta
+EOF
+
+cat > "${recover_stage2}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+echo "[rv-ltp-curated] log: ${recover_stage2_log}"
+echo "[rv-ltp-curated] detected kernel panic or init crash"
+exit 1
+EOF
+chmod +x "${recover_stage2}"
+
+STAGE2="${recover_stage2}" WHUSE_LTP_ROUNDS=1 WHUSE_LTP_OUTPUT_DIR="${tmpdir}/recover-out" \
+    "${ROUND_HELPER}" "${recover_round}" > "${recover_helper_log}" 2>&1
+
+assert_contains "${recover_helper_log}" "recovered candidates from stage2 log"
+assert_contains "${tmpdir}/recover-out/stable-pass.txt" "alpha"
+assert_contains "${tmpdir}/recover-out/stable-bad.txt" "beta"
+assert_contains "${tmpdir}/recover-out/stable-bad.txt" "delta"
+assert_contains "${tmpdir}/recover-out/stable-conf.txt" "gamma"
 
 echo "ok"

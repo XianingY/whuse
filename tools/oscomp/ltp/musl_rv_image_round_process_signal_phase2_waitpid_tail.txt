@@ -1,3 +1,0 @@
-waitpid07
-waitpid08
-waitpid09

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -70,11 +71,7 @@ ROUND_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     ),
 }
 
-PHASE_LIMITS: dict[str, int] = {
-    "fs_path": 16,
-    "open_io": 16,
-    "process_signal": 16,
-}
+PHASED_ROUNDS = {"fs_path", "open_io", "process_signal"}
 
 
 def read_case_set(path: Path) -> set[str]:
@@ -86,6 +83,8 @@ def write_lines(path: Path, lines: list[str]) -> None:
 
 
 def write_phase_slices(round_name: str, selected: list[str], chunk_size: int) -> None:
+    for stale in LTP_DIR.glob(f"musl_rv_image_round_{round_name}_phase*.txt"):
+        stale.unlink()
     phase_idx = 1
     start = 0
     while start < len(selected):
@@ -143,6 +142,15 @@ def select_cases(
 
 
 def main() -> int:
+    try:
+        phase_chunk_size = int(os.getenv("WHUSE_LTP_IMAGE_PHASE_SIZE", "128"))
+    except ValueError:
+        print("invalid WHUSE_LTP_IMAGE_PHASE_SIZE, must be integer > 0", file=sys.stderr)
+        return 2
+    if phase_chunk_size <= 0:
+        print(f"invalid WHUSE_LTP_IMAGE_PHASE_SIZE={phase_chunk_size}, must be > 0", file=sys.stderr)
+        return 2
+
     seed = read_case_set(IMAGE_SEED)
     curated = read_case_set(CURATED)
     blacklist = read_case_set(BLACKLIST)
@@ -157,9 +165,8 @@ def main() -> int:
         output = LTP_DIR / f"musl_rv_image_round_{round_name}.txt"
         write_lines(output, selected)
         print(f"{output.name}: {len(selected)}")
-        phase_limit = PHASE_LIMITS.get(round_name)
-        if phase_limit is not None:
-            write_phase_slices(round_name, selected, phase_limit)
+        if round_name in PHASED_ROUNDS:
+            write_phase_slices(round_name, selected, phase_chunk_size)
     return 0
 
 

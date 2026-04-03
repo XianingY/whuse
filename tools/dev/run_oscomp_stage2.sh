@@ -909,11 +909,13 @@ generate_ltp_candidate_lists() {
     local text_log="$1"
     local pass_out="$2"
     local bad_out="$3"
-    local pass_tmp bad_tmp summary_tmp
+    local conf_out="${4:-}"
+    local pass_tmp bad_tmp conf_tmp summary_tmp
     pass_tmp="$(mktemp)"
     bad_tmp="$(mktemp)"
+    conf_tmp="$(mktemp)"
     summary_tmp="$(mktemp)"
-    awk -F: -v pass_file="${pass_tmp}" -v bad_file="${bad_tmp}" -v summary_file="${summary_tmp}" '
+    awk -F: -v pass_file="${pass_tmp}" -v bad_file="${bad_tmp}" -v conf_file="${conf_tmp}" -v summary_file="${summary_tmp}" '
         /^RUN LTP CASE / {
             current_case = $0
             sub(/^RUN LTP CASE /, "", current_case)
@@ -961,6 +963,8 @@ generate_ltp_candidate_lists() {
             class_count[class]++
             if (rc == 0 && tpass > 0 && tfail == 0 && tbrok == 0) {
                 print case_name >> pass_file
+            } else if (class == "conf-only") {
+                print case_name >> conf_file
             } else if (class == "rc255" || class == "timeout" || class == "missing" || class == "tbrok" || class == "tfail" || class == "nonzero") {
                 print case_name >> bad_file
             }
@@ -974,13 +978,16 @@ generate_ltp_candidate_lists() {
     ' "${text_log}"
     sort -u "${pass_tmp}" > "${pass_out}"
     sort -u "${bad_tmp}" > "${bad_out}"
+    if [[ -n "${conf_out}" ]]; then
+        sort -u "${conf_tmp}" > "${conf_out}"
+    fi
     echo "[rv-ltp] class summary:"
     if [[ -s "${summary_tmp}" ]]; then
         sort "${summary_tmp}" | sed 's/^/[rv-ltp] class-count /'
     else
         echo "[rv-ltp] class-count none"
     fi
-    rm -f "${pass_tmp}" "${bad_tmp}" "${summary_tmp}"
+    rm -f "${pass_tmp}" "${bad_tmp}" "${conf_tmp}" "${summary_tmp}"
 }
 
 run_arch() {
@@ -1187,13 +1194,16 @@ run_arch() {
     if [[ "${arch}" == "rv" && "${effective_profile}" == "ltp" ]]; then
         local pass_candidates
         local bad_candidates
+        local conf_candidates
         local candidate_target_whitelist=""
         local candidate_target_blacklist=""
         pass_candidates="/tmp/rv-ltp-generic-${WHUSE_LTP_PROFILE}-pass-candidates-${RUN_ID}.txt"
         bad_candidates="/tmp/rv-ltp-generic-${WHUSE_LTP_PROFILE}-bad-candidates-${RUN_ID}.txt"
-        generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}"
+        conf_candidates="/tmp/rv-ltp-generic-${WHUSE_LTP_PROFILE}-conf-candidates-${RUN_ID}.txt"
+        generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}" "${conf_candidates}"
         echo "[${arch}] pass-candidates: ${pass_candidates} ($(wc -l < "${pass_candidates}"))"
         echo "[${arch}] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
+        echo "[${arch}] conf-candidates: ${conf_candidates} ($(wc -l < "${conf_candidates}"))"
         case "${WHUSE_LTP_PROFILE}" in
         full | curated)
             candidate_target_whitelist="${WHUSE_LTP_CURATED_WHITELIST}"
@@ -1320,7 +1330,7 @@ run_ltp_riscv_mode() {
     fi
 
     local tpass tfail tbrok tconf timeout_count
-    local pass_candidates bad_candidates
+    local pass_candidates bad_candidates conf_candidates
     tpass="$(count_matches "TPASS" "${text_log}")"
     tfail="$(count_matches "TFAIL" "${text_log}")"
     tbrok="$(count_matches "TBROK" "${text_log}")"
@@ -1328,9 +1338,11 @@ run_ltp_riscv_mode() {
     timeout_count="$(count_matches "whuse-oscomp-step-timeout:ltp_testcode.sh" "${text_log}")"
     pass_candidates="/tmp/rv-ltp-${mode}-pass-candidates-${TS}.txt"
     bad_candidates="/tmp/rv-ltp-${mode}-bad-candidates-${TS}.txt"
-    generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}"
+    conf_candidates="/tmp/rv-ltp-${mode}-conf-candidates-${TS}.txt"
+    generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}" "${conf_candidates}"
     echo "[${label}] pass-candidates: ${pass_candidates} ($(wc -l < "${pass_candidates}"))"
     echo "[${label}] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
+    echo "[${label}] conf-candidates: ${conf_candidates} ($(wc -l < "${conf_candidates}"))"
     apply_ltp_candidate_lists "${label}" "${pass_candidates}" "${bad_candidates}" "${ltp_whitelist}" "${ltp_blacklist}"
     if [[ "${suite_done_seen}" == "0" ]] && rg -q "whuse-oscomp-suite-done" "${text_log}"; then
         suite_done_seen=1

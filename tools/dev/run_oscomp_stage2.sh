@@ -7,6 +7,12 @@ XTASK_CMD=(cargo run --manifest-path "${REPO_ROOT}/tools/xtask/Cargo.toml" --)
 
 LTP_SCORE_WHITELIST="${REPO_ROOT}/tools/oscomp/ltp/score_whitelist.txt"
 LTP_SCORE_BLACKLIST="${REPO_ROOT}/tools/oscomp/ltp/score_blacklist.txt"
+LTP_SCORE_WHITELIST_GLIBC_RV="${REPO_ROOT}/tools/oscomp/ltp/score_whitelist_glibc_rv.txt"
+LTP_SCORE_BLACKLIST_GLIBC_RV="${REPO_ROOT}/tools/oscomp/ltp/score_blacklist_glibc_rv.txt"
+LTP_SCORE_WHITELIST_MUSL_LA="${REPO_ROOT}/tools/oscomp/ltp/score_whitelist_musl_la.txt"
+LTP_SCORE_BLACKLIST_MUSL_LA="${REPO_ROOT}/tools/oscomp/ltp/score_blacklist_musl_la.txt"
+LTP_SCORE_WHITELIST_GLIBC_LA="${REPO_ROOT}/tools/oscomp/ltp/score_whitelist_glibc_la.txt"
+LTP_SCORE_BLACKLIST_GLIBC_LA="${REPO_ROOT}/tools/oscomp/ltp/score_blacklist_glibc_la.txt"
 LTP_CURATED_WHITELIST_DEFAULT="${REPO_ROOT}/tools/oscomp/ltp/musl_rv_curated_whitelist.txt"
 LTP_CURATED_BLACKLIST_DEFAULT="${REPO_ROOT}/tools/oscomp/ltp/musl_rv_curated_blacklist.txt"
 
@@ -88,10 +94,10 @@ loongarch_full_root_steps=(
     "time-test"
     "basic_testcode.sh"
     "busybox_testcode.sh"
+    "ltp_testcode.sh"
     "libctest_testcode.sh"
     "lua_testcode.sh"
     "libc-bench"
-    "ltp_testcode.sh"
     "iozone_testcode.sh"
     "lmbench_testcode.sh"
     "unixbench_testcode.sh"
@@ -240,14 +246,43 @@ resolve_expected_root_steps() {
     local profile="${1:-full}"
     local arch="${2:-}"
     if [[ -z "${profile}" || "${profile}" == "full" ]]; then
+        local full_max_group="${WHUSE_STAGE2_FULL_MAX_GROUP:-all}"
+        local full_max_step=""
+        if [[ -n "${full_max_group}" && "${full_max_group}" != "all" ]]; then
+            if full_max_step="$(profile_root_step "${full_max_group}" 2>/dev/null)"; then
+                :
+            else
+                full_max_step=""
+            fi
+        fi
+        local -a full_steps=()
         case "${arch}" in
-        loongarch)
-            printf '%s\n' "${loongarch_full_root_steps[@]}"
+        loongarch | la)
+            full_steps=("${loongarch_full_root_steps[@]}")
+            ;;
+        riscv | rv | "")
+            full_steps=("${riscv_full_root_steps[@]}")
             ;;
         *)
-            printf '%s\n' "${riscv_full_root_steps[@]}"
+            full_steps=("${riscv_full_root_steps[@]}")
             ;;
         esac
+        if [[ -z "${full_max_step}" ]]; then
+            printf '%s\n' "${full_steps[@]}"
+            return 0
+        fi
+        local step
+        local found=0
+        for step in "${full_steps[@]}"; do
+            printf '%s\n' "${step}"
+            if [[ "${step}" == "${full_max_step}" ]]; then
+                found=1
+                break
+            fi
+        done
+        if [[ "${found}" -eq 0 ]]; then
+            printf '%s\n' "${full_steps[@]}"
+        fi
         return 0
     fi
     profile_root_step "${profile}"
@@ -802,6 +837,36 @@ canonicalize_path() {
     printf '%s\n' "${path}"
 }
 
+ltp_score_whitelist_for_target() {
+    local arch="$1"
+    local runtime="$2"
+    case "${arch}:${runtime}" in
+    rv:musl) printf '%s\n' "${WHUSE_LTP_WHITELIST}" ;;
+    rv:glibc) printf '%s\n' "${LTP_SCORE_WHITELIST_GLIBC_RV}" ;;
+    la:musl) printf '%s\n' "${LTP_SCORE_WHITELIST_MUSL_LA}" ;;
+    la:glibc) printf '%s\n' "${LTP_SCORE_WHITELIST_GLIBC_LA}" ;;
+    *)
+        echo "unsupported ltp whitelist target: ${arch}:${runtime}" >&2
+        return 1
+        ;;
+    esac
+}
+
+ltp_score_blacklist_for_target() {
+    local arch="$1"
+    local runtime="$2"
+    case "${arch}:${runtime}" in
+    rv:musl) printf '%s\n' "${WHUSE_LTP_BLACKLIST}" ;;
+    rv:glibc) printf '%s\n' "${LTP_SCORE_BLACKLIST_GLIBC_RV}" ;;
+    la:musl) printf '%s\n' "${LTP_SCORE_BLACKLIST_MUSL_LA}" ;;
+    la:glibc) printf '%s\n' "${LTP_SCORE_BLACKLIST_GLIBC_LA}" ;;
+    *)
+        echo "unsupported ltp blacklist target: ${arch}:${runtime}" >&2
+        return 1
+        ;;
+    esac
+}
+
 resolve_ltp_mode_config() {
     local mode="$1"
     local profile whitelist blacklist
@@ -894,6 +959,40 @@ inject_ltp_runtime_files() {
     if [[ -n "${WHUSE_LTP_CASE_TIMEOUT:-}" ]]; then
         write_runtime_image_config "${image}" "/musl/.whuse_ltp_case_timeout" "${WHUSE_LTP_CASE_TIMEOUT}"
     fi
+}
+
+inject_ltp_target_score_files() {
+    local arch="$1"
+    local image="$2"
+    local runtime whitelist_host blacklist_host
+    local whitelist_image_path blacklist_image_path
+    write_runtime_image_config "${image}" "/musl/.whuse_ltp_profile" "${WHUSE_LTP_PROFILE}"
+    if [[ -n "${WHUSE_LTP_STEP_TIMEOUT:-}" ]]; then
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_step_timeout" "${WHUSE_LTP_STEP_TIMEOUT}"
+    fi
+    if [[ -n "${WHUSE_LTP_CASE_TIMEOUT:-}" ]]; then
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_case_timeout" "${WHUSE_LTP_CASE_TIMEOUT}"
+    fi
+    for runtime in musl glibc; do
+        whitelist_host="$(ltp_score_whitelist_for_target "${arch}" "${runtime}")"
+        blacklist_host="$(ltp_score_blacklist_for_target "${arch}" "${runtime}")"
+        if [[ -n "${whitelist_host}" && ! -f "${whitelist_host}" ]]; then
+            echo "missing target ltp whitelist for ${arch}/${runtime}: ${whitelist_host}" >&2
+            return 1
+        fi
+        if [[ -n "${blacklist_host}" && ! -f "${blacklist_host}" ]]; then
+            echo "missing target ltp blacklist for ${arch}/${runtime}: ${blacklist_host}" >&2
+            return 1
+        fi
+        whitelist_image_path="/${runtime}/ltp_score_whitelist.txt"
+        blacklist_image_path="/${runtime}/ltp_score_blacklist.txt"
+        write_runtime_image_file "${image}" "${whitelist_image_path}" "${whitelist_host}"
+        write_runtime_image_file "${image}" "${blacklist_image_path}" "${blacklist_host}"
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_whitelist_${runtime}" "${whitelist_image_path}"
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_blacklist_${runtime}" "${blacklist_image_path}"
+    done
+    write_runtime_image_config "${image}" "/musl/.whuse_ltp_whitelist" "/musl/ltp_score_whitelist.txt"
+    write_runtime_image_config "${image}" "/musl/.whuse_ltp_blacklist" "/musl/ltp_score_blacklist.txt"
 }
 
 inject_ltp_runtime_config() {
@@ -1009,10 +1108,8 @@ run_arch() {
     effective_profile="$(effective_oscomp_profile)"
     validate_oscomp_profile "${effective_profile}"
     inject_stage2_local_env "${runtime_image}"
-    if [[ "${arch}" == "rv" ]]; then
-        if [[ "${effective_profile}" == "full" || "${effective_profile}" == "ltp" ]]; then
-            inject_ltp_runtime_files "${runtime_image}" "${WHUSE_LTP_PROFILE}" "${WHUSE_LTP_WHITELIST}" "${WHUSE_LTP_BLACKLIST}"
-        fi
+    if [[ "${effective_profile}" == "full" || "${effective_profile}" == "ltp" ]]; then
+        inject_ltp_target_score_files "${arch}" "${runtime_image}"
     fi
     if [[ "${WHUSE_OSCOMP_RUNTIME_FILTER}" != "both" ]]; then
         inject_oscomp_runtime_filter "${runtime_image}" "${WHUSE_OSCOMP_RUNTIME_FILTER}"
@@ -1266,6 +1363,7 @@ run_ltp_riscv_mode() {
     ltp_blacklist="${ltp_config[2]}"
     prepare_ltp_runtime_image "${RV_IMG}"
     runtime_image="${prepared_runtime_image}"
+    inject_oscomp_runtime_filter "${runtime_image}" "musl"
     inject_ltp_runtime_config "${runtime_image}" "${ltp_profile}" "${ltp_whitelist}" "${ltp_blacklist}"
 
     echo "[${label}] running ltp-only, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, profile=${ltp_profile}, whitelist=${ltp_whitelist:-none}, blacklist=${ltp_blacklist:-none}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"

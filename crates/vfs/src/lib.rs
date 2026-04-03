@@ -67,6 +67,12 @@ const PIPE_CAPACITY: usize = 16 * 4096;
 const PIPE_MIN_CAPACITY: usize = 4096;
 static CONSOLE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
+const DEV_MEMFS: u64 = 0x1000_0000_0000_0001;
+const DEV_PROCFS: u64 = 0x1000_0000_0000_0002;
+const DEV_DEVFS: u64 = 0x1000_0000_0000_0003;
+const DEV_EXT4_ROOT: u64 = 0x2000_0000_0000_0001;
+const DEV_EXT4_MNT: u64 = 0x2000_0000_0000_0002;
+
 fn write_console_bytes(bytes: &[u8]) {
     let _guard = CONSOLE_WRITE_LOCK.lock();
     for byte in bytes.iter().copied() {
@@ -98,11 +104,14 @@ pub enum NodeKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileStat {
+    pub dev: u64,
+    pub ino: u64,
     pub mode: u32,
     pub size: u64,
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
+    pub rdev: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +130,58 @@ impl InodeMeta {
             uid: 0,
             gid: 0,
         }
+    }
+}
+
+fn stable_nonzero_hash64(input: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in input.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
+fn local_dev_for_path(path: &str) -> u64 {
+    if path == "/dev" || path.starts_with("/dev/") {
+        DEV_DEVFS
+    } else if path == "/proc" || path.starts_with("/proc/") {
+        DEV_PROCFS
+    } else {
+        DEV_MEMFS
+    }
+}
+
+fn ext4_dev_for_path(path: &str) -> u64 {
+    if path == "/mnt" || path.starts_with("/mnt/") {
+        DEV_EXT4_MNT
+    } else {
+        DEV_EXT4_ROOT
+    }
+}
+
+fn synthetic_local_ino(node: &Arc<Node>, path: &str) -> u64 {
+    let raw = (Arc::as_ptr(node) as usize as u64) >> 4;
+    if raw == 0 {
+        stable_nonzero_hash64(path)
+    } else {
+        raw
+    }
+}
+
+const fn makedev(major: u32, minor: u32) -> u64 {
+    ((major as u64) << 8) | (minor as u64)
+}
+
+fn char_device_rdev(path: &str) -> u64 {
+    match path {
+        "/dev/null" => makedev(1, 3),
+        "/dev/zero" => makedev(1, 5),
+        "/dev/random" => makedev(1, 8),
+        "/dev/urandom" => makedev(1, 9),
+        "/dev/console" => makedev(5, 1),
+        "/dev/rtc0" => makedev(248, 0),
+        _ => 0,
     }
 }
 
@@ -460,7 +521,7 @@ impl KernelVfs {
             socket_bindings: BTreeMap::new(),
             raw_sockets: Vec::new(),
         };
-        for dir in ["/dev", "/proc", "/mnt", "/tmp", "/bin", "/etc"] {
+        for dir in ["/dev", "/proc", "/mnt", "/tmp", "/bin", "/etc", "/sys"] {
             let _ = vfs.mkdir("/", dir, 0o755);
         }
         for dir in [
@@ -474,6 +535,9 @@ impl KernelVfs {
             "/proc/sys/net/ipv6/conf/lo",
             "/proc/sys/net/ipv6/conf/ltp_ns_veth1",
             "/proc/sys/net/ipv6/conf/ltp_ns_veth2",
+            "/sys/devices",
+            "/sys/devices/system",
+            "/sys/devices/system/cpu",
         ] {
             let _ = vfs.mkdir("/", dir, 0o755);
         }
@@ -507,6 +571,7 @@ impl KernelVfs {
         let _ = vfs.mkdir("/", "/proc/self", 0o755);
         let _ = vfs.create_proc_file("/proc/self/stat", PROC_SELF_STAT);
         let _ = vfs.create_proc_file("/proc/self/maps", PROC_SELF_MAPS);
+        let _ = vfs.create_file_with_mode("/", "/sys/devices/system/cpu/online", b"0\n", 0o444);
         vfs
     }
 
@@ -602,11 +667,14 @@ impl KernelVfs {
     ) -> KernelResult<()> {
         let absolute = normalize_path("/", path);
         let stat = FileStat {
+            dev: ext4_dev_for_path(&absolute),
+            ino: stable_nonzero_hash64(&absolute),
             mode: mode.unwrap_or(S_IFREG | 0o755),
             size: contents.len() as u64,
             nlink: 1,
             uid: 0,
             gid: 0,
+            rdev: 0,
         };
         self.external_preloaded
             .insert(absolute.clone(), (Arc::new(contents.to_vec()), stat));
@@ -2242,11 +2310,14 @@ impl KernelVfs {
                 ));
             }
             return Ok(Some(FileStat {
+                dev: ext4_dev_for_path(absolute),
+                ino: stable_nonzero_hash64(absolute),
                 mode: S_IFDIR | 0o755,
                 size: 0,
                 nlink: 1,
                 uid: 0,
                 gid: 0,
+                rdev: 0,
             }));
         }
 
@@ -2259,11 +2330,14 @@ impl KernelVfs {
                     ));
                 }
                 Ok(Some(FileStat {
+                    dev: ext4_dev_for_path(absolute),
+                    ino: stable_nonzero_hash64(absolute),
                     mode: stat.mode,
                     size: stat.size,
                     nlink: stat.nlink,
                     uid: 0,
                     gid: 0,
+                    rdev: 0,
                 }))
             }
             Err(err) if err == ENOENT => Ok(None),
@@ -2317,11 +2391,14 @@ impl KernelVfs {
             || absolute == mount.target
         {
             return Ok(Some(FileStat {
+                dev: ext4_dev_for_path(absolute),
+                ino: stable_nonzero_hash64(absolute),
                 mode: S_IFDIR | 0o755,
                 size: 0,
                 nlink: 1,
                 uid: 0,
                 gid: 0,
+                rdev: 0,
             }));
         }
         Ok(None)
@@ -2515,11 +2592,14 @@ impl KernelVfs {
                 self.external_stat_cache.insert(
                     absolute.to_string(),
                     FileStat {
+                        dev: ext4_dev_for_path(absolute),
+                        ino: stable_nonzero_hash64(absolute),
                         mode: stat.mode,
                         size: stat.size,
                         nlink: stat.nlink,
                         uid: 0,
                         gid: 0,
+                        rdev: 0,
                     },
                 );
                 stat
@@ -2590,14 +2670,19 @@ impl KernelVfs {
         stat: fs_ext4::Ext4FileStat,
     ) {
         let absolute = normalize_path(dir_absolute, name);
+        let dev = ext4_dev_for_path(&absolute);
+        let ino = stable_nonzero_hash64(&absolute);
         self.external_stat_cache.insert(
             absolute,
             FileStat {
+                dev,
+                ino,
                 mode: stat.mode,
                 size: stat.size,
                 nlink: stat.nlink,
                 uid: 0,
                 gid: 0,
+                rdev: 0,
             },
         );
     }
@@ -2858,12 +2943,31 @@ impl KernelVfs {
         let (uid, gid, nlink) = meta
             .map(|meta| (meta.uid, meta.gid, meta.nlink))
             .unwrap_or((0, 0, 1));
+        let is_ext4 = matches!(&*guard, NodeData::Ext4File(_) | NodeData::Ext4Dir(_));
+        let dev = if is_ext4 {
+            ext4_dev_for_path(path)
+        } else {
+            local_dev_for_path(path)
+        };
+        let ino = if is_ext4 {
+            stable_nonzero_hash64(path)
+        } else {
+            synthetic_local_ino(node, path)
+        };
+        let rdev = if node.kind == NodeKind::CharDevice {
+            char_device_rdev(path)
+        } else {
+            0
+        };
         Ok(FileStat {
+            dev,
+            ino,
             mode,
             size,
             nlink,
             uid,
             gid,
+            rdev,
         })
     }
 }
@@ -2934,11 +3038,18 @@ impl FileHandle {
             },
         };
         FileStat {
+            dev: local_dev_for_path(&self.path),
+            ino: synthetic_local_ino(&self.node, &self.path),
             mode,
             size,
             nlink: 1,
             uid: 0,
             gid: 0,
+            rdev: if self.node.kind == NodeKind::CharDevice {
+                char_device_rdev(&self.path)
+            } else {
+                0
+            },
         }
     }
 
@@ -4105,13 +4216,36 @@ mod tests {
         assert_eq!(
             vfs.external_stat_cache.get("/bin/hello"),
             Some(&super::FileStat {
+                dev: super::ext4_dev_for_path("/bin/hello"),
+                ino: super::stable_nonzero_hash64("/bin/hello"),
                 mode: super::S_IFREG | 0o644,
                 size: b"hello from ext4".len() as u64,
                 nlink: 1,
                 uid: 0,
                 gid: 0,
+                rdev: 0,
             })
         );
+    }
+
+    #[test]
+    fn ext4_stat_handle_reports_stable_nonzero_device_and_inode() {
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        let handle_a = vfs.open("/", "/bin/hello", 0, 0).unwrap();
+        let handle_b = vfs.open("/", "/bin/hello", 0, 0).unwrap();
+        let stat_a = vfs.stat_handle(&handle_a).unwrap();
+        let stat_b = vfs.stat_handle(&handle_b).unwrap();
+
+        assert_ne!(stat_a.dev, 0);
+        assert_ne!(stat_a.ino, 0);
+        assert_eq!(stat_a.dev, stat_b.dev);
+        assert_eq!(stat_a.ino, stat_b.ino);
     }
 
     #[test]
@@ -4218,6 +4352,23 @@ mod tests {
             Err(super::ENOENT)
         );
         assert!(!vfs.external_stat_cache.contains_key("/etc/localtime"));
+    }
+
+    #[test]
+    fn sys_cpu_online_stub_is_available() {
+        let mut vfs = KernelVfs::new();
+        let stat = vfs
+            .stat_path_open_probe("/", "/sys/devices/system/cpu/online", super::O_RDONLY)
+            .expect("/sys/devices/system/cpu/online should exist");
+        assert_eq!(stat.mode & super::S_IFMT, super::S_IFREG);
+
+        let mut handle = vfs
+            .open_with_owner("/", "/sys/devices/system/cpu/online", super::O_RDONLY, 0, 0, 0)
+            .expect("open /sys/devices/system/cpu/online");
+        let bytes = vfs
+            .read(&mut handle, 16)
+            .expect("read /sys/devices/system/cpu/online");
+        assert_eq!(bytes, b"0\n");
     }
 
     #[test]

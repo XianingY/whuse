@@ -434,6 +434,12 @@ impl AddressSpace {
             let map_start = align_up(old_break, PAGE_SIZE);
             let map_end = align_up(requested_break, PAGE_SIZE);
             if map_end > map_start {
+                {
+                    let inner = self.inner.lock();
+                    if overlaps(&inner.mappings, map_start, map_end - map_start) {
+                        return Ok(old_break);
+                    }
+                }
                 self.map_fixed_bytes(map_start, &[], map_end - map_start, DEFAULT_PROT)?;
             }
         } else if requested_break < old_break {
@@ -560,6 +566,30 @@ impl AddressSpace {
             "unmapped prev={} next={} brk={:#x} next_mmap={:#x}",
             prev, next, inner.program_break, inner.next_mapping_base
         )
+    }
+
+    pub fn debug_segments(&self, start: usize, len: usize) -> String {
+        if len == 0 {
+            return "<empty>".to_string();
+        }
+        let end = start.saturating_add(len);
+        let inner = self.inner.lock();
+        let mut parts = Vec::new();
+        for segment in inner.mappings.values() {
+            let seg_start = segment.area.start;
+            let seg_end = seg_start.saturating_add(segment.area.len);
+            if seg_start < end && start < seg_end {
+                parts.push(format!(
+                    "{:#x}-{:#x}/prot={:#x}",
+                    seg_start, seg_end, segment.area.prot
+                ));
+            }
+        }
+        if parts.is_empty() {
+            "<none>".to_string()
+        } else {
+            parts.join(",")
+        }
     }
 
     pub fn write_bytes(&self, addr: usize, bytes: &[u8]) -> KernelResult<()> {
@@ -824,7 +854,10 @@ impl AddressSpace {
 
         {
             let mut inner = self.inner.lock();
-            inner.program_break = program.highest_end.max(USER_HEAP_BASE);
+            inner.program_break = program
+                .highest_end
+                .max(interp.as_ref().map(|image| image.highest_end).unwrap_or(0))
+                .max(USER_HEAP_BASE);
         }
         let stack_top = USER_STACK_TOP;
         let stack_base = stack_top - USER_STACK_SIZE;
@@ -917,6 +950,10 @@ impl AddressSpace {
             let mapped_vaddr = ph.vaddr.checked_add(load_bias).ok_or(ENOEXEC)?;
             let seg_start = align_down(mapped_vaddr, PAGE_SIZE);
             let page_offset = mapped_vaddr - seg_start;
+            if (ph.offset & (PAGE_SIZE - 1)) != page_offset {
+                return Err(ENOEXEC);
+            }
+            let file_page_start = align_down(ph.offset, PAGE_SIZE);
             // PT_LOAD segments are page-granular once mapped into userspace.
             // The bytes between the logical end of the segment and the end of
             // its last page must remain accessible/zero-filled, otherwise PIE
@@ -930,8 +967,7 @@ impl AddressSpace {
             seg_bytes
                 .try_reserve_exact(page_offset + ph.file_size)
                 .map_err(|_| ENOMEM)?;
-            seg_bytes.resize(page_offset, 0);
-            seg_bytes.extend_from_slice(&image[ph.offset..data_end]);
+            seg_bytes.extend_from_slice(&image[file_page_start..data_end]);
             self.map_fixed_bytes(
                 seg_start,
                 &seg_bytes,
@@ -2017,6 +2053,7 @@ mod tests {
         map_segment_pages_cow_riscv, AddressSpace, SegmentStorage, Sv39PageTableBuilder, EFAULT,
         ENOEXEC, PAGE_SIZE, RISCV_PTE_R, RISCV_PTE_W, RISCV_PTE_X,
     };
+    use alloc::vec::Vec;
 
     const TEST_ELF: &[u8] = &[
         0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0xf3, 0, 1, 0, 0, 0,
@@ -2025,6 +2062,95 @@ mod tests {
         0, 0x00, 0x10, 0x00, 0x40, 0, 0, 0, 0, 0x00, 0x10, 0x00, 0x40, 0, 0, 0, 0, 4, 0, 0, 0, 0,
         0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0x13, 0, 0, 0, 0, 0, 0, 0,
     ];
+
+    fn write_u16_le(buf: &mut [u8], offset: usize, value: u16) {
+        buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32_le(buf: &mut [u8], offset: usize, value: u32) {
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u64_le(buf: &mut [u8], offset: usize, value: u64) {
+        buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn build_unaligned_second_load_elf() -> Vec<u8> {
+        let mut elf = vec![0u8; 0x2000];
+
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // little-endian
+        elf[6] = 1; // current version
+
+        write_u16_le(&mut elf, 16, 2); // ET_EXEC
+        write_u16_le(&mut elf, 18, 0xf3); // EM_RISCV
+        write_u32_le(&mut elf, 20, 1); // EV_CURRENT
+        write_u64_le(&mut elf, 24, 0x4000_0080); // e_entry
+        write_u64_le(&mut elf, 32, 64); // e_phoff
+        write_u16_le(&mut elf, 52, 64); // e_ehsize
+        write_u16_le(&mut elf, 54, 56); // e_phentsize
+        write_u16_le(&mut elf, 56, 2); // e_phnum
+
+        // First PT_LOAD covers only the first page of the file.
+        write_u32_le(&mut elf, 64, 1); // PT_LOAD
+        write_u32_le(&mut elf, 68, 0b101); // R|X
+        write_u64_le(&mut elf, 72, 0x0); // p_offset
+        write_u64_le(&mut elf, 80, 0x4000_0000); // p_vaddr
+        write_u64_le(&mut elf, 88, 0x4000_0000); // p_paddr
+        write_u64_le(&mut elf, 96, 0x1000); // p_filesz
+        write_u64_le(&mut elf, 104, 0x1000); // p_memsz
+        write_u64_le(&mut elf, 112, 0x1000); // p_align
+
+        // Second PT_LOAD starts mid-page and should preserve bytes from the
+        // aligned file page prefix instead of replacing them with zeros.
+        write_u32_le(&mut elf, 120, 1); // PT_LOAD
+        write_u32_le(&mut elf, 124, 0b110); // R|W
+        write_u64_le(&mut elf, 128, 0x1800); // p_offset
+        write_u64_le(&mut elf, 136, 0x4000_1800); // p_vaddr
+        write_u64_le(&mut elf, 144, 0x4000_1800); // p_paddr
+        write_u64_le(&mut elf, 152, 0x200); // p_filesz
+        write_u64_le(&mut elf, 160, 0x200); // p_memsz
+        write_u64_le(&mut elf, 168, 0x1000); // p_align
+
+        for (index, byte) in elf[0x1000..0x1800].iter_mut().enumerate() {
+            *byte = ((index as u8) ^ 0x5a).wrapping_add(1);
+        }
+        for (index, byte) in elf[0x1800..0x1a00].iter_mut().enumerate() {
+            *byte = 0xc0 | ((index as u8) & 0x3f);
+        }
+
+        elf
+    }
+
+    fn build_minimal_dynamic_elf(mem_size: usize, flags: u32) -> Vec<u8> {
+        let mut elf = vec![0u8; 0x1000];
+        let file_size = elf.len() as u64;
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // 64-bit
+        elf[5] = 1; // little-endian
+        elf[6] = 1; // current version
+        write_u16_le(&mut elf, 16, 3); // ET_DYN
+        write_u16_le(&mut elf, 18, 243); // EM_RISCV
+        write_u32_le(&mut elf, 20, 1); // EV_CURRENT
+        write_u64_le(&mut elf, 24, 0x100); // e_entry
+        write_u64_le(&mut elf, 32, 64); // e_phoff
+        write_u16_le(&mut elf, 52, 64); // e_ehsize
+        write_u16_le(&mut elf, 54, 56); // e_phentsize
+        write_u16_le(&mut elf, 56, 1); // e_phnum
+
+        write_u32_le(&mut elf, 64, 1); // PT_LOAD
+        write_u32_le(&mut elf, 68, flags);
+        write_u64_le(&mut elf, 72, 0x0); // p_offset
+        write_u64_le(&mut elf, 80, 0x0); // p_vaddr
+        write_u64_le(&mut elf, 88, 0x0); // p_paddr
+        write_u64_le(&mut elf, 96, file_size); // p_filesz
+        write_u64_le(&mut elf, 104, mem_size as u64); // p_memsz
+        write_u64_le(&mut elf, 112, PAGE_SIZE as u64); // p_align
+
+        elf[0x100..0x104].copy_from_slice(&[0x13, 0, 0, 0]);
+        elf
+    }
 
     #[test]
     fn address_space_round_trip() {
@@ -2102,6 +2228,92 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.entry, 0x4000_1000);
         assert_eq!(aspace.read_bytes(0x4000_1000, 4).unwrap(), &[0x13, 0, 0, 0]);
+    }
+
+    #[test]
+    fn dynamic_brk_growth_does_not_overwrite_interp_rx_segment() {
+        let aspace = AddressSpace::new_user();
+        let program = build_minimal_dynamic_elf(PAGE_SIZE, 0b101);
+        let interp = build_minimal_dynamic_elf(PAGE_SIZE * 3, 0b101);
+        let loaded = aspace
+            .load_elf_images(
+                &program,
+                Some(&interp),
+                &[String::from("/bin/test")],
+                &[],
+                Some("/bin/test"),
+            )
+            .unwrap();
+
+        let interp_text = loaded.interp_base + 0x100;
+        let interp_end = loaded.interp_base + PAGE_SIZE * 3;
+
+        assert_eq!(
+            aspace.read_bytes(interp_text, 4).unwrap(),
+            [0x13, 0, 0, 0],
+            "interpreter text must be readable before brk growth"
+        );
+
+        aspace.brk(Some(interp_end + PAGE_SIZE - 1)).unwrap();
+
+        assert_eq!(
+            aspace.read_bytes(interp_text, 4).unwrap(),
+            [0x13, 0, 0, 0],
+            "brk growth must not overwrite interpreter text"
+        );
+        assert!(
+            aspace.describe_addr(interp_text).contains("prot=0x5"),
+            "interpreter text must remain executable after brk growth: {}",
+            aspace.describe_addr(interp_text)
+        );
+    }
+
+    #[test]
+    fn brk_growth_does_not_unmap_existing_mmap_segment() {
+        let aspace = AddressSpace::new_user();
+        let initial_brk = aspace.brk(None).unwrap();
+        let mmap_base = initial_brk + PAGE_SIZE;
+
+        aspace
+            .map_fixed_bytes(mmap_base, b"LIBC", PAGE_SIZE, 0b101)
+            .unwrap();
+        assert_eq!(aspace.read_bytes(mmap_base, 4).unwrap(), b"LIBC");
+
+        let result = aspace.brk(Some(mmap_base + PAGE_SIZE)).unwrap();
+
+        assert_eq!(
+            result, initial_brk,
+            "brk must refuse growth that would overlap an existing mapping"
+        );
+        assert_eq!(
+            aspace.read_bytes(mmap_base, 4).unwrap(),
+            b"LIBC",
+            "existing mmap segment must remain intact after rejected brk growth"
+        );
+        assert!(
+            aspace.describe_addr(mmap_base).contains("prot=0x5"),
+            "mmap segment must remain executable after rejected brk growth: {}",
+            aspace.describe_addr(mmap_base)
+        );
+    }
+
+    #[test]
+    fn unaligned_second_load_preserves_aligned_file_page_prefix() {
+        let aspace = AddressSpace::new_user();
+        let elf = build_unaligned_second_load_elf();
+
+        aspace
+            .load_static_elf(&elf, &[String::from("/bin/test")], &[])
+            .unwrap();
+
+        assert_eq!(
+            aspace.read_bytes(0x4000_1000, 32).unwrap(),
+            elf[0x1000..0x1020].to_vec()
+        );
+        assert_eq!(
+            aspace.read_bytes(0x4000_1800, 32).unwrap(),
+            elf[0x1800..0x1820].to_vec()
+        );
     }
 
     #[test]

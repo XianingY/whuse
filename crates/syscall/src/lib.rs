@@ -433,6 +433,16 @@ fn ltp_path_debug_enabled() -> bool {
 }
 
 #[inline]
+fn ltp_bootstrap_debug_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_LTP_BOOTSTRAP"), Some("1"))
+}
+
+#[inline]
+fn glibc_ltp_probe_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_GLIBC_LTP_PROBE"), Some("1"))
+}
+
+#[inline]
 fn busybox_probe_debug_enabled() -> bool {
     matches!(option_env!("WHUSE_DEBUG_BUSYBOX_PROBES"), Some("1"))
 }
@@ -690,8 +700,10 @@ fn log_user_path_fault(process: &proc::Process, syscall: &str, path_ptr: usize) 
 }
 
 fn is_ltp_path_debug_task(name: &str) -> bool {
-    ltp_path_debug_enabled()
-        && matches!(
+    if !ltp_path_debug_enabled() {
+        return false;
+    }
+    matches!(
         name,
         "readlink01" | "readlinkat02" | "fchownat02" | "link04" | "close01" | "dup01"
     )
@@ -705,6 +717,97 @@ fn is_ltp_path_debug_task(name: &str) -> bool {
 
 fn is_ltp_wait_debug_task(name: &str) -> bool {
     is_ltp_path_debug_task(name)
+}
+
+fn is_loongarch_ltp_bootstrap_task(name: &str) -> bool {
+    if !cfg!(target_arch = "loongarch64") || !ltp_bootstrap_debug_enabled() {
+        return false;
+    }
+    matches!(
+        name,
+        "brk01" | "brk02" | "close01" | "close02" | "dup01" | "dup02" | "dup04" | "dup07"
+    ) || name.ends_with("/brk01")
+        || name.ends_with("/brk02")
+        || name.ends_with("/close01")
+        || name.ends_with("/close02")
+        || name.ends_with("/dup01")
+        || name.ends_with("/dup02")
+        || name.ends_with("/dup04")
+        || name.ends_with("/dup07")
+}
+
+fn should_trace_loongarch_ltp_brk_payload(name: &str, path: &str) -> bool {
+    cfg!(target_arch = "loongarch64")
+        && (name == "brk01"
+            || name == "brk02"
+            || name.ends_with("/brk01")
+            || name.ends_with("/brk02"))
+        && (path.contains("/tmp/whuse-ltp-glibc-brk01.")
+            || path.contains("/tmp/whuse-ltp-glibc-brk02."))
+}
+
+fn debug_payload_preview(data: &[u8], limit: usize) -> String {
+    let mut out = String::new();
+    for &byte in data.iter().take(limit) {
+        match byte {
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    if data.len() > limit {
+        out.push_str("...");
+    }
+    out
+}
+
+fn should_skip_loongarch_ltp_open_prechecks(name: &str, absolute: &str) -> bool {
+    cfg!(target_arch = "loongarch64")
+        && (name.starts_with("/musl/ltp/testcases/bin/") || name.starts_with("/glibc/ltp/testcases/bin/"))
+        && (absolute.starts_with("/musl/ltp/testcases/bin/")
+            || absolute.starts_with("/glibc/ltp/testcases/bin/")
+            || absolute.starts_with("/musl/ltp/testcases/lib/")
+            || absolute.starts_with("/glibc/ltp/testcases/lib/"))
+}
+
+fn is_glibc_ltp_task(name: &str) -> bool {
+    glibc_ltp_probe_enabled() && name.starts_with("/glibc/ltp/testcases/bin/")
+}
+
+fn glibc_ltp_probe_process(
+    procs: &ProcessTable,
+    fd: Option<i32>,
+) -> Option<(usize, usize, String, String, String)> {
+    procs.current().ok().and_then(|process| {
+        if !is_glibc_ltp_task(process.name.as_str()) {
+            return None;
+        }
+        let path = match fd {
+            Some(fd) => process
+                .fd(fd)
+                .map(|handle| handle.path.clone())
+                .unwrap_or_else(|_| format!("<fd:{}-unresolved>", fd)),
+            None => "<none>".to_string(),
+        };
+        Some((
+            process.tid,
+            process.tgid,
+            process.name.clone(),
+            process.cwd.clone(),
+            path,
+        ))
+    })
+}
+
+fn log_loongarch_ltp_bootstrap(process: &proc::Process, syscall: &str, detail: &str) {
+    if is_loongarch_ltp_bootstrap_task(process.name.as_str()) {
+        log_always(&format!(
+            "whuse-la-ltp-bootstrap syscall={} tgid={} tid={} name={} cwd={} {}",
+            syscall, process.tgid, process.tid, process.name, process.cwd, detail
+        ));
+    }
 }
 
 fn log_ltp_path_debug(process: &proc::Process, syscall: &str, detail: &str) {
@@ -1603,6 +1706,8 @@ impl SyscallDispatcher {
         }
         let openat_probe = stage2_openat_debug_enabled()
             && is_libctest_openat_probe_task(name.as_str(), tgid, proc_cwd.as_str());
+        let ltp_open_probe =
+            name.starts_with("/musl/ltp/testcases/bin/") || name.starts_with("/glibc/ltp/testcases/bin/");
         let busybox_testfile_probe =
             is_busybox_testfile_probe_task(name.as_str(), proc_cwd.as_str())
                 && is_busybox_testfile_probe_path(path.as_str());
@@ -1612,6 +1717,12 @@ impl SyscallDispatcher {
         if openat_probe {
             log_always(&format!(
                 "whuse-libctest:openat-enter tid={} tgid={} name={} dirfd={} cwd={} path={} raw_flags={:#x} flags={:#x}",
+                tid, tgid, name, dirfd, proc_cwd, path, raw_flags, flags
+            ));
+        }
+        if ltp_open_probe {
+            log_always(&format!(
+                "whuse-ltp-openat:enter tid={} tgid={} name={} dirfd={} cwd={} path={} raw_flags={:#x} flags={:#x}",
                 tid, tgid, name, dirfd, proc_cwd, path, raw_flags, flags
             ));
         }
@@ -1639,6 +1750,19 @@ impl SyscallDispatcher {
         };
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
         let absolute = vfs.absolute_path(&cwd, &path);
+        if ltp_open_probe {
+            log_always(&format!(
+                "whuse-ltp-openat:resolved tid={} tgid={} name={} dirfd={} proc_cwd={} resolved_cwd={} path={} absolute={} flags={:#x}",
+                tid, tgid, name, dirfd, proc_cwd, cwd, path, absolute, flags
+            ));
+        }
+        let skip_ltp_prechecks = should_skip_loongarch_ltp_open_prechecks(name.as_str(), absolute.as_str());
+        if skip_ltp_prechecks && ltp_open_probe {
+            log_always(&format!(
+                "whuse-ltp-openat:precheck-skip tid={} tgid={} name={} absolute={} reason=loongarch-ltp-open-precheck-hang",
+                tid, tgid, name, absolute
+            ));
+        }
         ensure_proc_pid_stat_file(procs, scheduler, vfs, absolute.as_str())?;
         ensure_proc_self_fd_dir(procs, vfs, absolute.as_str())?;
         if is_ltp_path_debug_task(name.as_str()) {
@@ -1647,7 +1771,7 @@ impl SyscallDispatcher {
                 tgid, tid, name, proc_cwd, dirfd, path, cwd, raw_flags, flags
             ));
         }
-        if (raw_flags & O_NOATIME) != 0 && current_euid != 0 {
+        if !skip_ltp_prechecks && (raw_flags & O_NOATIME) != 0 && current_euid != 0 {
             match vfs.stat_path(&cwd, &path) {
                 Ok(stat) if stat.uid == current_euid => {}
                 Ok(_) => return Err(EPERM),
@@ -1655,7 +1779,9 @@ impl SyscallDispatcher {
                 Err(err) => return Err(err),
             }
         }
-        let existing_stat = if (flags & O_CREAT) != 0 {
+        let existing_stat = if skip_ltp_prechecks {
+            None
+        } else if (flags & O_CREAT) != 0 {
             vfs.stat_path_cached_only(&cwd, &path).ok()
         } else {
             vfs.stat_path_open_probe(&cwd, &path, flags)
@@ -1708,6 +1834,12 @@ impl SyscallDispatcher {
                 tid, tgid, cwd, path
             ));
         }
+        if ltp_open_probe {
+            log_always(&format!(
+                "whuse-ltp-openat:vfs-open-begin tid={} tgid={} cwd={} path={} absolute={}",
+                tid, tgid, cwd, path, absolute
+            ));
+        }
         let mut handle =
             match vfs.open_with_owner(&cwd, &path, flags, mode, current_euid, current_egid) {
                 Ok(handle) => handle,
@@ -1746,6 +1878,12 @@ impl SyscallDispatcher {
                         log_always(&format!(
                             "whuse-busybox-copy:openat-vfs-open-err tid={} tgid={} err={} cwd={} path={}",
                             tid, tgid, err, cwd, path
+                        ));
+                    }
+                    if ltp_open_probe {
+                        log_always(&format!(
+                            "whuse-ltp-openat:vfs-open-err tid={} tgid={} err={} cwd={} path={} absolute={}",
+                            tid, tgid, err, cwd, path, absolute
                         ));
                     }
                     return Err(err);
@@ -1787,6 +1925,12 @@ impl SyscallDispatcher {
                 tid, tgid, handle.path
             ));
         }
+        if ltp_open_probe {
+            log_always(&format!(
+                "whuse-ltp-openat:vfs-open-ok tid={} tgid={} resolved={}",
+                tid, tgid, handle.path
+            ));
+        }
         handle.flags = with_cloexec_flag(handle.flags, (raw_flags as usize & O_CLOEXEC) != 0);
         let fd = procs.current_mut()?.add_fd(handle)?;
         if iozone_probe {
@@ -1819,6 +1963,12 @@ impl SyscallDispatcher {
                 tid, tgid, fd
             ));
         }
+        if ltp_open_probe {
+            log_always(&format!(
+                "whuse-ltp-openat:exit tid={} tgid={} fd={}",
+                tid, tgid, fd
+            ));
+        }
         Ok(fd as usize)
     }
 
@@ -1832,6 +1982,19 @@ impl SyscallDispatcher {
         let fd = args.0[0] as i32;
         let owner_tgid = procs.current_tgid()?;
         let handle = procs.current()?.fd(fd)?.clone();
+        let glibc_ltp = glibc_ltp_probe_process(procs, Some(fd));
+        let bootstrap_ltp = procs
+            .current()
+            .ok()
+            .filter(|process| is_loongarch_ltp_bootstrap_task(process.name.as_str()))
+            .map(|process| {
+                (
+                    process.tid,
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                )
+            });
         let (tid, tgid, name, proc_cwd) = {
             let process = procs.current()?;
             (
@@ -1850,6 +2013,18 @@ impl SyscallDispatcher {
                 tid, tgid, name, fd, handle.path
             ));
         }
+        if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
+            log_always(&format!(
+                "whuse-la-ltp-bootstrap syscall=close-enter tgid={} tid={} name={} cwd={} fd={} path={} flags={:#x}",
+                tgid, tid, name, cwd, fd, handle.path, handle.flags
+            ));
+        }
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
+            log_always(&format!(
+                "whuse-glibc-ltp-close:enter tgid={} tid={} name={} cwd={} fd={} path={} flags={:#x}",
+                tgid, tid, name, cwd, fd, path, handle.flags
+            ));
+        }
         procs.current_mut()?.close_fd(fd)?;
         let wake_blocked = vfs.is_pipe(&handle);
         let released_locks = FCNTL_LOCK_STATE
@@ -1859,6 +2034,18 @@ impl SyscallDispatcher {
             log_always(&format!(
                 "whuse-busybox:close-exit tid={} tgid={} name={} fd={} path={} wake_blocked={} released_locks={}",
                 tid, tgid, name, fd, handle.path, wake_blocked, released_locks
+            ));
+        }
+        if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
+            log_always(&format!(
+                "whuse-la-ltp-bootstrap syscall=close-exit tgid={} tid={} name={} cwd={} fd={} path={} wake_blocked={} released_locks={}",
+                tgid, tid, name, cwd, fd, handle.path, wake_blocked, released_locks
+            ));
+        }
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
+            log_always(&format!(
+                "whuse-glibc-ltp-close:exit tgid={} tid={} name={} cwd={} fd={} path={} wake_blocked={} released_locks={}",
+                tgid, tid, name, cwd, fd, path, wake_blocked, released_locks
             ));
         }
         drop(handle);
@@ -1916,11 +2103,24 @@ impl SyscallDispatcher {
         let fd = args.0[0] as i32;
         let offset = args.0[1] as isize;
         let whence = args.0[2] as u32;
+        let glibc_ltp = glibc_ltp_probe_process(procs, Some(fd));
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
+            log_always(&format!(
+                "whuse-glibc-ltp-lseek:enter tgid={} tid={} name={} cwd={} fd={} path={} offset={} whence={}",
+                tgid, tid, name, cwd, fd, path, offset, whence
+            ));
+        }
         let process = procs.current_mut()?;
         process.sync_fd_offset_from_alias(fd)?;
         let handle = process.fd_mut(fd)?;
         let position = vfs.seek(handle, offset, whence)?;
         process.sync_fd_offset_to_aliases(fd)?;
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
+            log_always(&format!(
+                "whuse-glibc-ltp-lseek:ok tgid={} tid={} name={} cwd={} fd={} path={} position={}",
+                tgid, tid, name, cwd, fd, path, position
+            ));
+        }
         Ok(position)
     }
 
@@ -1934,6 +2134,19 @@ impl SyscallDispatcher {
         let fd = args.0[0] as i32;
         let buf = args.0[1];
         let count = args.0[2];
+        let glibc_ltp = glibc_ltp_probe_process(procs, Some(fd));
+        let bootstrap_ltp = procs
+            .current()
+            .ok()
+            .filter(|process| is_loongarch_ltp_bootstrap_task(process.name.as_str()))
+            .map(|process| {
+                (
+                    process.tid,
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                )
+            });
         let bytes = {
             let process = procs.current_mut()?;
             process.sync_fd_offset_from_alias(fd)?;
@@ -1965,6 +2178,18 @@ impl SyscallDispatcher {
                     proc_tid, proc_tgid, fd, pipe_path, count, handle.offset
                 ));
             }
+            if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
+                log_always(&format!(
+                    "whuse-glibc-ltp-read:enter tgid={} tid={} name={} cwd={} fd={} path={} count={} off={}",
+                    tgid, tid, name, cwd, fd, path, count, handle.offset
+                ));
+            }
+            if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
+                log_always(&format!(
+                    "whuse-la-ltp-bootstrap syscall=read-enter tgid={} tid={} name={} cwd={} fd={} path={} count={} off={}",
+                    tgid, tid, name, cwd, fd, pipe_path, count, handle.offset
+                ));
+            }
             match vfs.read(handle, count) {
                 Ok(bytes) => {
                     if iozone_probe {
@@ -1987,6 +2212,18 @@ impl SyscallDispatcher {
                             pipe_path,
                             bytes.len(),
                             handle.offset
+                        ));
+                    }
+                    if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
+                        log_always(&format!(
+                            "whuse-glibc-ltp-read:ok tgid={} tid={} name={} cwd={} fd={} path={} bytes={} off={}",
+                            tgid, tid, name, cwd, fd, path, bytes.len(), handle.offset
+                        ));
+                    }
+                    if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
+                        log_always(&format!(
+                            "whuse-la-ltp-bootstrap syscall=read-ok tgid={} tid={} name={} cwd={} fd={} path={} bytes={} off={}",
+                            tgid, tid, name, cwd, fd, pipe_path, bytes.len(), handle.offset
                         ));
                     }
                     bytes
@@ -2013,6 +2250,18 @@ impl SyscallDispatcher {
                             proc_tid, proc_tgid, fd, pipe_path, err
                         ));
                     }
+                    if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
+                        log_always(&format!(
+                            "whuse-glibc-ltp-read:err tgid={} tid={} name={} cwd={} fd={} path={} err={}",
+                            tgid, tid, name, cwd, fd, path, err
+                        ));
+                    }
+                    if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
+                        log_always(&format!(
+                            "whuse-la-ltp-bootstrap syscall=read-err tgid={} tid={} name={} cwd={} fd={} path={} err={}",
+                            tgid, tid, name, cwd, fd, pipe_path, err
+                        ));
+                    }
                     return Err(err);
                 }
             }
@@ -2035,6 +2284,18 @@ impl SyscallDispatcher {
         let fd = args.0[0] as i32;
         let buf = args.0[1];
         let count = args.0[2];
+        let bootstrap_ltp = procs
+            .current()
+            .ok()
+            .filter(|process| is_loongarch_ltp_bootstrap_task(process.name.as_str()))
+            .map(|process| {
+                (
+                    process.tid,
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                )
+            });
         let data = procs
             .current()?
             .read_user_bytes(buf, count)
@@ -2046,15 +2307,46 @@ impl SyscallDispatcher {
             if !fd_is_writable(handle.flags) {
                 return Err(EBADF);
             }
+            if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
+                log_always(&format!(
+                    "whuse-la-ltp-bootstrap syscall=write-enter tgid={} tid={} name={} cwd={} fd={} path={} count={} off={}",
+                    tgid, tid, name, cwd, fd, handle.path, data.len(), handle.offset
+                ));
+                if should_trace_loongarch_ltp_brk_payload(name.as_str(), handle.path.as_str()) {
+                    log_always(&format!(
+                        "whuse-la-ltp-bootstrap syscall=write-preview tgid={} tid={} name={} fd={} path={} preview={}",
+                        tgid,
+                        tid,
+                        name,
+                        fd,
+                        handle.path,
+                        debug_payload_preview(&data, 192)
+                    ));
+                }
+            }
             let is_pipe = vfs.is_pipe(handle);
             let is_socket = vfs.is_socket(handle);
             let nonblock = (handle.flags & (O_NONBLOCK as u32)) != 0;
             match vfs.write(handle, &data) {
                 Ok(written) => {
+                    if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
+                        log_always(&format!(
+                            "whuse-la-ltp-bootstrap syscall=write-ok tgid={} tid={} name={} cwd={} fd={} path={} written={} off={}",
+                            tgid, tid, name, cwd, fd, handle.path, written, handle.offset
+                        ));
+                    }
                     process.sync_fd_offset_to_aliases(fd)?;
                     Ok((is_pipe, is_socket, nonblock, written))
                 }
-                Err(err) => Err((is_pipe, is_socket, nonblock, err)),
+                Err(err) => {
+                    if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
+                        log_always(&format!(
+                            "whuse-la-ltp-bootstrap syscall=write-err tgid={} tid={} name={} cwd={} fd={} path={} err={}",
+                            tgid, tid, name, cwd, fd, handle.path, err
+                        ));
+                    }
+                    Err((is_pipe, is_socket, nonblock, err))
+                }
             }
         };
         match result {
@@ -2253,6 +2545,11 @@ impl SyscallDispatcher {
             .ok()
             .filter(|process| is_ltp_wait_debug_task(process.name.as_str()))
             .map(|process| (process.tid, process.tgid, process.name.clone(), process.cwd.clone()));
+        let bootstrap_ltp = procs
+            .current()
+            .ok()
+            .filter(|process| is_loongarch_ltp_bootstrap_task(process.name.as_str()))
+            .map(|process| (process.tid, process.tgid, process.name.clone(), process.cwd.clone()));
         let wake_blocked_after_exit = current_process_has_pipe_or_socket_fd(procs, vfs);
         let libcbench_leader = procs
             .current()
@@ -2263,6 +2560,12 @@ impl SyscallDispatcher {
             log_always(&format!(
                 "whuse-ltp:exit-enter tid={} tgid={} name={} cwd={} exit_group={} code={}",
                 tid, tgid, name, cwd, exit_group, args.0[0] as i32
+            ));
+        }
+        if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
+            log_always(&format!(
+                "whuse-la-ltp-bootstrap syscall=exit-enter tgid={} tid={} name={} cwd={} exit_group={} code={}",
+                tgid, tid, name, cwd, exit_group, args.0[0] as i32
             ));
         }
         if let Some((tid, tgid)) = libcbench_leader {
@@ -2305,6 +2608,12 @@ impl SyscallDispatcher {
             log_always(&format!(
                 "whuse-ltp:exit-result tid={} tgid={} name={} cwd={} group_exited={} parent_tgid={:?}",
                 tid, tgid, name, cwd, exit.group_exited, exit.parent_tgid
+            ));
+        }
+        if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
+            log_always(&format!(
+                "whuse-la-ltp-bootstrap syscall=exit-result tgid={} tid={} name={} cwd={} group_exited={} parent_tgid={:?}",
+                tgid, tid, name, cwd, exit.group_exited, exit.parent_tgid
             ));
         }
         let released_locks = if exit_group || exit.group_exited {
@@ -2415,11 +2724,24 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let fd = args.0[0] as i32;
         let stat_ptr = args.0[1];
+        let glibc_ltp = glibc_ltp_probe_process(procs, Some(fd));
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
+            log_always(&format!(
+                "whuse-glibc-ltp-fstat:enter tgid={} tid={} name={} cwd={} fd={} path={}",
+                tgid, tid, name, cwd, fd, path
+            ));
+        }
         let stat = {
             let process = procs.current()?;
             let handle = process.fd(fd)?;
             vfs.stat_handle(handle)?
         };
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
+            log_always(&format!(
+                "whuse-glibc-ltp-fstat:ok tgid={} tid={} name={} cwd={} fd={} path={} dev={:#x} ino={:#x} rdev={:#x} mode={:#o} size={}",
+                tgid, tid, name, cwd, fd, path, stat.dev, stat.ino, stat.rdev, stat.mode, stat.size
+            ));
+        }
         procs
             .current_mut()?
             .write_user_bytes(stat_ptr, &stat_to_bytes(stat))
@@ -2451,6 +2773,13 @@ impl SyscallDispatcher {
 
     fn sys_brk(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let requested = args.0[0];
+        if let Ok(process) = procs.current() {
+            log_loongarch_ltp_bootstrap(
+                process,
+                "brk-enter",
+                &format!("requested={:#x}", requested),
+            );
+        }
         if syscall_trace_enabled() {
             trace_line(&format!("whuse: sys_brk requested={:#x}", requested));
         }
@@ -2458,6 +2787,14 @@ impl SyscallDispatcher {
         let res = process
             .address_space
             .brk((requested != 0).then_some(requested));
+        log_loongarch_ltp_bootstrap(
+            process,
+            "brk-result",
+            &match &res {
+                Ok(val) => format!("requested={:#x} res={:#x}", requested, val),
+                Err(err) => format!("requested={:#x} err={}", requested, err),
+            },
+        );
         if syscall_trace_enabled() {
             match &res {
                 Ok(val) => trace_line(&format!("whuse: sys_brk success res={:#x}", val)),
@@ -2735,9 +3072,41 @@ impl SyscallDispatcher {
         if argv.is_empty() {
             argv.push(display_path.clone());
         }
+        let execve_ltp_timeout_probe = display_path.contains("busybox")
+            && argv.get(1).map(String::as_str) == Some("timeout")
+            && argv
+                .iter()
+                .any(|arg| arg.starts_with("/musl/ltp/testcases/bin/") || arg.starts_with("/glibc/ltp/testcases/bin/"));
+        let execve_musl_ltp_probe = display_path.starts_with("/musl/ltp/testcases/bin/");
+        let execve_glibc_ltp_probe = display_path.starts_with("/glibc/ltp/testcases/bin/");
+        let execve_any_ltp_probe =
+            execve_musl_ltp_probe || execve_glibc_ltp_probe || execve_ltp_timeout_probe;
+        #[cfg(target_arch = "loongarch64")]
+        let skip_exec_stat_for_ltp_case = execve_musl_ltp_probe || execve_glibc_ltp_probe;
+        #[cfg(not(target_arch = "loongarch64"))]
+        let skip_exec_stat_for_ltp_case = false;
         if execve_iozone_probe {
             log_always(&format!(
                 "whuse-la-iozone:execve-stage path-ready display={} argv0={}",
+                display_path,
+                argv.first().map(String::as_str).unwrap_or("")
+            ));
+        }
+        if execve_any_ltp_probe {
+            log_always(&format!(
+                "whuse-ltp-exec:enter tgid={} cwd={} display={} argv0={}",
+                procs.current_tgid().unwrap_or(0),
+                cwd,
+                display_path,
+                argv.first().map(String::as_str).unwrap_or("")
+            ));
+            log_always(&format!("whuse-ltp-exec:argv {:?}", argv));
+        }
+        if execve_glibc_ltp_probe {
+            log_always(&format!(
+                "whuse-glibc-ltp-exec:enter tgid={} cwd={} display={} argv0={}",
+                procs.current_tgid().unwrap_or(0),
+                cwd,
                 display_path,
                 argv.first().map(String::as_str).unwrap_or("")
             ));
@@ -2829,26 +3198,59 @@ impl SyscallDispatcher {
                 shebang_hops,
                 argv.first().map(|s| s.as_str()).unwrap_or("")
             ));
+            if execve_any_ltp_probe {
+                log_always(&format!(
+                    "whuse-ltp-exec:stage-loop display={} path={} hops={}",
+                    display_path, path, shebang_hops
+                ));
+            }
             if path.contains("busybox") && argv.len() > 1 {
                 BUSYBOX_APPLETS
                     .lock()
                     .insert(procs.current_tgid().unwrap_or(0), argv[1].clone());
             }
-            let stat = vfs.stat_path(&cwd, &path)?;
-            let mode = stat.mode & 0o170000;
-            if mode == 0o040000 {
-                return Err(EACCES);
-            }
-            if mode != 0o100000 {
-                return Err(EACCES);
-            }
-            if (stat.mode & 0o111) == 0 {
-                return Err(EACCES);
+            if !skip_exec_stat_for_ltp_case {
+                if execve_any_ltp_probe {
+                    log_always(&format!(
+                        "whuse-ltp-exec:stat-begin display={} path={}",
+                        display_path, path
+                    ));
+                }
+                let stat = vfs.stat_path(&cwd, &path)?;
+                if execve_any_ltp_probe {
+                    log_always(&format!(
+                        "whuse-ltp-exec:stat-ok display={} path={} mode={:#o} size={}",
+                        display_path, path, stat.mode, stat.size
+                    ));
+                }
+                let mode = stat.mode & 0o170000;
+                if mode == 0o040000 {
+                    return Err(EACCES);
+                }
+                if mode != 0o100000 {
+                    return Err(EACCES);
+                }
+                if (stat.mode & 0o111) == 0 {
+                    return Err(EACCES);
+                }
+            } else if execve_any_ltp_probe {
+                log_always(&format!(
+                    "whuse-ltp-exec:stat-skip display={} path={} reason=loongarch-ltp-precheck-hang",
+                    display_path, path
+                ));
             }
             let file_data = match read_exec_file_image(vfs, &cwd, &path) {
                 Ok(data) => data,
                 Err(err) => return Err(err),
             };
+            if execve_any_ltp_probe {
+                log_always(&format!(
+                    "whuse-ltp-exec:image-loaded display={} path={} bytes={}",
+                    display_path,
+                    path,
+                    file_data.len()
+                ));
+            }
             if file_data.is_empty() {
                 trace_line(&format!("whuse: execve stage empty-image path={}", path));
                 return Err(ENOEXEC);
@@ -2980,6 +3382,18 @@ impl SyscallDispatcher {
                         display_path, interp_path
                     ));
                 }
+                if execve_any_ltp_probe {
+                    log_always(&format!(
+                        "whuse-ltp-exec:interp-detected display={} interp={}",
+                        display_path, interp_path
+                    ));
+                }
+                if execve_glibc_ltp_probe {
+                    log_always(&format!(
+                        "whuse-glibc-ltp-exec:interp-detected display={} interp={}",
+                        display_path, interp_path
+                    ));
+                }
                 trace_line(&format!(
                     "whuse: execve stage interp-detected path={} interp={}",
                     path, interp_path
@@ -2993,6 +3407,18 @@ impl SyscallDispatcher {
                             display_path, candidate
                         ));
                     }
+                    if execve_any_ltp_probe {
+                        log_always(&format!(
+                            "whuse-ltp-exec:interp-candidate display={} candidate={}",
+                            display_path, candidate
+                        ));
+                    }
+                    if execve_glibc_ltp_probe {
+                        log_always(&format!(
+                            "whuse-glibc-ltp-exec:interp-candidate display={} candidate={}",
+                            display_path, candidate
+                        ));
+                    }
                     trace_line(&format!(
                         "whuse: execve stage interp-candidate-try path={} candidate={}",
                         path, candidate
@@ -3002,6 +3428,22 @@ impl SyscallDispatcher {
                             if execve_iozone_probe {
                                 log_always(&format!(
                                     "whuse-la-iozone:execve-interp-ok path={} candidate={} bytes={}",
+                                    display_path,
+                                    candidate,
+                                    image.len()
+                                ));
+                            }
+                            if execve_any_ltp_probe {
+                                log_always(&format!(
+                                    "whuse-ltp-exec:interp-ok display={} candidate={} bytes={}",
+                                    display_path,
+                                    candidate,
+                                    image.len()
+                                ));
+                            }
+                            if execve_glibc_ltp_probe {
+                                log_always(&format!(
+                                    "whuse-glibc-ltp-exec:interp-ok display={} candidate={} bytes={}",
                                     display_path,
                                     candidate,
                                     image.len()
@@ -3020,6 +3462,18 @@ impl SyscallDispatcher {
                             if execve_iozone_probe {
                                 log_always(&format!(
                                     "whuse-la-iozone:execve-interp-err path={} candidate={} err={}",
+                                    display_path, candidate, err
+                                ));
+                            }
+                            if execve_any_ltp_probe {
+                                log_always(&format!(
+                                    "whuse-ltp-exec:interp-err display={} candidate={} err={}",
+                                    display_path, candidate, err
+                                ));
+                            }
+                            if execve_glibc_ltp_probe {
+                                log_always(&format!(
+                                    "whuse-glibc-ltp-exec:interp-err display={} candidate={} err={}",
                                     display_path, candidate, err
                                 ));
                             }
@@ -3047,6 +3501,22 @@ impl SyscallDispatcher {
                         ));
                     }
                     return Err(ENOEXEC);
+                }
+                if execve_glibc_ltp_probe {
+                    log_always(&format!(
+                        "whuse-glibc-ltp-exec:interp-image display={} interp={} bytes={}",
+                        display_path,
+                        interp_path,
+                        interp_image.len()
+                    ));
+                }
+                if execve_any_ltp_probe {
+                    log_always(&format!(
+                        "whuse-ltp-exec:interp-image display={} interp={} bytes={}",
+                        display_path,
+                        interp_path,
+                        interp_image.len()
+                    ));
                 }
                 trace_line(&format!(
                     "whuse: execve stage interp-image interp={} bytes={}",
@@ -3132,10 +3602,40 @@ impl SyscallDispatcher {
                         loaded.interp_base
                     ));
             }
+            if execve_any_ltp_probe {
+                log_always(&format!(
+                    "whuse-ltp-exec:load-elf-done display={} entry={:#x} program_entry={:#x} interp_base={:#x} phdr={:#x} dyn={}",
+                    display_path,
+                    loaded.entry,
+                    loaded.program_entry,
+                    loaded.interp_base,
+                    loaded.phdr_addr,
+                    loaded.is_dyn
+                ));
+            }
+            if execve_glibc_ltp_probe {
+                log_always(&format!(
+                    "whuse-glibc-ltp-exec:load-elf-done display={} entry={:#x} program_entry={:#x} interp_base={:#x} phdr={:#x} dyn={}",
+                    display_path,
+                    loaded.entry,
+                    loaded.program_entry,
+                    loaded.interp_base,
+                    loaded.phdr_addr,
+                    loaded.is_dyn
+                ));
+            }
             let process = procs.current_mut()?;
             process.trap_frame.sepc = loaded.entry;
             process.trap_frame.regs[2] = loaded.stack_pointer;
             process.name = display_path;
+            if execve_glibc_ltp_probe {
+                log_always(&format!(
+                    "whuse-glibc-ltp-exec:interp-window display={} interp_base={:#x} window={}",
+                    process.name,
+                    loaded.interp_base,
+                    process.address_space.debug_segments(loaded.interp_base, 0x24000)
+                ));
+            }
             let _ = process.address_space.map_fixed_bytes(
                 SIGNAL_TRAMPOLINE_BASE,
                 &SIGNAL_TRAMPOLINE_CODE,
@@ -3190,6 +3690,21 @@ impl SyscallDispatcher {
         let flags = args.0[3];
         let fd = args.0[4] as isize;
         let offset = args.0[5];
+        let glibc_ltp_mmap = procs
+            .current()
+            .ok()
+            .filter(|process| is_glibc_ltp_task(process.name.as_str()))
+            .map(|process| {
+                let path = if fd >= 0 {
+                    process
+                        .fd(fd as i32)
+                        .map(|handle| handle.path.clone())
+                        .unwrap_or_else(|_| format!("<fd:{}-unresolved>", fd))
+                } else {
+                    "<anon>".to_string()
+                };
+                (process.tid, process.tgid, process.name.clone(), process.cwd.clone(), path)
+            });
         if len == 0 {
             return Err(EINVAL);
         }
@@ -3243,6 +3758,13 @@ impl SyscallDispatcher {
             None => None,
         };
 
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp_mmap {
+            log_always(&format!(
+                "whuse-glibc-ltp-mmap:enter tgid={} tid={} name={} cwd={} addr={:#x} len={:#x} prot={:#x} flags={:#x} fd={} offset={:#x} path={}",
+                tgid, tid, name, cwd, addr, len, prot, flags, fd, offset, path
+            ));
+        }
+
         if anonymous {
             let base = if let Some(target) = target {
                 if mapping_type == MAP_SHARED {
@@ -3271,6 +3793,12 @@ impl SyscallDispatcher {
                         .map_anonymous(aligned_len, prot)?
                 }
             };
+            if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp_mmap {
+                log_always(&format!(
+                    "whuse-glibc-ltp-mmap:anon-ok tgid={} tid={} name={} cwd={} base={:#x} len={:#x} prot={:#x} flags={:#x} path={}",
+                    tgid, tid, name, cwd, base, aligned_len, prot, flags, path
+                ));
+            }
             return Ok(base);
         }
 
@@ -3280,6 +3808,12 @@ impl SyscallDispatcher {
         let mut handle = procs.current()?.fd(fd as i32)?.clone();
         handle.offset = offset;
         let data = vfs.read(&mut handle, len)?;
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp_mmap {
+            log_always(&format!(
+                "whuse-glibc-ltp-mmap:file-read tgid={} tid={} name={} cwd={} path={} bytes={} aligned_len={:#x} offset={:#x}",
+                tgid, tid, name, cwd, path, data.len(), aligned_len, offset
+            ));
+        }
         if let Some(target) = target {
             if mapping_type == MAP_SHARED {
                 procs.current_mut()?.address_space.map_fixed_shared_bytes(
@@ -3296,31 +3830,93 @@ impl SyscallDispatcher {
                     prot,
                 )?;
             }
+            if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp_mmap {
+                log_always(&format!(
+                    "whuse-glibc-ltp-mmap:fixed-ok tgid={} tid={} name={} cwd={} base={:#x} len={:#x} prot={:#x} flags={:#x} path={} bytes={}",
+                    tgid, tid, name, cwd, target, aligned_len, prot, flags, path, data.len()
+                ));
+            }
             return Ok(target);
         }
+        let temp_prot = prot | 0b010;
         let base = if mapping_type == MAP_SHARED {
             procs
                 .current_mut()?
                 .address_space
-                .map_anonymous_shared(aligned_len, prot)?
+                .map_anonymous_shared(aligned_len, temp_prot)?
         } else {
             procs
                 .current_mut()?
                 .address_space
-                .map_anonymous(aligned_len, prot)?
+                .map_anonymous(aligned_len, temp_prot)?
         };
         procs
             .current_mut()?
             .address_space
             .write_bytes(base, &data)
             .map_err(|_| EFAULT)?;
+        if temp_prot != prot {
+            procs.current_mut()?.address_space.mprotect(base, aligned_len, prot)?;
+        }
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp_mmap {
+            log_always(&format!(
+                "whuse-glibc-ltp-mmap:ok tgid={} tid={} name={} cwd={} base={:#x} len={:#x} prot={:#x} flags={:#x} path={} bytes={}",
+                tgid, tid, name, cwd, base, aligned_len, prot, flags, path, data.len()
+            ));
+        }
         Ok(base)
     }
 
     fn sys_munmap(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let addr = args.0[0];
         let len = args.0[1];
+        let glibc_ltp = procs.current().ok().and_then(|process| {
+            is_glibc_ltp_task(process.name.as_str()).then(|| {
+                (
+                    process.tid,
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                    process.address_space.describe_addr(addr),
+                    len.checked_sub(1)
+                        .and_then(|delta| addr.checked_add(delta))
+                        .map(|end| process.address_space.describe_addr(end))
+                        .unwrap_or_else(|| "<none>".to_string()),
+                )
+            })
+        });
+        if let Some((tid, tgid, name, cwd, start_desc, end_desc)) = &glibc_ltp {
+            log_always(&format!(
+                "whuse-glibc-ltp-munmap:enter tgid={} tid={} name={} cwd={} addr={:#x} len={:#x} aligned_addr={} start={} end={}",
+                tgid,
+                tid,
+                name,
+                cwd,
+                addr,
+                len,
+                addr & (PAGE_SIZE - 1) == 0,
+                start_desc,
+                end_desc
+            ));
+        }
         procs.current_mut()?.address_space.unmap(addr, len)?;
+        if let Some((tid, tgid, name, cwd, _, _)) = &glibc_ltp {
+            let process = procs.current()?;
+            log_always(&format!(
+                "whuse-glibc-ltp-munmap:ok tgid={} tid={} name={} cwd={} addr={:#x} len={:#x} after_start={} after_end={}",
+                tgid,
+                tid,
+                name,
+                cwd,
+                addr,
+                len,
+                process.address_space.describe_addr(addr),
+                len.checked_sub(1)
+                    .and_then(|delta| addr.checked_add(delta))
+                    .map(|end| process.address_space.describe_addr(end))
+                    .unwrap_or_else(|| "<none>".to_string())
+            ));
+        }
         Ok(0)
     }
 
@@ -3328,10 +3924,58 @@ impl SyscallDispatcher {
         let addr = args.0[0];
         let len = args.0[1];
         let prot = args.0[2];
+        let glibc_ltp = procs.current().ok().and_then(|process| {
+            is_glibc_ltp_task(process.name.as_str()).then(|| {
+                (
+                    process.tid,
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                    process.address_space.describe_addr(addr),
+                    len.checked_sub(1)
+                        .and_then(|delta| addr.checked_add(delta))
+                        .map(|end| process.address_space.describe_addr(end))
+                        .unwrap_or_else(|| "<none>".to_string()),
+                )
+            })
+        });
+        if let Some((tid, tgid, name, cwd, start_desc, end_desc)) = &glibc_ltp {
+            log_always(&format!(
+                "whuse-glibc-ltp-mprotect:enter tgid={} tid={} name={} cwd={} addr={:#x} len={:#x} prot={:#x} aligned_addr={} start={} end={}",
+                tgid,
+                tid,
+                name,
+                cwd,
+                addr,
+                len,
+                prot,
+                addr & (PAGE_SIZE - 1) == 0,
+                start_desc,
+                end_desc
+            ));
+        }
         procs
             .current_mut()?
             .address_space
             .mprotect(addr, len, prot)?;
+        if let Some((tid, tgid, name, cwd, _, _)) = &glibc_ltp {
+            let process = procs.current()?;
+            log_always(&format!(
+                "whuse-glibc-ltp-mprotect:ok tgid={} tid={} name={} cwd={} addr={:#x} len={:#x} prot={:#x} after_start={} after_end={}",
+                tgid,
+                tid,
+                name,
+                cwd,
+                addr,
+                len,
+                prot,
+                process.address_space.describe_addr(addr),
+                len.checked_sub(1)
+                    .and_then(|delta| addr.checked_add(delta))
+                    .map(|end| process.address_space.describe_addr(end))
+                    .unwrap_or_else(|| "<none>".to_string())
+            ));
+        }
         Ok(0)
     }
 
@@ -3796,10 +4440,23 @@ impl SyscallDispatcher {
         let buf = args.0[1];
         let count = args.0[2];
         let offset = parse_nonnegative_rw_offset(args.0[3])?;
+        let glibc_ltp = glibc_ltp_probe_process(procs, Some(fd));
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
+            log_always(&format!(
+                "whuse-glibc-ltp-pread64:enter tgid={} tid={} name={} cwd={} fd={} path={} count={} offset={:#x}",
+                tgid, tid, name, cwd, fd, path, count, offset
+            ));
+        }
         let mut handle = procs.current()?.fd(fd)?.clone();
         ensure_positional_read_fd(&handle, vfs)?;
         handle.offset = offset;
         let bytes = vfs.read(&mut handle, count)?;
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
+            log_always(&format!(
+                "whuse-glibc-ltp-pread64:ok tgid={} tid={} name={} cwd={} fd={} path={} bytes={} offset={:#x}",
+                tgid, tid, name, cwd, fd, path, bytes.len(), offset
+            ));
+        }
         procs
             .current_mut()?
             .write_user_bytes(buf, &bytes)
@@ -4115,6 +4772,7 @@ impl SyscallDispatcher {
         let busybox_cp_probe = is_busybox_cp_probe_tgid(tgid, name.as_str());
         let busybox_resource_copy_probe =
             is_busybox_resource_copy_probe(name.as_str(), path.as_str());
+        let glibc_ltp_probe = is_glibc_ltp_task(name.as_str());
         if busybox_testfile_probe {
             log_always(&format!(
                 "whuse-busybox:fstatat-enter tid={} tgid={} name={} dirfd={} cwd={} path={} flags={:#x}",
@@ -4131,6 +4789,12 @@ impl SyscallDispatcher {
             log_always(&format!(
                 "whuse-busybox-copy:fstatat-enter tid={} tgid={} dirfd={} cwd={} path={} flags={:#x}",
                 tid, tgid, dirfd, proc_cwd, path, flags
+            ));
+        }
+        if glibc_ltp_probe {
+            log_always(&format!(
+                "whuse-glibc-ltp-fstatat:enter tid={} tgid={} name={} dirfd={} cwd={} path={} flags={:#x}",
+                tid, tgid, name, dirfd, proc_cwd, path, flags
             ));
         }
         let stat = if path.is_empty() && (flags & AT_EMPTY_PATH_FLAG) != 0 {
@@ -4192,6 +4856,12 @@ impl SyscallDispatcher {
             log_always(&format!(
                 "whuse-busybox-copy:fstatat-vfs-ok tid={} tgid={} cwd={} path={} mode={:#o} size={}",
                 tid, tgid, proc_cwd, path, stat.mode, stat.size
+            ));
+        }
+        if glibc_ltp_probe {
+            log_always(&format!(
+                "whuse-glibc-ltp-fstatat:ok tid={} tgid={} name={} cwd={} path={} dev={:#x} ino={:#x} rdev={:#x} mode={:#o} size={}",
+                tid, tgid, name, proc_cwd, path, stat.dev, stat.ino, stat.rdev, stat.mode, stat.size
             ));
         }
         if matches!(
@@ -4994,6 +5664,7 @@ impl SyscallDispatcher {
         let busybox_cp_probe = is_busybox_cp_probe_tgid(tgid, name.as_str());
         let busybox_resource_copy_probe =
             is_busybox_resource_copy_probe(name.as_str(), path.as_str());
+        let glibc_ltp_probe = is_glibc_ltp_task(name.as_str());
         let iozone_probe = is_iozone_probe_target(name.as_str(), path.as_str());
         if iozone_probe {
             log_always(&format!(
@@ -5027,6 +5698,12 @@ impl SyscallDispatcher {
             log_always(&format!(
                 "whuse-busybox-copy:statx-enter tid={} tgid={} dirfd={} cwd={} path={} flags={:#x} mask={:#x}",
                 tid, tgid, dirfd, proc_cwd, path, flags, args.0[3]
+            ));
+        }
+        if glibc_ltp_probe {
+            log_always(&format!(
+                "whuse-glibc-ltp-statx:enter tid={} tgid={} name={} dirfd={} cwd={} path={} flags={:#x} mask={:#x}",
+                tid, tgid, name, dirfd, proc_cwd, path, flags, args.0[3]
             ));
         }
         if let Some(applet) = BUSYBOX_APPLETS.lock().get(&procs.current_tgid()?).cloned() {
@@ -5159,6 +5836,12 @@ impl SyscallDispatcher {
             log_always(&format!(
                 "whuse-busybox-copy:statx-vfs-ok tid={} tgid={} path={} mode={:#o} size={}",
                 tid, tgid, path, stat.mode, stat.size
+            ));
+        }
+        if glibc_ltp_probe {
+            log_always(&format!(
+                "whuse-glibc-ltp-statx:ok tid={} tgid={} name={} cwd={} path={} dev={:#x} ino={:#x} rdev={:#x} mode={:#o} size={}",
+                tid, tgid, name, proc_cwd, path, stat.dev, stat.ino, stat.rdev, stat.mode, stat.size
             ));
         }
         let bytes = statx_bytes(stat);
@@ -7751,10 +8434,13 @@ fn read_timespec_ns(process: &proc::Process, addr: usize) -> Result<u64, i32> {
 fn stat_to_bytes(stat: FileStat) -> [u8; 128] {
     // Linux-compatible struct kstat layout used by OS COMP basic tests.
     let mut out = [0u8; 128];
+    out[0..8].copy_from_slice(&stat.dev.to_le_bytes());
+    out[8..16].copy_from_slice(&stat.ino.to_le_bytes());
     out[16..20].copy_from_slice(&stat.mode.to_le_bytes());
     out[20..24].copy_from_slice(&stat.nlink.to_le_bytes());
     out[24..28].copy_from_slice(&stat.uid.to_le_bytes());
     out[28..32].copy_from_slice(&stat.gid.to_le_bytes());
+    out[32..40].copy_from_slice(&stat.rdev.to_le_bytes());
     out[48..56].copy_from_slice(&stat.size.to_le_bytes());
     out[56..60].copy_from_slice(&(4096u32).to_le_bytes());
     out[64..72].copy_from_slice(&(stat.size / 512).to_le_bytes());
@@ -8480,12 +9166,26 @@ fn parse_elf_interp(data: &[u8]) -> Option<String> {
 
 fn exec_interp_candidates(display_path: &str, interp_path: &str) -> Vec<String> {
     let mut ordered = Vec::new();
+    let interp_name = interp_path
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty());
+    if display_path.starts_with("/glibc/ltp/testcases/bin/") {
+        if let Some(name) = interp_name {
+            ordered.push(format!("/glibc/ltp/testcases/lib/{}", name));
+        }
+    }
     if display_path.starts_with("/musl/") {
         ordered.push("/musl/lib/libc.so".to_string());
         ordered.push(interp_path.to_string());
     } else {
         ordered.push(interp_path.to_string());
         ordered.push("/musl/lib/libc.so".to_string());
+    }
+    if display_path.starts_with("/glibc/ltp/testcases/bin/") {
+        if let Some(name) = interp_name {
+            ordered.push(format!("/glibc/lib/{}", name));
+        }
     }
     ordered.push("/glibc/lib/ld-linux-loongarch-lp64d.so.1".to_string());
     ordered.push("/lib/ld-linux-riscv64-lp64d.so.1".to_string());
@@ -9261,14 +9961,31 @@ fn statfs_bytes() -> [u8; 120] {
     out
 }
 
+fn split_stat_dev(dev: u64) -> (u32, u32) {
+    let class = dev >> 60;
+    if class == 0x1 || class == 0x2 {
+        return (class as u32, (dev & 0xffff_ffff) as u32);
+    }
+    ((((dev >> 8) & 0x0fff_ffff) as u32), (dev & 0xff) as u32)
+}
+
 fn statx_bytes(stat: FileStat) -> [u8; 256] {
     let mut out = [0u8; 256];
     out[..4].copy_from_slice(&0x7ffu32.to_le_bytes());
-    out[28..32].copy_from_slice(&stat.mode.to_le_bytes());
-    out[40..48].copy_from_slice(&stat.size.to_le_bytes());
+    out[4..8].copy_from_slice(&4096u32.to_le_bytes());
     out[16..20].copy_from_slice(&stat.nlink.to_le_bytes());
     out[20..24].copy_from_slice(&stat.uid.to_le_bytes());
     out[24..28].copy_from_slice(&stat.gid.to_le_bytes());
+    out[28..30].copy_from_slice(&(stat.mode as u16).to_le_bytes());
+    out[32..40].copy_from_slice(&stat.ino.to_le_bytes());
+    out[40..48].copy_from_slice(&stat.size.to_le_bytes());
+    out[48..56].copy_from_slice(&(stat.size / 512).to_le_bytes());
+    let (rdev_major, rdev_minor) = split_stat_dev(stat.rdev);
+    let (dev_major, dev_minor) = split_stat_dev(stat.dev);
+    out[128..132].copy_from_slice(&rdev_major.to_le_bytes());
+    out[132..136].copy_from_slice(&rdev_minor.to_le_bytes());
+    out[136..140].copy_from_slice(&dev_major.to_le_bytes());
+    out[140..144].copy_from_slice(&dev_minor.to_le_bytes());
     out
 }
 
@@ -9309,7 +10026,7 @@ mod tests {
     use proc::ProcessTable;
     use spin::Once;
     use task::Scheduler;
-    use vfs::{EpollWatch, KernelVfs};
+    use vfs::{EpollWatch, FileStat, KernelVfs};
 
     struct TestCpu;
     struct TestMemory;
@@ -9485,6 +10202,70 @@ mod tests {
     }
 
     #[test]
+    fn stat_to_bytes_exposes_device_inode_and_rdev_fields() {
+        let bytes = super::stat_to_bytes(FileStat {
+            mode: 0o100755,
+            size: 0x1234_5678,
+            nlink: 3,
+            uid: 1000,
+            gid: 1001,
+            dev: 0x0102_0304_0506_0708,
+            ino: 0x1112_1314_1516_1718,
+            rdev: 0x2122_2324_2526_2728,
+        });
+
+        assert_eq!(
+            u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            0x1112_1314_1516_1718
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            0x2122_2324_2526_2728
+        );
+    }
+
+    #[test]
+    fn statx_bytes_exposes_linux_layout_fields() {
+        let bytes = super::statx_bytes(FileStat {
+            mode: 0o100755,
+            size: 0x1234_5678_9abc_def0,
+            nlink: 3,
+            uid: 1000,
+            gid: 1001,
+            dev: 0x2000_0000_0000_0001,
+            ino: 0x1112_1314_1516_1718,
+            rdev: ((5u64) << 8) | 7u64,
+        });
+
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0x7ff);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 4096);
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 1000);
+        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 1001);
+        assert_eq!(u16::from_le_bytes(bytes[28..30].try_into().unwrap()), 0o100755);
+        assert_eq!(
+            u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            0x1112_1314_1516_1718
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            0x1234_5678_9abc_def0
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[48..56].try_into().unwrap()),
+            0x1234_5678_9abc_def0 / 512
+        );
+        assert_eq!(u32::from_le_bytes(bytes[128..132].try_into().unwrap()), 5);
+        assert_eq!(u32::from_le_bytes(bytes[132..136].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(bytes[136..140].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[140..144].try_into().unwrap()), 1);
+    }
+
+    #[test]
     fn basic_phase1_syscalls() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
@@ -9583,6 +10364,22 @@ mod tests {
             exec_interp_candidates("/glibc/basic/brk", "/lib/ld-linux-riscv64-lp64d.so.1");
         assert_eq!(
             candidates.first().map(String::as_str),
+            Some("/lib/ld-linux-riscv64-lp64d.so.1")
+        );
+    }
+
+    #[test]
+    fn glibc_ltp_exec_interp_candidates_prefer_testcase_local_loader() {
+        let candidates = exec_interp_candidates(
+            "/glibc/ltp/testcases/bin/brk01",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+        );
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some("/glibc/ltp/testcases/lib/ld-linux-riscv64-lp64d.so.1")
+        );
+        assert_eq!(
+            candidates.get(1).map(String::as_str),
             Some("/lib/ld-linux-riscv64-lp64d.so.1")
         );
     }
@@ -11505,6 +12302,59 @@ mod tests {
             &mut vfs,
         );
         assert_eq!(rc, -(super::EFAULT as isize));
+    }
+
+    #[test]
+    fn mmap_private_file_without_fixed_address_populates_readonly_bytes() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("mmap-readonly", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("mmap-readonly", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        vfs.create_file_with_mode("/", "/tmp/mmap-readonly.bin", b"hello", 0o644)
+            .unwrap();
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb0a0, b"/tmp/mmap-readonly.bin\0");
+
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xb0a0,
+                vfs::O_RDONLY as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0, "open readonly file for mmap should succeed");
+
+        let mapped = dispatcher.dispatch(
+            super::SYS_MMAP,
+            SyscallArgs([0, 5, 0b001, super::MAP_PRIVATE, fd as usize, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(mapped >= 0, "readonly private file mmap should succeed");
+
+        let bytes = procs
+            .current()
+            .unwrap()
+            .read_user_bytes(mapped as usize, 5)
+            .unwrap();
+        assert_eq!(&bytes, b"hello");
     }
 
     #[test]

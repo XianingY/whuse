@@ -35,6 +35,9 @@ const ROBUST_HEAD_WORDS: usize = 3;
 const PROCESS_NAME_MAX_BYTES: usize = 256;
 const FORK_CLONE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 pub const MAX_OPEN_FDS: i32 = 256;
+const PRIO_PROCESS: i32 = 0;
+const PRIO_PGRP: i32 = 1;
+const PRIO_USER: i32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessState {
@@ -161,6 +164,8 @@ pub struct Process {
     pub egid: u32,
     pub groups: Vec<u32>,
     pub umask: u32,
+    scheduler_policy: usize,
+    scheduler_priority: i32,
     pub state: ProcessState,
     pub exit_code: Option<i32>,
     pub address_space: AddressSpace,
@@ -250,6 +255,8 @@ impl Process {
             egid: 0,
             groups: Vec::new(),
             umask: 0o022,
+            scheduler_policy: 0,
+            scheduler_priority: 0,
             state: ProcessState::Ready,
             exit_code: None,
             address_space,
@@ -528,6 +535,8 @@ impl Process {
             egid: self.egid,
             groups: self.groups.clone(),
             umask: self.umask,
+            scheduler_policy: self.scheduler_policy,
+            scheduler_priority: self.scheduler_priority,
             state: ProcessState::Ready,
             exit_code: None,
             address_space,
@@ -590,6 +599,8 @@ impl Process {
             egid: self.egid,
             groups: self.groups.clone(),
             umask: self.umask,
+            scheduler_policy: self.scheduler_policy,
+            scheduler_priority: self.scheduler_priority,
             state: ProcessState::Ready,
             exit_code: None,
             address_space,
@@ -663,6 +674,8 @@ impl Process {
             egid: self.egid,
             groups: self.groups.clone(),
             umask: self.umask,
+            scheduler_policy: self.scheduler_policy,
+            scheduler_priority: self.scheduler_priority,
             state: ProcessState::Ready,
             exit_code: None,
             address_space,
@@ -739,6 +752,23 @@ impl Process {
 
     pub fn clear_child_tid(&self) -> Option<usize> {
         self.clear_child_tid
+    }
+
+    pub fn scheduler_policy(&self) -> usize {
+        self.scheduler_policy
+    }
+
+    pub fn scheduler_priority(&self) -> i32 {
+        self.scheduler_priority
+    }
+
+    pub fn set_scheduler_policy(&mut self, policy: usize, priority: i32) {
+        self.scheduler_policy = policy;
+        self.scheduler_priority = priority;
+    }
+
+    pub fn set_scheduler_priority(&mut self, priority: i32) {
+        self.scheduler_priority = priority;
     }
 }
 
@@ -1173,6 +1203,155 @@ impl ProcessTable {
             process.pgid = pid;
         }
         Ok(pid)
+    }
+
+    pub fn scheduler_policy_of(&self, pid: usize) -> KernelResult<usize> {
+        if pid == 0 {
+            Ok(self.current()?.scheduler_policy())
+        } else {
+            Ok(self.find_process_by_pid(pid)?.scheduler_policy())
+        }
+    }
+
+    pub fn scheduler_priority_of(&self, pid: usize) -> KernelResult<i32> {
+        if pid == 0 {
+            Ok(self.current()?.scheduler_priority())
+        } else {
+            Ok(self.find_process_by_pid(pid)?.scheduler_priority())
+        }
+    }
+
+    pub fn set_scheduler_policy_of(
+        &mut self,
+        pid: usize,
+        policy: usize,
+        priority: i32,
+    ) -> KernelResult<()> {
+        let process = if pid == 0 {
+            self.current_mut()?
+        } else {
+            self.find_process_by_pid_mut(pid)?
+        };
+        process.set_scheduler_policy(policy, priority);
+        Ok(())
+    }
+
+    pub fn set_scheduler_priority_of(&mut self, pid: usize, priority: i32) -> KernelResult<()> {
+        let process = if pid == 0 {
+            self.current_mut()?
+        } else {
+            self.find_process_by_pid_mut(pid)?
+        };
+        process.set_scheduler_priority(priority);
+        Ok(())
+    }
+
+    pub fn getpriority(&self, which: i32, who: i32) -> KernelResult<i32> {
+        match which {
+            PRIO_PROCESS => {
+                let target = if who == 0 {
+                    self.current()?
+                } else {
+                    self.find_process_by_pid(who as usize)?
+                };
+                Ok(target.scheduler_priority())
+            }
+            PRIO_PGRP => {
+                let pgid = if who == 0 {
+                    self.current_pgid()?
+                } else if who < 0 {
+                    return Err(ESRCH);
+                } else {
+                    who as usize
+                };
+                self.processes
+                    .values()
+                    .filter(|process| {
+                        process.state != ProcessState::Exited && process.pgid == pgid
+                    })
+                    .map(|process| process.scheduler_priority())
+                    .min()
+                    .ok_or(ESRCH)
+            }
+            PRIO_USER => {
+                let uid = if who == 0 {
+                    self.current()?.uid as i32
+                } else {
+                    who
+                };
+                self.processes
+                    .values()
+                    .filter(|process| {
+                        process.state != ProcessState::Exited
+                            && ((process.uid as i32) == uid || (process.euid as i32) == uid)
+                    })
+                    .map(|process| process.scheduler_priority())
+                    .min()
+                    .ok_or(ESRCH)
+            }
+            _ => Err(EINVAL),
+        }
+    }
+
+    pub fn setpriority(&mut self, which: i32, who: i32, priority: i32) -> KernelResult<()> {
+        match which {
+            PRIO_PROCESS => {
+                let pid = if who == 0 {
+                    self.current_tgid()?
+                } else if who < 0 {
+                    return Err(ESRCH);
+                } else {
+                    who as usize
+                };
+                self.set_scheduler_priority_of(pid, priority)
+            }
+            PRIO_PGRP => {
+                let pgid = if who == 0 {
+                    self.current_pgid()?
+                } else if who < 0 {
+                    return Err(ESRCH);
+                } else {
+                    who as usize
+                };
+                let mut changed = false;
+                for process in self
+                    .processes
+                    .values_mut()
+                    .filter(|process| {
+                        process.state != ProcessState::Exited && process.pgid == pgid
+                    })
+                {
+                    process.set_scheduler_priority(priority);
+                    changed = true;
+                }
+                if changed {
+                    Ok(())
+                } else {
+                    Err(ESRCH)
+                }
+            }
+            PRIO_USER => {
+                let uid = if who == 0 {
+                    self.current()?.uid as i32
+                } else {
+                    who
+                };
+                let mut changed = false;
+                for process in self.processes.values_mut().filter(|process| {
+                    process.state != ProcessState::Exited
+                        && ((process.uid as i32) == uid || (process.euid as i32) == uid)
+                }) {
+                    process.set_scheduler_priority(priority);
+                    changed = true;
+                }
+                if changed {
+                    Ok(())
+                } else {
+                    Err(ESRCH)
+                }
+            }
+            _ => Err(EINVAL),
+        }
     }
 
     pub fn setuid_current(&mut self, uid: u32) -> KernelResult<()> {

@@ -3467,62 +3467,30 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
             OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH, err
         )),
     }
-    match vfs.create_file(
-        "/",
+    install_ltp_score_text_file(
+        vfs,
         OSCOMP_LTP_SCORE_WHITELIST_PATH,
-        OSCOMP_LTP_SCORE_WHITELIST.as_bytes(),
-    ) {
-        Ok(()) => logln(format_args!(
-            "whuse: installed ltp score whitelist {}",
-            OSCOMP_LTP_SCORE_WHITELIST_PATH
-        )),
-        Err(err) => logln(format_args!(
-            "whuse: failed ltp score whitelist {} err={}",
-            OSCOMP_LTP_SCORE_WHITELIST_PATH, err
-        )),
-    }
-    match vfs.create_file(
-        "/",
+        OSCOMP_LTP_SCORE_WHITELIST,
+        "ltp score whitelist",
+    );
+    install_ltp_score_text_file(
+        vfs,
         OSCOMP_LTP_SCORE_BLACKLIST_PATH,
-        OSCOMP_LTP_SCORE_BLACKLIST.as_bytes(),
-    ) {
-        Ok(()) => logln(format_args!(
-            "whuse: installed ltp score blacklist {}",
-            OSCOMP_LTP_SCORE_BLACKLIST_PATH
-        )),
-        Err(err) => logln(format_args!(
-            "whuse: failed ltp score blacklist {} err={}",
-            OSCOMP_LTP_SCORE_BLACKLIST_PATH, err
-        )),
-    }
-    match vfs.create_file(
-        "/",
+        OSCOMP_LTP_SCORE_BLACKLIST,
+        "ltp score blacklist",
+    );
+    install_ltp_score_text_file(
+        vfs,
         OSCOMP_LTP_SCORE_WHITELIST_GLIBC_PATH,
-        OSCOMP_LTP_SCORE_WHITELIST_GLIBC.as_bytes(),
-    ) {
-        Ok(()) => logln(format_args!(
-            "whuse: installed glibc ltp score whitelist {}",
-            OSCOMP_LTP_SCORE_WHITELIST_GLIBC_PATH
-        )),
-        Err(err) => logln(format_args!(
-            "whuse: failed glibc ltp score whitelist {} err={}",
-            OSCOMP_LTP_SCORE_WHITELIST_GLIBC_PATH, err
-        )),
-    }
-    match vfs.create_file(
-        "/",
+        OSCOMP_LTP_SCORE_WHITELIST_GLIBC,
+        "glibc ltp score whitelist",
+    );
+    install_ltp_score_text_file(
+        vfs,
         OSCOMP_LTP_SCORE_BLACKLIST_GLIBC_PATH,
-        OSCOMP_LTP_SCORE_BLACKLIST_GLIBC.as_bytes(),
-    ) {
-        Ok(()) => logln(format_args!(
-            "whuse: installed glibc ltp score blacklist {}",
-            OSCOMP_LTP_SCORE_BLACKLIST_GLIBC_PATH
-        )),
-        Err(err) => logln(format_args!(
-            "whuse: failed glibc ltp score blacklist {} err={}",
-            OSCOMP_LTP_SCORE_BLACKLIST_GLIBC_PATH, err
-        )),
-    }
+        OSCOMP_LTP_SCORE_BLACKLIST_GLIBC,
+        "glibc ltp score blacklist",
+    );
     for cfg_path in [
         OSCOMP_CFG_ONLY_STEP_PATH,
     ] {
@@ -3598,6 +3566,24 @@ fn install_fallback_symlink(vfs: &mut KernelVfs, path: &str, target: &str) {
         Err(err) => logln(format_args!(
             "whuse: failed fallback symlink {} -> {} err={}",
             path, target, err
+        )),
+    }
+}
+
+fn install_ltp_score_text_file(vfs: &mut KernelVfs, path: &str, fallback: &str, label: &str) {
+    let (payload, source) = match vfs.read_file_all("/", path) {
+        Ok(existing) if !existing.is_empty() => (existing, "image"),
+        _ => (fallback.as_bytes().to_vec(), "builtin"),
+    };
+    let _ = vfs.unlink("/", path);
+    match vfs.create_file("/", path, &payload) {
+        Ok(()) => logln(format_args!(
+            "whuse: installed {} {} source={}",
+            label, path, source
+        )),
+        Err(err) => logln(format_args!(
+            "whuse: failed {} {} err={}",
+            label, path, err
         )),
     }
 }

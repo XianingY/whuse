@@ -1,6 +1,6 @@
 use crate::{
-    DispatchContext, SyscallArgs, SYS_BRK, SYS_MADVISE, SYS_MLOCK, SYS_MLOCK2, SYS_MMAP,
-    SYS_MPROTECT, SYS_MREMAP, SYS_MSYNC, SYS_MUNMAP,
+    DispatchContext, SyscallArgs, SYS_BRK, SYS_MADVISE, SYS_MLOCK, SYS_MLOCK2, SYS_MLOCKALL,
+    SYS_MMAP, SYS_MPROTECT, SYS_MREMAP, SYS_MSYNC, SYS_MUNLOCKALL, SYS_MUNMAP,
 };
 
 pub(crate) fn dispatch(
@@ -16,6 +16,8 @@ pub(crate) fn dispatch(
         SYS_MPROTECT => ctx.dispatcher.sys_mprotect(args, ctx.procs),
         SYS_MSYNC => Ok(0),
         SYS_MLOCK | SYS_MLOCK2 => Ok(0),
+        SYS_MLOCKALL => ctx.dispatcher.sys_mlockall(args, ctx.procs),
+        SYS_MUNLOCKALL => ctx.dispatcher.sys_munlockall(ctx.procs),
         SYS_MADVISE => Ok(0),
         _ => return None,
     })

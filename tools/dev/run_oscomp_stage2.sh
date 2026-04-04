@@ -15,6 +15,12 @@ LTP_SCORE_WHITELIST_GLIBC_LA="${REPO_ROOT}/tools/oscomp/ltp/score_whitelist_glib
 LTP_SCORE_BLACKLIST_GLIBC_LA="${REPO_ROOT}/tools/oscomp/ltp/score_blacklist_glibc_la.txt"
 LTP_CURATED_WHITELIST_DEFAULT="${REPO_ROOT}/tools/oscomp/ltp/musl_rv_curated_whitelist.txt"
 LTP_CURATED_BLACKLIST_DEFAULT="${REPO_ROOT}/tools/oscomp/ltp/musl_rv_curated_blacklist.txt"
+LTP_CURATED_WHITELIST_GLIBC_RV="${REPO_ROOT}/tools/oscomp/ltp/curated_whitelist_glibc_rv.txt"
+LTP_CURATED_BLACKLIST_GLIBC_RV="${REPO_ROOT}/tools/oscomp/ltp/curated_blacklist_glibc_rv.txt"
+LTP_CURATED_WHITELIST_MUSL_LA="${REPO_ROOT}/tools/oscomp/ltp/curated_whitelist_musl_la.txt"
+LTP_CURATED_BLACKLIST_MUSL_LA="${REPO_ROOT}/tools/oscomp/ltp/curated_blacklist_musl_la.txt"
+LTP_CURATED_WHITELIST_GLIBC_LA="${REPO_ROOT}/tools/oscomp/ltp/curated_whitelist_glibc_la.txt"
+LTP_CURATED_BLACKLIST_GLIBC_LA="${REPO_ROOT}/tools/oscomp/ltp/curated_blacklist_glibc_la.txt"
 
 MODE="${1:-riscv}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-3600}"
@@ -54,6 +60,22 @@ export WHUSE_LTP_WHITELIST="${WHUSE_LTP_WHITELIST:-${LTP_SCORE_WHITELIST}}"
 export WHUSE_LTP_BLACKLIST="${WHUSE_LTP_BLACKLIST:-${LTP_SCORE_BLACKLIST}}"
 export WHUSE_LTP_CURATED_WHITELIST="${WHUSE_LTP_CURATED_WHITELIST:-${LTP_CURATED_WHITELIST_DEFAULT}}"
 export WHUSE_LTP_CURATED_BLACKLIST="${WHUSE_LTP_CURATED_BLACKLIST:-${LTP_CURATED_BLACKLIST_DEFAULT}}"
+export WHUSE_LTP_SCORE_WHITELIST_RV_MUSL="${WHUSE_LTP_SCORE_WHITELIST_RV_MUSL:-${WHUSE_LTP_WHITELIST}}"
+export WHUSE_LTP_SCORE_BLACKLIST_RV_MUSL="${WHUSE_LTP_SCORE_BLACKLIST_RV_MUSL:-${WHUSE_LTP_BLACKLIST}}"
+export WHUSE_LTP_SCORE_WHITELIST_RV_GLIBC="${WHUSE_LTP_SCORE_WHITELIST_RV_GLIBC:-${LTP_SCORE_WHITELIST_GLIBC_RV}}"
+export WHUSE_LTP_SCORE_BLACKLIST_RV_GLIBC="${WHUSE_LTP_SCORE_BLACKLIST_RV_GLIBC:-${LTP_SCORE_BLACKLIST_GLIBC_RV}}"
+export WHUSE_LTP_SCORE_WHITELIST_LA_MUSL="${WHUSE_LTP_SCORE_WHITELIST_LA_MUSL:-${LTP_SCORE_WHITELIST_MUSL_LA}}"
+export WHUSE_LTP_SCORE_BLACKLIST_LA_MUSL="${WHUSE_LTP_SCORE_BLACKLIST_LA_MUSL:-${LTP_SCORE_BLACKLIST_MUSL_LA}}"
+export WHUSE_LTP_SCORE_WHITELIST_LA_GLIBC="${WHUSE_LTP_SCORE_WHITELIST_LA_GLIBC:-${LTP_SCORE_WHITELIST_GLIBC_LA}}"
+export WHUSE_LTP_SCORE_BLACKLIST_LA_GLIBC="${WHUSE_LTP_SCORE_BLACKLIST_LA_GLIBC:-${LTP_SCORE_BLACKLIST_GLIBC_LA}}"
+export WHUSE_LTP_CURATED_WHITELIST_RV_MUSL="${WHUSE_LTP_CURATED_WHITELIST_RV_MUSL:-${WHUSE_LTP_CURATED_WHITELIST}}"
+export WHUSE_LTP_CURATED_BLACKLIST_RV_MUSL="${WHUSE_LTP_CURATED_BLACKLIST_RV_MUSL:-${WHUSE_LTP_CURATED_BLACKLIST}}"
+export WHUSE_LTP_CURATED_WHITELIST_RV_GLIBC="${WHUSE_LTP_CURATED_WHITELIST_RV_GLIBC:-${LTP_CURATED_WHITELIST_GLIBC_RV}}"
+export WHUSE_LTP_CURATED_BLACKLIST_RV_GLIBC="${WHUSE_LTP_CURATED_BLACKLIST_RV_GLIBC:-${LTP_CURATED_BLACKLIST_GLIBC_RV}}"
+export WHUSE_LTP_CURATED_WHITELIST_LA_MUSL="${WHUSE_LTP_CURATED_WHITELIST_LA_MUSL:-${LTP_CURATED_WHITELIST_MUSL_LA}}"
+export WHUSE_LTP_CURATED_BLACKLIST_LA_MUSL="${WHUSE_LTP_CURATED_BLACKLIST_LA_MUSL:-${LTP_CURATED_BLACKLIST_MUSL_LA}}"
+export WHUSE_LTP_CURATED_WHITELIST_LA_GLIBC="${WHUSE_LTP_CURATED_WHITELIST_LA_GLIBC:-${LTP_CURATED_WHITELIST_GLIBC_LA}}"
+export WHUSE_LTP_CURATED_BLACKLIST_LA_GLIBC="${WHUSE_LTP_CURATED_BLACKLIST_LA_GLIBC:-${LTP_CURATED_BLACKLIST_GLIBC_LA}}"
 export WHUSE_LTP_STEP_TIMEOUT="${WHUSE_LTP_STEP_TIMEOUT:-1800}"
 export WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT:-45}"
 export WHUSE_LTP_APPLY_CANDIDATES="${WHUSE_LTP_APPLY_CANDIDATES:-0}"
@@ -841,10 +863,10 @@ ltp_score_whitelist_for_target() {
     local arch="$1"
     local runtime="$2"
     case "${arch}:${runtime}" in
-    rv:musl) printf '%s\n' "${WHUSE_LTP_WHITELIST}" ;;
-    rv:glibc) printf '%s\n' "${LTP_SCORE_WHITELIST_GLIBC_RV}" ;;
-    la:musl) printf '%s\n' "${LTP_SCORE_WHITELIST_MUSL_LA}" ;;
-    la:glibc) printf '%s\n' "${LTP_SCORE_WHITELIST_GLIBC_LA}" ;;
+    rv:musl) printf '%s\n' "${WHUSE_LTP_SCORE_WHITELIST_RV_MUSL}" ;;
+    rv:glibc) printf '%s\n' "${WHUSE_LTP_SCORE_WHITELIST_RV_GLIBC}" ;;
+    la:musl) printf '%s\n' "${WHUSE_LTP_SCORE_WHITELIST_LA_MUSL}" ;;
+    la:glibc) printf '%s\n' "${WHUSE_LTP_SCORE_WHITELIST_LA_GLIBC}" ;;
     *)
         echo "unsupported ltp whitelist target: ${arch}:${runtime}" >&2
         return 1
@@ -856,15 +878,89 @@ ltp_score_blacklist_for_target() {
     local arch="$1"
     local runtime="$2"
     case "${arch}:${runtime}" in
-    rv:musl) printf '%s\n' "${WHUSE_LTP_BLACKLIST}" ;;
-    rv:glibc) printf '%s\n' "${LTP_SCORE_BLACKLIST_GLIBC_RV}" ;;
-    la:musl) printf '%s\n' "${LTP_SCORE_BLACKLIST_MUSL_LA}" ;;
-    la:glibc) printf '%s\n' "${LTP_SCORE_BLACKLIST_GLIBC_LA}" ;;
+    rv:musl) printf '%s\n' "${WHUSE_LTP_SCORE_BLACKLIST_RV_MUSL}" ;;
+    rv:glibc) printf '%s\n' "${WHUSE_LTP_SCORE_BLACKLIST_RV_GLIBC}" ;;
+    la:musl) printf '%s\n' "${WHUSE_LTP_SCORE_BLACKLIST_LA_MUSL}" ;;
+    la:glibc) printf '%s\n' "${WHUSE_LTP_SCORE_BLACKLIST_LA_GLIBC}" ;;
     *)
         echo "unsupported ltp blacklist target: ${arch}:${runtime}" >&2
         return 1
         ;;
     esac
+}
+
+ltp_curated_whitelist_for_target() {
+    local arch="$1"
+    local runtime="$2"
+    case "${arch}:${runtime}" in
+    rv:musl) printf '%s\n' "${WHUSE_LTP_CURATED_WHITELIST_RV_MUSL}" ;;
+    rv:glibc) printf '%s\n' "${WHUSE_LTP_CURATED_WHITELIST_RV_GLIBC}" ;;
+    la:musl) printf '%s\n' "${WHUSE_LTP_CURATED_WHITELIST_LA_MUSL}" ;;
+    la:glibc) printf '%s\n' "${WHUSE_LTP_CURATED_WHITELIST_LA_GLIBC}" ;;
+    *)
+        echo "unsupported ltp curated whitelist target: ${arch}:${runtime}" >&2
+        return 1
+        ;;
+    esac
+}
+
+ltp_curated_blacklist_for_target() {
+    local arch="$1"
+    local runtime="$2"
+    case "${arch}:${runtime}" in
+    rv:musl) printf '%s\n' "${WHUSE_LTP_CURATED_BLACKLIST_RV_MUSL}" ;;
+    rv:glibc) printf '%s\n' "${WHUSE_LTP_CURATED_BLACKLIST_RV_GLIBC}" ;;
+    la:musl) printf '%s\n' "${WHUSE_LTP_CURATED_BLACKLIST_LA_MUSL}" ;;
+    la:glibc) printf '%s\n' "${WHUSE_LTP_CURATED_BLACKLIST_LA_GLIBC}" ;;
+    *)
+        echo "unsupported ltp curated blacklist target: ${arch}:${runtime}" >&2
+        return 1
+        ;;
+    esac
+}
+
+ltp_whitelist_for_target_profile() {
+    local profile="$1"
+    local arch="$2"
+    local runtime="$3"
+    if [[ "${profile}" == "curated" ]]; then
+        ltp_curated_whitelist_for_target "${arch}" "${runtime}"
+    else
+        ltp_score_whitelist_for_target "${arch}" "${runtime}"
+    fi
+}
+
+ltp_blacklist_for_target_profile() {
+    local profile="$1"
+    local arch="$2"
+    local runtime="$3"
+    if [[ "${profile}" == "curated" ]]; then
+        ltp_curated_blacklist_for_target "${arch}" "${runtime}"
+    else
+        ltp_score_blacklist_for_target "${arch}" "${runtime}"
+    fi
+}
+
+is_protected_score_path() {
+    local path="$1"
+    local candidate
+    local protected_paths=(
+        "${WHUSE_LTP_SCORE_WHITELIST_RV_MUSL}"
+        "${WHUSE_LTP_SCORE_BLACKLIST_RV_MUSL}"
+        "${WHUSE_LTP_SCORE_WHITELIST_RV_GLIBC}"
+        "${WHUSE_LTP_SCORE_BLACKLIST_RV_GLIBC}"
+        "${WHUSE_LTP_SCORE_WHITELIST_LA_MUSL}"
+        "${WHUSE_LTP_SCORE_BLACKLIST_LA_MUSL}"
+        "${WHUSE_LTP_SCORE_WHITELIST_LA_GLIBC}"
+        "${WHUSE_LTP_SCORE_BLACKLIST_LA_GLIBC}"
+    )
+    for candidate in "${protected_paths[@]}"; do
+        [[ -n "${candidate}" ]] || continue
+        if [[ "${path}" == "$(canonicalize_path "${candidate}")" ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 resolve_ltp_mode_config() {
@@ -904,7 +1000,6 @@ apply_ltp_candidate_lists() {
     local bad_candidates="$3"
     local target_whitelist="$4"
     local target_blacklist="$5"
-    local score_whitelist_real score_blacklist_real
     local target_whitelist_real target_blacklist_real
 
     [[ "${WHUSE_LTP_APPLY_CANDIDATES}" == "1" ]] || return 0
@@ -914,16 +1009,14 @@ apply_ltp_candidate_lists() {
         return 1
     fi
 
-    score_whitelist_real="$(canonicalize_path "${LTP_SCORE_WHITELIST}")"
-    score_blacklist_real="$(canonicalize_path "${LTP_SCORE_BLACKLIST}")"
     target_whitelist_real="$(canonicalize_path "${target_whitelist}")"
     target_blacklist_real="$(canonicalize_path "${target_blacklist}")"
 
-    if [[ "${target_whitelist_real}" == "${score_whitelist_real}" ]]; then
+    if is_protected_score_path "${target_whitelist_real}"; then
         echo "[${label}] refusing to overwrite protected score whitelist: ${target_whitelist}" >&2
         return 1
     fi
-    if [[ "${target_blacklist_real}" == "${score_blacklist_real}" ]]; then
+    if is_protected_score_path "${target_blacklist_real}"; then
         echo "[${label}] refusing to overwrite protected score blacklist: ${target_blacklist}" >&2
         return 1
     fi
@@ -966,6 +1059,10 @@ inject_ltp_target_score_files() {
     local image="$2"
     local runtime whitelist_host blacklist_host
     local whitelist_image_path blacklist_image_path
+    local ltp_file_profile="${WHUSE_LTP_PROFILE}"
+    if [[ "${ltp_file_profile}" != "curated" ]]; then
+        ltp_file_profile="score"
+    fi
     write_runtime_image_config "${image}" "/musl/.whuse_ltp_profile" "${WHUSE_LTP_PROFILE}"
     if [[ -n "${WHUSE_LTP_STEP_TIMEOUT:-}" ]]; then
         write_runtime_image_config "${image}" "/musl/.whuse_ltp_step_timeout" "${WHUSE_LTP_STEP_TIMEOUT}"
@@ -974,8 +1071,8 @@ inject_ltp_target_score_files() {
         write_runtime_image_config "${image}" "/musl/.whuse_ltp_case_timeout" "${WHUSE_LTP_CASE_TIMEOUT}"
     fi
     for runtime in musl glibc; do
-        whitelist_host="$(ltp_score_whitelist_for_target "${arch}" "${runtime}")"
-        blacklist_host="$(ltp_score_blacklist_for_target "${arch}" "${runtime}")"
+        whitelist_host="$(ltp_whitelist_for_target_profile "${ltp_file_profile}" "${arch}" "${runtime}")"
+        blacklist_host="$(ltp_blacklist_for_target_profile "${ltp_file_profile}" "${arch}" "${runtime}")"
         if [[ -n "${whitelist_host}" && ! -f "${whitelist_host}" ]]; then
             echo "missing target ltp whitelist for ${arch}/${runtime}: ${whitelist_host}" >&2
             return 1
@@ -1009,6 +1106,7 @@ generate_ltp_candidate_lists() {
     local pass_out="$2"
     local bad_out="$3"
     local conf_out="${4:-}"
+    local label="${5:-ltp}"
     local pass_tmp bad_tmp conf_tmp summary_tmp
     pass_tmp="$(mktemp)"
     bad_tmp="$(mktemp)"
@@ -1080,11 +1178,11 @@ generate_ltp_candidate_lists() {
     if [[ -n "${conf_out}" ]]; then
         sort -u "${conf_tmp}" > "${conf_out}"
     fi
-    echo "[rv-ltp] class summary:"
+    echo "[${label}] class summary:"
     if [[ -s "${summary_tmp}" ]]; then
-        sort "${summary_tmp}" | sed 's/^/[rv-ltp] class-count /'
+        sort "${summary_tmp}" | sed "s/^/[${label}] class-count /"
     else
-        echo "[rv-ltp] class-count none"
+        echo "[${label}] class-count none"
     fi
     rm -f "${pass_tmp}" "${bad_tmp}" "${conf_tmp}" "${summary_tmp}"
 }
@@ -1288,24 +1386,31 @@ run_arch() {
         fi
     fi
 
-    if [[ "${arch}" == "rv" && "${effective_profile}" == "ltp" ]]; then
+    if [[ "${effective_profile}" == "ltp" ]]; then
         local pass_candidates
         local bad_candidates
         local conf_candidates
+        local candidate_label
+        local candidate_runtime="${WHUSE_OSCOMP_RUNTIME_FILTER}"
         local candidate_target_whitelist=""
         local candidate_target_blacklist=""
-        pass_candidates="/tmp/rv-ltp-generic-${WHUSE_LTP_PROFILE}-pass-candidates-${RUN_ID}.txt"
-        bad_candidates="/tmp/rv-ltp-generic-${WHUSE_LTP_PROFILE}-bad-candidates-${RUN_ID}.txt"
-        conf_candidates="/tmp/rv-ltp-generic-${WHUSE_LTP_PROFILE}-conf-candidates-${RUN_ID}.txt"
-        generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}" "${conf_candidates}"
+        candidate_label="${arch}-ltp-${candidate_runtime}-${WHUSE_LTP_PROFILE}"
+        pass_candidates="/tmp/${candidate_label}-pass-candidates-${RUN_ID}.txt"
+        bad_candidates="/tmp/${candidate_label}-bad-candidates-${RUN_ID}.txt"
+        conf_candidates="/tmp/${candidate_label}-conf-candidates-${RUN_ID}.txt"
+        generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}" "${conf_candidates}" "${candidate_label}"
         echo "[${arch}] pass-candidates: ${pass_candidates} ($(wc -l < "${pass_candidates}"))"
         echo "[${arch}] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
         echo "[${arch}] conf-candidates: ${conf_candidates} ($(wc -l < "${conf_candidates}"))"
         case "${WHUSE_LTP_PROFILE}" in
         full | curated)
-            candidate_target_whitelist="${WHUSE_LTP_CURATED_WHITELIST}"
-            candidate_target_blacklist="${WHUSE_LTP_CURATED_BLACKLIST}"
-            apply_ltp_candidate_lists "${arch}" "${pass_candidates}" "${bad_candidates}" "${candidate_target_whitelist}" "${candidate_target_blacklist}"
+            if [[ "${candidate_runtime}" == "both" ]]; then
+                echo "[${arch}] skip candidate apply: WHUSE_OSCOMP_RUNTIME_FILTER=both cannot map pass/bad to a single target curated file"
+            else
+                candidate_target_whitelist="$(ltp_curated_whitelist_for_target "${arch}" "${candidate_runtime}")"
+                candidate_target_blacklist="$(ltp_curated_blacklist_for_target "${arch}" "${candidate_runtime}")"
+                apply_ltp_candidate_lists "${candidate_label}" "${pass_candidates}" "${bad_candidates}" "${candidate_target_whitelist}" "${candidate_target_blacklist}"
+            fi
             ;;
         esac
     fi
@@ -1437,7 +1542,7 @@ run_ltp_riscv_mode() {
     pass_candidates="/tmp/rv-ltp-${mode}-pass-candidates-${TS}.txt"
     bad_candidates="/tmp/rv-ltp-${mode}-bad-candidates-${TS}.txt"
     conf_candidates="/tmp/rv-ltp-${mode}-conf-candidates-${TS}.txt"
-    generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}" "${conf_candidates}"
+    generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}" "${conf_candidates}" "${label}"
     echo "[${label}] pass-candidates: ${pass_candidates} ($(wc -l < "${pass_candidates}"))"
     echo "[${label}] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
     echo "[${label}] conf-candidates: ${conf_candidates} ($(wc -l < "${conf_candidates}"))"

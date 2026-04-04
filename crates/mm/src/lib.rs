@@ -24,6 +24,7 @@ const USER_HEAP_BASE: usize = 0x4000_0000;
 const USER_STACK_SIZE: usize = 0x80_000;
 const USER_STACK_TOP: usize = 0x7fff_f000;
 const USER_MMAP_BASE: usize = 0x5000_0000;
+const USER_MMAP_GUARD_GAP: usize = PAGE_SIZE * 512;
 const DEFAULT_PROT: usize = 0b11;
 const PAGE_SIZE: usize = 4096;
 const DEBUG_LARGE_SEGMENT_ALLOC: bool = false;
@@ -434,13 +435,18 @@ impl AddressSpace {
             let map_start = align_up(old_break, PAGE_SIZE);
             let map_end = align_up(requested_break, PAGE_SIZE);
             if map_end > map_start {
-                {
-                    let inner = self.inner.lock();
-                    if overlaps(&inner.mappings, map_start, map_end - map_start) {
-                        return Ok(old_break);
+                let mut page = map_start;
+                while page < map_end {
+                    let next = (page + PAGE_SIZE).min(map_end);
+                    let page_missing = {
+                        let inner = self.inner.lock();
+                        !overlaps(&inner.mappings, page, next - page)
+                    };
+                    if page_missing {
+                        self.map_fixed_bytes(page, &[], next - page, DEFAULT_PROT)?;
                     }
+                    page = next;
                 }
-                self.map_fixed_bytes(map_start, &[], map_end - map_start, DEFAULT_PROT)?;
             }
         } else if requested_break < old_break {
             let unmap_start = align_up(requested_break, PAGE_SIZE);
@@ -858,6 +864,13 @@ impl AddressSpace {
                 .highest_end
                 .max(interp.as_ref().map(|image| image.highest_end).unwrap_or(0))
                 .max(USER_HEAP_BASE);
+            if interp.is_some() {
+                // Reserve space for the dynamic loader and libc mmaps so brk/sbrk
+                // growth tests can expand without colliding with adjacent RX pages.
+                inner.next_mapping_base = inner
+                    .next_mapping_base
+                    .max(inner.program_break.saturating_add(USER_MMAP_GUARD_GAP));
+            }
         }
         let stack_top = USER_STACK_TOP;
         let stack_base = stack_top - USER_STACK_SIZE;
@@ -2269,6 +2282,32 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_elf_keeps_future_mmaps_away_from_brk() {
+        let aspace = AddressSpace::new_user();
+        let program = build_minimal_dynamic_elf(PAGE_SIZE, 0b101);
+        let interp = build_minimal_dynamic_elf(PAGE_SIZE * 3, 0b101);
+        let _loaded = aspace
+            .load_elf_images(
+                &program,
+                Some(&interp),
+                &[String::from("/bin/test")],
+                &[],
+                Some("/bin/test"),
+            )
+            .unwrap();
+
+        let brk_base = aspace.brk(None).unwrap();
+        let mmap_base = aspace.map_anonymous(PAGE_SIZE, 0b101).unwrap();
+
+        assert!(
+            mmap_base >= brk_base + super::USER_MMAP_GUARD_GAP,
+            "dynamic ELF should reserve a gap between brk and later mmaps: brk={:#x} mmap={:#x}",
+            brk_base,
+            mmap_base
+        );
+    }
+
+    #[test]
     fn brk_growth_does_not_unmap_existing_mmap_segment() {
         let aspace = AddressSpace::new_user();
         let initial_brk = aspace.brk(None).unwrap();
@@ -2295,6 +2334,38 @@ mod tests {
             "mmap segment must remain executable after rejected brk growth: {}",
             aspace.describe_addr(mmap_base)
         );
+    }
+
+    #[test]
+    fn brk_growth_after_heap_mprotect_can_reclaim_heap_vma() {
+        let aspace = AddressSpace::new_user();
+        let initial_brk = aspace.brk(None).unwrap();
+        let first_request = initial_brk + PAGE_SIZE * 2 - 1;
+
+        assert_eq!(aspace.brk(Some(first_request)).unwrap(), first_request);
+        aspace
+            .mprotect(initial_brk + PAGE_SIZE, PAGE_SIZE, 0b001)
+            .unwrap();
+
+        let second_request = first_request + PAGE_SIZE;
+        assert_eq!(aspace.brk(Some(second_request)).unwrap(), second_request);
+        assert_eq!(
+            aspace.read_bytes(second_request - 1, 1).unwrap(),
+            vec![0],
+            "heap growth after mprotect should still expose zeroed memory"
+        );
+    }
+
+    #[test]
+    fn brk_growth_can_extend_across_existing_heap_pages() {
+        let aspace = AddressSpace::new_user();
+        let initial_brk = aspace.brk(None).unwrap();
+        let first_request = initial_brk + PAGE_SIZE * 2 - 1;
+
+        assert_eq!(aspace.brk(Some(first_request)).unwrap(), first_request);
+
+        let second_request = first_request + PAGE_SIZE;
+        assert_eq!(aspace.brk(Some(second_request)).unwrap(), second_request);
     }
 
     #[test]

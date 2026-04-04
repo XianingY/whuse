@@ -254,3 +254,16 @@ writev01
 writev02
 writev05
 writev06
+kill13
+sighold02
+nanosleep01
+clock_nanosleep02
+bind02
+epoll_pwait04
+epoll_pwait05
+sendmmsg02
+bind05
+bind04
+accept02
+adjtimex03
+time-schedule

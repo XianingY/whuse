@@ -60,7 +60,8 @@ const PROC_MEMINFO: &[u8] = b"MemTotal:       1048576 kB\nMemFree:         52428
 const PROC_UPTIME: &[u8] = b"1.00 1.00\n";
 const PROC_STAT: &[u8] = b"cpu  1 0 1 1 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 1735689600\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n";
 const PROC_VERSION: &[u8] = b"Linux version 6.8.0-whuse (whuse@localdomain) #1 SMP PREEMPT\n";
-const PROC_SELF_STAT: &[u8] = b"1 (self) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 1 4096 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+// Keep utime nonzero so clock_gettime01's setup probe can observe CPU time.
+const PROC_SELF_STAT: &[u8] = b"1 (self) R 0 0 0 0 0 0 0 0 0 0 0 1 0 0 20 0 1 0 1 4096 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
 const PROC_SELF_MAPS: &[u8] = b"50000000-50080000 r-xp 00000000 00:00 0 /proc/self/exe\n";
 const EXT4_DIR_STAT_CACHE_MAX_SIZE: u64 = 512 * 1024;
 const PIPE_CAPACITY: usize = 16 * 4096;
@@ -1332,7 +1333,8 @@ impl KernelVfs {
         if size == 0 {
             return Ok(Vec::new());
         }
-        let mut out = Vec::with_capacity(size);
+        let mut out = Vec::new();
+        out.try_reserve_exact(size).map_err(|_| ENOMEM)?;
         while out.len() < size {
             let chunk_len = size - out.len();
             let chunk = self.read(&mut handle, chunk_len)?;
@@ -3117,7 +3119,7 @@ impl KernelObject for FileHandle {
                 let start = self.offset.min(buf.len());
                 let end = (start + len).min(buf.len());
                 self.offset = end;
-                Ok(buf[start..end].to_vec())
+                clone_slice_fallible(&buf[start..end])
             }
             NodeData::SparseFile(state) => {
                 let data = state.read_range(self.offset, len);
@@ -3129,7 +3131,7 @@ impl KernelObject for FileHandle {
                     let start = self.offset.min(cached.len());
                     let end = (start + len).min(cached.len());
                     self.offset = end;
-                    return Ok(cached[start..end].to_vec());
+                    return clone_slice_fallible(&cached[start..end]);
                 }
                 let trace_ext4_read =
                     stage2_openat_debug_enabled() && is_libctest_probe_path(self.path.as_str());
@@ -3175,7 +3177,8 @@ impl KernelObject for FileHandle {
                     return Err(EAGAIN);
                 }
                 let end = len.min(state.buf.len());
-                let mut out = Vec::with_capacity(end);
+                let mut out = Vec::new();
+                out.try_reserve_exact(end).map_err(|_| ENOMEM)?;
                 for _ in 0..end {
                     if let Some(byte) = state.buf.pop_front() {
                         out.push(byte);
@@ -3183,7 +3186,10 @@ impl KernelObject for FileHandle {
                 }
                 Ok(out)
             }
-            NodeData::Symlink(target) => Ok(target.as_bytes()[..target.len().min(len)].to_vec()),
+            NodeData::Symlink(target) => {
+                let end = target.len().min(len);
+                clone_slice_fallible(&target.as_bytes()[..end])
+            }
             NodeData::Event(counter) => {
                 if len < 8 {
                     return Err(EINVAL);
@@ -3216,10 +3222,16 @@ impl KernelObject for FileHandle {
             }
             NodeData::CharDevice => {
                 if self.path == "/dev/zero" {
-                    return Ok(alloc::vec![0; len]);
+                    let mut out = Vec::new();
+                    out.try_reserve_exact(len).map_err(|_| ENOMEM)?;
+                    out.resize(len, 0);
+                    return Ok(out);
                 }
                 if self.path == "/dev/random" || self.path == "/dev/urandom" {
-                    return Ok(alloc::vec![0u8; len]);
+                    let mut out = Vec::new();
+                    out.try_reserve_exact(len).map_err(|_| ENOMEM)?;
+                    out.resize(len, 0);
+                    return Ok(out);
                 }
                 Ok(Vec::new())
             }
@@ -3302,6 +3314,7 @@ impl KernelObject for FileHandle {
                     return Err(EAGAIN);
                 }
                 let write_len = available.min(data.len());
+                state.buf.try_reserve(write_len).map_err(|_| ENOMEM)?;
                 state.buf.extend(data[..write_len].iter().copied());
                 Ok(write_len)
             }
@@ -3593,6 +3606,16 @@ fn ensure_file_size(buf: &mut Vec<u8>, size: usize) -> KernelResult<()> {
     buf.try_reserve_exact(additional).map_err(|_| ENOMEM)?;
     buf.resize(size, 0);
     Ok(())
+}
+
+fn clone_slice_fallible(data: &[u8]) -> KernelResult<Vec<u8>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(data.len()).map_err(|_| ENOMEM)?;
+    out.extend_from_slice(data);
+    Ok(out)
 }
 
 fn open_wants_write(flags: u32) -> bool {

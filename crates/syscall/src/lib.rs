@@ -202,6 +202,10 @@ pub const SYS_NANOSLEEP: usize = 101;
 pub const SYS_GETITIMER: usize = 102;
 pub const SYS_SETITIMER: usize = 103;
 pub const SYS_CLOCK_GETRES: usize = 114;
+pub const SYS_SCHED_SETPARAM: usize = 118;
+pub const SYS_SCHED_SETSCHEDULER: usize = 119;
+pub const SYS_SCHED_GETSCHEDULER: usize = 120;
+pub const SYS_SCHED_GETPARAM: usize = 121;
 pub const SYS_SCHED_YIELD: usize = 124;
 pub const SYS_KILL: usize = 129;
 pub const SYS_TKILL: usize = 130;
@@ -215,6 +219,7 @@ pub const SYS_RT_SIGPROCMASK: usize = SYS_SIGPROCMASK;
 pub const SYS_RT_SIGPENDING: usize = 136;
 pub const SYS_RT_SIGTIMEDWAIT: usize = 137;
 pub const SYS_RT_SIGRETURN: usize = 139;
+pub const SYS_SETPRIORITY: usize = 140;
 pub const SYS_GETPRIORITY: usize = 141;
 pub const SYS_SETREGID: usize = 143;
 pub const SYS_SETREUID: usize = 145;
@@ -280,6 +285,8 @@ pub const SYS_MMAP: usize = 222;
 pub const SYS_MPROTECT: usize = 226;
 pub const SYS_MSYNC: usize = 227;
 pub const SYS_MLOCK: usize = 228;
+pub const SYS_MLOCKALL: usize = 230;
+pub const SYS_MUNLOCKALL: usize = 231;
 pub const SYS_MADVISE: usize = 233;
 pub const SYS_ACCEPT4: usize = 242;
 pub const SYS_WAIT: usize = 260;
@@ -2281,9 +2288,19 @@ impl SyscallDispatcher {
         scheduler: &mut Scheduler,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
+        const PIPE_SOCKET_WRITE_COPY_CHUNK: usize = 64 * 1024;
         let fd = args.0[0] as i32;
         let buf = args.0[1];
         let count = args.0[2];
+        let read_len = {
+            let process = procs.current()?;
+            let handle = process.fd(fd)?;
+            if vfs.is_pipe(handle) || vfs.is_socket(handle) {
+                count.min(PIPE_SOCKET_WRITE_COPY_CHUNK)
+            } else {
+                count
+            }
+        };
         let bootstrap_ltp = procs
             .current()
             .ok()
@@ -2298,7 +2315,7 @@ impl SyscallDispatcher {
             });
         let data = procs
             .current()?
-            .read_user_bytes(buf, count)
+            .read_user_bytes(buf, read_len)
             .map_err(|_| EFAULT)?;
         let result = {
             let process = procs.current_mut()?;
@@ -2374,6 +2391,83 @@ impl SyscallDispatcher {
 
     fn sys_sched_yield(&self, scheduler: &mut Scheduler) -> Result<usize, i32> {
         let _ = scheduler.yield_now();
+        Ok(0)
+    }
+
+    fn sys_sched_setscheduler(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        const SCHED_OTHER: usize = 0;
+        const SCHED_FIFO: usize = 1;
+        const SCHED_RR: usize = 2;
+        const SCHED_BATCH: usize = 3;
+        const SCHED_IDLE: usize = 5;
+        const SCHED_DEADLINE: usize = 6;
+
+        let pid = args.0[0];
+        let policy = args.0[1];
+        let param_ptr = args.0[2];
+        let priority = if param_ptr == 0 {
+            0
+        } else {
+            let bytes = procs
+                .current()?
+                .read_user_bytes(param_ptr, core::mem::size_of::<i32>())
+                .map_err(|_| EFAULT)?;
+            let mut raw = [0u8; 4];
+            raw.copy_from_slice(&bytes[..4]);
+            i32::from_le_bytes(raw)
+        };
+        match policy {
+            SCHED_OTHER => procs.set_scheduler_policy_of(pid, policy, 0)?,
+            SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => {
+                procs.set_scheduler_policy_of(pid, policy, priority)?
+            }
+            _ => return Err(EINVAL),
+        }
+        Ok(0)
+    }
+
+    fn sys_sched_getscheduler(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        Ok(procs.scheduler_policy_of(args.0[0])?)
+    }
+
+    fn sys_sched_setparam(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        let pid = args.0[0];
+        let param_ptr = args.0[1];
+        let bytes = procs
+            .current()?
+            .read_user_bytes(param_ptr, core::mem::size_of::<i32>())
+            .map_err(|_| EFAULT)?;
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&bytes[..4]);
+        let priority = i32::from_le_bytes(raw);
+        procs.set_scheduler_priority_of(pid, priority)?;
+        Ok(0)
+    }
+
+    fn sys_sched_getparam(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        let pid = args.0[0];
+        let param_ptr = args.0[1];
+        let priority = procs.scheduler_priority_of(pid)?;
+        procs
+            .current_mut()?
+            .write_user_bytes(param_ptr, &priority.to_le_bytes())
+            .map_err(|_| EFAULT)?;
         Ok(0)
     }
 
@@ -3924,6 +4018,12 @@ impl SyscallDispatcher {
         let addr = args.0[0];
         let len = args.0[1];
         let prot = args.0[2];
+        if len == 0 {
+            return Err(EINVAL);
+        }
+        if (addr & (PAGE_SIZE - 1)) != 0 {
+            return Err(EINVAL);
+        }
         let glibc_ltp = procs.current().ok().and_then(|process| {
             is_glibc_ltp_task(process.name.as_str()).then(|| {
                 (
@@ -6069,6 +6169,18 @@ impl SyscallDispatcher {
                         let _ = scheduler.block_current();
                         return Err(EAGAIN);
                     }
+                    if cancel_in_progress {
+                        let timeout_ptr = args.0[3];
+                        let deadline = if timeout_ptr == 0 {
+                            u64::MAX
+                        } else {
+                            now.saturating_add(read_timespec_ns(procs.current()?, timeout_ptr)?)
+                        };
+                        procs.enqueue_futex_waiter(uaddr, tid);
+                        let process = procs.current_mut()?;
+                        process.futex_wait_addr = Some(uaddr);
+                        process.futex_wait_deadline_ns = Some(deadline);
+                    }
                     return Err(EINTR);
                 }
                 let current = read_i32(procs.current()?, uaddr)?;
@@ -6136,6 +6248,9 @@ impl SyscallDispatcher {
                     ));
                 }
                 for tid in &woke {
+                    if let Ok(process) = procs.find_by_tid_mut(*tid) {
+                        process.cancellation_in_progress = false;
+                    }
                     let _ = scheduler.wake_task(*tid);
                 }
                 if libcbench_task && !woke.is_empty() && scheduler.ready_count() > 0 {
@@ -7277,8 +7392,45 @@ impl SyscallDispatcher {
         Ok(process.trap_frame.regs[10])
     }
 
-    fn sys_getpriority(&self) -> Result<usize, i32> {
-        Ok(20)
+    fn sys_setpriority(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        let which = args.0[0] as i32;
+        let who = args.0[1] as i32;
+        let priority = args.0[2] as i32;
+        procs.setpriority(which, who, priority)?;
+        Ok(0)
+    }
+
+    fn sys_getpriority(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        let which = args.0[0] as i32;
+        let who = args.0[1] as i32;
+        Ok(procs.getpriority(which, who)? as usize)
+    }
+
+    fn sys_mlockall(
+        &self,
+        args: SyscallArgs,
+        _procs: &mut ProcessTable,
+    ) -> Result<usize, i32> {
+        const MCL_CURRENT: usize = 1;
+        const MCL_FUTURE: usize = 2;
+        const MCL_ONFAULT: usize = 4;
+        let flags = args.0[0];
+        if flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
+            return Err(EINVAL);
+        }
+        Ok(0)
+    }
+
+    fn sys_munlockall(&self, _procs: &mut ProcessTable) -> Result<usize, i32> {
+        Ok(0)
     }
 
     fn sys_getsid(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
@@ -16895,6 +17047,159 @@ mod tests {
                 sysno
             );
         }
+    }
+
+    #[test]
+    fn sched_setscheduler_and_mlockall_roundtrip() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x2000, &[0; 4096]);
+        procs
+            .current_mut()
+            .unwrap()
+            .write_user_bytes(0x2000, &10i32.to_le_bytes())
+            .unwrap();
+
+        const SYS_SCHED_SETPARAM: usize = 118;
+        const SYS_SCHED_SETSCHEDULER: usize = 119;
+        const SYS_SCHED_GETSCHEDULER: usize = 120;
+        const SYS_SCHED_GETPARAM: usize = 121;
+        const SYS_SETPRIORITY: usize = 140;
+        const SYS_GETPRIORITY: usize = 141;
+        const SYS_MLOCKALL: usize = 230;
+        const SYS_MUNLOCKALL: usize = 231;
+        const PRIO_PROCESS: usize = 0;
+        const SCHED_FIFO: usize = 1;
+        const SCHED_OTHER: usize = 0;
+        const MCL_CURRENT: usize = 1;
+        const MCL_FUTURE: usize = 2;
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_SETSCHEDULER,
+                SyscallArgs([0, SCHED_FIFO, 0x2000, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_GETSCHEDULER,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            SCHED_FIFO as isize
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_GETPARAM,
+                SyscallArgs([0, 0x2000, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            procs.current().unwrap().read_user_bytes(0x2000, 4).unwrap(),
+            10i32.to_le_bytes()
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_SETPARAM,
+                SyscallArgs([0, 0x2000, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_GETSCHEDULER,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            SCHED_FIFO as isize
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SCHED_SETSCHEDULER,
+                SyscallArgs([0, SCHED_OTHER, 0x2000, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_GETPRIORITY,
+                SyscallArgs([PRIO_PROCESS, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SETPRIORITY,
+                SyscallArgs([PRIO_PROCESS, 0, 5, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_GETPRIORITY,
+                SyscallArgs([PRIO_PROCESS, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            5
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MLOCKALL,
+                SyscallArgs([MCL_CURRENT | MCL_FUTURE, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MUNLOCKALL,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
     }
 
     #[test]

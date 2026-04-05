@@ -1444,43 +1444,78 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    runtime=\"$1\"\n",
     "    timeout_s=\"$2\"\n",
     "    root=\"/$runtime\"\n",
+    "    basic_dir=\"./basic\"\n",
+    "    case_timeout_default=1\n",
+    "    if [ \"$WHUSE_OSCOMP_PROFILE\" = \"basic\" ]; then\n",
+    "        case_timeout_default=2\n",
+    "    fi\n",
+    "    basic_case_timeout=\"${WHUSE_BASIC_CASE_TIMEOUT:-$case_timeout_default}\"\n",
+    "    case \"$basic_case_timeout\" in\n",
+    "        ''|*[!0-9]*) basic_case_timeout=\"$case_timeout_default\" ;;\n",
+    "    esac\n",
+    "    basic_case_budget=\"${WHUSE_BASIC_CASE_BUDGET:-0}\"\n",
+    "    case \"$basic_case_budget\" in\n",
+    "        ''|*[!0-9]*) basic_case_budget=0 ;;\n",
+    "    esac\n",
+    "    tests=\"\n",
+    "brk\n",
+    "chdir\n",
+    "clone\n",
+    "close\n",
+    "dup2\n",
+    "dup\n",
+    "execve\n",
+    "exit\n",
+    "fork\n",
+    "fstat\n",
+    "getcwd\n",
+    "getdents\n",
+    "getpid\n",
+    "getppid\n",
+    "gettimeofday\n",
+    "mkdir_\n",
+    "mmap\n",
+    "mount\n",
+    "munmap\n",
+    "openat\n",
+    "open\n",
+    "pipe\n",
+    "read\n",
+    "sleep\n",
+    "times\n",
+    "umount\n",
+    "uname\n",
+    "unlink\n",
+    "wait\n",
+    "waitpid\n",
+    "write\n",
+    "yield\n",
+    "\"\n",
     "    echo \"#### OS COMP TEST GROUP START basic-$runtime ####\"\n",
     "    cd \"$root\" || return 1\n",
-    "    if [ \"$runtime\" = \"glibc\" ]; then\n",
-    "        echo \"Testing brk :\"\n",
+    "    rc=0\n",
+    "    executed=0\n",
+    "    for case_name in $tests; do\n",
+    "        if [ \"$basic_case_budget\" -gt 0 ] && [ \"$executed\" -ge \"$basic_case_budget\" ]; then\n",
+    "            echo whuse-oscomp-basic-case-budget-hit:${runtime}:$basic_case_budget\n",
+    "            break\n",
+    "        fi\n",
+    "        echo \"Testing $case_name :\"\n",
+    "        case_path=\"$basic_dir/$case_name\"\n",
     "        if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
-    "            /musl/busybox timeout \"$timeout_s\" ./basic/brk\n",
+    "            /musl/busybox timeout \"$basic_case_timeout\" \"$case_path\"\n",
     "        else\n",
-    "            ./basic/brk\n",
+    "            \"$case_path\"\n",
     "        fi\n",
-    "        rc=$?\n",
-    "    else\n",
-    "        echo \"Testing brk :\"\n",
-    "        if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
-    "            /musl/busybox timeout \"$timeout_s\" ./basic/brk\n",
-    "        else\n",
-    "            ./basic/brk\n",
+    "        case_rc=$?\n",
+    "        if [ \"$case_rc\" = \"124\" ]; then\n",
+    "            echo whuse-oscomp-basic-case-timeout:${runtime}:$case_name:$basic_case_timeout\n",
     "        fi\n",
-    "        rc=$?\n",
-    "        if [ \"$rc\" = \"0\" ]; then\n",
-    "            run_musl_sleep=1\n",
-    "            if [ \"${WHUSE_LOCAL_RUNTIME_FILTER:-both}\" = \"both\" ]; then\n",
-    "                # Keep dual-runtime basic deterministic: musl sleep currently triggers a child-side\n",
-    "                # trap path that can destabilize the immediately following glibc basic lane.\n",
-    "                run_musl_sleep=0\n",
-    "                echo whuse-oscomp-basic-note:musl/sleep:skip-when-glibc-enabled\n",
-    "            fi\n",
-    "            if [ \"$run_musl_sleep\" = \"1\" ]; then\n",
-    "                echo \"Testing sleep :\"\n",
-    "                if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
-    "                    /musl/busybox timeout \"$timeout_s\" ./basic/sleep\n",
-    "                else\n",
-    "                    ./basic/sleep\n",
-    "                fi\n",
-    "                rc=$?\n",
-    "            fi\n",
+    "        if [ \"$rc\" = \"0\" ] && [ \"$case_rc\" != \"0\" ]; then\n",
+    "            rc=\"$case_rc\"\n",
     "        fi\n",
-    "    fi\n",
+    "        executed=$((executed + 1))\n",
+    "    done\n",
     "    if [ \"$rc\" = \"127\" ] || [ \"$rc\" = \"126\" ]; then\n",
     "        if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
     "            /musl/busybox timeout \"$timeout_s\" /musl/busybox sh ./basic/run-all.sh\n",
@@ -4541,24 +4576,36 @@ mod tests {
     }
 
     #[test]
-    fn riscv_official_suite_runs_basic_testsuite_via_busybox_sh_run_all() {
+    fn riscv_official_suite_runs_basic_testsuite_via_dedicated_case_loop() {
         let script = render_oscomp_official_suite_script("full");
+        let helper_start = script
+            .find("run_basic_testsuite_runtime_entry() {\n")
+            .expect("basic helper should exist");
+        let helper_tail = &script[helper_start..];
+        let helper_end = helper_tail
+            .find("run_script_entry() {\n")
+            .expect("basic helper should end before run_script_entry");
+        let helper = &helper_tail[..helper_end];
 
         assert!(
             script.contains("run_basic_testsuite_runtime_entry()"),
             "RISC-V official suite should define a dedicated basic testsuite helper so full runs do not depend on the raw basic_testcode.sh shebang chain"
         );
         assert!(
-            script.contains("echo \"Testing brk :\""),
-            "RISC-V official suite should preserve the basic profile's visible Testing brk contract"
+            helper.contains("for case_name in $tests; do"),
+            "RISC-V basic helper should iterate an explicit case list instead of smoke-only brk execution"
         );
         assert!(
-            script.contains("./basic/brk"),
-            "RISC-V official suite should execute the basic brk binary from the runtime root"
+            helper.contains("Testing $case_name :"),
+            "RISC-V basic helper should preserve per-case Testing output"
         );
         assert!(
-            script.contains("./basic/sleep"),
-            "RISC-V official suite should keep the musl basic smoke path's sleep follow-up"
+            helper.contains("\nchdir\n") && helper.contains("\npipe\n") && helper.contains("\nwaitpid\n"),
+            "RISC-V basic helper should include the scorer-sensitive core basic cases"
+        );
+        assert!(
+            !helper.contains("whuse-oscomp-basic-note:musl/sleep:skip-when-glibc-enabled"),
+            "RISC-V basic helper should not hard-skip musl sleep in dual-runtime full mode"
         );
         assert!(
             script.contains("/musl/busybox sh ./basic/run-all.sh"),

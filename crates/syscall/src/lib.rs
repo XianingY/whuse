@@ -59,6 +59,7 @@ const FUTEX_WAIT_BITSET: usize = 9;
 const FUTEX_WAKE_BITSET: usize = 10;
 const ENOTTY: i32 = 25;
 const ENOSYS: i32 = 38;
+const ENODATA: i32 = 61;
 const ENAMETOOLONG: i32 = 36;
 const EROFS: i32 = 30;
 const EADDRNOTAVAIL: i32 = 99;
@@ -136,6 +137,7 @@ const TIMEX_TAI_OFF: usize = 160;
 const SIGCHLD: usize = 17;
 const UNIX_ABSTRACT_PREFIX: &str = "/__unix_abstract__/";
 
+pub const SYS_FGETXATTR: usize = 10;
 pub const SYS_EVENTFD2: usize = 19;
 pub const SYS_EPOLL_CREATE1: usize = 20;
 pub const SYS_EPOLL_CTL: usize = 21;
@@ -4346,12 +4348,14 @@ impl SyscallDispatcher {
         let oldfd = args.0[0] as i32;
         let newfd = args.0[1] as i32;
         let flags = args.0[2];
+        if (flags & !O_CLOEXEC) != 0 {
+            return Err(EINVAL);
+        }
         if newfd < 0 || newfd >= procs.current()?.nofile_limit_soft() {
             return Err(EBADF);
         }
         if oldfd == newfd {
-            let _ = procs.current()?.fd(oldfd)?;
-            return Ok(newfd as usize);
+            return Err(EINVAL);
         }
         let mut handle = procs.current()?.fd(oldfd)?.clone();
         handle.flags = with_cloexec_flag(handle.flags, (flags & O_CLOEXEC) != 0);
@@ -6852,8 +6856,11 @@ impl SyscallDispatcher {
     }
 
     fn sys_fsync(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
-        let _ = procs.current()?.fd(args.0[0] as i32)?;
-        Ok(0)
+        let handle = procs.current()?.fd(args.0[0] as i32)?;
+        match handle.object_kind() {
+            ObjectKind::Regular | ObjectKind::MemFd => Ok(0),
+            _ => Err(EINVAL),
+        }
     }
 
     fn sys_fstatfs(
@@ -6907,6 +6914,9 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let mode = args.0[1] as u32;
         let handle = procs.current()?.fd(args.0[0] as i32)?.clone();
+        if (handle.flags & (O_PATH as u32)) != 0 {
+            return Err(EBADF);
+        }
         vfs.chmod_handle(&handle, mode)?;
         Ok(0)
     }
@@ -6925,20 +6935,29 @@ impl SyscallDispatcher {
         }
         let path = read_at_path_allow_empty(procs.current()?, args.0[1], flags)?;
         let mode = args.0[2] as u32;
-        if path.is_empty() && (flags & AT_EMPTY_PATH_FLAG) != 0 {
-            if dirfd == AT_FDCWD {
-                return Ok(0);
-            }
-            let handle = procs.current()?.fd(dirfd)?.clone();
-            return vfs.chmod_handle(&handle, mode).map(|_| 0);
-        }
         if path.is_empty() {
+            if dirfd != AT_FDCWD {
+                let handle = procs.current()?.fd(dirfd)?.clone();
+                if (handle.flags & (O_PATH as u32)) != 0 {
+                    return Err(EBADF);
+                }
+                if (flags & AT_EMPTY_PATH_FLAG) != 0 {
+                    return vfs.chmod_handle(&handle, mode).map(|_| 0);
+                }
+            }
             return Err(ENOENT);
         }
         if path_is_too_long(path.as_str()) {
             return Err(ENAMETOOLONG);
         }
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
+        let absolute = vfs.absolute_path(&cwd, &path);
+        if let Some(proc_fd) = parse_proc_self_fd_path(absolute.as_str()) {
+            let probe_handle = procs.current()?.fd(proc_fd).map_err(|_| ENOENT)?;
+            if (probe_handle.flags & (O_PATH as u32)) != 0 {
+                return Err(EBADF);
+            }
+        }
         vfs.chmod_path(&cwd, &path, mode)?;
         Ok(0)
     }
@@ -6959,20 +6978,60 @@ impl SyscallDispatcher {
         let path = read_at_path_allow_empty(procs.current()?, path_ptr, flags)?;
         let owner = parse_optional_uid(args.0[2]);
         let group = parse_optional_uid(args.0[3]);
-        if path.is_empty() && (flags & AT_EMPTY_PATH_FLAG) != 0 {
-            if dirfd == AT_FDCWD {
-                return Ok(0);
+        if path.is_empty() {
+            if dirfd != AT_FDCWD {
+                let handle = procs.current()?.fd(dirfd)?.clone();
+                if (handle.flags & (O_PATH as u32)) != 0 {
+                    return Err(EBADF);
+                }
+                if (flags & AT_EMPTY_PATH_FLAG) != 0 {
+                    if (vfs.mount_flags_for_path("/", &handle.path) & (MS_RDONLY as u32)) != 0 {
+                        return Err(EROFS);
+                    }
+                    if procs.current()?.euid != 0 {
+                        return Err(EPERM);
+                    }
+                    return vfs.chown_handle(&handle, owner, group).map(|_| 0);
+                }
             }
-            let handle = procs.current()?.fd(dirfd)?.clone();
-            return vfs.chown_handle(&handle, owner, group).map(|_| 0);
+            return Err(ENOENT);
+        }
+        if path_is_too_long(path.as_str()) {
+            return Err(ENAMETOOLONG);
         }
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
+        let absolute = vfs.absolute_path(&cwd, &path);
+        if let Some(proc_fd) = parse_proc_self_fd_path(absolute.as_str()) {
+            let probe_handle = procs.current()?.fd(proc_fd).map_err(|_| ENOENT)?;
+            if (probe_handle.flags & (O_PATH as u32)) != 0 {
+                return Err(EBADF);
+            }
+        }
+        let (uid, gid, euid) = {
+            let process = procs.current()?;
+            (process.euid, process.egid, process.euid)
+        };
+        let parent_stat = vfs.stat_path("/", absolute_parent_path(&absolute)?)?;
+        if !access_mode_allowed(uid, gid, parent_stat, X_OK) {
+            return Err(EACCES);
+        }
+        if (flags & AT_SYMLINK_NOFOLLOW_FLAG) != 0 {
+            let _ = vfs.stat_path_nofollow("/", &absolute)?;
+        } else {
+            let _ = vfs.stat_path("/", &absolute)?;
+        }
+        if (vfs.mount_flags_for_path(&cwd, &path) & (MS_RDONLY as u32)) != 0 {
+            return Err(EROFS);
+        }
+        if euid != 0 {
+            return Err(EPERM);
+        }
         log_ltp_path_debug(
             procs.current()?,
             "fchownat",
             &format!(
-                "dirfd={} path={} resolved_cwd={} owner={:?} group={:?} flags={:#x}",
-                dirfd, path, cwd, owner, group, flags
+                "dirfd={} path={} resolved_cwd={} absolute={} owner={:?} group={:?} flags={:#x}",
+                dirfd, path, cwd, absolute, owner, group, flags
             ),
         );
         if (flags & AT_SYMLINK_NOFOLLOW_FLAG) != 0 {
@@ -6983,11 +7042,51 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
-    fn sys_fchown(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
-        let _owner = args.0[1];
-        let _group = args.0[2];
-        let _ = procs.current()?.fd(args.0[0] as i32)?;
+    fn sys_fchown(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        vfs: &mut KernelVfs,
+    ) -> Result<usize, i32> {
+        let owner = parse_optional_uid(args.0[1]);
+        let group = parse_optional_uid(args.0[2]);
+        let (euid, handle) = {
+            let process = procs.current()?;
+            (process.euid, process.fd(args.0[0] as i32)?.clone())
+        };
+        if (handle.flags & (O_PATH as u32)) != 0 {
+            return Err(EBADF);
+        }
+        if (vfs.mount_flags_for_path("/", &handle.path) & (MS_RDONLY as u32)) != 0 {
+            return Err(EROFS);
+        }
+        if euid != 0 {
+            return Err(EPERM);
+        }
+        vfs.chown_handle(&handle, owner, group)?;
         Ok(0)
+    }
+
+    fn sys_fgetxattr(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
+        let fd = args.0[0] as i32;
+        let name_ptr = args.0[1];
+        let value_ptr = args.0[2];
+        let size = args.0[3];
+        if name_ptr == 0 {
+            return Err(EFAULT);
+        }
+        let _ = procs.current()?.read_user_cstr(name_ptr).map_err(|_| EFAULT)?;
+        let handle = procs.current()?.fd(fd)?;
+        if (handle.flags & (O_PATH as u32)) != 0 {
+            return Err(EBADF);
+        }
+        if size == 0 {
+            return Ok(0);
+        }
+        if value_ptr == 0 {
+            return Err(EFAULT);
+        }
+        Err(ENODATA)
     }
 
     fn sys_utimensat(
@@ -8844,6 +8943,15 @@ fn absolute_parent_path(path: &str) -> Result<&str, i32> {
     }
 }
 
+fn parse_proc_self_fd_path(path: &str) -> Option<i32> {
+    let suffix = path.strip_prefix("/proc/self/fd/")?;
+    if suffix.is_empty() || suffix.contains('/') {
+        return None;
+    }
+    let fd = suffix.parse::<i32>().ok()?;
+    (fd >= 0).then_some(fd)
+}
+
 fn timespec_to_bytes(ts: Timespec) -> [u8; 16] {
     let mut out = [0u8; 16];
     out[..8].copy_from_slice(&ts.tv_sec.to_le_bytes());
@@ -9765,11 +9873,11 @@ fn open_existing_directory_should_fail(flags: u32) -> bool {
 }
 
 fn fd_is_readable(flags: u32) -> bool {
-    (flags & 0b11) != O_WRONLY
+    (flags & (O_PATH as u32)) == 0 && (flags & 0b11) != O_WRONLY
 }
 
 fn fd_is_writable(flags: u32) -> bool {
-    (flags & 0b11) != O_RDONLY
+    (flags & (O_PATH as u32)) == 0 && (flags & 0b11) != O_RDONLY
 }
 
 fn ensure_positional_read_fd(handle: &FileHandle, vfs: &KernelVfs) -> Result<(), i32> {
@@ -10732,6 +10840,94 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[132..136].try_into().unwrap()), 7);
         assert_eq!(u32::from_le_bytes(bytes[136..140].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(bytes[140..144].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn fsync_rejects_pipe_socket_and_fifo_like_ltp_fsync03() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        if let Err(err) = vfs.mkdir("/", "/tmp", 0o777) {
+            assert_eq!(err, super::EEXIST);
+        }
+
+        let (pipe_read, pipe_write) = vfs.create_pipe().unwrap();
+        let pipe_read_fd = procs.current_mut().unwrap().add_fd(pipe_read).unwrap();
+        let pipe_write_fd = procs.current_mut().unwrap().add_fd(pipe_write).unwrap();
+
+        let socket_fd = procs
+            .current_mut()
+            .unwrap()
+            .add_fd(vfs.create_socket(1, 1, 0).unwrap())
+            .unwrap();
+
+        vfs.mknodat_with_owner("/", "/tmp/fsync03-fifo", 0o010000 | 0o644, 0, 0)
+            .unwrap();
+        let fifo_read = vfs
+            .open("/", "/tmp/fsync03-fifo", vfs::O_RDONLY | vfs::O_NONBLOCK, 0)
+            .unwrap();
+        let _fifo_read_fd = procs.current_mut().unwrap().add_fd(fifo_read).unwrap();
+        let fifo_write = vfs.open("/", "/tmp/fsync03-fifo", vfs::O_WRONLY, 0).unwrap();
+        let fifo_write_fd = procs.current_mut().unwrap().add_fd(fifo_write).unwrap();
+        procs.current_mut().unwrap().close_fd(pipe_read_fd).unwrap();
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSYNC,
+                SyscallArgs([pipe_write_fd as usize, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINVAL as isize)
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSYNC,
+                SyscallArgs([socket_fd as usize, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINVAL as isize)
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSYNC,
+                SyscallArgs([pipe_read_fd as usize, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EBADF as isize)
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSYNC,
+                SyscallArgs([usize::MAX, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EBADF as isize)
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSYNC,
+                SyscallArgs([fifo_write_fd as usize, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINVAL as isize)
+        );
     }
 
     #[test]
@@ -12912,6 +13108,110 @@ mod tests {
     }
 
     #[test]
+    fn dup3_rejects_same_oldfd_newfd_with_einval() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("dup3_02_samefd", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("dup3_02_samefd", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let (read_end, write_end) = vfs.create_pipe().unwrap();
+        let read_fd = procs.current_mut().unwrap().add_fd(read_end).unwrap();
+        let _write_fd = procs.current_mut().unwrap().add_fd(write_end).unwrap();
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_DUP3,
+                SyscallArgs([read_fd as usize, read_fd as usize, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EINVAL as isize)
+        );
+    }
+
+    #[test]
+    fn dup3_rejects_unknown_flags_with_einval() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("dup3_02_flags", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("dup3_02_flags", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let (read_end, write_end) = vfs.create_pipe().unwrap();
+        let read_fd = procs.current_mut().unwrap().add_fd(read_end).unwrap();
+        let _write_fd = procs.current_mut().unwrap().add_fd(write_end).unwrap();
+        let target_fd = (read_fd + 10) as usize;
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_DUP3,
+                SyscallArgs([
+                    read_fd as usize,
+                    target_fd,
+                    super::O_NONBLOCK,
+                    0,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EINVAL as isize)
+        );
+    }
+
+    #[test]
+    fn dup3_accepts_o_cloexec_and_sets_fd_flag() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("dup3_cloexec", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("dup3_cloexec", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let (read_end, write_end) = vfs.create_pipe().unwrap();
+        let read_fd = procs.current_mut().unwrap().add_fd(read_end).unwrap();
+        let _write_fd = procs.current_mut().unwrap().add_fd(write_end).unwrap();
+        let target_fd = (read_fd + 11) as usize;
+        const F_GETFD: usize = 1;
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_DUP3,
+                SyscallArgs([read_fd as usize, target_fd, super::O_CLOEXEC, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            target_fd as isize
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FCNTL,
+                SyscallArgs([target_fd, F_GETFD, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            1
+        );
+    }
+
+    #[test]
     fn pipe_fcntl_setpipe_sz_updates_capacity() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
@@ -14774,6 +15074,524 @@ mod tests {
         let target_stat = vfs.stat_path("/", "/tmp/fchownat-link").unwrap();
         assert_eq!((link_stat.uid, link_stat.gid), (1000, 1000));
         assert_eq!((target_stat.uid, target_stat.gid), (0, 0));
+    }
+
+    #[test]
+    fn fchownat_empty_path_without_at_empty_path_returns_enoent() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("fchownat02", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("fchownat02", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd320, b"\0");
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FCHOWNAT,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xd320,
+                    1000,
+                    1000,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::ENOENT as isize)
+        );
+    }
+
+    #[test]
+    fn fchmodat_empty_path_without_at_empty_path_on_opath_returns_ebadf() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("open13", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("open13", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd330, b"/tmp\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd370, b"/tmp/open13-fchmodat\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd3b0, b"\0");
+        let mkdir_rc = dispatcher.dispatch(
+            SYS_MKDIR,
+            SyscallArgs([0xd330, 0o777, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(mkdir_rc == 0 || mkdir_rc == -(super::EEXIST as isize));
+        assert!(
+            dispatcher.dispatch(
+                SYS_OPENAT,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xd370,
+                    (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                    0o644,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ) >= 0
+        );
+        let opath_fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xd370,
+                ((super::O_PATH as u32) | vfs::O_RDWR) as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(opath_fd >= 0);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FCHMODAT,
+                SyscallArgs([opath_fd as usize, 0xd3b0, 0o644, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EBADF as isize)
+        );
+    }
+
+    #[test]
+    fn fchownat_empty_path_without_at_empty_path_on_opath_returns_ebadf() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("open13", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("open13", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd3d0, b"/tmp\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd410, b"/tmp/open13-fchownat\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd450, b"\0");
+        let mkdir_rc = dispatcher.dispatch(
+            SYS_MKDIR,
+            SyscallArgs([0xd3d0, 0o777, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(mkdir_rc == 0 || mkdir_rc == -(super::EEXIST as isize));
+        assert!(
+            dispatcher.dispatch(
+                SYS_OPENAT,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xd410,
+                    (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                    0o644,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ) >= 0
+        );
+        let opath_fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xd410,
+                ((super::O_PATH as u32) | vfs::O_RDWR) as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(opath_fd >= 0);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FCHOWNAT,
+                SyscallArgs([opath_fd as usize, 0xd450, 1000, 1000, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EBADF as isize)
+        );
+    }
+
+    #[test]
+    fn fchmodat_proc_self_fd_path_rejects_opath_descriptor_with_ebadf() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("open13", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("open13", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd490, b"/tmp\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd4d0, b"/tmp/open13-fchmodat-proc\0");
+        let mkdir_rc = dispatcher.dispatch(
+            SYS_MKDIR,
+            SyscallArgs([0xd490, 0o777, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(mkdir_rc == 0 || mkdir_rc == -(super::EEXIST as isize));
+        assert!(
+            dispatcher.dispatch(
+                SYS_OPENAT,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xd4d0,
+                    (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                    0o644,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ) >= 0
+        );
+        let opath_fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xd4d0,
+                ((super::O_PATH as u32) | vfs::O_RDWR) as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(opath_fd >= 0);
+
+        let proc_path = format!("/proc/self/fd/{}\0", opath_fd);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd520, proc_path.as_bytes());
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FCHMODAT,
+                SyscallArgs([super::AT_FDCWD as usize, 0xd520, 0o666, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EBADF as isize)
+        );
+    }
+
+    #[test]
+    fn fchownat_proc_self_fd_path_rejects_opath_descriptor_with_ebadf() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("open13", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("open13", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd560, b"/tmp\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd5a0, b"/tmp/open13-fchownat-proc\0");
+        let mkdir_rc = dispatcher.dispatch(
+            SYS_MKDIR,
+            SyscallArgs([0xd560, 0o777, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(mkdir_rc == 0 || mkdir_rc == -(super::EEXIST as isize));
+        assert!(
+            dispatcher.dispatch(
+                SYS_OPENAT,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xd5a0,
+                    (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                    0o644,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ) >= 0
+        );
+        let opath_fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xd5a0,
+                ((super::O_PATH as u32) | vfs::O_RDWR) as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(opath_fd >= 0);
+
+        let proc_path = format!("/proc/self/fd/{}\0", opath_fd);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd5e0, proc_path.as_bytes());
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FCHOWNAT,
+                SyscallArgs([super::AT_FDCWD as usize, 0xd5e0, 1000, 1000, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EBADF as isize)
+        );
+    }
+
+    #[test]
+    fn fchown_rejects_opath_descriptor_with_ebadf() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("open13", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("open13", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd360, b"/tmp\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd3a0, b"/tmp/open13-fchown\0");
+        let mkdir_rc = dispatcher.dispatch(
+            SYS_MKDIR,
+            SyscallArgs([0xd360, 0o777, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(mkdir_rc == 0 || mkdir_rc == -(super::EEXIST as isize));
+        assert!(
+            dispatcher.dispatch(
+                SYS_OPENAT,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xd3a0,
+                    (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                    0o644,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ) >= 0
+        );
+        let opath_fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xd3a0,
+                ((super::O_PATH as u32) | vfs::O_RDWR) as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(opath_fd >= 0);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FCHOWN,
+                SyscallArgs([opath_fd as usize, 1000, 1000, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EBADF as isize)
+        );
+    }
+
+    #[test]
+    fn read_write_reject_opath_descriptor_even_with_rdwr_bits() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("open13", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("open13", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd3e0, b"/tmp\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd420, b"/tmp/open13-rw\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xd460, b"abc\0");
+        let mkdir_rc = dispatcher.dispatch(
+            SYS_MKDIR,
+            SyscallArgs([0xd3e0, 0o777, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(mkdir_rc == 0 || mkdir_rc == -(super::EEXIST as isize));
+        assert!(
+            dispatcher.dispatch(
+                SYS_OPENAT,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xd420,
+                    (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                    0o644,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ) >= 0
+        );
+        let opath_fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xd420,
+                ((super::O_PATH as u32) | vfs::O_RDWR) as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(opath_fd >= 0);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_READ,
+                SyscallArgs([opath_fd as usize, 0xd460, 3, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EBADF as isize)
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_WRITE,
+                SyscallArgs([opath_fd as usize, 0xd460, 3, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EBADF as isize)
+        );
     }
 
     #[test]

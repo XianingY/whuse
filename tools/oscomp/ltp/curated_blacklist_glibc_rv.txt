@@ -26,7 +26,6 @@ fcntl17_64
 fcntl19
 fcntl22
 fcntl22_64
-fsync03
 ftruncate04_64
 msgctl12
 msgget02

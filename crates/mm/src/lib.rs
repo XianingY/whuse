@@ -1512,10 +1512,16 @@ fn riscv_make_table_pte(paddr: usize) -> u64 {
 }
 
 fn riscv_segment_pte_flags(prot: usize) -> u64 {
-    let mut flags = RISCV_PTE_U | RISCV_PTE_A | RISCV_PTE_D;
+    let mut flags = RISCV_PTE_A | RISCV_PTE_D;
     let mut read = prot & 0b001 != 0;
     let write = prot & 0b010 != 0;
     let exec = prot & 0b100 != 0;
+    if !read && !write && !exec {
+        // Preserve a present mapping for PROT_NONE but keep it inaccessible
+        // to user mode by clearing U.
+        return flags | RISCV_PTE_R | RISCV_PTE_W;
+    }
+    flags |= RISCV_PTE_U;
     // RISC-V leaf PTEs do not allow execute-only encodings (R=0,W=0,X=1).
     // Align with Linux-style mappings: executable pages are at least readable.
     if exec {
@@ -1529,9 +1535,6 @@ fn riscv_segment_pte_flags(prot: usize) -> u64 {
     }
     if exec {
         flags |= RISCV_PTE_X;
-    }
-    if flags & (RISCV_PTE_R | RISCV_PTE_W | RISCV_PTE_X) == 0 {
-        flags |= RISCV_PTE_R | RISCV_PTE_W;
     }
     flags
 }
@@ -1552,12 +1555,13 @@ fn loong_segment_pte_flags(prot: usize) -> u64 {
     let mut read = prot & 0b001 != 0;
     let write = prot & 0b010 != 0;
     let exec = prot & 0b100 != 0;
+    if !read && !write && !exec {
+        // Keep the mapping present but supervisor-only for PROT_NONE.
+        return loong_pte_flags(true, false, false, false, false);
+    }
     // Keep user mappings permissive enough for toolchains that request
     // write-only or execute-only pages during loader transitions.
     if write || exec {
-        read = true;
-    }
-    if !read && !write && !exec {
         read = true;
     }
     loong_pte_flags(read, write, exec, true, false)
@@ -2456,6 +2460,22 @@ mod tests {
         let l0_phys = ((l1[vpn1] >> 10) as usize) << 12;
         let l0 = builder.table_mut(l0_phys);
         l0[vpn0]
+    }
+
+    #[test]
+    fn prot_none_riscv_leaf_is_present_but_not_user_accessible() {
+        let flags = riscv_segment_pte_flags(0);
+        assert_eq!(flags & super::RISCV_PTE_U, 0);
+        assert_ne!(flags & super::RISCV_PTE_R, 0);
+        assert_ne!(flags & super::RISCV_PTE_W, 0);
+    }
+
+    #[test]
+    fn prot_none_loong_leaf_is_present_but_not_user_accessible() {
+        let flags = loong_segment_pte_flags(0);
+        assert_eq!(flags & (super::LA_PTE_PLVL | super::LA_PTE_PLVH), 0);
+        assert_eq!(flags & super::LA_PTE_NR, 0);
+        assert_ne!(flags & super::LA_PTE_NX, 0);
     }
 
     #[test]

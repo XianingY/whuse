@@ -30,6 +30,13 @@ assert_not_contains() {
     fi
 }
 
+assert_has_case_entry() {
+    local path="$1"
+    if ! grep -Eq '^[[:space:]]*[^#[:space:]]' "${path}"; then
+        fail "expected ${path} to contain at least one case entry"
+    fi
+}
+
 assert_function_contains() {
     local path="$1"
     local function_name="$2"
@@ -104,6 +111,10 @@ assert_file_exists "${LTP_DIR}/curated_whitelist_musl_la.txt"
 assert_file_exists "${LTP_DIR}/curated_blacklist_musl_la.txt"
 assert_file_exists "${LTP_DIR}/curated_whitelist_glibc_la.txt"
 assert_file_exists "${LTP_DIR}/curated_blacklist_glibc_la.txt"
+assert_file_exists "${LTP_DIR}/pending_whitelist_rv_musl.txt"
+assert_file_exists "${LTP_DIR}/pending_blacklist_rv_musl.txt"
+assert_file_exists "${LTP_DIR}/pending_whitelist_glibc_rv.txt"
+assert_file_exists "${LTP_DIR}/pending_blacklist_glibc_rv.txt"
 assert_file_exists "${LTP_DIR}/musl_rv_batch_file_syscalls.txt"
 assert_file_exists "${LTP_DIR}/musl_rv_batch_open_io.txt"
 assert_file_exists "${LTP_DIR}/musl_rv_batch_stat.txt"
@@ -118,13 +129,18 @@ for blacklist in \
     "${LTP_DIR}/score_blacklist_glibc_la.txt" \
     "${LTP_DIR}/musl_rv_curated_blacklist.txt" \
     "${LTP_DIR}/curated_blacklist_glibc_rv.txt" \
+    "${LTP_DIR}/pending_blacklist_glibc_rv.txt" \
     "${LTP_DIR}/curated_blacklist_musl_la.txt" \
     "${LTP_DIR}/curated_blacklist_glibc_la.txt"; do
-    assert_contains "${blacklist}" "close01"
+    assert_has_case_entry "${blacklist}"
 done
 
 assert_contains "${RUNNER}" "WHUSE_LTP_CURATED_WHITELIST"
 assert_contains "${RUNNER}" "WHUSE_LTP_CURATED_BLACKLIST"
+assert_contains "${RUNNER}" "WHUSE_LTP_PENDING_WHITELIST_RV_MUSL"
+assert_contains "${RUNNER}" "WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC"
+assert_contains "${RUNNER}" "WHUSE_LTP_AUTO_PROMOTE_SCORE"
+assert_contains "${RUNNER}" "WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX"
 assert_contains "${RUNNER}" "WHUSE_STAGE2_REQUIRE_GUEST_SHUTDOWN"
 assert_contains "${RUNNER}" "RUN_ID="
 assert_contains "${RUNNER}" 'export WHUSE_STAGE2_BASIC_PROFILE="${WHUSE_STAGE2_BASIC_PROFILE:-full}"'
@@ -133,6 +149,7 @@ assert_contains "${RUNNER}" 'export WHUSE_STAGE2_GATE_LIBCTEST_SCOPE="${WHUSE_ST
 assert_contains "${RUNNER}" 'export WHUSE_STAGE2_LIBCBENCH_SCOPE="${WHUSE_STAGE2_LIBCBENCH_SCOPE:-full}"'
 assert_contains "${RUNNER}" 'export WHUSE_STAGE2_LMBENCH_SCOPE="${WHUSE_STAGE2_LMBENCH_SCOPE:-full}"'
 assert_contains "${RUNNER}" "ltp-riscv-curated"
+assert_contains "${RUNNER}" "ltp-riscv-pending"
 assert_contains "${RUNNER}" "candidate_label=\"\${arch}-ltp-\${candidate_runtime}-\${WHUSE_LTP_PROFILE}\""
 assert_contains "${RUNNER}" "pass-candidates-\${RUN_ID}.txt"
 assert_contains "${RUNNER}" "bad-candidates-\${RUN_ID}.txt"
@@ -150,23 +167,32 @@ assert_contains "${RUNNER}" "runtime marker verification failed"
 assert_contains "${RUNNER}" "build_stage2_local_env()"
 assert_contains "${RUNNER}" "inject_stage2_local_env"
 assert_contains "${RUNNER}" "inject_ltp_runtime_files()"
+assert_contains "${RUNNER}" "runtime_hint"
 assert_contains "${RUNNER}" "inject_ltp_target_score_files()"
 assert_contains "${RUNNER}" "write_runtime_image_file \"\${image}\" \"\${whitelist_image_path}\" \"\${whitelist_host}\""
 assert_contains "${RUNNER}" "write_runtime_image_file \"\${image}\" \"\${blacklist_image_path}\" \"\${blacklist_host}\""
 assert_contains "${RUNNER}" "write_runtime_image_config \"\${image}\" \"/musl/.whuse_ltp_whitelist_\${runtime}\" \"\${whitelist_image_path}\""
 assert_contains "${RUNNER}" "write_runtime_image_config \"\${image}\" \"/musl/.whuse_ltp_blacklist_\${runtime}\" \"\${blacklist_image_path}\""
+assert_contains "${RUNNER}" "write_runtime_image_config \"\${image}\" \"/musl/.whuse_ltp_whitelist_\${runtime_hint}\" \"\${ltp_whitelist_guest_path}\""
+assert_contains "${RUNNER}" "write_runtime_image_config \"\${image}\" \"/musl/.whuse_ltp_blacklist_\${runtime_hint}\" \"\${ltp_blacklist_guest_path}\""
 assert_contains "${RUNNER}" "write_runtime_image_config \"\${image}\" \"/musl/.whuse_ltp_whitelist\" \"/musl/ltp_score_whitelist.txt\""
 assert_contains "${RUNNER}" "write_runtime_image_config \"\${image}\" \"/musl/.whuse_ltp_blacklist\" \"/musl/ltp_score_blacklist.txt\""
 assert_contains "${RUNNER}" "ltp_score_whitelist_for_target()"
 assert_contains "${RUNNER}" "ltp_score_blacklist_for_target()"
 assert_contains "${RUNNER}" "ltp_curated_whitelist_for_target()"
 assert_contains "${RUNNER}" "ltp_curated_blacklist_for_target()"
+assert_contains "${RUNNER}" "ltp_pending_whitelist_for_target()"
+assert_contains "${RUNNER}" "ltp_pending_blacklist_for_target()"
+assert_contains "${RUNNER}" "select_ltp_score_promotion_candidates()"
+assert_contains "${RUNNER}" "run_ltp_riscv_score_gate()"
+assert_contains "${RUNNER}" "apply_ltp_curated_to_score_promotions()"
 assert_contains "${RUNNER}" "ltp_whitelist_for_target_profile()"
 assert_contains "${RUNNER}" "ltp_blacklist_for_target_profile()"
 assert_contains "${RUNNER}" "score_whitelist_glibc_rv.txt"
 assert_contains "${RUNNER}" "score_whitelist_musl_la.txt"
 assert_contains "${RUNNER}" "score_whitelist_glibc_la.txt"
 assert_contains "${RUNNER}" "curated_whitelist_glibc_rv.txt"
+assert_contains "${RUNNER}" "pending_whitelist_glibc_rv.txt"
 assert_contains "${RUNNER}" "curated_whitelist_musl_la.txt"
 assert_contains "${RUNNER}" "curated_whitelist_glibc_la.txt"
 assert_contains "${RUNNER}" "WHUSE_LTP_SCORE_WHITELIST_RV_GLIBC"
@@ -178,6 +204,7 @@ assert_contains "${RUNNER}" "WHUSE_STAGE2_USE_IMAGE_COPY=1"
 assert_contains "${RUNNER}" "if [[ \"\${effective_profile}\" == \"full\" || \"\${effective_profile}\" == \"ltp\" ]]; then"
 assert_contains "${RUNNER}" "inject_ltp_target_score_files \"\${arch}\" \"\${runtime_image}\""
 assert_contains "${RUNNER}" "prepare_ltp_runtime_image \"\${RV_IMG}\""
+assert_contains "${RUNNER}" "inject_ltp_runtime_config \"\${runtime_image}\" \"\${ltp_profile}\" \"\${ltp_whitelist}\" \"\${ltp_blacklist}\" \"\${runtime_filter}\""
 assert_contains "${RUNNER}" "export WHUSE_STAGE2_FULL_MAX_GROUP=\"\${WHUSE_STAGE2_FULL_MAX_GROUP:-all}\""
 assert_contains "${RUNNER}" "WHUSE_STAGE2_FULL_MAX_GROUP=\${WHUSE_STAGE2_FULL_MAX_GROUP}"
 assert_contains "${RUNNER}" "WHUSE_OSCOMP_RUNTIME_FILTER=\${WHUSE_OSCOMP_RUNTIME_FILTER}"
@@ -187,6 +214,16 @@ assert_contains "${RUNNER}" "has_kernel_panic_or_init_crash"
 assert_contains "${RUNNER}" "panicked at|kernel panic|FATAL KERNEL TRAP|pid 1 \\(init\\).*(trap|crash)|^panic(:| |$)"
 assert_contains "${RUNNER}" "refusing to overwrite protected score whitelist"
 assert_contains "${RUNNER}" "skip candidate apply: WHUSE_OSCOMP_RUNTIME_FILTER=both cannot map pass/bad to a single target curated file"
+assert_contains "${RUNNER}" "skip pending promotion: WHUSE_OSCOMP_RUNTIME_FILTER=both cannot map pass-candidates to a single runtime pending list"
+assert_contains "${RUNNER}" "skip pending promotion apply: no pass-candidates"
+assert_contains "${RUNNER}" "pending->curated promoted"
+assert_contains "${RUNNER}" "pending apply requires pending whitelist, curated whitelist, and curated blacklist targets"
+assert_contains "${RUNNER}" "remove_cases_from_list_preserve_order \"\${curated_blacklist}\" \"\${pass_candidates}\" \"\${curated_blacklist_tmp}\""
+assert_contains "${RUNNER}" "ltp_curated_blacklist_for_target \"rv\" \"\${runtime_filter}\""
+assert_contains "${RUNNER}" "curated stability regression detected"
+assert_contains "${RUNNER}" "curated->score promoted"
+assert_contains "${RUNNER}" "score gate failed for candidate batch"
+assert_contains "${RUNNER}" "score alarm:"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "if [ \\\"\$line\\\" = \\\"hwclock\\\" ]; then"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "glibc-busybox-not-priority"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "glibc-libctest-not-scored"
@@ -241,9 +278,9 @@ assert_not_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "glib
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "run_ltp_step_runtime"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "run_basic_testsuite_runtime_entry()"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "run_basic_testsuite_runtime_entry \\\"\$runtime\\\" \\\"\$timeout_s\\\""
-assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "echo \\\"Testing brk :\\\""
-assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "./basic/brk"
-assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "./basic/sleep"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "for case_name in \$tests; do"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "case_path="
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "waitpid"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "/musl/busybox sh ./basic/run-all.sh"
 assert_not_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" 'if [ "$WHUSE_OSCOMP_PROFILE" = "basic" ] && [ "$marker_script" = "basic_testcode.sh" ]'
 assert_not_contains "${RUNNER}" "rg -q \"KERNEL PANIC|panic|pid 1 \\(init\\).*trap\""

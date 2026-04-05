@@ -62,9 +62,14 @@ Key runtime env vars:
 - `WHUSE_QEMU_MODE`: `contest` (docker qemu) or `host` (local qemu).
 - `WHUSE_QEMU_RISCV_MEM`: RISC-V QEMU RAM size (default `1G`).
 - `WHUSE_QEMU_LOONGARCH_MEM`: LoongArch QEMU RAM size (default `1G`).
-- `WHUSE_LTP_PROFILE`: LTP mode (`score`=whitelist/blacklist high-yield, `full`=broader execution).
+- `WHUSE_LTP_PROFILE`: LTP mode (`score`=site score path, `curated`=stable-set regression check, `pending`=local incremental queue, `full`=broader execution).
 - `WHUSE_LTP_WHITELIST`: LTP score whitelist path (default `/musl/ltp_score_whitelist.txt`).
 - `WHUSE_LTP_BLACKLIST`: LTP score blacklist path (default `/musl/ltp_score_blacklist.txt`).
+- `WHUSE_LTP_PENDING_WHITELIST_RV_MUSL` / `WHUSE_LTP_PENDING_BLACKLIST_RV_MUSL`: RV musl pending lists.
+- `WHUSE_LTP_PENDING_WHITELIST_RV_GLIBC` / `WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC`: RV glibc pending lists.
+- `WHUSE_LTP_APPLY_CANDIDATES`: list auto-apply switch (`ltp-riscv-pending` defaults to `1` unless explicitly set).
+- `WHUSE_LTP_AUTO_PROMOTE_SCORE`: enable/disable `curated -> score` auto-promotion (`1` by default).
+- `WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX`: per-batch promotion cap for `curated -> score` (`8..16`, default `8`).
 
 ## 3) Standard Command Blocks
 
@@ -110,7 +115,17 @@ Use `strings` first — QEMU log output is binary-mixed; plain `grep` will repor
 
 ```bash
 TIMEOUT_SECS=2400 WHUSE_LTP_PROFILE=score tools/dev/run_oscomp_stage2.sh ltp-riscv
+TIMEOUT_SECS=2400 WHUSE_OSCOMP_RUNTIME_FILTER=glibc tools/dev/run_oscomp_stage2.sh ltp-riscv-pending
+TIMEOUT_SECS=2400 WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh ltp-riscv-pending
+TIMEOUT_SECS=2400 WHUSE_OSCOMP_RUNTIME_FILTER=glibc tools/dev/run_oscomp_stage2.sh ltp-riscv-curated
+TIMEOUT_SECS=2400 WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh ltp-riscv-curated
 ```
+
+LTP three-layer responsibilities:
+
+- `score`: protected site path; generic candidate-apply never rewrites it, only curated-gated promotion can update it.
+- `pending`: local work queue; pass-candidates auto-promote to `curated` and are removed from `pending` whitelist.
+- `curated`: stable regression layer; if `bad/conf=0`, auto-promotes up to `WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX` pass-cases into `score` only after a score-gate run passes; no auto-demotion.
 
 ### 3.6 Raw exit verification (contest-style)
 
@@ -228,6 +243,10 @@ TIMEOUT_SECS=240 WHUSE_STAGE2_IMAGE_POLICY=never WHUSE_STAGE2_USE_IMAGE_COPY=1 W
 TIMEOUT_SECS=240 WHUSE_STAGE2_IMAGE_POLICY=never WHUSE_STAGE2_USE_IMAGE_COPY=1 WHUSE_OSCOMP_PROFILE=libctest WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh loongarch
 TIMEOUT_SECS=240 WHUSE_STAGE2_IMAGE_POLICY=never WHUSE_STAGE2_USE_IMAGE_COPY=1 WHUSE_OSCOMP_PROFILE=full WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh riscv
 TIMEOUT_SECS=2400 WHUSE_LTP_PROFILE=score tools/dev/run_oscomp_stage2.sh ltp-riscv
+TIMEOUT_SECS=2400 WHUSE_OSCOMP_RUNTIME_FILTER=glibc tools/dev/run_oscomp_stage2.sh ltp-riscv-pending
+TIMEOUT_SECS=2400 WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh ltp-riscv-pending
+TIMEOUT_SECS=2400 WHUSE_OSCOMP_RUNTIME_FILTER=glibc tools/dev/run_oscomp_stage2.sh ltp-riscv-curated
+TIMEOUT_SECS=2400 WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh ltp-riscv-curated
 ```
 
 Current target markers:

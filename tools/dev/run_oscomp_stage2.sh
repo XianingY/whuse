@@ -21,6 +21,10 @@ LTP_CURATED_WHITELIST_MUSL_LA="${REPO_ROOT}/tools/oscomp/ltp/curated_whitelist_m
 LTP_CURATED_BLACKLIST_MUSL_LA="${REPO_ROOT}/tools/oscomp/ltp/curated_blacklist_musl_la.txt"
 LTP_CURATED_WHITELIST_GLIBC_LA="${REPO_ROOT}/tools/oscomp/ltp/curated_whitelist_glibc_la.txt"
 LTP_CURATED_BLACKLIST_GLIBC_LA="${REPO_ROOT}/tools/oscomp/ltp/curated_blacklist_glibc_la.txt"
+LTP_PENDING_WHITELIST_RV_MUSL="${REPO_ROOT}/tools/oscomp/ltp/pending_whitelist_rv_musl.txt"
+LTP_PENDING_BLACKLIST_RV_MUSL="${REPO_ROOT}/tools/oscomp/ltp/pending_blacklist_rv_musl.txt"
+LTP_PENDING_WHITELIST_RV_GLIBC="${REPO_ROOT}/tools/oscomp/ltp/pending_whitelist_glibc_rv.txt"
+LTP_PENDING_BLACKLIST_RV_GLIBC="${REPO_ROOT}/tools/oscomp/ltp/pending_blacklist_glibc_rv.txt"
 
 MODE="${1:-riscv}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-3600}"
@@ -31,6 +35,7 @@ LTP_PROFILE_WAS_SET=0
 LTP_WHITELIST_WAS_SET=0
 LTP_BLACKLIST_WAS_SET=0
 LTP_STEP_TIMEOUT_WAS_SET=0
+LTP_APPLY_CANDIDATES_WAS_SET=0
 if [[ -v WHUSE_LTP_PROFILE ]]; then
     LTP_PROFILE_WAS_SET=1
 fi
@@ -42,6 +47,9 @@ if [[ -v WHUSE_LTP_BLACKLIST ]]; then
 fi
 if [[ -v WHUSE_LTP_STEP_TIMEOUT ]]; then
     LTP_STEP_TIMEOUT_WAS_SET=1
+fi
+if [[ -v WHUSE_LTP_APPLY_CANDIDATES ]]; then
+    LTP_APPLY_CANDIDATES_WAS_SET=1
 fi
 if [[ -v WHUSE_STAGE2_BASIC_PROFILE ]]; then
     STAGE2_BASIC_PROFILE_WAS_SET=1
@@ -105,6 +113,13 @@ export WHUSE_LTP_CURATED_WHITELIST_LA_MUSL="${WHUSE_LTP_CURATED_WHITELIST_LA_MUS
 export WHUSE_LTP_CURATED_BLACKLIST_LA_MUSL="${WHUSE_LTP_CURATED_BLACKLIST_LA_MUSL:-${LTP_CURATED_BLACKLIST_MUSL_LA}}"
 export WHUSE_LTP_CURATED_WHITELIST_LA_GLIBC="${WHUSE_LTP_CURATED_WHITELIST_LA_GLIBC:-${LTP_CURATED_WHITELIST_GLIBC_LA}}"
 export WHUSE_LTP_CURATED_BLACKLIST_LA_GLIBC="${WHUSE_LTP_CURATED_BLACKLIST_LA_GLIBC:-${LTP_CURATED_BLACKLIST_GLIBC_LA}}"
+export WHUSE_LTP_PENDING_WHITELIST_RV_MUSL="${WHUSE_LTP_PENDING_WHITELIST_RV_MUSL:-${LTP_PENDING_WHITELIST_RV_MUSL}}"
+export WHUSE_LTP_PENDING_BLACKLIST_RV_MUSL="${WHUSE_LTP_PENDING_BLACKLIST_RV_MUSL:-${LTP_PENDING_BLACKLIST_RV_MUSL}}"
+export WHUSE_LTP_PENDING_WHITELIST_RV_GLIBC="${WHUSE_LTP_PENDING_WHITELIST_RV_GLIBC:-${LTP_PENDING_WHITELIST_RV_GLIBC}}"
+export WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC="${WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC:-${LTP_PENDING_BLACKLIST_RV_GLIBC}}"
+export WHUSE_LTP_AUTO_PROMOTE_SCORE="${WHUSE_LTP_AUTO_PROMOTE_SCORE:-1}"
+export WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX="${WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX:-8}"
+export WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION="${WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION:-1}"
 export WHUSE_LTP_STEP_TIMEOUT="${WHUSE_LTP_STEP_TIMEOUT:-300}"
 export WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT:-45}"
 export WHUSE_LTP_APPLY_CANDIDATES="${WHUSE_LTP_APPLY_CANDIDATES:-0}"
@@ -274,6 +289,17 @@ validate_oscomp_case_filter() {
 }
 
 validate_oscomp_case_filter "${WHUSE_OSCOMP_CASE_FILTER}"
+
+validate_ltp_score_promotion_batch_max() {
+    local value="$1"
+    if [[ "${value}" =~ ^[0-9]+$ ]] && [[ "${value}" -ge 8 ]] && [[ "${value}" -le 16 ]]; then
+        return 0
+    fi
+    echo "invalid WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX=${value} (expected integer in [8,16])" >&2
+    return 1
+}
+
+validate_ltp_score_promotion_batch_max "${WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX}"
 
 profile_root_step() {
     local profile="$1"
@@ -522,9 +548,10 @@ ensure_oscomp_images() {
     loongarch | loongarch-raw-exit) requested_arches=("la") ;;
     ltp-riscv) requested_arches=("rv") ;;
     ltp-riscv-curated) requested_arches=("rv") ;;
+    ltp-riscv-pending) requested_arches=("rv") ;;
     both | both-raw-exit) requested_arches=("rv" "la") ;;
     *)
-        echo "usage: $0 [riscv|riscv-raw-exit|loongarch|loongarch-raw-exit|ltp-riscv|ltp-riscv-curated|both|both-raw-exit]" >&2
+        echo "usage: $0 [riscv|riscv-raw-exit|loongarch|loongarch-raw-exit|ltp-riscv|ltp-riscv-curated|ltp-riscv-pending|both|both-raw-exit]" >&2
         exit 2
         ;;
     esac
@@ -950,12 +977,40 @@ ltp_curated_blacklist_for_target() {
     esac
 }
 
+ltp_pending_whitelist_for_target() {
+    local arch="$1"
+    local runtime="$2"
+    case "${arch}:${runtime}" in
+    rv:musl) printf '%s\n' "${WHUSE_LTP_PENDING_WHITELIST_RV_MUSL}" ;;
+    rv:glibc) printf '%s\n' "${WHUSE_LTP_PENDING_WHITELIST_RV_GLIBC}" ;;
+    *)
+        echo "unsupported ltp pending whitelist target: ${arch}:${runtime}" >&2
+        return 1
+        ;;
+    esac
+}
+
+ltp_pending_blacklist_for_target() {
+    local arch="$1"
+    local runtime="$2"
+    case "${arch}:${runtime}" in
+    rv:musl) printf '%s\n' "${WHUSE_LTP_PENDING_BLACKLIST_RV_MUSL}" ;;
+    rv:glibc) printf '%s\n' "${WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC}" ;;
+    *)
+        echo "unsupported ltp pending blacklist target: ${arch}:${runtime}" >&2
+        return 1
+        ;;
+    esac
+}
+
 ltp_whitelist_for_target_profile() {
     local profile="$1"
     local arch="$2"
     local runtime="$3"
     if [[ "${profile}" == "curated" ]]; then
         ltp_curated_whitelist_for_target "${arch}" "${runtime}"
+    elif [[ "${profile}" == "pending" ]]; then
+        ltp_pending_whitelist_for_target "${arch}" "${runtime}"
     else
         ltp_score_whitelist_for_target "${arch}" "${runtime}"
     fi
@@ -967,6 +1022,8 @@ ltp_blacklist_for_target_profile() {
     local runtime="$3"
     if [[ "${profile}" == "curated" ]]; then
         ltp_curated_blacklist_for_target "${arch}" "${runtime}"
+    elif [[ "${profile}" == "pending" ]]; then
+        ltp_pending_blacklist_for_target "${arch}" "${runtime}"
     else
         ltp_score_blacklist_for_target "${arch}" "${runtime}"
     fi
@@ -1016,6 +1073,11 @@ resolve_ltp_mode_config() {
             blacklist="${WHUSE_LTP_CURATED_BLACKLIST}"
         fi
         ;;
+    pending)
+        if [[ "${LTP_PROFILE_WAS_SET}" != "1" ]]; then
+            profile="pending"
+        fi
+        ;;
     *)
         echo "unsupported ltp mode config: ${mode}" >&2
         return 1
@@ -1057,25 +1119,421 @@ apply_ltp_candidate_lists() {
     echo "[${label}] applied candidate lists to ${target_whitelist} and ${target_blacklist}"
 }
 
+merge_case_lists_preserve_order() {
+    local base_file="$1"
+    local add_file="$2"
+    local out_file="$3"
+    awk '
+        FNR == NR {
+            if ($0 == "") {
+                next
+            }
+            if (!seen[$0]++) {
+                print $0
+            }
+            next
+        }
+        {
+            if ($0 == "") {
+                next
+            }
+            if (!seen[$0]++) {
+                print $0
+            }
+        }
+    ' "${base_file}" "${add_file}" >"${out_file}"
+}
+
+remove_cases_from_list_preserve_order() {
+    local list_file="$1"
+    local remove_file="$2"
+    local out_file="$3"
+    awk '
+        FNR == NR {
+            if ($0 != "") {
+                rm[$0] = 1
+            }
+            next
+        }
+        {
+            if ($0 == "") {
+                next
+            }
+            if (!rm[$0]) {
+                print $0
+            }
+        }
+    ' "${remove_file}" "${list_file}" >"${out_file}"
+}
+
+write_ltp_review_file() {
+    local label="$1"
+    local bad_candidates="$2"
+    local conf_candidates="$3"
+    local review_out="$4"
+    : >"${review_out}"
+    while IFS= read -r case_name; do
+        [[ -n "${case_name}" ]] || continue
+        printf 'bad:%s\n' "${case_name}" >>"${review_out}"
+    done <"${bad_candidates}"
+    while IFS= read -r case_name; do
+        [[ -n "${case_name}" ]] || continue
+        printf 'conf:%s\n' "${case_name}" >>"${review_out}"
+    done <"${conf_candidates}"
+    echo "[${label}] review-candidates: ${review_out} ($(wc -l < "${review_out}"))"
+}
+
+apply_ltp_pending_promotions() {
+    local label="$1"
+    local pass_candidates="$2"
+    local bad_candidates="$3"
+    local conf_candidates="$4"
+    local pending_whitelist="$5"
+    local curated_whitelist="$6"
+    local curated_blacklist="$7"
+    local pending_real curated_whitelist_real curated_blacklist_real
+    local pending_tmp curated_tmp curated_blacklist_tmp review_out
+    review_out="/tmp/${label}-pending-review-${RUN_ID}.txt"
+    write_ltp_review_file "${label}" "${bad_candidates}" "${conf_candidates}" "${review_out}"
+
+    if [[ "${WHUSE_LTP_APPLY_CANDIDATES}" != "1" ]]; then
+        echo "[${label}] skip pending apply: WHUSE_LTP_APPLY_CANDIDATES=${WHUSE_LTP_APPLY_CANDIDATES}"
+        return 0
+    fi
+    if [[ -z "${pending_whitelist}" || -z "${curated_whitelist}" || -z "${curated_blacklist}" ]]; then
+        echo "[${label}] pending apply requires pending whitelist, curated whitelist, and curated blacklist targets" >&2
+        return 1
+    fi
+    if [[ ! -f "${pending_whitelist}" || ! -f "${curated_whitelist}" || ! -f "${curated_blacklist}" ]]; then
+        echo "[${label}] pending apply missing target file(s): pending=${pending_whitelist} curated=${curated_whitelist} curated_blacklist=${curated_blacklist}" >&2
+        return 1
+    fi
+
+    pending_real="$(canonicalize_path "${pending_whitelist}")"
+    curated_whitelist_real="$(canonicalize_path "${curated_whitelist}")"
+    curated_blacklist_real="$(canonicalize_path "${curated_blacklist}")"
+    if is_protected_score_path "${pending_real}" || is_protected_score_path "${curated_whitelist_real}" || is_protected_score_path "${curated_blacklist_real}"; then
+        echo "[${label}] refusing pending promotion against protected score files" >&2
+        return 1
+    fi
+    if [[ ! -s "${pass_candidates}" ]]; then
+        echo "[${label}] skip pending promotion apply: no pass-candidates"
+        return 0
+    fi
+
+    pending_tmp="$(mktemp)"
+    curated_tmp="$(mktemp)"
+    curated_blacklist_tmp="$(mktemp)"
+    remove_cases_from_list_preserve_order "${pending_whitelist}" "${pass_candidates}" "${pending_tmp}"
+    merge_case_lists_preserve_order "${curated_whitelist}" "${pass_candidates}" "${curated_tmp}"
+    remove_cases_from_list_preserve_order "${curated_blacklist}" "${pass_candidates}" "${curated_blacklist_tmp}"
+    cp "${pending_tmp}" "${pending_whitelist}"
+    cp "${curated_tmp}" "${curated_whitelist}"
+    cp "${curated_blacklist_tmp}" "${curated_blacklist}"
+    rm -f "${pending_tmp}" "${curated_tmp}" "${curated_blacklist_tmp}"
+    echo "[${label}] pending->curated promoted $(wc -l < "${pass_candidates}") case(s); updated ${pending_whitelist}, ${curated_whitelist}, and ${curated_blacklist}"
+}
+
+check_ltp_curated_stability() {
+    local label="$1"
+    local bad_candidates="$2"
+    local conf_candidates="$3"
+    local review_out
+    review_out="/tmp/${label}-curated-review-${RUN_ID}.txt"
+    write_ltp_review_file "${label}" "${bad_candidates}" "${conf_candidates}" "${review_out}"
+    if [[ -s "${review_out}" ]]; then
+        echo "[${label}] curated stability regression detected; review ${review_out}" >&2
+        return 1
+    fi
+    echo "[${label}] curated stability ok"
+    return 0
+}
+
+check_ltp_score_gate_candidates() {
+    local label="$1"
+    local candidate_whitelist="$2"
+    local pass_candidates="$3"
+    local bad_candidates="$4"
+    local conf_candidates="$5"
+    local review_out
+    review_out="/tmp/${label}-score-gate-candidate-review-${RUN_ID}.txt"
+    : >"${review_out}"
+    while IFS= read -r case_name; do
+        [[ -n "${case_name}" ]] || continue
+        if rg -qx "${case_name}" "${pass_candidates}"; then
+            continue
+        fi
+        if rg -qx "${case_name}" "${bad_candidates}"; then
+            printf 'bad:%s\n' "${case_name}" >>"${review_out}"
+            continue
+        fi
+        if rg -qx "${case_name}" "${conf_candidates}"; then
+            printf 'conf:%s\n' "${case_name}" >>"${review_out}"
+            continue
+        fi
+        printf 'missing:%s\n' "${case_name}" >>"${review_out}"
+    done <"${candidate_whitelist}"
+    if [[ -s "${review_out}" ]]; then
+        echo "[${label}] score gate candidate regression detected; review ${review_out}" >&2
+        return 1
+    fi
+    echo "[${label}] score gate candidate batch ok"
+    return 0
+}
+
+select_ltp_score_promotion_candidates() {
+    local pass_candidates="$1"
+    local score_whitelist="$2"
+    local score_blacklist="$3"
+    local batch_max="$4"
+    local out_file="$5"
+    awk -v limit="${batch_max}" '
+        FNR == NR {
+            if ($0 != "") {
+                in_whitelist[$0] = 1
+            }
+            next
+        }
+        {
+            if ($0 == "") {
+                next
+            }
+            if (in_whitelist[$0] || seen[$0]) {
+                next
+            }
+            seen[$0] = 1
+            print $0
+            count++
+            if (count >= limit) {
+                exit
+            }
+        }
+    ' "${score_whitelist}" "${pass_candidates}" >"${out_file}"
+}
+
+run_ltp_riscv_score_gate() {
+    local runtime_filter="$1"
+    local gate_whitelist="$2"
+    local gate_blacklist="$3"
+    local gate_label="$4"
+    local saved_step_timeout="${WHUSE_LTP_STEP_TIMEOUT}"
+    local rc=0
+    if [[ "${LTP_STEP_TIMEOUT_WAS_SET}" != "1" ]]; then
+        WHUSE_LTP_STEP_TIMEOUT=1800
+    fi
+    local log="/tmp/${gate_label}-score-gate-${RUN_ID}.log"
+    local text_log="/tmp/${gate_label}-score-gate-${RUN_ID}.strings.log"
+    local runtime_image
+    local suite_done_seen=0
+    local terminated_by_suite_done=0
+    local pass_candidates bad_candidates conf_candidates review_out
+    local gate_ok=0
+
+    prepare_ltp_runtime_image "${RV_IMG}"
+    runtime_image="${prepared_runtime_image}"
+    inject_oscomp_runtime_filter "${runtime_image}" "${runtime_filter}"
+    inject_ltp_runtime_config "${runtime_image}" "score" "${gate_whitelist}" "${gate_blacklist}" "${runtime_filter}"
+
+    echo "[${gate_label}] running score gate, timeout=${TIMEOUT_SECS}s, runtime=${runtime_filter}, whitelist=${gate_whitelist}, blacklist=${gate_blacklist}"
+    if [[ "${WHUSE_STAGE2_STOP_ON_SUITE_DONE}" == "1" ]]; then
+        local runner_pid
+        setsid timeout "${TIMEOUT_SECS}s" env \
+            WHUSE_DISK_IMAGE="${runtime_image}" \
+            WHUSE_LTP_PROFILE="score" \
+            WHUSE_LTP_WHITELIST="${gate_whitelist}" \
+            WHUSE_LTP_BLACKLIST="${gate_blacklist}" \
+            WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT}" \
+            "${XTASK_CMD[@]}" qemu-riscv >"${log}" 2>&1 &
+        runner_pid=$!
+        while kill -0 "${runner_pid}" 2>/dev/null; do
+            if [[ -f "${log}" ]] && grep -a -q "whuse-oscomp-suite-done" "${log}"; then
+                suite_done_seen=1
+                terminated_by_suite_done=1
+                kill -TERM -- "-${runner_pid}" 2>/dev/null || true
+                for _ in $(seq 1 10); do
+                    if ! kill -0 "${runner_pid}" 2>/dev/null; then
+                        break
+                    fi
+                    sleep 1
+                done
+                kill -KILL -- "-${runner_pid}" 2>/dev/null || true
+                break
+            fi
+            sleep 2
+        done
+        wait "${runner_pid}" 2>/dev/null || true
+    else
+        timeout "${TIMEOUT_SECS}s" env \
+            WHUSE_DISK_IMAGE="${runtime_image}" \
+            WHUSE_LTP_PROFILE="score" \
+            WHUSE_LTP_WHITELIST="${gate_whitelist}" \
+            WHUSE_LTP_BLACKLIST="${gate_blacklist}" \
+            WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT}" \
+            "${XTASK_CMD[@]}" qemu-riscv >"${log}" 2>&1 || true
+    fi
+
+    strings "${log}" >"${text_log}" || true
+    echo "[${gate_label}] score-gate log: ${log}"
+
+    if has_kernel_panic_or_init_crash "${text_log}"; then
+        echo "[${gate_label}] score gate detected kernel panic or init crash" >&2
+        print_kernel_panic_or_init_crash_matches "${text_log}" >&2
+        gate_ok=1
+    fi
+    if ! rg -q "whuse-oscomp-step-begin:ltp_testcode.sh" "${text_log}"; then
+        echo "[${gate_label}] score gate missing step-begin: ltp_testcode.sh" >&2
+        gate_ok=1
+    fi
+    if ! rg -q "whuse-oscomp-step-end:ltp_testcode.sh:|whuse-oscomp-step-timeout:ltp_testcode.sh" "${text_log}"; then
+        echo "[${gate_label}] score gate missing step-close: ltp_testcode.sh" >&2
+        gate_ok=1
+    fi
+
+    pass_candidates="/tmp/${gate_label}-score-gate-pass-${RUN_ID}.txt"
+    bad_candidates="/tmp/${gate_label}-score-gate-bad-${RUN_ID}.txt"
+    conf_candidates="/tmp/${gate_label}-score-gate-conf-${RUN_ID}.txt"
+    review_out="/tmp/${gate_label}-score-gate-review-${RUN_ID}.txt"
+    generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}" "${conf_candidates}" "${gate_label}-score-gate"
+    write_ltp_review_file "${gate_label}-score-gate" "${bad_candidates}" "${conf_candidates}" "${review_out}"
+    if [[ -s "${review_out}" ]]; then
+        echo "[${gate_label}] score gate alarm: bad/conf cases detected in existing score lane; review ${review_out}" >&2
+    fi
+    if ! check_ltp_score_gate_candidates "${gate_label}" "${gate_whitelist}" "${pass_candidates}" "${bad_candidates}" "${conf_candidates}"; then
+        gate_ok=1
+    fi
+    echo "[${gate_label}] score-gate summary: suite_done_seen=${suite_done_seen} terminated_by_suite_done=${terminated_by_suite_done}"
+
+    WHUSE_LTP_STEP_TIMEOUT="${saved_step_timeout}"
+    if [[ "${gate_ok}" -ne 0 ]]; then
+        rc=1
+    fi
+    return "${rc}"
+}
+
+apply_ltp_curated_to_score_promotions() {
+    local label="$1"
+    local runtime="$2"
+    local pass_candidates="$3"
+    local score_whitelist="$4"
+    local score_blacklist="$5"
+    local candidates_tmp merged_whitelist_tmp merged_blacklist_tmp
+    local candidate_review prune_tmp next_candidates
+    local gate_passed=0
+    local score_whitelist_real score_blacklist_real
+
+    if [[ "${WHUSE_LTP_AUTO_PROMOTE_SCORE}" != "1" ]]; then
+        echo "[${label}] skip score promotion: WHUSE_LTP_AUTO_PROMOTE_SCORE=${WHUSE_LTP_AUTO_PROMOTE_SCORE}"
+        return 0
+    fi
+
+    candidates_tmp="$(mktemp)"
+    select_ltp_score_promotion_candidates "${pass_candidates}" "${score_whitelist}" "${score_blacklist}" "${WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX}" "${candidates_tmp}"
+    if [[ ! -s "${candidates_tmp}" ]]; then
+        echo "[${label}] skip score promotion: no new curated pass cases"
+        rm -f "${candidates_tmp}"
+        return 0
+    fi
+
+    candidate_review="/tmp/${label}-score-gate-candidate-review-${RUN_ID}.txt"
+    while [[ -s "${candidates_tmp}" ]]; do
+        merged_whitelist_tmp="$(mktemp)"
+        merged_blacklist_tmp="$(mktemp)"
+        merge_case_lists_preserve_order "${score_whitelist}" "${candidates_tmp}" "${merged_whitelist_tmp}"
+        remove_cases_from_list_preserve_order "${score_blacklist}" "${candidates_tmp}" "${merged_blacklist_tmp}"
+        if run_ltp_riscv_score_gate "${runtime}" "${candidates_tmp}" "${merged_blacklist_tmp}" "${label}"; then
+            gate_passed=1
+            break
+        fi
+        if [[ ! -s "${candidate_review}" ]]; then
+            echo "[${label}] score gate failed for candidate batch and no candidate review was produced; keep score files unchanged" >&2
+            rm -f "${candidates_tmp}" "${merged_whitelist_tmp}" "${merged_blacklist_tmp}"
+            return 1
+        fi
+        prune_tmp="$(mktemp)"
+        awk -F: 'NF >= 2 && $2 != "" { print $2 }' "${candidate_review}" | awk '!seen[$0]++' > "${prune_tmp}"
+        if [[ ! -s "${prune_tmp}" ]]; then
+            echo "[${label}] score gate failed for candidate batch and no prunable cases were identified; keep score files unchanged" >&2
+            rm -f "${candidates_tmp}" "${merged_whitelist_tmp}" "${merged_blacklist_tmp}" "${prune_tmp}"
+            return 1
+        fi
+        next_candidates="$(mktemp)"
+        remove_cases_from_list_preserve_order "${candidates_tmp}" "${prune_tmp}" "${next_candidates}"
+        if cmp -s "${candidates_tmp}" "${next_candidates}"; then
+            echo "[${label}] score gate prune made no progress; keep score files unchanged" >&2
+            rm -f "${candidates_tmp}" "${merged_whitelist_tmp}" "${merged_blacklist_tmp}" "${prune_tmp}" "${next_candidates}"
+            return 1
+        fi
+        echo "[${label}] score gate pruned $(wc -l < "${prune_tmp}") unstable case(s) and will retry with $(wc -l < "${next_candidates}") case(s)"
+        mv "${next_candidates}" "${candidates_tmp}"
+        rm -f "${prune_tmp}" "${merged_whitelist_tmp}" "${merged_blacklist_tmp}"
+    done
+    if [[ "${gate_passed}" -ne 1 ]]; then
+        echo "[${label}] score gate failed for candidate batch; keep score files unchanged" >&2
+        rm -f "${candidates_tmp}" "${merged_whitelist_tmp:-}" "${merged_blacklist_tmp:-}"
+        return 1
+    fi
+    if [[ ! -s "${candidates_tmp}" ]]; then
+        echo "[${label}] score gate pruned all candidates; no score promotion applied"
+        rm -f "${candidates_tmp}" "${merged_whitelist_tmp}" "${merged_blacklist_tmp}"
+        return 0
+    fi
+
+    if [[ "${WHUSE_LTP_APPLY_CANDIDATES}" != "1" ]]; then
+        echo "[${label}] skip score promotion apply: WHUSE_LTP_APPLY_CANDIDATES=${WHUSE_LTP_APPLY_CANDIDATES}"
+        rm -f "${candidates_tmp}" "${merged_whitelist_tmp}" "${merged_blacklist_tmp}"
+        return 0
+    fi
+
+    score_whitelist_real="$(canonicalize_path "${score_whitelist}")"
+    score_blacklist_real="$(canonicalize_path "${score_blacklist}")"
+    if ! is_protected_score_path "${score_whitelist_real}" || ! is_protected_score_path "${score_blacklist_real}"; then
+        echo "[${label}] refusing score promotion to non-score targets: ${score_whitelist} ${score_blacklist}" >&2
+        rm -f "${candidates_tmp}" "${merged_whitelist_tmp}" "${merged_blacklist_tmp}"
+        return 1
+    fi
+
+    cp "${merged_whitelist_tmp}" "${score_whitelist}"
+    cp "${merged_blacklist_tmp}" "${score_blacklist}"
+    echo "[${label}] curated->score promoted $(wc -l < "${candidates_tmp}") case(s) into ${score_whitelist}"
+    rm -f "${candidates_tmp}" "${merged_whitelist_tmp}" "${merged_blacklist_tmp}"
+    return 0
+}
+
 inject_ltp_runtime_files() {
     local image="$1"
     local ltp_profile="$2"
     local ltp_whitelist_path="$3"
     local ltp_blacklist_path="$4"
+    local runtime_hint="${5:-}"
+    local runtime_dir="musl"
+    local ltp_whitelist_guest_path="${ltp_whitelist_path}"
+    local ltp_blacklist_guest_path="${ltp_blacklist_path}"
+    case "${runtime_hint}" in
+    musl | glibc) runtime_dir="${runtime_hint}" ;;
+    *) runtime_dir="musl" ;;
+    esac
     write_runtime_image_config "${image}" "/musl/.whuse_ltp_profile" "${ltp_profile}"
     if [[ -n "${ltp_whitelist_path}" && -f "${ltp_whitelist_path}" ]]; then
-        write_runtime_image_file "${image}" "/musl/ltp_score_whitelist.host.txt" "${ltp_whitelist_path}"
-        ltp_whitelist_path="/musl/ltp_score_whitelist.host.txt"
+        ltp_whitelist_guest_path="/${runtime_dir}/ltp_score_whitelist.host.txt"
+        write_runtime_image_file "${image}" "${ltp_whitelist_guest_path}" "${ltp_whitelist_path}"
     fi
     if [[ -n "${ltp_blacklist_path}" && -f "${ltp_blacklist_path}" ]]; then
-        write_runtime_image_file "${image}" "/musl/ltp_score_blacklist.host.txt" "${ltp_blacklist_path}"
-        ltp_blacklist_path="/musl/ltp_score_blacklist.host.txt"
+        ltp_blacklist_guest_path="/${runtime_dir}/ltp_score_blacklist.host.txt"
+        write_runtime_image_file "${image}" "${ltp_blacklist_guest_path}" "${ltp_blacklist_path}"
     fi
-    if [[ -n "${ltp_whitelist_path}" ]]; then
-        write_runtime_image_config "${image}" "/musl/.whuse_ltp_whitelist" "${ltp_whitelist_path}"
+    if [[ -n "${ltp_whitelist_guest_path}" ]]; then
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_whitelist" "${ltp_whitelist_guest_path}"
     fi
-    if [[ -n "${ltp_blacklist_path}" ]]; then
-        write_runtime_image_config "${image}" "/musl/.whuse_ltp_blacklist" "${ltp_blacklist_path}"
+    if [[ -n "${ltp_blacklist_guest_path}" ]]; then
+        write_runtime_image_config "${image}" "/musl/.whuse_ltp_blacklist" "${ltp_blacklist_guest_path}"
+    fi
+    if [[ "${runtime_hint}" == "musl" || "${runtime_hint}" == "glibc" ]]; then
+        if [[ -n "${ltp_whitelist_guest_path}" ]]; then
+            write_runtime_image_config "${image}" "/musl/.whuse_ltp_whitelist_${runtime_hint}" "${ltp_whitelist_guest_path}"
+        fi
+        if [[ -n "${ltp_blacklist_guest_path}" ]]; then
+            write_runtime_image_config "${image}" "/musl/.whuse_ltp_blacklist_${runtime_hint}" "${ltp_blacklist_guest_path}"
+        fi
     fi
     if [[ -n "${WHUSE_LTP_STEP_TIMEOUT:-}" ]]; then
         write_runtime_image_config "${image}" "/musl/.whuse_ltp_step_timeout" "${WHUSE_LTP_STEP_TIMEOUT}"
@@ -1091,7 +1549,14 @@ inject_ltp_target_score_files() {
     local runtime whitelist_host blacklist_host
     local whitelist_image_path blacklist_image_path
     local ltp_file_profile="${WHUSE_LTP_PROFILE}"
-    if [[ "${ltp_file_profile}" != "curated" ]]; then
+    case "${ltp_file_profile}" in
+    curated | pending | score)
+        ;;
+    *)
+        ltp_file_profile="score"
+        ;;
+    esac
+    if [[ "${ltp_file_profile}" == "pending" && "${arch}" != "rv" ]]; then
         ltp_file_profile="score"
     fi
     write_runtime_image_config "${image}" "/musl/.whuse_ltp_profile" "${WHUSE_LTP_PROFILE}"
@@ -1128,8 +1593,9 @@ inject_ltp_runtime_config() {
     local ltp_profile="$2"
     local ltp_whitelist_path="$3"
     local ltp_blacklist_path="$4"
+    local runtime_hint="${5:-}"
     inject_oscomp_profile "${image}" "ltp"
-    inject_ltp_runtime_files "${image}" "${ltp_profile}" "${ltp_whitelist_path}" "${ltp_blacklist_path}"
+    inject_ltp_runtime_files "${image}" "${ltp_profile}" "${ltp_whitelist_path}" "${ltp_blacklist_path}" "${runtime_hint}"
 }
 
 generate_ltp_candidate_lists() {
@@ -1204,10 +1670,10 @@ generate_ltp_candidate_lists() {
             }
         }
     ' "${text_log}"
-    sort -u "${pass_tmp}" > "${pass_out}"
-    sort -u "${bad_tmp}" > "${bad_out}"
+    awk '!seen[$0]++' "${pass_tmp}" > "${pass_out}"
+    awk '!seen[$0]++' "${bad_tmp}" > "${bad_out}"
     if [[ -n "${conf_out}" ]]; then
-        sort -u "${conf_tmp}" > "${conf_out}"
+        awk '!seen[$0]++' "${conf_tmp}" > "${conf_out}"
     fi
     echo "[${label}] class summary:"
     if [[ -s "${summary_tmp}" ]]; then
@@ -1454,6 +1920,7 @@ run_arch() {
         local candidate_runtime="${WHUSE_OSCOMP_RUNTIME_FILTER}"
         local candidate_target_whitelist=""
         local candidate_target_blacklist=""
+        local candidate_pending_whitelist=""
         candidate_label="${arch}-ltp-${candidate_runtime}-${WHUSE_LTP_PROFILE}"
         pass_candidates="/tmp/${candidate_label}-pass-candidates-${RUN_ID}.txt"
         bad_candidates="/tmp/${candidate_label}-bad-candidates-${RUN_ID}.txt"
@@ -1463,13 +1930,59 @@ run_arch() {
         echo "[${arch}] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
         echo "[${arch}] conf-candidates: ${conf_candidates} ($(wc -l < "${conf_candidates}"))"
         case "${WHUSE_LTP_PROFILE}" in
-        full | curated)
+        full)
             if [[ "${candidate_runtime}" == "both" ]]; then
                 echo "[${arch}] skip candidate apply: WHUSE_OSCOMP_RUNTIME_FILTER=both cannot map pass/bad to a single target curated file"
             else
                 candidate_target_whitelist="$(ltp_curated_whitelist_for_target "${arch}" "${candidate_runtime}")"
                 candidate_target_blacklist="$(ltp_curated_blacklist_for_target "${arch}" "${candidate_runtime}")"
                 apply_ltp_candidate_lists "${candidate_label}" "${pass_candidates}" "${bad_candidates}" "${candidate_target_whitelist}" "${candidate_target_blacklist}"
+            fi
+            ;;
+        curated)
+            local curated_regression=0
+            if ! check_ltp_curated_stability "${candidate_label}" "${bad_candidates}" "${conf_candidates}"; then
+                ok=1
+                curated_regression=1
+            fi
+            if [[ "${arch}" != "rv" ]]; then
+                echo "[${arch}] skip curated->score promotion: only rv is enabled"
+            elif [[ "${candidate_runtime}" == "both" ]]; then
+                echo "[${arch}] skip curated->score promotion: WHUSE_OSCOMP_RUNTIME_FILTER=both cannot map to one score lane"
+            elif [[ "${curated_regression}" -ne 0 && "${WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION}" != "1" ]]; then
+                echo "[${arch}] skip curated->score promotion: curated regression present and WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION=${WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION}"
+            else
+                apply_ltp_curated_to_score_promotions \
+                    "${candidate_label}" \
+                    "${candidate_runtime}" \
+                    "${pass_candidates}" \
+                    "$(ltp_score_whitelist_for_target "${arch}" "${candidate_runtime}")" \
+                    "$(ltp_score_blacklist_for_target "${arch}" "${candidate_runtime}")" || ok=1
+            fi
+            ;;
+        pending)
+            if [[ "${candidate_runtime}" == "both" ]]; then
+                echo "[${arch}] skip pending promotion: WHUSE_OSCOMP_RUNTIME_FILTER=both cannot map pass-candidates to a single runtime pending list" >&2
+                ok=1
+            else
+                candidate_pending_whitelist="$(ltp_pending_whitelist_for_target "${arch}" "${candidate_runtime}")"
+                candidate_target_whitelist="$(ltp_curated_whitelist_for_target "${arch}" "${candidate_runtime}")"
+                apply_ltp_pending_promotions \
+                    "${candidate_label}" \
+                    "${pass_candidates}" \
+                    "${bad_candidates}" \
+                    "${conf_candidates}" \
+                    "${candidate_pending_whitelist}" \
+                    "${candidate_target_whitelist}" \
+                    "$(ltp_curated_blacklist_for_target "${arch}" "${candidate_runtime}")" || ok=1
+            fi
+            ;;
+        score)
+            local score_review_out
+            score_review_out="/tmp/${candidate_label}-score-review-${RUN_ID}.txt"
+            write_ltp_review_file "${candidate_label}-score" "${bad_candidates}" "${conf_candidates}" "${score_review_out}"
+            if [[ -s "${score_review_out}" ]]; then
+                echo "[${arch}] score alarm: bad/conf cases detected; review ${score_review_out}" >&2
             fi
             ;;
         esac
@@ -1551,7 +2064,7 @@ run_ltp_riscv_mode() {
     prepare_ltp_runtime_image "${RV_IMG}"
     runtime_image="${prepared_runtime_image}"
     inject_oscomp_runtime_filter "${runtime_image}" "${runtime_filter}"
-    inject_ltp_runtime_config "${runtime_image}" "${ltp_profile}" "${ltp_whitelist}" "${ltp_blacklist}"
+    inject_ltp_runtime_config "${runtime_image}" "${ltp_profile}" "${ltp_whitelist}" "${ltp_blacklist}" "${runtime_filter}"
 
     echo "[${label}] running ltp-only, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, profile=${ltp_profile}, whitelist=${ltp_whitelist:-none}, blacklist=${ltp_blacklist:-none}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"
     if [[ "${WHUSE_STAGE2_STOP_ON_SUITE_DONE}" == "1" ]]; then
@@ -1628,7 +2141,44 @@ run_ltp_riscv_mode() {
     echo "[${label}] pass-candidates: ${pass_candidates} ($(wc -l < "${pass_candidates}"))"
     echo "[${label}] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
     echo "[${label}] conf-candidates: ${conf_candidates} ($(wc -l < "${conf_candidates}"))"
-    apply_ltp_candidate_lists "${label}" "${pass_candidates}" "${bad_candidates}" "${ltp_whitelist}" "${ltp_blacklist}"
+    case "${mode}" in
+    pending)
+        apply_ltp_pending_promotions \
+            "${label}" \
+            "${pass_candidates}" \
+            "${bad_candidates}" \
+            "${conf_candidates}" \
+            "${ltp_whitelist}" \
+            "$(ltp_curated_whitelist_for_target "rv" "${runtime_filter}")" \
+            "$(ltp_curated_blacklist_for_target "rv" "${runtime_filter}")" || ok=1
+        ;;
+    curated)
+        local curated_regression=0
+        if ! check_ltp_curated_stability "${label}" "${bad_candidates}" "${conf_candidates}"; then
+            ok=1
+            curated_regression=1
+        fi
+        if [[ "${curated_regression}" -eq 0 || "${WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION}" == "1" ]]; then
+            apply_ltp_curated_to_score_promotions \
+                "${label}" \
+                "${runtime_filter}" \
+                "${pass_candidates}" \
+                "$(ltp_score_whitelist_for_target "rv" "${runtime_filter}")" \
+                "$(ltp_score_blacklist_for_target "rv" "${runtime_filter}")" || ok=1
+        else
+            echo "[${label}] skip curated->score promotion: curated regression present and WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION=${WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION}"
+        fi
+        ;;
+    *)
+        local score_review_out
+        score_review_out="/tmp/${label}-score-review-${RUN_ID}.txt"
+        write_ltp_review_file "${label}-score" "${bad_candidates}" "${conf_candidates}" "${score_review_out}"
+        if [[ -s "${score_review_out}" ]]; then
+            echo "[${label}] score alarm: bad/conf cases detected; review ${score_review_out}" >&2
+        fi
+        apply_ltp_candidate_lists "${label}" "${pass_candidates}" "${bad_candidates}" "${ltp_whitelist}" "${ltp_blacklist}" || ok=1
+        ;;
+    esac
     if [[ "${suite_done_seen}" == "0" ]] && rg -q "whuse-oscomp-suite-done" "${text_log}"; then
         suite_done_seen=1
     fi
@@ -1643,7 +2193,33 @@ run_ltp_riscv() {
 }
 
 run_ltp_riscv_curated() {
-    run_ltp_riscv_mode "curated"
+    local prev_apply_candidates="${WHUSE_LTP_APPLY_CANDIDATES}"
+    local rc=0
+    if [[ "${LTP_APPLY_CANDIDATES_WAS_SET}" != "1" ]]; then
+        WHUSE_LTP_APPLY_CANDIDATES=1
+    fi
+    if run_ltp_riscv_mode "curated"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    WHUSE_LTP_APPLY_CANDIDATES="${prev_apply_candidates}"
+    return "${rc}"
+}
+
+run_ltp_riscv_pending() {
+    local prev_apply_candidates="${WHUSE_LTP_APPLY_CANDIDATES}"
+    local rc=0
+    if [[ "${LTP_APPLY_CANDIDATES_WAS_SET}" != "1" ]]; then
+        WHUSE_LTP_APPLY_CANDIDATES=1
+    fi
+    if run_ltp_riscv_mode "pending"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    WHUSE_LTP_APPLY_CANDIDATES="${prev_apply_candidates}"
+    return "${rc}"
 }
 
 count_matches() {
@@ -1685,6 +2261,9 @@ ltp-riscv)
 ltp-riscv-curated)
     run_ltp_riscv_curated
     ;;
+ltp-riscv-pending)
+    run_ltp_riscv_pending
+    ;;
 both)
     run_arch "rv" "${RV_IMG}" "qemu-riscv"
     run_arch "la" "${LA_IMG}" "qemu-loongarch"
@@ -1694,7 +2273,7 @@ both-raw-exit)
     run_arch_raw_exit "la" "${LA_IMG}" "qemu-loongarch"
     ;;
 *)
-    echo "usage: $0 [riscv|riscv-raw-exit|loongarch|loongarch-raw-exit|ltp-riscv|ltp-riscv-curated|both|both-raw-exit]" >&2
+    echo "usage: $0 [riscv|riscv-raw-exit|loongarch|loongarch-raw-exit|ltp-riscv|ltp-riscv-curated|ltp-riscv-pending|both|both-raw-exit]" >&2
     exit 2
     ;;
 esac

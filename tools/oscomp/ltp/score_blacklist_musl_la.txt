@@ -45,3 +45,4 @@ rt_sigprocmask02
 sigsuspend01
 statx09
 utime02
+close01

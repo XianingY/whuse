@@ -111,10 +111,27 @@ assert_file_exists "${LTP_DIR}/musl_rv_batch_memory.txt"
 assert_file_exists "${LTP_DIR}/musl_rv_batch_sync.txt"
 assert_file_exists "${LTP_DIR}/musl_rv_batch_path.txt"
 
+for blacklist in \
+    "${LTP_DIR}/score_blacklist.txt" \
+    "${LTP_DIR}/score_blacklist_glibc_rv.txt" \
+    "${LTP_DIR}/score_blacklist_musl_la.txt" \
+    "${LTP_DIR}/score_blacklist_glibc_la.txt" \
+    "${LTP_DIR}/musl_rv_curated_blacklist.txt" \
+    "${LTP_DIR}/curated_blacklist_glibc_rv.txt" \
+    "${LTP_DIR}/curated_blacklist_musl_la.txt" \
+    "${LTP_DIR}/curated_blacklist_glibc_la.txt"; do
+    assert_contains "${blacklist}" "close01"
+done
+
 assert_contains "${RUNNER}" "WHUSE_LTP_CURATED_WHITELIST"
 assert_contains "${RUNNER}" "WHUSE_LTP_CURATED_BLACKLIST"
 assert_contains "${RUNNER}" "WHUSE_STAGE2_REQUIRE_GUEST_SHUTDOWN"
 assert_contains "${RUNNER}" "RUN_ID="
+assert_contains "${RUNNER}" 'export WHUSE_STAGE2_BASIC_PROFILE="${WHUSE_STAGE2_BASIC_PROFILE:-full}"'
+assert_contains "${RUNNER}" 'export WHUSE_STAGE2_BUSYBOX_PROFILE="${WHUSE_STAGE2_BUSYBOX_PROFILE:-full}"'
+assert_contains "${RUNNER}" 'export WHUSE_STAGE2_GATE_LIBCTEST_SCOPE="${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE:-full}"'
+assert_contains "${RUNNER}" 'export WHUSE_STAGE2_LIBCBENCH_SCOPE="${WHUSE_STAGE2_LIBCBENCH_SCOPE:-full}"'
+assert_contains "${RUNNER}" 'export WHUSE_STAGE2_LMBENCH_SCOPE="${WHUSE_STAGE2_LMBENCH_SCOPE:-full}"'
 assert_contains "${RUNNER}" "ltp-riscv-curated"
 assert_contains "${RUNNER}" "candidate_label=\"\${arch}-ltp-\${candidate_runtime}-\${WHUSE_LTP_PROFILE}\""
 assert_contains "${RUNNER}" "pass-candidates-\${RUN_ID}.txt"
@@ -184,17 +201,36 @@ assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "run_
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "run_basic_testsuite_runtime_entry \\\"\$runtime\\\" \\\"\$timeout_s\\\""
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "/musl/busybox sh ./run-all.sh"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "run_ltp_step_runtime"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "whuse_ltp_count_lines()"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "whuse_ltp_list_contains()"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "whuse_ltp_cleanup_case_tree()"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" 'case_status=\"$case_log.status\"'
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" 'while [ ! -f \"$case_status\" ]'
+assert_not_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "/musl/busybox wc -l < \"\$whitelist\""
+assert_not_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "/musl/busybox grep -Fqx \"\$case_name\" \"\$WHUSE_LTP_WHITELIST\""
+assert_not_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "/musl/busybox grep -Fqx \"\$case_name\" \"\$WHUSE_LTP_BLACKLIST\""
+assert_not_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" '/musl/busybox timeout \"$WHUSE_LTP_CASE_TIMEOUT\" \"$case_path\" >\"$case_log\" 2>&1'
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "run_loongarch_full_ltp_step"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "render_oscomp_ltp_step_helper_script("
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "OSCOMP_LTP_STEP_HELPER_PATH"
 assert_function_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "select_oscomp_suite_script" "render_selected_oscomp_suite_script("
 assert_function_not_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "select_oscomp_suite_script" "render_oscomp_official_suite_script("
 assert_function_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "render_selected_oscomp_suite_script" "render_oscomp_internal_full_suite_script("
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "/musl/busybox sh /tmp/whuse-oscomp-ltp-step.sh"
+assert_function_not_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "render_oscomp_internal_full_suite_script" "script.push_str(ltp_helpers);"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "WHUSE_STAGE2_BASIC_PROFILE=\${WHUSE_STAGE2_BASIC_PROFILE:-__WHUSE_STAGE2_BASIC_PROFILE__}"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "WHUSE_STAGE2_BUSYBOX_PROFILE=\${WHUSE_STAGE2_BUSYBOX_PROFILE:-__WHUSE_STAGE2_BUSYBOX_PROFILE__}"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" 'case "$WHUSE_OSCOMP_PROFILE:$WHUSE_STAGE2_BASIC_PROFILE" in'
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "full:smoke)"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "run_busybox_smoke_step()"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "WHUSE_STAGE2_GATE_LIBCTEST_SCOPE"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "run_libctest_smoke_step"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "WHUSE_STAGE2_LIBCBENCH_SCOPE"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "run_libcbench_smoke_step"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "WHUSE_STAGE2_LMBENCH_SCOPE"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "run_lmbench_smoke_step"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "whuse-oscomp-shell-suite-begin"
-assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "/musl/busybox sh /tmp/whuse-oscomp-suite.sh"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" ". /tmp/whuse-oscomp-suite.sh"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_loongarch.inc.rs" "whuse-oscomp-shell-suite-end:\$rc"
 assert_contains "${REPO_ROOT}/crates/syscall/src/lib.rs" "whuse-busybox:utimensat-shortcut"
 assert_not_contains "${RUNNER}" "cp \"\${pass_candidates}\" \"\${REPO_ROOT}/tools/oscomp/ltp/score_whitelist.txt\""
@@ -203,6 +239,13 @@ assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "whuse-os
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "glibc-libctest-known-oom"
 assert_not_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "glibc-ltp-not-scored"
 assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "run_ltp_step_runtime"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "run_basic_testsuite_runtime_entry()"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "run_basic_testsuite_runtime_entry \\\"\$runtime\\\" \\\"\$timeout_s\\\""
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "echo \\\"Testing brk :\\\""
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "./basic/brk"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "./basic/sleep"
+assert_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" "/musl/busybox sh ./basic/run-all.sh"
+assert_not_contains "${REPO_ROOT}/crates/kernel-core/src/lib_riscv.inc.rs" 'if [ "$WHUSE_OSCOMP_PROFILE" = "basic" ] && [ "$marker_script" = "basic_testcode.sh" ]'
 assert_not_contains "${RUNNER}" "rg -q \"KERNEL PANIC|panic|pid 1 \\(init\\).*trap\""
 assert_order_in_array_block "${RUNNER}" "riscv_full_root_steps" "iozone_testcode.sh" "ltp_testcode.sh"
 assert_order_in_array_block "${RUNNER}" "riscv_full_root_steps" "ltp_testcode.sh" "libctest_testcode.sh"

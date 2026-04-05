@@ -61,6 +61,7 @@ const ECFG_TI: usize = 1 << 11;
 const LA_TIMER_FREQ_HZ: u64 = 100_000_000;
 const LOONGARCH_VIRT_GED_REG_BASE: usize = 0x100e001c;
 const LOONGARCH_VIRT_GED_S5_SLEEP_CTL: u8 = 0x34;
+static TIMER_FREQ_HZ: AtomicU64 = AtomicU64::new(LA_TIMER_FREQ_HZ);
 
 #[cfg(target_arch = "loongarch64")]
 global_asm!(
@@ -266,8 +267,17 @@ __whuse_user_trap_entry:
     csrrd $t0, 0x1
     st.d $t0, $a0, 264
     csrrd $t0, 0x5
+    andi $t2, $t0, 0x800
+    beqz $t2, .Lwhuse_user_trap_no_timer_clear
+    li.d $t2, 1
+    csrwr $t2, 0x44
+.Lwhuse_user_trap_no_timer_clear:
     srli.d $t1, $t0, 16
     andi $t1, $t1, 0x3f
+    andi $t2, $t0, 0x800
+    beqz $t2, .Lwhuse_user_trap_store_scause
+    li.d $t1, 0x100
+.Lwhuse_user_trap_store_scause:
     st.d $t1, $a0, 272
     csrrd $t0, 0x7
     st.d $t0, $a0, 280
@@ -391,6 +401,60 @@ fn init_loongarch_mmu() {
 #[cfg(not(target_arch = "loongarch64"))]
 fn init_loongarch_mmu() {}
 
+#[cfg(target_arch = "loongarch64")]
+#[inline]
+fn read_cpucfg(index: usize) -> usize {
+    let bits: usize;
+    unsafe {
+        core::arch::asm!("cpucfg {}, {}", out(reg) bits, in(reg) index);
+    }
+    bits
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline]
+fn read_time_ticks() -> u64 {
+    let count: u64;
+    unsafe {
+        core::arch::asm!("rdtime.d {}, $r0", out(reg) count);
+    }
+    count
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn detect_timer_freq_hz() -> u64 {
+    let base = (read_cpucfg(4) & 0xffff_ffff) as u64;
+    let ratio = read_cpucfg(5);
+    let mul = (ratio & 0xffff) as u64;
+    let div = ((ratio >> 16) & 0xffff) as u64;
+    if base == 0 || mul == 0 || div == 0 {
+        return LA_TIMER_FREQ_HZ;
+    }
+    base.saturating_mul(mul) / div
+}
+
+#[inline]
+fn timer_freq_hz() -> u64 {
+    let hz = TIMER_FREQ_HZ.load(Ordering::Relaxed);
+    if hz == 0 { LA_TIMER_FREQ_HZ } else { hz }
+}
+
+#[inline]
+fn ticks_to_nanos(ticks: u64) -> u64 {
+    let hz = timer_freq_hz().max(1);
+    (((ticks as u128) * 1_000_000_000u128) / (hz as u128)) as u64
+}
+
+#[inline]
+fn nanos_to_ticks_ceil(nanos: u64) -> u64 {
+    let hz = timer_freq_hz().max(1);
+    let numerator = (nanos as u128)
+        .saturating_mul(hz as u128)
+        .saturating_add(1_000_000_000u128 - 1);
+    let ticks = numerator / 1_000_000_000u128;
+    ticks.max(1).min(u64::MAX as u128) as u64
+}
+
 pub fn bootstrap(dtb_pa: usize) {
     extern "C" {
         fn end();
@@ -410,6 +474,11 @@ pub fn bootstrap(dtb_pa: usize) {
     if let Some(discovery) = discovery {
         INTERRUPT.configure(&discovery);
         VIRTIO_BLK.bootstrap(&discovery);
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let hz = detect_timer_freq_hz().max(1);
+        TIMER_FREQ_HZ.store(hz, Ordering::Relaxed);
     }
     #[cfg(target_arch = "loongarch64")]
     unsafe {
@@ -687,11 +756,7 @@ impl HalTimer for VirtTimer {
     fn monotonic_nanos(&self) -> u64 {
         #[cfg(target_arch = "loongarch64")]
         {
-            let count: u64;
-            unsafe {
-                core::arch::asm!("rdtime.d {}, $r0", out(reg) count);
-            }
-            count * 10
+            ticks_to_nanos(read_time_ticks())
         }
         #[cfg(not(target_arch = "loongarch64"))]
         {
@@ -702,20 +767,17 @@ impl HalTimer for VirtTimer {
     fn program_oneshot(&self, deadline_nanos: u64) {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
-            let now_ticks: u64;
-            core::arch::asm!("rdtime.d {}, $r0", out(reg) now_ticks);
-            let now_nanos = now_ticks * 10;
-
+            let now_nanos = ticks_to_nanos(read_time_ticks());
             let delta_nanos = deadline_nanos.saturating_sub(now_nanos);
-            let delta_ticks = delta_nanos / 10;
-            let init_val = delta_ticks.max(1000);
+            let init_val = nanos_to_ticks_ceil(delta_nanos).max(1);
 
             let mut ecfg: usize;
             core::arch::asm!("csrrd {}, 0x4", out(reg) ecfg);
             ecfg |= ECFG_TI;
             core::arch::asm!("csrwr {}, 0x4", in(reg) ecfg);
 
-            let tcfg: usize = (init_val as usize) << 2 | 0x1;
+            let tcfg_init = init_val.min((usize::MAX >> 2) as u64) as usize;
+            let tcfg: usize = (tcfg_init << 2) | 0x1;
             core::arch::asm!("csrwr {}, 0x41", in(reg) tcfg);
 
             let _ = (tcfg, ecfg);

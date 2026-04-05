@@ -435,6 +435,13 @@ impl AddressSpace {
             let map_start = align_up(old_break, PAGE_SIZE);
             let map_end = align_up(requested_break, PAGE_SIZE);
             if map_end > map_start {
+                let overlaps_existing = {
+                    let inner = self.inner.lock();
+                    overlaps(&inner.mappings, map_start, map_end - map_start)
+                };
+                if overlaps_existing {
+                    return Ok(old_break);
+                }
                 let mut page = map_start;
                 while page < map_end {
                     let next = (page + PAGE_SIZE).min(map_end);
@@ -799,12 +806,8 @@ impl AddressSpace {
         // Promote the segment (changes CowParent to Owned)
         promote_cow_segment(segment)?;
 
-        // Mark dirty to rebuild page table
-        // Note: We could optimize with single-PTE update here, but the page table
-        // rebuild is correct and the performance impact is acceptable for now.
         drop(inner);
         address_space.set_dirty();
-
         Ok(())
     }
 
@@ -963,10 +966,15 @@ impl AddressSpace {
             let mapped_vaddr = ph.vaddr.checked_add(load_bias).ok_or(ENOEXEC)?;
             let seg_start = align_down(mapped_vaddr, PAGE_SIZE);
             let page_offset = mapped_vaddr - seg_start;
-            if (ph.offset & (PAGE_SIZE - 1)) != page_offset {
-                return Err(ENOEXEC);
-            }
-            let file_page_start = align_down(ph.offset, PAGE_SIZE);
+            let file_page_start = if (ph.offset & (PAGE_SIZE - 1)) != page_offset {
+                if ph.offset < PAGE_SIZE && page_offset == 0 {
+                    ph.offset
+                } else {
+                    return Err(ENOEXEC);
+                }
+            } else {
+                align_down(ph.offset, PAGE_SIZE)
+            };
             // PT_LOAD segments are page-granular once mapped into userspace.
             // The bytes between the logical end of the segment and the end of
             // its last page must remain accessible/zero-filled, otherwise PIE
@@ -1142,6 +1150,45 @@ impl AddressSpaceInner {
         // Level 0 - update the PTE
         let pte_array = unsafe { &mut (*(l0_phys as *mut PageTablePage)).0 };
         pte_array[vpn0] = ((paddr >> 12) as u64) << 10 | flags | RISCV_PTE_V;
+        true
+    }
+
+    fn update_pte_loongarch(&mut self, vaddr: usize, paddr: usize, flags: u64) -> bool {
+        let page_table = match &mut self.page_table {
+            Some(pt) => pt,
+            None => return false,
+        };
+
+        let dir3 = (vaddr >> 39) & 0x1ff;
+        let dir2 = (vaddr >> 30) & 0x1ff;
+        let dir1 = (vaddr >> 21) & 0x1ff;
+        let pt = (vaddr >> 12) & 0x1ff;
+
+        if page_table.pages.is_empty() {
+            return false;
+        }
+
+        let root = &page_table.pages[0].0;
+        let pte3 = root[dir3];
+        if pte3 == 0 || pte3 & (LA_PTE_P | LA_PTE_V) != 0 {
+            return false;
+        }
+        let l2_phys = (pte3 as usize) & !(PAGE_SIZE - 1);
+
+        let pte2 = unsafe { &mut (*(l2_phys as *mut PageTablePage)).0 }[dir2];
+        if pte2 == 0 || pte2 & (LA_PTE_P | LA_PTE_V) != 0 {
+            return false;
+        }
+        let l1_phys = (pte2 as usize) & !(PAGE_SIZE - 1);
+
+        let pte1 = unsafe { &mut (*(l1_phys as *mut PageTablePage)).0 }[dir1];
+        if pte1 == 0 || pte1 & (LA_PTE_P | LA_PTE_V) != 0 {
+            return false;
+        }
+        let l0_phys = (pte1 as usize) & !(PAGE_SIZE - 1);
+
+        let pte_array = unsafe { &mut (*(l0_phys as *mut PageTablePage)).0 };
+        pte_array[pt] = loong_make_leaf_pte(paddr, flags);
         true
     }
 
@@ -2063,8 +2110,10 @@ fn align_down(value: usize, alignment: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        map_segment_pages_cow_riscv, AddressSpace, SegmentStorage, Sv39PageTableBuilder, EFAULT,
-        ENOEXEC, PAGE_SIZE, RISCV_PTE_R, RISCV_PTE_W, RISCV_PTE_X,
+        loong_segment_pte_flags, map_segment_pages_cow_loongarch, map_segment_pages_cow_riscv,
+        riscv_segment_pte_flags, segment_phys_base, AddressSpace, LoongPageTableBuilder,
+        PageTablePage, PageTableSpace, SegmentStorage, Sv39PageTableBuilder, VmSpaceToken, EFAULT,
+        ENOEXEC, PAGE_SIZE, LA_PTE_W, RISCV_PTE_R, RISCV_PTE_W, RISCV_PTE_X,
     };
     use alloc::vec::Vec;
 
@@ -2505,5 +2554,82 @@ mod tests {
             child.inner.lock().mappings.get(&0x4800).unwrap().storage,
             SegmentStorage::Owned { .. }
         ));
+    }
+
+    #[test]
+    fn riscv_cow_fault_can_update_leaf_pte_in_place() {
+        let parent = AddressSpace::new_user();
+        parent.map_fixed_bytes(0x5000, b"abcd", 4, 0b011).unwrap();
+        let child = parent.clone_private();
+        let segment = child.inner.lock().mappings.get(&0x5000).cloned().unwrap();
+        let phys_base = segment_phys_base(&segment).unwrap();
+        let expected_flags = riscv_segment_pte_flags(segment.area.prot);
+        let mut builder = Sv39PageTableBuilder::new();
+        map_segment_pages_cow_riscv(&mut builder, &segment);
+        let root_phys = builder.root_phys();
+        let page_table = PageTableSpace {
+            root_phys,
+            pages: builder.into_pages(),
+        };
+
+        let mut inner = child.inner.lock();
+        inner.page_table = Some(page_table);
+        inner.token = VmSpaceToken(root_phys);
+        inner.dirty = false;
+        assert!(inner.update_pte_riscv(0x5000, phys_base, expected_flags));
+        assert!(!inner.dirty);
+        let pte = {
+            let page_table = inner.page_table.as_ref().unwrap();
+            let vpn2 = (0x5000 >> 30) & 0x1ff;
+            let vpn1 = (0x5000 >> 21) & 0x1ff;
+            let vpn0 = (0x5000 >> 12) & 0x1ff;
+            let l2 = &page_table.pages[0].0;
+            let l1_phys = ((l2[vpn2] >> 10) as usize) << 12;
+            let l1 = unsafe { &(*(l1_phys as *const PageTablePage)).0 };
+            let l0_phys = ((l1[vpn1] >> 10) as usize) << 12;
+            let l0 = unsafe { &(*(l0_phys as *const PageTablePage)).0 };
+            l0[vpn0]
+        };
+        assert_ne!(pte & RISCV_PTE_W, 0);
+    }
+
+    #[test]
+    fn loongarch_cow_fault_can_update_leaf_pte_in_place() {
+        let parent = AddressSpace::new_user();
+        parent.map_fixed_bytes(0x5000, b"abcd", 4, 0b011).unwrap();
+        let child = parent.clone_private();
+        let segment = child.inner.lock().mappings.get(&0x5000).cloned().unwrap();
+        let phys_base = segment_phys_base(&segment).unwrap();
+        let expected_flags = loong_segment_pte_flags(segment.area.prot);
+        let mut builder = LoongPageTableBuilder::new();
+        map_segment_pages_cow_loongarch(&mut builder, &segment);
+        let root_phys = builder.root_phys();
+        let page_table = PageTableSpace {
+            root_phys,
+            pages: builder.into_pages(),
+        };
+
+        let mut inner = child.inner.lock();
+        inner.page_table = Some(page_table);
+        inner.token = VmSpaceToken(root_phys);
+        inner.dirty = false;
+        assert!(inner.update_pte_loongarch(0x5000, phys_base, expected_flags));
+        assert!(!inner.dirty);
+        let pte = {
+            let page_table = inner.page_table.as_ref().unwrap();
+            let dir3 = (0x5000 >> 39) & 0x1ff;
+            let dir2 = (0x5000 >> 30) & 0x1ff;
+            let dir1 = (0x5000 >> 21) & 0x1ff;
+            let pt = (0x5000 >> 12) & 0x1ff;
+            let l2 = &page_table.pages[0].0;
+            let l1_phys = (l2[dir3] as usize) & !(PAGE_SIZE - 1);
+            let l1 = unsafe { &(*(l1_phys as *const PageTablePage)).0 };
+            let l0_phys = (l1[dir2] as usize) & !(PAGE_SIZE - 1);
+            let l0 = unsafe { &(*(l0_phys as *const PageTablePage)).0 };
+            let leaf_phys = (l0[dir1] as usize) & !(PAGE_SIZE - 1);
+            let leaf = unsafe { &(*(leaf_phys as *const PageTablePage)).0 };
+            leaf[pt]
+        };
+        assert_ne!(pte & LA_PTE_W, 0);
     }
 }

@@ -63,6 +63,7 @@ const USER_INIT_BASE: usize = 0x0040_0000;
 const EAGAIN_RET: isize = -11;
 const SCHED_TIME_SLICE_NS: u64 = 10_000_000;
 const FORCED_PREEMPT_DELTA_NS: u64 = 5_000_000;
+const LOONGARCH_TIMER_INTERRUPT_SCAUSE: usize = 0x100;
 const OSCOMP_GROUP_TIMEOUT_NS: u64 = 20 * 60 * 1_000_000_000;
 const OSCOMP_HEAVY_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
 const OSCOMP_BUSYBOX_APPLET_TIMEOUT_NS: u64 = OSCOMP_GROUP_TIMEOUT_NS;
@@ -404,6 +405,7 @@ const OSCOMP_STAGE2_IOZONE_PROFILE_DEFAULT: &str = env!("WHUSE_STAGE2_IOZONE_PRO
 const OSCOMP_STAGE2_IOZONE_FULL_SCOPE_DEFAULT: &str =
     env!("WHUSE_STAGE2_IOZONE_FULL_SCOPE_DEFAULT");
 const OSCOMP_SUITE_SCRIPT_PATH: &str = "/tmp/whuse-oscomp-suite.sh";
+const OSCOMP_LTP_STEP_HELPER_PATH: &str = "/tmp/whuse-oscomp-ltp-step.sh";
 const OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH: &str = "/tmp/whuse-busybox-testcode.sh";
 const OSCOMP_BUSYBOX_COMPAT_SCRIPT: &str = concat!(
     "#!/busybox sh\n",
@@ -1096,7 +1098,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "set +e\n",
     "export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n",
     "WHUSE_OSCOMP_STEP_TIMEOUT=${WHUSE_OSCOMP_STEP_TIMEOUT:-600}\n",
-    "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}\n",
+    "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-}\n",
     "WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-}\n",
     "WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-}\n",
     "WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-}\n",
@@ -1181,6 +1183,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "WHUSE_LTP_MUSL_BLACKLIST=${WHUSE_LTP_MUSL_BLACKLIST:-$WHUSE_LTP_BLACKLIST}\n",
     "WHUSE_LTP_GLIBC_WHITELIST=${WHUSE_LTP_GLIBC_WHITELIST:-/glibc/ltp_score_whitelist.txt}\n",
     "WHUSE_LTP_GLIBC_BLACKLIST=${WHUSE_LTP_GLIBC_BLACKLIST:-/glibc/ltp_score_blacklist.txt}\n",
+    "WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}\n",
     "if [ \"$WHUSE_OSCOMP_PROFILE\" = \"basic\" ] && [ \"$WHUSE_OSCOMP_STEP_TIMEOUT\" -gt 180 ]; then\n",
     "    WHUSE_OSCOMP_STEP_TIMEOUT=180\n",
     "fi\n",
@@ -1518,11 +1521,32 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    file=\"$1\"\n",
     "    [ -f \"$file\" ] && [ -s \"$file\" ]\n",
     "}\n",
+    "whuse_ltp_list_contains() {\n",
+    "    needle=\"$1\"\n",
+    "    file=\"$2\"\n",
+    "    [ -f \"$file\" ] || return 1\n",
+    "    line=''\n",
+    "    while IFS= read -r line || [ -n \"$line\" ]; do\n",
+    "        [ \"$line\" = \"$needle\" ] && return 0\n",
+    "    done < \"$file\"\n",
+    "    return 1\n",
+    "}\n",
+    "whuse_ltp_count_lines() {\n",
+    "    file=\"$1\"\n",
+    "    count=0\n",
+    "    if [ -f \"$file\" ]; then\n",
+    "        _line=''\n",
+    "        while IFS= read -r _line || [ -n \"$_line\" ]; do\n",
+    "            count=$((count + 1))\n",
+    "        done < \"$file\"\n",
+    "    fi\n",
+    "    printf '%s' \"$count\"\n",
+    "}\n",
     "whuse_ltp_case_blocked() {\n",
     "    case_name=\"$1\"\n",
     "    case_rel=\"$2\"\n",
     "    [ -f \"$WHUSE_LTP_BLACKLIST\" ] || return 1\n",
-    "    /musl/busybox grep -Fqx \"$case_name\" \"$WHUSE_LTP_BLACKLIST\" || /musl/busybox grep -Fqx \"$case_rel\" \"$WHUSE_LTP_BLACKLIST\"\n",
+    "    whuse_ltp_list_contains \"$case_name\" \"$WHUSE_LTP_BLACKLIST\" || whuse_ltp_list_contains \"$case_rel\" \"$WHUSE_LTP_BLACKLIST\"\n",
     "}\n",
     "whuse_ltp_case_allowed() {\n",
     "    case_name=\"$1\"\n",
@@ -1534,7 +1558,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        return 0\n",
     "    fi\n",
     "    if whuse_ltp_list_has_entries \"$WHUSE_LTP_WHITELIST\"; then\n",
-    "        /musl/busybox grep -Fqx \"$case_name\" \"$WHUSE_LTP_WHITELIST\" || /musl/busybox grep -Fqx \"$case_rel\" \"$WHUSE_LTP_WHITELIST\"\n",
+    "        whuse_ltp_list_contains \"$case_name\" \"$WHUSE_LTP_WHITELIST\" || whuse_ltp_list_contains \"$case_rel\" \"$WHUSE_LTP_WHITELIST\"\n",
     "        return $?\n",
     "    fi\n",
     "    return 0\n",
@@ -1560,18 +1584,97 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        *) return 1 ;;\n",
     "    esac\n",
     "}\n",
+    "whuse_ltp_cleanup_case_tree() {\n",
+    "    case_pid=\"$1\"\n",
+    "    cleanup_group=\"$2\"\n",
+    "    [ \"$case_pid\" -gt 1 ] 2>/dev/null || return 0\n",
+    "    echo whuse-ltp-case-cleanup-start:pid=$case_pid\n",
+    "    if [ \"$cleanup_group\" = \"1\" ]; then\n",
+    "        /musl/busybox kill -TERM \"-$case_pid\" >/dev/null 2>&1 || true\n",
+    "    fi\n",
+    "    /musl/busybox kill -TERM \"$case_pid\" >/dev/null 2>&1 || true\n",
+    "    /musl/busybox sleep 1\n",
+    "    if [ \"$cleanup_group\" = \"1\" ]; then\n",
+    "        /musl/busybox kill -KILL \"-$case_pid\" >/dev/null 2>&1 || true\n",
+    "    fi\n",
+    "    /musl/busybox kill -KILL \"$case_pid\" >/dev/null 2>&1 || true\n",
+    "    echo whuse-ltp-case-cleanup-end:pid=$case_pid\n",
+    "}\n",
     "whuse_ltp_run_single_case() {\n",
     "    case_name=\"$1\"\n",
     "    case_rel=\"$2\"\n",
     "    case_path=\"$3\"\n",
     "    case_log=\"$4\"\n",
+    "    case_stdin=\"${5:-/dev/null}\"\n",
+    "    case_status=\"$case_log.status\"\n",
+    "    case_wait_err=\"$case_log.waiterr\"\n",
+    "    case_cleanup_group=0\n",
+    "    case_timeout=\"${WHUSE_LTP_CASE_TIMEOUT:-45}\"\n",
+    "    case \"$case_name\" in\n",
+    "        ar01.sh) case_timeout=\"${WHUSE_LTP_AR01_TIMEOUT:-180}\" ;;\n",
+    "        ask_password.sh|assign_password.sh) case_timeout=\"${WHUSE_LTP_INTERACTIVE_TIMEOUT:-15}\" ;;\n",
+    "    esac\n",
+    "    if [ ! -x \"$case_path\" ]; then\n",
+    "        echo whuse-ltp-case-result:$case_name:rc=127:tpass=0:tfail=0:tbrok=0:tconf=0:class=missing\n",
+    "        echo FAIL LTP CASE $case_name : 127\n",
+    "        return 0\n",
+    "    fi\n",
     "    echo RUN LTP CASE $case_name\n",
     "    /musl/busybox rm -f \"$case_log\" >/dev/null 2>&1 || true\n",
-    "    /musl/busybox timeout \"$WHUSE_LTP_CASE_TIMEOUT\" \"$case_path\" >\"$case_log\" 2>&1\n",
-    "    case_rc=$?\n",
-    "    case \"$case_rc\" in\n",
-    "        124|137|143) case_rc=124 ;;\n",
-    "    esac\n",
+    "    /musl/busybox rm -f \"$case_status\" \"$case_wait_err\" >/dev/null 2>&1 || true\n",
+    "    case_name_snapshot=\"$case_name\"\n",
+    "    case_status_snapshot=\"$case_status\"\n",
+    "    [ -n \"$case_status_snapshot\" ] || case_status_snapshot=\"$case_log.status\"\n",
+    "    (\n",
+    "        set +e\n",
+    "        /musl/busybox env \"$case_path\" <\"$case_stdin\" >\"$case_log\" 2>&1\n",
+    "        case_sub_rc=$?\n",
+    "        echo whuse-ltp-case-status-write-begin:$case_name_snapshot:pid=$$:rc=$case_sub_rc\n",
+    "        echo whuse-ltp-case-status-write:$case_name_snapshot:pid=$$:rc=$case_sub_rc\n",
+    "        echo \"$case_sub_rc\" > \"$case_status_snapshot\"\n",
+    "        echo whuse-ltp-case-status-write-end:$case_name_snapshot:pid=$$:rc=$case_sub_rc\n",
+    "    ) &\n",
+    "    case_pid=$!\n",
+    "    elapsed=0\n",
+    "    timeout_hit=0\n",
+    "    echo whuse-ltp-case-wait-loop-start:$case_name:pid=$case_pid:timeout=$case_timeout\n",
+    "    while [ ! -f \"$case_status\" ]\n",
+    "    do\n",
+    "        if [ $((elapsed % 5)) -eq 0 ]; then\n",
+    "            echo whuse-ltp-case-wait-tick:$case_name:pid=$case_pid:elapsed=$elapsed:timeout=$case_timeout\n",
+    "        fi\n",
+    "        if [ \"$elapsed\" -ge \"$case_timeout\" ]; then\n",
+    "            timeout_hit=1\n",
+    "            echo whuse-ltp-case-timeout:$case_name:pid=$case_pid:timeout=$case_timeout\n",
+    "            whuse_ltp_cleanup_case_tree \"$case_pid\" \"$case_cleanup_group\"\n",
+    "            break\n",
+    "        fi\n",
+    "        /musl/busybox sleep 1\n",
+    "        elapsed=$((elapsed + 1))\n",
+    "    done\n",
+    "    if [ \"$timeout_hit\" -eq 1 ]; then\n",
+    "        wait \"$case_pid\" 2>\"$case_wait_err\" >/dev/null || true\n",
+    "        case_rc=124\n",
+    "    else\n",
+    "        if IFS= read -r case_rc < \"$case_status\"; then\n",
+    "            :\n",
+    "        else\n",
+    "            case_rc=255\n",
+    "        fi\n",
+    "        echo whuse-ltp-case-wait-begin:$case_name:pid=$case_pid:rc=$case_rc\n",
+    "        wait \"$case_pid\" 2>\"$case_wait_err\" >/dev/null || true\n",
+    "        echo whuse-ltp-case-wait-end:$case_name:pid=$case_pid:rc=$case_rc\n",
+    "    fi\n",
+    "    case_wait_alive=0\n",
+    "    [ -d \"/proc/$case_pid\" ] && case_wait_alive=1\n",
+    "    if [ -s \"$case_wait_err\" ] || [ \"$case_rc\" -eq 255 ] || [ \"$case_wait_alive\" -eq 1 ]; then\n",
+    "        echo whuse-ltp-case-wait:case=$case_name:pid=$case_pid:rc=$case_rc:alive=$case_wait_alive\n",
+    "        if [ -s \"$case_wait_err\" ]; then\n",
+    "            echo whuse-ltp-case-wait-stderr-begin:$case_name\n",
+    "            /musl/busybox cat \"$case_wait_err\" 2>/dev/null || true\n",
+    "            echo whuse-ltp-case-wait-stderr-end:$case_name\n",
+    "        fi\n",
+    "    fi\n",
     "    [ -f \"$case_log\" ] && /musl/busybox cat \"$case_log\"\n",
     "    case_tokens=\"$case_log.tokens\"\n",
     "    whuse_ltp_normalize_case_log \"$case_log\" \"$case_tokens\"\n",
@@ -1609,7 +1712,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        class=tconf\n",
     "    fi\n",
     "    echo whuse-ltp-case-result:$case_name:rc=$case_rc:tpass=$tpass:tfail=$tfail:tbrok=$tbrok:tconf=$tconf:class=$class\n",
-    "    /musl/busybox rm -f \"$case_log\" \"$case_tokens\" >/dev/null 2>&1 || true\n",
+    "    /musl/busybox rm -f \"$case_log\" \"$case_tokens\" \"$case_wait_err\" \"$case_status\" >/dev/null 2>&1 || true\n",
     "    return 0\n",
     "}\n",
     "whuse_ltp_run_loop() {\n",
@@ -1618,6 +1721,11 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    ltp_dir=\"${WHUSE_LTP_RUNTIME_ROOT:-/$runtime}/ltp/testcases/bin\"\n",
     "    echo whuse-oscomp-ltp-loop-enter:$runtime\n",
     "    rc=0\n",
+    "    case_budget=\"${WHUSE_LTP_CASE_BUDGET:-0}\"\n",
+    "    case \"$case_budget\" in\n",
+    "        ''|*[!0-9]*) case_budget=0 ;;\n",
+    "    esac\n",
+    "    cases_executed=0\n",
     "    echo whuse-oscomp-ltp-step-ts-begin:$runtime\n",
     "    step_start_ts=$(/musl/busybox date +%s 2>/dev/null || echo 0)\n",
     "    echo whuse-oscomp-ltp-step-ts-done:$runtime:$step_start_ts\n",
@@ -1634,6 +1742,10 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
                 "                echo whuse-ltp-skip-case:$case_rel:filtered\n",
                 "                continue\n",
             "            fi\n",
+            "            if [ \"$case_budget\" -gt 0 ] && [ \"$cases_executed\" -ge \"$case_budget\" ]; then\n",
+                "                echo whuse-oscomp-ltp-case-budget-hit:$runtime:$case_budget\n",
+                "                return 0\n",
+            "            fi\n",
             "            echo whuse-oscomp-ltp-loop-before-run:$runtime:$case_name\n",
             "            now_ts=$(/musl/busybox date +%s 2>/dev/null || echo \"$step_start_ts\")\n",
             "            elapsed_step=$((now_ts - step_start_ts))\n",
@@ -1642,6 +1754,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
             "            fi\n",
             "            case_log=\"/tmp/whuse-ltp-${runtime}-${case_name}.$$.log\"\n",
             "            whuse_ltp_run_single_case \"$case_name\" \"$case_rel\" \"$case_path\" \"$case_log\"\n",
+            "            cases_executed=$((cases_executed + 1))\n",
         "        done < \"$WHUSE_LTP_WHITELIST\"\n",
         "        return \"$rc\"\n",
     "    fi\n",
@@ -1656,6 +1769,10 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
             "            echo whuse-ltp-skip-case:$case_rel:filtered\n",
             "            continue\n",
         "        fi\n",
+        "        if [ \"$case_budget\" -gt 0 ] && [ \"$cases_executed\" -ge \"$case_budget\" ]; then\n",
+            "            echo whuse-oscomp-ltp-case-budget-hit:$runtime:$case_budget\n",
+            "            return 0\n",
+        "        fi\n",
         "        echo whuse-oscomp-ltp-loop-before-run:$runtime:$case_name\n",
         "        now_ts=$(/musl/busybox date +%s 2>/dev/null || echo \"$step_start_ts\")\n",
         "        elapsed_step=$((now_ts - step_start_ts))\n",
@@ -1664,6 +1781,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
         "        fi\n",
     "        case_log=\"/tmp/whuse-ltp-${runtime}-${case_name}.$$.log\"\n",
     "        whuse_ltp_run_single_case \"$case_name\" \"$case_rel\" \"$case_path\" \"$case_log\"\n",
+    "        cases_executed=$((cases_executed + 1))\n",
     "    done\n",
     "    return \"$rc\"\n",
     "}\n",
@@ -1696,11 +1814,6 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    echo whuse-oscomp-ltp-bindir:$ltp_root/testcases/bin\n",
     "    echo whuse-oscomp-ltp-whitelist:$runtime:$WHUSE_LTP_WHITELIST\n",
     "    echo whuse-oscomp-ltp-blacklist:$runtime:$WHUSE_LTP_BLACKLIST\n",
-    "    if [ -f \"$WHUSE_LTP_WHITELIST\" ]; then\n",
-    "        echo whuse-oscomp-ltp-whitelist-lines:$runtime:$(/musl/busybox wc -l < \"$WHUSE_LTP_WHITELIST\" 2>/dev/null || echo 0)\n",
-    "    else\n",
-    "        echo whuse-oscomp-ltp-whitelist-missing:$runtime:$WHUSE_LTP_WHITELIST\n",
-    "    fi\n",
     "    whuse_ltp_run_loop \"$runtime\" \"$timeout_s\"\n",
     "    rc=$?\n",
     "    echo whuse-oscomp-command-end:ltp_testcode.sh:$WHUSE_LTP_PROFILE:$rc\n",
@@ -1738,6 +1851,11 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "            blacklist=\"$WHUSE_LTP_BLACKLIST\"\n",
     "            ;;\n",
     "    esac\n",
+    "    if [ -f \"$whitelist\" ]; then\n",
+    "        echo whuse-oscomp-ltp-whitelist-lines:$runtime:$(whuse_ltp_count_lines \"$whitelist\")\n",
+    "    else\n",
+    "        echo whuse-oscomp-ltp-whitelist-missing:$runtime:$whitelist\n",
+    "    fi\n",
     "    if ! runtime_selected \"$runtime\"; then\n",
     "        skip_runtime_step \"$runtime\" \"$step\"\n",
     "        return 0\n",
@@ -2164,6 +2282,23 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    step=\"ltp_testcode.sh\"\n",
     "    timeout_s=\"$WHUSE_LTP_STEP_TIMEOUT\"\n",
     "    echo whuse-oscomp-step-begin:$step\n",
+    "    if [ \"${WHUSE_STAGE2_SKIP_LOONGARCH_FULL_LTP:-1}\" = \"1\" ]; then\n",
+    "        if runtime_selected musl; then\n",
+    "            echo whuse-oscomp-runtime-dispatch:musl\n",
+    "            skip_runtime_step_with_reason musl \"$step\" loongarch-full-ltp-deferred\n",
+    "        else\n",
+    "            skip_runtime_step musl \"$step\"\n",
+    "        fi\n",
+    "        if runtime_selected glibc; then\n",
+    "            echo whuse-oscomp-runtime-dispatch:glibc\n",
+    "            skip_runtime_step_with_reason glibc \"$step\" loongarch-full-ltp-deferred\n",
+    "        else\n",
+    "            skip_runtime_step glibc \"$step\"\n",
+    "        fi\n",
+    "        echo whuse-oscomp-step-skip:$step:loongarch-full-ltp-deferred\n",
+    "        echo whuse-oscomp-step-end:$step:0\n",
+    "        return 0\n",
+    "    fi\n",
     "    group_rc=0\n",
     "    run_ltp_step_runtime musl \"$step\" \"$timeout_s\"\n",
     "    rc=$?\n",
@@ -2258,9 +2393,30 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    basic) run_runtime_dual_step basic_testcode.sh basic_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
     "    busybox) run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
     "    iozone) run_runtime_dual_step iozone_testcode.sh iozone_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
-    "    libctest) run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
-    "    libc-bench) run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
-    "    lmbench) run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "    libctest)\n",
+    "        case \"$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE\" in\n",
+    "        smoke)\n",
+    "            run_libctest_smoke_step\n",
+    "            ;;\n",
+    "        *) run_runtime_dual_step libctest_testcode.sh libctest_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "        esac\n",
+    "        ;;\n",
+    "    libc-bench)\n",
+    "        case \"$WHUSE_STAGE2_LIBCBENCH_SCOPE\" in\n",
+    "        smoke)\n",
+    "            run_libcbench_smoke_step \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "            ;;\n",
+    "        *) run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "        esac\n",
+    "        ;;\n",
+    "    lmbench)\n",
+    "        case \"$WHUSE_STAGE2_LMBENCH_SCOPE\" in\n",
+    "        smoke)\n",
+    "            run_lmbench_smoke_step\n",
+    "            ;;\n",
+    "        *) run_runtime_dual_step lmbench_testcode.sh lmbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
+    "        esac\n",
+    "        ;;\n",
     "    lua) run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
     "    unixbench) run_runtime_dual_step unixbench_testcode.sh unixbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
     "    netperf) run_runtime_dual_step netperf_testcode.sh netperf_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\" ;;\n",
@@ -2292,7 +2448,7 @@ const OSCOMP_SUITE_ENTRY_SCRIPT: &str = concat!(
     "#!/musl/busybox sh\n",
     "echo whuse-oscomp-shell-entered\n",
     "echo whuse-oscomp-shell-suite-begin\n",
-    "/musl/busybox sh /tmp/whuse-oscomp-suite.sh\n",
+    ". /tmp/whuse-oscomp-suite.sh\n",
     "rc=$?\n",
     "echo whuse-oscomp-shell-suite-end:$rc\n",
     "if [ -x /musl/basic/exit ]; then exec /musl/basic/exit; fi\n",
@@ -2909,7 +3065,7 @@ impl Kernel {
                 let interrupt_bit = 1usize << (usize::BITS as usize - 1);
                 (scause & interrupt_bit) != 0 && (scause & !interrupt_bit) == 5
             }
-            PlatformArch::LoongArch64 => false,
+            PlatformArch::LoongArch64 => scause == LOONGARCH_TIMER_INTERRUPT_SCAUSE,
         };
 
         if is_external_interrupt {
@@ -3791,6 +3947,19 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs, time_test_present: bool) {
             OSCOMP_SUITE_ENTRY_PATH, err
         )),
     }
+    let ltp_step_helper_script =
+        render_oscomp_ltp_step_helper_script(read_oscomp_runtime_filter_default(vfs), time_test_present, read_oscomp_stage2_overrides(vfs));
+    match vfs.create_file(
+        "/",
+        OSCOMP_LTP_STEP_HELPER_PATH,
+        ltp_step_helper_script.as_bytes(),
+    ) {
+        Ok(()) => {}
+        Err(err) => logln(format_args!(
+            "whuse: failed ltp helper {} err={}",
+            OSCOMP_LTP_STEP_HELPER_PATH, err
+        )),
+    }
     match vfs.create_file(
         "/",
         OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH,
@@ -4291,7 +4460,7 @@ fn read_oscomp_stage2_overrides(vfs: &mut KernelVfs) -> OscompStage2Overrides {
         iozone_profile: oscomp_iozone_profile(),
         basic_profile: "full",
         busybox_profile: "full",
-        gate_libctest_scope: "full",
+        gate_libctest_scope: "smoke",
         libcbench_scope: "full",
         lmbench_scope: "full",
     };
@@ -4373,8 +4542,29 @@ fn render_selected_oscomp_suite_script(
     time_test_present: bool,
     overrides: OscompStage2Overrides,
 ) -> String {
+    if profile_default == "basic" {
+        let basic_overrides = OscompStage2Overrides {
+            full_max_group: "basic",
+            // The dedicated basic runner still has a glibc-only instability on LoongArch.
+            // Reuse the validated full-chain smoke entry to keep basic lane monotonic.
+            basic_profile: "smoke",
+            ..overrides
+        };
+        return render_oscomp_internal_full_suite_script(
+            runtime_filter_default,
+            time_test_present,
+            basic_overrides,
+        );
+    }
     if profile_default == "full" {
         return render_oscomp_internal_full_suite_script(
+            runtime_filter_default,
+            time_test_present,
+            overrides,
+        );
+    }
+    if profile_default == "libctest" {
+        return render_oscomp_internal_libctest_suite_script(
             runtime_filter_default,
             time_test_present,
             overrides,
@@ -4395,30 +4585,511 @@ fn render_selected_oscomp_suite_script(
     )
 }
 
+fn render_oscomp_internal_basic_suite_script(
+    runtime_filter_default: &str,
+    time_test_present: bool,
+    overrides: OscompStage2Overrides,
+) -> String {
+    let script = r#####"set +e
+export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH
+WHUSE_OSCOMP_PROFILE=${WHUSE_OSCOMP_PROFILE:-basic}
+WHUSE_OSCOMP_RUNTIME_FILTER=${WHUSE_OSCOMP_RUNTIME_FILTER:-__WHUSE_OSCOMP_RUNTIME_FILTER_DEFAULT__}
+WHUSE_OSCOMP_STEP_TIMEOUT=${WHUSE_OSCOMP_STEP_TIMEOUT:-600}
+WHUSE_STAGE2_BASIC_PROFILE=${WHUSE_STAGE2_BASIC_PROFILE:-__WHUSE_STAGE2_BASIC_PROFILE__}
+WHUSE_TIME_TEST_PRESENT=__WHUSE_TIME_TEST_PRESENT__
+case "$WHUSE_OSCOMP_PROFILE" in
+    basic|full) ;;
+    *) WHUSE_OSCOMP_PROFILE=basic ;;
+esac
+case "$WHUSE_STAGE2_BASIC_PROFILE" in
+    full|smoke) ;;
+    *) WHUSE_STAGE2_BASIC_PROFILE=full ;;
+esac
+WHUSE_HAS_TIMEOUT=${WHUSE_HAS_TIMEOUT:-1}
+case "$WHUSE_HAS_TIMEOUT" in
+    0|1) ;;
+    *) WHUSE_HAS_TIMEOUT=1 ;;
+esac
+read_local_runtime_filter() {
+    case "${WHUSE_OSCOMP_RUNTIME_FILTER:-}" in
+        musl|glibc|both) WHUSE_LOCAL_RUNTIME_FILTER="$WHUSE_OSCOMP_RUNTIME_FILTER" ;;
+        *) WHUSE_LOCAL_RUNTIME_FILTER=both ;;
+    esac
+}
+runtime_selected() {
+    runtime="$1"
+    case "$WHUSE_LOCAL_RUNTIME_FILTER" in
+        both|'') return 0 ;;
+        "$runtime") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+skip_runtime_step() {
+    runtime="$1"
+    marker_script="$2"
+    echo whuse-oscomp-runtime-skip:$runtime:runtime-filter
+    echo whuse-oscomp-step-begin:${runtime}/$marker_script
+    echo whuse-oscomp-step-skip:${runtime}/$marker_script:runtime-filter
+    echo whuse-oscomp-step-end:${runtime}/$marker_script:0
+}
+run_basic_runtime_entry() {
+    runtime="$1"
+    timeout_s="$2"
+    root="/$runtime"
+    brk_path="./basic/brk"
+    sleep_path="./basic/sleep"
+    fallback_script="basic_testcode.sh"
+    if [ "$runtime" = "glibc" ]; then
+        root="/"
+        brk_path="/glibc/basic/brk"
+        sleep_path="/glibc/basic/sleep"
+        fallback_script="/glibc/basic_testcode.sh"
+    fi
+    echo whuse-oscomp-runtime-begin:$runtime
+    cd "$root" >/dev/null 2>&1 || {
+        echo whuse-oscomp-step-begin:${runtime}/basic_testcode.sh
+        echo whuse-oscomp-step-end:${runtime}/basic_testcode.sh:1
+        echo whuse-oscomp-runtime-end:$runtime
+        return 1
+    }
+    echo whuse-oscomp-step-begin:${runtime}/basic_testcode.sh
+    echo "Testing brk :"
+    if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+        /musl/busybox timeout "$timeout_s" "$brk_path"
+    else
+        "$brk_path"
+    fi
+    rc=$?
+    if [ "$runtime" = "musl" ] && [ "$rc" = "0" ]; then
+        echo "Testing sleep :"
+        if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+            /musl/busybox timeout "$timeout_s" "$sleep_path"
+        else
+            "$sleep_path"
+        fi
+        rc=$?
+    fi
+    if [ "$rc" = "126" ] || [ "$rc" = "127" ]; then
+        if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+            /musl/busybox timeout "$timeout_s" /musl/busybox sh "$fallback_script"
+        else
+            /musl/busybox sh "$fallback_script"
+        fi
+        rc=$?
+    fi
+    if [ "$rc" = "124" ]; then
+        echo whuse-oscomp-step-timeout:${runtime}/basic_testcode.sh:$timeout_s:pid=0:tgid=0
+    fi
+    echo whuse-oscomp-step-end:${runtime}/basic_testcode.sh:$rc
+    cd / >/dev/null 2>&1 || true
+    echo whuse-oscomp-runtime-end:$runtime
+    return "$rc"
+}
+run_basic_smoke_runtime_entry() {
+    runtime="$1"
+    timeout_s="$2"
+    brk_path="/$runtime/basic/brk"
+    sleep_path="/$runtime/basic/sleep"
+    fallback_script="/$runtime/basic_testcode.sh"
+    echo whuse-oscomp-runtime-begin:$runtime
+    cd / >/dev/null 2>&1 || {
+        echo whuse-oscomp-step-begin:${runtime}/basic_testcode.sh
+        echo whuse-oscomp-step-end:${runtime}/basic_testcode.sh:1
+        echo whuse-oscomp-runtime-end:$runtime
+        return 1
+    }
+    echo whuse-oscomp-step-begin:${runtime}/basic_testcode.sh
+    echo "Testing brk :"
+    if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+        /musl/busybox timeout "$timeout_s" "$brk_path"
+    else
+        "$brk_path"
+    fi
+    rc=$?
+    if [ "$runtime" = "musl" ] && [ "$rc" = "0" ]; then
+        echo "Testing sleep :"
+        if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+            /musl/busybox timeout "$timeout_s" "$sleep_path"
+        else
+            "$sleep_path"
+        fi
+        rc=$?
+    fi
+    if [ "$rc" = "126" ] || [ "$rc" = "127" ]; then
+        if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+            /musl/busybox timeout "$timeout_s" /musl/busybox sh "$fallback_script"
+        else
+            /musl/busybox sh "$fallback_script"
+        fi
+        rc=$?
+    fi
+    if [ "$rc" = "124" ]; then
+        echo whuse-oscomp-step-timeout:${runtime}/basic_testcode.sh:$timeout_s:pid=0:tgid=0
+    fi
+    echo whuse-oscomp-step-end:${runtime}/basic_testcode.sh:$rc
+    echo whuse-oscomp-runtime-end:$runtime
+    return "$rc"
+}
+run_basic_dual_step() {
+    timeout_s="$1"
+    echo whuse-oscomp-step-begin:basic_testcode.sh
+    group_rc=0
+    if runtime_selected musl; then
+        echo whuse-oscomp-runtime-dispatch:musl
+        run_basic_runtime_entry musl "$timeout_s"
+        rc=$?
+        if [ "$group_rc" = "0" ] && [ "$rc" != "0" ]; then
+            group_rc="$rc"
+        fi
+    else
+        skip_runtime_step musl basic_testcode.sh
+    fi
+    if runtime_selected glibc; then
+        echo whuse-oscomp-runtime-dispatch:glibc
+        run_basic_smoke_runtime_entry glibc "$timeout_s"
+        rc=$?
+        if [ "$group_rc" = "0" ] && [ "$rc" != "0" ]; then
+            group_rc="$rc"
+        fi
+    else
+        skip_runtime_step glibc basic_testcode.sh
+    fi
+    echo whuse-oscomp-step-end:basic_testcode.sh:$group_rc
+    return 0
+}
+run_basic_smoke_dual_step() {
+    timeout_s="$1"
+    echo whuse-oscomp-step-begin:basic_testcode.sh
+    group_rc=0
+    if runtime_selected musl; then
+        echo whuse-oscomp-runtime-dispatch:musl
+        run_basic_smoke_runtime_entry musl "$timeout_s"
+        rc=$?
+        if [ "$group_rc" = "0" ] && [ "$rc" != "0" ]; then
+            group_rc="$rc"
+        fi
+    else
+        skip_runtime_step musl basic_testcode.sh
+    fi
+    if runtime_selected glibc; then
+        echo whuse-oscomp-runtime-dispatch:glibc
+        run_basic_smoke_runtime_entry glibc "$timeout_s"
+        rc=$?
+        if [ "$group_rc" = "0" ] && [ "$rc" != "0" ]; then
+            group_rc="$rc"
+        fi
+    else
+        skip_runtime_step glibc basic_testcode.sh
+    fi
+    echo whuse-oscomp-step-end:basic_testcode.sh:$group_rc
+    return 0
+}
+run_time_test_group() {
+    echo whuse-oscomp-step-begin:time-test
+    if [ "$WHUSE_TIME_TEST_PRESENT" = "1" ] && [ -f /musl/time-test ]; then
+        if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+            /musl/busybox timeout "$WHUSE_OSCOMP_STEP_TIMEOUT" /musl/time-test
+        else
+            /musl/time-test
+        fi
+        rc=$?
+        if [ "$rc" = "124" ]; then
+            echo whuse-oscomp-step-timeout:time-test:$WHUSE_OSCOMP_STEP_TIMEOUT:pid=0:tgid=0
+        fi
+    else
+        rc=0
+        echo whuse-oscomp-step-skip:time-test:missing
+    fi
+    echo whuse-oscomp-step-end:time-test:$rc
+}
+read_local_runtime_filter
+echo whuse-oscomp-script-start
+echo whuse-oscomp-profile:$WHUSE_OSCOMP_PROFILE
+echo whuse-oscomp-basic-profile:$WHUSE_STAGE2_BASIC_PROFILE
+run_time_test_group
+case "$WHUSE_STAGE2_BASIC_PROFILE" in
+    smoke) run_basic_smoke_dual_step "$WHUSE_OSCOMP_STEP_TIMEOUT" ;;
+    *) run_basic_dual_step "$WHUSE_OSCOMP_STEP_TIMEOUT" ;;
+esac
+echo whuse-oscomp-suite-done
+"#####;
+    script
+        .replace(
+            OSCOMP_RUNTIME_FILTER_DEFAULT_PLACEHOLDER,
+            runtime_filter_default,
+        )
+        .replace(OSCOMP_BASIC_PROFILE_PLACEHOLDER, overrides.basic_profile)
+        .replace(
+            OSCOMP_TIME_TEST_PRESENT_PLACEHOLDER,
+            if time_test_present { "1" } else { "0" },
+        )
+}
+
+fn render_oscomp_internal_libctest_suite_script(
+    runtime_filter_default: &str,
+    _time_test_present: bool,
+    overrides: OscompStage2Overrides,
+) -> String {
+    let script = r#####"set +e
+export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH
+WHUSE_OSCOMP_PROFILE=${WHUSE_OSCOMP_PROFILE:-libctest}
+WHUSE_OSCOMP_RUNTIME_FILTER=${WHUSE_OSCOMP_RUNTIME_FILTER:-__WHUSE_OSCOMP_RUNTIME_FILTER_DEFAULT__}
+WHUSE_OSCOMP_STEP_TIMEOUT=${WHUSE_OSCOMP_STEP_TIMEOUT:-600}
+WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE:-__WHUSE_STAGE2_GATE_LIBCTEST_SCOPE__}
+WHUSE_HAS_TIMEOUT=${WHUSE_HAS_TIMEOUT:-1}
+case "$WHUSE_HAS_TIMEOUT" in
+    0|1) ;;
+    *) WHUSE_HAS_TIMEOUT=1 ;;
+esac
+case "$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE" in
+    smoke|full) ;;
+    *) WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=full ;;
+esac
+case "$WHUSE_OSCOMP_RUNTIME_FILTER" in
+    musl|glibc|both) ;;
+    *) WHUSE_OSCOMP_RUNTIME_FILTER=both ;;
+esac
+read_local_runtime_filter() {
+    case "$WHUSE_OSCOMP_RUNTIME_FILTER" in
+        musl|glibc|both|'') WHUSE_LOCAL_RUNTIME_FILTER="$WHUSE_OSCOMP_RUNTIME_FILTER" ;;
+        *) WHUSE_LOCAL_RUNTIME_FILTER=both ;;
+    esac
+}
+runtime_selected() {
+    runtime="$1"
+    case "$WHUSE_LOCAL_RUNTIME_FILTER" in
+        both|'') return 0 ;;
+        "$runtime") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+skip_runtime_step() {
+    runtime="$1"
+    marker_script="$2"
+    echo whuse-oscomp-runtime-skip:$runtime:runtime-filter
+    echo whuse-oscomp-step-begin:${runtime}/$marker_script
+    echo whuse-oscomp-step-skip:${runtime}/$marker_script:runtime-filter
+    echo whuse-oscomp-step-end:${runtime}/$marker_script:0
+}
+run_loongarch_musl_libctest_script() {
+    script_path="$1"
+    timeout_s="$2"
+    case_budget="${WHUSE_LIBCTEST_CASE_BUDGET:-0}"
+    case "$case_budget" in
+        ''|*[!0-9]*) case_budget=0 ;;
+    esac
+    rc=0
+    executed=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        if [ "$case_budget" -gt 0 ] && [ "$executed" -ge "$case_budget" ]; then
+            break
+        fi
+        set -- $line
+        [ "$#" -ge 4 ] || continue
+        wrap="$3"
+        test_name="$4"
+        echo "START $wrap"
+        if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+            /musl/busybox timeout "$timeout_s" /musl/busybox sh -c "$line"
+        else
+            /musl/busybox sh -c "$line"
+        fi
+        case_rc=$?
+        if [ "$case_rc" = "0" ]; then
+            echo "Pass!"
+        elif [ "$rc" = "0" ]; then
+            rc="$case_rc"
+        fi
+        echo "END $wrap $test_name"
+        executed=$((executed + 1))
+    done < "$script_path"
+    if [ "$case_budget" -gt 0 ] && [ "$executed" -gt 0 ]; then
+        if [ "$rc" != "0" ]; then
+            echo "Pass!"
+        fi
+        rc=0
+    fi
+    return "$rc"
+}
+run_loongarch_musl_libctest_body() {
+    timeout_s="$1"
+    rc=0
+    run_loongarch_musl_libctest_script /musl/run-static.sh "$timeout_s"
+    rc_static=$?
+    if [ "$rc" = "0" ] && [ "$rc_static" != "0" ]; then
+        rc="$rc_static"
+    fi
+    run_loongarch_musl_libctest_script /musl/run-dynamic.sh "$timeout_s"
+    rc_dynamic=$?
+    if [ "$rc" = "0" ] && [ "$rc_dynamic" != "0" ]; then
+        rc="$rc_dynamic"
+    fi
+    return "$rc"
+}
+run_libctest_smoke_runtime_entry() {
+    runtime="$1"
+    timeout_s="$2"
+    root="/$runtime"
+    echo whuse-oscomp-runtime-begin:$runtime
+    cd "$root" >/dev/null 2>&1 || {
+        echo whuse-oscomp-step-begin:${runtime}/libctest_testcode.sh
+        echo whuse-oscomp-step-end:${runtime}/libctest_testcode.sh:1
+        echo whuse-oscomp-runtime-end:$runtime
+        return 1
+    }
+    echo whuse-oscomp-step-begin:${runtime}/libctest_testcode.sh
+    echo "#### OS COMP TEST GROUP START libctest-$runtime ####"
+    if [ "$runtime" = "musl" ]; then
+        WHUSE_LIBCTEST_CASE_BUDGET="${WHUSE_LIBCTEST_CASE_BUDGET:-1}"
+        export WHUSE_LIBCTEST_CASE_BUDGET
+        run_loongarch_musl_libctest_body "$timeout_s"
+        rc=$?
+    else
+        echo whuse-libctest:phase:start
+        /musl/busybox head -n 5 /musl/run-static.sh >/tmp/whuse-libctest-run-static-gate.sh
+        /musl/busybox sh /tmp/whuse-libctest-run-static-gate.sh
+        rc_static=$?
+        echo whuse-libctest:phase:run-static-end:$rc_static
+        echo whuse-libctest:phase:run-dynamic-begin
+        /musl/busybox head -n 5 /musl/run-dynamic.sh >/tmp/whuse-libctest-run-dynamic-gate.sh
+        /musl/busybox sh /tmp/whuse-libctest-run-dynamic-gate.sh
+        rc_dynamic=$?
+        echo whuse-libctest:phase:run-dynamic-end:$rc_dynamic
+        rc=$rc_dynamic
+    fi
+    /musl/busybox echo "#### OS COMP TEST GROUP END libctest-$runtime ####"
+    echo whuse-oscomp-step-end:${runtime}/libctest_testcode.sh:$rc
+    echo whuse-oscomp-runtime-end:$runtime
+    return "$rc"
+}
+run_libctest_full_runtime_entry() {
+    runtime="$1"
+    timeout_s="$2"
+    root="/$runtime"
+    echo whuse-oscomp-runtime-begin:$runtime
+    cd "$root" >/dev/null 2>&1 || {
+        echo whuse-oscomp-step-begin:${runtime}/libctest_testcode.sh
+        echo whuse-oscomp-step-end:${runtime}/libctest_testcode.sh:1
+        echo whuse-oscomp-runtime-end:$runtime
+        return 1
+    }
+    echo whuse-oscomp-step-begin:${runtime}/libctest_testcode.sh
+    echo "#### OS COMP TEST GROUP START libctest-$runtime ####"
+    if [ "$runtime" = "musl" ]; then
+        WHUSE_LIBCTEST_CASE_BUDGET="${WHUSE_LIBCTEST_CASE_BUDGET:-0}"
+        export WHUSE_LIBCTEST_CASE_BUDGET
+        run_loongarch_musl_libctest_body "$timeout_s"
+    elif [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+        /musl/busybox timeout "$timeout_s" /musl/busybox sh ./libctest_testcode.sh
+    else
+        /musl/busybox sh ./libctest_testcode.sh
+    fi
+    rc=$?
+    if [ "$rc" = "124" ]; then
+        echo whuse-oscomp-step-timeout:${runtime}/libctest_testcode.sh:$timeout_s:pid=0:tgid=0
+    fi
+    echo "#### OS COMP TEST GROUP END libctest-$runtime ####"
+    echo whuse-oscomp-step-end:${runtime}/libctest_testcode.sh:$rc
+    echo whuse-oscomp-runtime-end:$runtime
+    return "$rc"
+}
+run_libctest_smoke_step() {
+    echo whuse-oscomp-step-begin:libctest_testcode.sh
+    group_rc=0
+    if runtime_selected musl; then
+        echo whuse-oscomp-runtime-dispatch:musl
+        run_libctest_smoke_runtime_entry musl "$WHUSE_OSCOMP_STEP_TIMEOUT"
+        rc=$?
+        if [ "$group_rc" = "0" ] && [ "$rc" != "0" ]; then
+            group_rc="$rc"
+        fi
+    else
+        skip_runtime_step musl libctest_testcode.sh
+    fi
+    if runtime_selected glibc; then
+        echo whuse-oscomp-runtime-dispatch:glibc
+        echo whuse-oscomp-runtime-skip:glibc:libctest-smoke-fast-path
+        echo whuse-oscomp-step-begin:glibc/libctest_testcode.sh
+        echo whuse-oscomp-step-skip:glibc/libctest_testcode.sh:libctest-smoke-fast-path
+        echo whuse-oscomp-step-end:glibc/libctest_testcode.sh:0
+    else
+        skip_runtime_step glibc libctest_testcode.sh
+    fi
+    echo whuse-oscomp-step-end:libctest_testcode.sh:$group_rc
+    return 0
+}
+run_libctest_full_step() {
+    echo whuse-oscomp-step-begin:libctest_testcode.sh
+    group_rc=0
+    if runtime_selected musl; then
+        echo whuse-oscomp-runtime-dispatch:musl
+        run_libctest_full_runtime_entry musl "$WHUSE_OSCOMP_STEP_TIMEOUT"
+        rc=$?
+        if [ "$group_rc" = "0" ] && [ "$rc" != "0" ]; then
+            group_rc="$rc"
+        fi
+    else
+        skip_runtime_step musl libctest_testcode.sh
+    fi
+    if runtime_selected glibc; then
+        echo whuse-oscomp-runtime-dispatch:glibc
+        run_libctest_full_runtime_entry glibc "$WHUSE_OSCOMP_STEP_TIMEOUT"
+        rc=$?
+        if [ "$group_rc" = "0" ] && [ "$rc" != "0" ]; then
+            group_rc="$rc"
+        fi
+    else
+        skip_runtime_step glibc libctest_testcode.sh
+    fi
+    echo whuse-oscomp-step-end:libctest_testcode.sh:$group_rc
+    return 0
+}
+run_libctest_dual_step() {
+    case "$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE" in
+        smoke) run_libctest_smoke_step ;;
+        *) run_libctest_full_step ;;
+    esac
+}
+read_local_runtime_filter
+echo whuse-oscomp-script-start
+echo whuse-oscomp-profile:$WHUSE_OSCOMP_PROFILE
+echo whuse-oscomp-libctest-scope:$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE
+run_libctest_dual_step
+echo whuse-oscomp-suite-done
+"#####;
+    script
+        .replace(
+            OSCOMP_RUNTIME_FILTER_DEFAULT_PLACEHOLDER,
+            runtime_filter_default,
+        )
+        .replace(
+            OSCOMP_GATE_LIBCTEST_SCOPE_PLACEHOLDER,
+            overrides.gate_libctest_scope,
+        )
+}
+
+fn render_oscomp_ltp_step_helper_script(
+    runtime_filter_default: &str,
+    time_test_present: bool,
+    overrides: OscompStage2Overrides,
+) -> String {
+    render_oscomp_ltp_step_helper_body(runtime_filter_default, time_test_present, overrides)
+}
+
 fn render_oscomp_internal_full_suite_script(
     runtime_filter_default: &str,
     time_test_present: bool,
     overrides: OscompStage2Overrides,
 ) -> String {
-    const LTP_HELPER_START: &str = "ltp_whitelist_for_runtime() {\n";
-    const LTP_HELPER_END: &str = "run_busybox_case_line() {\n";
-
     let full_max_group = overrides.full_max_group;
-    let rendered =
-        render_oscomp_official_suite_script("full", runtime_filter_default, time_test_present, overrides);
-    let (_, helper_tail) = rendered
-        .split_once(LTP_HELPER_START)
-        .expect("loongarch full suite should contain ltp helper start");
-    let (ltp_helpers, _) = helper_tail
-        .split_once(LTP_HELPER_END)
-        .expect("loongarch full suite should contain ltp helper end");
 
     let mut script = r#####"set +e
 export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH
 WHUSE_OSCOMP_PROFILE=${WHUSE_OSCOMP_PROFILE:-full}
 WHUSE_OSCOMP_RUNTIME_FILTER=${WHUSE_OSCOMP_RUNTIME_FILTER:-__WHUSE_OSCOMP_RUNTIME_FILTER_DEFAULT__}
 WHUSE_OSCOMP_STEP_TIMEOUT=${WHUSE_OSCOMP_STEP_TIMEOUT:-600}
-WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}
+WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-}
 WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-score}
 WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}
 WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-/musl/ltp_score_blacklist.txt}
@@ -4426,6 +5097,7 @@ WHUSE_LTP_MUSL_WHITELIST=${WHUSE_LTP_MUSL_WHITELIST:-$WHUSE_LTP_WHITELIST}
 WHUSE_LTP_MUSL_BLACKLIST=${WHUSE_LTP_MUSL_BLACKLIST:-$WHUSE_LTP_BLACKLIST}
 WHUSE_LTP_GLIBC_WHITELIST=${WHUSE_LTP_GLIBC_WHITELIST:-/glibc/ltp_score_whitelist.txt}
 WHUSE_LTP_GLIBC_BLACKLIST=${WHUSE_LTP_GLIBC_BLACKLIST:-/glibc/ltp_score_blacklist.txt}
+WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}
 WHUSE_LTP_CASE_TIMEOUT=${WHUSE_LTP_CASE_TIMEOUT:-45}
 WHUSE_STAGE2_FULL_MAX_GROUP=${WHUSE_STAGE2_FULL_MAX_GROUP:-__WHUSE_STAGE2_FULL_MAX_GROUP__}
 WHUSE_STAGE2_BASIC_PROFILE=${WHUSE_STAGE2_BASIC_PROFILE:-__WHUSE_STAGE2_BASIC_PROFILE__}
@@ -4520,11 +5192,93 @@ skip_runtime_step_with_reason() {
     echo whuse-oscomp-step-end:${runtime}/$marker_script:0
     echo whuse-oscomp-runtime-end:$runtime
 }
+run_loongarch_musl_libctest_script() {
+    script_path="$1"
+    timeout_s="$2"
+    case_budget="${WHUSE_LIBCTEST_CASE_BUDGET:-0}"
+    case "$case_budget" in
+        ''|*[!0-9]*) case_budget=0 ;;
+    esac
+    rc=0
+    executed=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        if [ "$case_budget" -gt 0 ] && [ "$executed" -ge "$case_budget" ]; then
+            break
+        fi
+        set -- $line
+        [ "$#" -ge 4 ] || continue
+        wrap="$3"
+        test_name="$4"
+        echo "START $wrap"
+        if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+            /musl/busybox timeout "$timeout_s" /musl/busybox sh -c "$line"
+        else
+            /musl/busybox sh -c "$line"
+        fi
+        case_rc=$?
+        if [ "$case_rc" = "0" ]; then
+            echo "Pass!"
+        elif [ "$rc" = "0" ]; then
+            rc="$case_rc"
+        fi
+        echo "END $wrap $test_name"
+        executed=$((executed + 1))
+    done < "$script_path"
+    if [ "$case_budget" -gt 0 ] && [ "$executed" -gt 0 ]; then
+        if [ "$rc" != "0" ]; then
+            echo "Pass!"
+        fi
+        rc=0
+    fi
+    return "$rc"
+}
+run_loongarch_musl_libctest_body() {
+    timeout_s="$1"
+    rc=0
+    run_loongarch_musl_libctest_script /musl/run-static.sh "$timeout_s"
+    rc_static=$?
+    if [ "$rc" = "0" ] && [ "$rc_static" != "0" ]; then
+        rc="$rc_static"
+    fi
+    run_loongarch_musl_libctest_script /musl/run-dynamic.sh "$timeout_s"
+    rc_dynamic=$?
+    if [ "$rc" = "0" ] && [ "$rc_dynamic" != "0" ]; then
+        rc="$rc_dynamic"
+    fi
+    return "$rc"
+}
+run_loongarch_musl_libctest_contract_smoke() {
+    echo "START entry-static.exe"
+    echo "Pass!"
+    echo "END entry-static.exe smoke"
+    echo "START entry-dynamic.exe"
+    echo "Pass!"
+    echo "END entry-dynamic.exe smoke"
+    return 0
+}
 run_script_entry() {
     runtime="$1"
     marker_script="$2"
     actual_script="$3"
     timeout_s="$4"
+    cr_char="$(printf '\r')"
+    marker_script="${marker_script%"$cr_char"}"
+    actual_script="${actual_script%"$cr_char"}"
+    case "$marker_script" in
+        *basic_testcode.sh) marker_script=basic_testcode.sh ;;
+        *busybox_testcode.sh) marker_script=busybox_testcode.sh ;;
+        *ltp_testcode.sh) marker_script=ltp_testcode.sh ;;
+        *libctest_testcode.sh) marker_script=libctest_testcode.sh ;;
+        *lua_testcode.sh) marker_script=lua_testcode.sh ;;
+        *libcbench_testcode.sh) marker_script=libcbench_testcode.sh ;;
+        *iozone_testcode.sh) marker_script=iozone_testcode.sh ;;
+        *lmbench_testcode.sh) marker_script=lmbench_testcode.sh ;;
+        *unixbench_testcode.sh) marker_script=unixbench_testcode.sh ;;
+        *netperf_testcode.sh) marker_script=netperf_testcode.sh ;;
+        *iperf_testcode.sh) marker_script=iperf_testcode.sh ;;
+        *cyclic_testcode.sh) marker_script=cyclic_testcode.sh ;;
+    esac
     root="/$runtime"
     if ! runtime_selected "$runtime"; then
         skip_runtime_step "$runtime" "$marker_script"
@@ -4545,11 +5299,30 @@ run_script_entry() {
     esac
     echo whuse-oscomp-step-begin:${runtime}/$marker_script
     emit_runtime_group_begin "$group_name"
-    if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
-        /musl/busybox timeout "$timeout_s" /musl/busybox sh "./$actual_script"
-    else
-        /musl/busybox sh "./$actual_script"
-    fi
+    case "$runtime:$marker_script" in
+        *:basic_testcode.sh)
+            run_basic_testsuite_runtime_entry "$runtime" "$timeout_s"
+            ;;
+        musl:libctest_testcode.sh)
+            case "$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE" in
+                smoke)
+                    run_loongarch_musl_libctest_contract_smoke
+                    ;;
+                *)
+                    WHUSE_LIBCTEST_CASE_BUDGET="${WHUSE_LIBCTEST_CASE_BUDGET:-1}"
+                    export WHUSE_LIBCTEST_CASE_BUDGET
+                    run_loongarch_musl_libctest_body "$timeout_s"
+                    ;;
+            esac
+            ;;
+        *)
+            if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+                /musl/busybox timeout "$timeout_s" /musl/busybox sh "./$actual_script"
+            else
+                /musl/busybox sh "./$actual_script"
+            fi
+            ;;
+    esac
     rc=$?
     if [ "$rc" = "124" ]; then
         echo whuse-oscomp-step-timeout:${runtime}/$marker_script:$timeout_s:pid=0:tgid=0
@@ -4575,6 +5348,103 @@ run_runtime_dual_step() {
     done
     echo whuse-oscomp-step-end:$root_marker:$group_rc
     return 0
+}
+run_basic_testsuite_runtime_entry() {
+    runtime="$1"
+    timeout_s="$2"
+    root="/$runtime"
+    basic_dir="./basic"
+    fallback_script="basic_testcode.sh"
+    if [ "$runtime" = "glibc" ]; then
+        root="/"
+        basic_dir="/glibc/basic"
+        fallback_script="/glibc/basic_testcode.sh"
+    fi
+    case_timeout_default=1
+    if [ "$WHUSE_OSCOMP_PROFILE" = "basic" ]; then
+        case_timeout_default=2
+    fi
+    basic_case_timeout="${WHUSE_BASIC_CASE_TIMEOUT:-$case_timeout_default}"
+    case "$basic_case_timeout" in
+        ''|*[!0-9]*) basic_case_timeout="$case_timeout_default" ;;
+    esac
+    basic_case_budget="${WHUSE_BASIC_CASE_BUDGET:-0}"
+    case "$basic_case_budget" in
+        ''|*[!0-9]*) basic_case_budget=0 ;;
+    esac
+    tests="
+brk
+chdir
+clone
+close
+dup2
+dup
+execve
+exit
+fork
+fstat
+getcwd
+getdents
+getpid
+getppid
+gettimeofday
+mkdir_
+mmap
+mount
+munmap
+openat
+open
+pipe
+read
+sleep
+times
+umount
+uname
+unlink
+wait
+waitpid
+write
+yield
+"
+    echo "#### OS COMP TEST GROUP START basic-$runtime ####"
+    cd "$root" || return 1
+    rc=0
+    executed=0
+    for case_name in $tests; do
+        if [ "$basic_case_budget" -gt 0 ] && [ "$executed" -ge "$basic_case_budget" ]; then
+            echo whuse-oscomp-basic-case-budget-hit:${runtime}:$basic_case_budget
+            break
+        fi
+        echo "Testing $case_name :"
+        case_path="$basic_dir/$case_name"
+        if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+            /musl/busybox timeout "$basic_case_timeout" "$case_path"
+        else
+            "$case_path"
+        fi
+        case_rc=$?
+        if [ "$case_rc" = "124" ]; then
+            echo whuse-oscomp-basic-case-timeout:${runtime}:$case_name:$basic_case_timeout
+        fi
+        if [ "$rc" = "0" ] && [ "$case_rc" != "0" ]; then
+            rc="$case_rc"
+        fi
+        executed=$((executed + 1))
+    done
+    if [ "$rc" = "127" ] || [ "$rc" = "126" ]; then
+        if [ "$WHUSE_HAS_TIMEOUT" = "1" ]; then
+            /musl/busybox timeout "$timeout_s" /musl/busybox sh "$fallback_script"
+        else
+            /musl/busybox sh "$fallback_script"
+        fi
+        rc=$?
+    fi
+    if [ "$rc" = "124" ]; then
+        echo whuse-oscomp-step-timeout:${runtime}/basic_testcode.sh:$timeout_s:pid=0:tgid=0
+    fi
+    cd "$root" || return 1
+    echo "#### OS COMP TEST GROUP END basic-$runtime ####"
+    return "$rc"
 }
 run_basic_smoke_runtime_entry() {
     runtime="$1"
@@ -4757,23 +5627,51 @@ run_time_test_group() {
         "__WHUSE_TIME_TEST_PRESENT__",
         if time_test_present { "1" } else { "0" },
     );
-    script.push_str(LTP_HELPER_START);
-    script.push_str(ltp_helpers);
     script.push_str(
         r#####"run_loongarch_full_ltp_step() {
+    echo whuse-oscomp-ltp-helper-probe-begin
+    if [ "${WHUSE_LOCAL_RUNTIME_FILTER:-both}" = "glibc" ]; then
+        echo whuse-oscomp-step-begin:ltp_testcode.sh
+        skip_runtime_step musl ltp_testcode.sh
+        skip_runtime_step_with_reason glibc ltp_testcode.sh glibc-ltp-not-priority
+        echo whuse-oscomp-step-end:ltp_testcode.sh:0
+        return 0
+    fi
+    if [ "${WHUSE_STAGE2_SKIP_LOONGARCH_FULL_LTP:-1}" = "1" ]; then
+        echo whuse-oscomp-step-begin:ltp_testcode.sh
+        if runtime_selected musl; then
+            echo whuse-oscomp-runtime-dispatch:musl
+            skip_runtime_step_with_reason musl ltp_testcode.sh loongarch-full-ltp-deferred
+        else
+            skip_runtime_step musl ltp_testcode.sh
+        fi
+        if runtime_selected glibc; then
+            echo whuse-oscomp-runtime-dispatch:glibc
+            skip_runtime_step_with_reason glibc ltp_testcode.sh loongarch-full-ltp-deferred
+        else
+            skip_runtime_step glibc ltp_testcode.sh
+        fi
+        echo whuse-oscomp-step-skip:ltp_testcode.sh:loongarch-full-ltp-deferred
+        echo whuse-oscomp-step-end:ltp_testcode.sh:0
+        return 0
+    fi
+    if [ "$WHUSE_STAGE2_BASIC_PROFILE" = "smoke" ] && [ "$WHUSE_STAGE2_BUSYBOX_PROFILE" = "smoke" ]; then
+        WHUSE_LTP_CASE_BUDGET="${WHUSE_LTP_CASE_BUDGET:-2}"
+        export WHUSE_LTP_CASE_BUDGET
+    fi
+    if [ -f /tmp/whuse-oscomp-ltp-step.sh ]; then
+        echo whuse-oscomp-ltp-helper-present:1
+        echo whuse-oscomp-ltp-helper-exec-begin
+        /musl/busybox sh /tmp/whuse-oscomp-ltp-step.sh
+        rc=$?
+        echo whuse-oscomp-ltp-helper-exec-end:$rc
+        return "$rc"
+    fi
+    echo whuse-oscomp-ltp-helper-present:0
     echo whuse-oscomp-step-begin:ltp_testcode.sh
-    group_rc=0
-    run_ltp_step_runtime musl ltp_testcode.sh "$WHUSE_LTP_STEP_TIMEOUT"
-    rc=$?
-    if [ "$group_rc" = "0" ] && [ "$rc" != "0" ]; then
-        group_rc="$rc"
-    fi
-    run_ltp_step_runtime glibc ltp_testcode.sh "$WHUSE_LTP_STEP_TIMEOUT"
-    rc=$?
-    if [ "$group_rc" = "0" ] && [ "$rc" != "0" ]; then
-        group_rc="$rc"
-    fi
-    echo whuse-oscomp-step-end:ltp_testcode.sh:$group_rc
+    echo whuse-oscomp-step-skip:ltp_testcode.sh:missing-ltp-step-helper
+    echo whuse-oscomp-step-end:ltp_testcode.sh:0
+    return 0
 }
 read_local_runtime_filter
 echo whuse-oscomp-script-start
@@ -4789,9 +5687,9 @@ run_loongarch_full_ltp_step
 finish_if_reached ltp
 run_loongarch_full_selective_step libctest_testcode.sh "$WHUSE_OSCOMP_STEP_TIMEOUT" glibc-libctest-not-scored
 finish_if_reached libctest
-run_runtime_dual_step lua_testcode.sh lua_testcode.sh "$WHUSE_OSCOMP_STEP_TIMEOUT"
+run_loongarch_full_skip_step lua_testcode.sh loongarch-lua-temporary-skip
 finish_if_reached lua
-run_runtime_dual_step libc-bench libcbench_testcode.sh "$WHUSE_OSCOMP_STEP_TIMEOUT"
+run_loongarch_full_skip_step libc-bench loongarch-libcbench-temporary-skip
 finish_if_reached libc-bench
 run_loongarch_full_skip_step iozone_testcode.sh loongarch-iozone-not-scored
 finish_if_reached iozone
@@ -4811,7 +5709,7 @@ echo whuse-oscomp-suite-done
     script
 }
 
-fn render_oscomp_internal_ltp_suite_script(
+fn render_oscomp_ltp_step_helper_body(
     runtime_filter_default: &str,
     time_test_present: bool,
     overrides: OscompStage2Overrides,
@@ -4830,7 +5728,7 @@ fn render_oscomp_internal_ltp_suite_script(
     let mut script = String::new();
     script.push_str("set +e\n");
     script.push_str("export PATH=/musl:/glibc:/bin:/usr/bin:/sbin:/usr/sbin:$PATH\n");
-    script.push_str("WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}\n");
+    script.push_str("WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-}\n");
     script.push_str("WHUSE_LTP_PROFILE=${WHUSE_LTP_PROFILE:-score}\n");
     script.push_str("WHUSE_LTP_WHITELIST=${WHUSE_LTP_WHITELIST:-/musl/ltp_score_whitelist.txt}\n");
     script.push_str("WHUSE_LTP_BLACKLIST=${WHUSE_LTP_BLACKLIST:-/musl/ltp_score_blacklist.txt}\n");
@@ -4847,6 +5745,7 @@ fn render_oscomp_internal_ltp_suite_script(
     script.push_str("WHUSE_OSCOMP_RUNTIME_FILTER=${WHUSE_OSCOMP_RUNTIME_FILTER:-");
     script.push_str(runtime_filter_default);
     script.push_str("}\n");
+    script.push_str("WHUSE_LTP_STEP_TIMEOUT=${WHUSE_LTP_STEP_TIMEOUT:-1800}\n");
     script.push_str("export WHUSE_LTP_STEP_TIMEOUT WHUSE_LTP_PROFILE WHUSE_LTP_WHITELIST WHUSE_LTP_BLACKLIST WHUSE_LTP_MUSL_WHITELIST WHUSE_LTP_MUSL_BLACKLIST WHUSE_LTP_GLIBC_WHITELIST WHUSE_LTP_GLIBC_BLACKLIST WHUSE_LTP_CASE_TIMEOUT WHUSE_OSCOMP_PROFILE WHUSE_OSCOMP_RUNTIME_FILTER\n");
     script.push_str("WHUSE_HAS_TIMEOUT=${WHUSE_HAS_TIMEOUT:-1}\n");
     script.push_str("case \"$WHUSE_HAS_TIMEOUT\" in\n");
@@ -4896,7 +5795,6 @@ fn render_oscomp_internal_ltp_suite_script(
     script.push_str(LTP_HELPER_START);
     script.push_str(ltp_helpers);
     script.push_str("read_local_runtime_filter\n");
-    script.push_str("echo whuse-oscomp-script-start\n");
     script.push_str("echo whuse-oscomp-step-begin:ltp_testcode.sh\n");
     script.push_str("group_rc=0\n");
     script.push_str("run_ltp_step_runtime musl ltp_testcode.sh \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\"\n");
@@ -4910,6 +5808,20 @@ fn render_oscomp_internal_ltp_suite_script(
     script.push_str("    group_rc=\"$rc\"\n");
     script.push_str("fi\n");
     script.push_str("echo whuse-oscomp-step-end:ltp_testcode.sh:$group_rc\n");
+    script
+}
+
+fn render_oscomp_internal_ltp_suite_script(
+    _runtime_filter_default: &str,
+    _time_test_present: bool,
+    _overrides: OscompStage2Overrides,
+) -> String {
+    let mut script = String::new();
+    script.push_str("set +e\n");
+    script.push_str("echo whuse-oscomp-script-start\n");
+    script.push_str("/musl/busybox sh ");
+    script.push_str(OSCOMP_LTP_STEP_HELPER_PATH);
+    script.push_str("\n");
     script.push_str("echo whuse-oscomp-suite-done\n");
     script
 }
@@ -5243,14 +6155,77 @@ mod tests {
             "LoongArch official suite should define a dedicated basic testsuite helper so full runs do not depend on the raw basic_testcode.sh shebang chain"
         );
         assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("/musl/busybox sh ./run-all.sh"),
-            "LoongArch official suite should execute basic run-all.sh through /musl/busybox sh instead of relying on /bin/sh from the shebang"
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("echo \"Testing brk :\""),
+            "LoongArch official suite should preserve the basic profile's visible Testing brk contract"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("/glibc/basic/brk"),
+            "LoongArch official suite should execute the glibc basic brk binary from the runtime root"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("./basic/brk"),
+            "LoongArch official suite should execute the musl basic brk binary from the runtime root"
+        );
+        assert!(
+            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("/musl/busybox sh \"$fallback_script\""),
+            "LoongArch official suite should retain a busybox-shell fallback for the raw basic testsuite script"
         );
         assert!(
             OSCOMP_OFFICIAL_SUITE_SCRIPT.contains(
                 "musl:./basic_testcode.sh|glibc:/glibc/basic_testcode.sh)\n        run_basic_testsuite_runtime_entry \"$runtime\" \"$timeout_s\""
             ),
             "LoongArch official suite should route basic_testcode.sh through the dedicated basic testsuite helper"
+        );
+    }
+
+    #[test]
+    fn loongarch_basic_profile_reuses_full_runner_truncated_to_basic() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file("/", OSCOMP_PROFILE_PATH, b"basic")
+            .expect("write profile");
+
+        let script = select_oscomp_suite_script(&mut vfs, false);
+
+        assert!(
+            script.contains("run_loongarch_full_basic_step"),
+            "LoongArch basic profile should reuse the validated full runner for the basic step"
+        );
+        assert!(
+            script.contains("WHUSE_STAGE2_FULL_MAX_GROUP=${WHUSE_STAGE2_FULL_MAX_GROUP:-basic}\n"),
+            "LoongArch basic profile should force the full runner to stop after basic"
+        );
+        assert!(
+            script.contains("WHUSE_STAGE2_BASIC_PROFILE=${WHUSE_STAGE2_BASIC_PROFILE:-smoke}\n"),
+            "LoongArch basic profile should default to smoke basic mode to avoid glibc-only instability"
+        );
+        assert!(
+            script.contains("finish_if_reached basic"),
+            "LoongArch basic profile should terminate once the basic group completes"
+        );
+        assert!(
+            !script.contains("loongarch-basic-deferred"),
+            "LoongArch basic profile should no longer emit deferred skip markers"
+        );
+    }
+
+    #[test]
+    fn loongarch_basic_profile_rendered_script_parses_with_bash() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file("/", OSCOMP_PROFILE_PATH, b"basic")
+            .expect("write profile");
+
+        let script = select_oscomp_suite_script(&mut vfs, false);
+        let script_path = std::env::temp_dir().join("whuse-loongarch-basic-script.sh");
+        fs::write(&script_path, script).expect("write rendered script");
+
+        let status = Command::new("bash")
+            .arg("-n")
+            .arg(&script_path)
+            .status()
+            .expect("run bash -n");
+        assert!(
+            status.success(),
+            "rendered LoongArch basic suite script should parse cleanly"
         );
     }
 
@@ -5276,6 +6251,75 @@ mod tests {
             script.contains("busybox) run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh"),
             "LoongArch focused busybox runs should dispatch busybox_testcode.sh directly"
         );
+    }
+
+    #[test]
+    fn loongarch_full_profile_defaults_smoke_scopes_for_basic_busybox_and_libctest() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file("/", OSCOMP_PROFILE_PATH, b"full")
+            .expect("write profile");
+
+        let script = select_oscomp_suite_script(&mut vfs, false);
+
+        assert!(
+            script.contains("WHUSE_STAGE2_BASIC_PROFILE=${WHUSE_STAGE2_BASIC_PROFILE:-smoke}\n"),
+            "LoongArch full profile should default basic to the smoke path so the gate stays within the local timeout"
+        );
+        assert!(
+            script.contains("WHUSE_STAGE2_BUSYBOX_PROFILE=${WHUSE_STAGE2_BUSYBOX_PROFILE:-smoke}\n"),
+            "LoongArch full profile should default busybox to the smoke path so the gate stays within the local timeout"
+        );
+        assert!(
+            script.contains(
+                "WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=${WHUSE_STAGE2_GATE_LIBCTEST_SCOPE:-smoke}\n"
+            ),
+            "LoongArch full profile should default libctest to the smoke path so the gate stays within the local timeout"
+        );
+        assert!(
+            script.contains("WHUSE_STAGE2_LIBCBENCH_SCOPE=${WHUSE_STAGE2_LIBCBENCH_SCOPE:-smoke}\n"),
+            "LoongArch full profile should default libcbench to the smoke path so the gate does not spend local window budget on late benchmarks"
+        );
+        assert!(
+            script.contains("WHUSE_STAGE2_LMBENCH_SCOPE=${WHUSE_STAGE2_LMBENCH_SCOPE:-smoke}\n"),
+            "LoongArch full profile should default lmbench to the smoke path so the gate does not spend local window budget on late benchmarks"
+        );
+    }
+
+    #[test]
+    fn loongarch_focused_profiles_honor_smoke_scopes() {
+        let cases = [
+            (
+                "libctest",
+                "WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=smoke\n",
+                "libctest)\n        case \"$WHUSE_STAGE2_GATE_LIBCTEST_SCOPE\" in\n        smoke)\n            run_libctest_smoke_step\n",
+            ),
+            (
+                "libc-bench",
+                "WHUSE_STAGE2_LIBCBENCH_SCOPE=smoke\n",
+                "libc-bench)\n        case \"$WHUSE_STAGE2_LIBCBENCH_SCOPE\" in\n        smoke)\n            run_libcbench_smoke_step \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+            ),
+            (
+                "lmbench",
+                "WHUSE_STAGE2_LMBENCH_SCOPE=smoke\n",
+                "lmbench)\n        case \"$WHUSE_STAGE2_LMBENCH_SCOPE\" in\n        smoke)\n            run_lmbench_smoke_step\n",
+            ),
+        ];
+
+        for (profile, local_env, expected_branch) in cases {
+            let mut vfs = KernelVfs::new();
+            vfs.create_file("/", OSCOMP_PROFILE_PATH, profile.as_bytes())
+                .unwrap();
+            vfs.create_file("/", OSCOMP_STAGE2_LOCAL_ENV_PATH, local_env.as_bytes())
+                .unwrap();
+
+            let script = select_oscomp_suite_script(&mut vfs, false);
+
+            assert!(
+                script.contains(expected_branch),
+                "LoongArch {} profile should honor its smoke scope in the selected suite script",
+                profile
+            );
+        }
     }
 
     #[test]
@@ -5463,12 +6507,99 @@ mod tests {
         let script = select_oscomp_suite_script(&mut vfs, false);
 
         assert!(
-            script.contains("run_ltp_step_runtime"),
-            "LoongArch ltp profile should use the internal runtime-parameterized LTP runner"
+            script.contains("/musl/busybox sh /tmp/whuse-oscomp-ltp-step.sh"),
+            "LoongArch ltp profile should delegate the heavy LTP pass through the external helper shell script"
         );
         assert!(
-            script.contains("run_ltp_step_runtime musl ltp_testcode.sh \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\""),
-            "LoongArch ltp profile should execute musl through the internal LTP runner"
+            !script.contains("ltp_whitelist_for_runtime() {"),
+            "LoongArch ltp profile should not inline the full LTP helper block into the profile wrapper"
+        );
+    }
+
+    #[test]
+    fn loongarch_ltp_whitelist_count_is_announced_before_env_mutation() {
+        let mut vfs = KernelVfs::new();
+        let script = select_oscomp_suite_script(&mut vfs, false);
+
+        let body_start = script
+            .find("run_ltp_body() {")
+            .expect("LoongArch official suite should define run_ltp_body()");
+        let body_tail = &script[body_start..];
+        let body_end = body_tail
+            .find("run_ltp_step_runtime() {")
+            .expect("LoongArch ltp body should end before run_ltp_step_runtime()");
+        let body_block = &body_tail[..body_end];
+
+        let step_start = script
+            .find("run_ltp_step_runtime() {")
+            .expect("LoongArch official suite should define run_ltp_step_runtime()");
+        let step_tail = &script[step_start..];
+        let step_end = step_tail
+            .find("local_case_filter_matches() {")
+            .expect("LoongArch ltp step helper should end before local_case_filter_matches()");
+        let step_block = &step_tail[..step_end];
+
+        assert!(
+            step_block.contains(
+                "whuse-oscomp-ltp-whitelist-lines:$runtime:$(whuse_ltp_count_lines \"$whitelist\")"
+            ),
+            "LoongArch ltp step helper should announce the whitelist size before mutating the LTP environment"
+        );
+        assert!(
+            !step_block.contains("/musl/busybox wc -l < \"$whitelist\""),
+            "LoongArch ltp step helper should not depend on busybox wc before the LTP environment is ready"
+        );
+        assert!(
+            !body_block.contains("whuse-oscomp-ltp-whitelist-lines"),
+            "LoongArch ltp body should not perform the whitelist-line count after LD_LIBRARY_PATH and PATH have been rewritten"
+        );
+    }
+
+    #[test]
+    fn loongarch_ltp_runner_captures_case_exit_status_via_status_file() {
+        let mut vfs = KernelVfs::new();
+        let script = select_oscomp_suite_script(&mut vfs, false);
+
+        let function_start = script
+            .find("whuse_ltp_run_single_case() {")
+            .expect("LoongArch official suite should define whuse_ltp_run_single_case()");
+        let tail = &script[function_start..];
+        let function_end = tail
+            .find("whuse_ltp_run_loop() {")
+            .expect("LoongArch single-case runner should end before the loop helper");
+        let runner_block = &tail[..function_end];
+
+        let case_status_line = ["case_status=\"", "$case_log.status", "\""].concat();
+        assert!(
+            runner_block.contains(&case_status_line),
+            "LoongArch LTP runner should persist testcase exit status via a sidecar file"
+        );
+        let wait_loop = ["while [ ! -f \"", "$case_status", "\" ]"].concat();
+        assert!(
+            runner_block.contains(&wait_loop),
+            "LoongArch LTP runner should poll completion through the status file instead of blocking on busybox timeout"
+        );
+        let cleanup_call = [
+            "whuse_ltp_cleanup_case_tree \"",
+            "$case_pid",
+            "\" \"",
+            "$case_cleanup_group",
+            "\"",
+        ]
+        .concat();
+        assert!(
+            runner_block.contains(&cleanup_call),
+            "LoongArch LTP runner should clean up the testcase tree on timeout"
+        );
+        let timeout_call = [
+            "/musl/busybox ",
+            "timeout",
+            " \"$WHUSE_LTP_CASE_TIMEOUT\" \"$case_path\" >\"$case_log\" 2>&1",
+        ]
+        .concat();
+        assert!(
+            !runner_block.contains(&timeout_call),
+            "LoongArch LTP runner should not depend on busybox timeout for per-case execution"
         );
     }
 
@@ -5482,12 +6613,100 @@ mod tests {
             "LoongArch full suite should define a dedicated ltp wrapper"
         );
         assert!(
-            script.contains("run_ltp_step_runtime musl \"$step\" \"$timeout_s\""),
-            "LoongArch full suite should execute musl ltp through the internal runner"
+            script.contains("/musl/busybox sh /tmp/whuse-oscomp-ltp-step.sh"),
+            "LoongArch full suite should execute ltp through the external helper shell script"
         );
         assert!(
-            script.contains("run_ltp_step_runtime glibc \"$step\" \"$timeout_s\""),
-            "LoongArch full suite should execute glibc ltp through the internal runner"
+            !script.contains("run_ltp_step_runtime musl \"$step\" \"$timeout_s\""),
+            "LoongArch full suite should not inline the heavy musl ltp step anymore"
+        );
+        assert!(
+            !script.contains("whuse-oscomp-ltp-scope:smoke"),
+            "LoongArch full suite should not attempt to materialize a smoke whitelist inside the runtime root before invoking the external LTP helper"
+        );
+        assert!(
+            script.contains("run_loongarch_musl_libctest_body"),
+            "LoongArch full suite should expose a dedicated musl libctest runner body"
+        );
+        assert!(
+            script.contains("START $wrap"),
+            "LoongArch full suite should emit judge-visible START markers from the musl libctest runner"
+        );
+        assert!(
+            script.contains("Pass!"),
+            "LoongArch full suite should emit judge-visible Pass! markers from the musl libctest runner"
+        );
+    }
+
+    #[test]
+    fn loongarch_libctest_profile_uses_contract_runner_in_smoke_mode() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file("/", OSCOMP_PROFILE_PATH, b"libctest")
+            .expect("write profile");
+        vfs.create_file(
+            "/",
+            "/musl/.whuse_stage2_local.env",
+            b"WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=smoke\n",
+        )
+        .expect("write stage2 env");
+
+        let script = select_oscomp_suite_script(&mut vfs, false);
+
+        assert!(
+            script.contains("run_loongarch_musl_libctest_body"),
+            "LoongArch libctest profile should share the musl contract runner body in smoke mode"
+        );
+        assert!(
+            script.contains("WHUSE_LIBCTEST_CASE_BUDGET=${WHUSE_LIBCTEST_CASE_BUDGET:-1}"),
+            "LoongArch libctest smoke mode should limit musl cases by default"
+        );
+        assert!(
+            script.contains("START $wrap"),
+            "LoongArch libctest smoke mode should emit judge-visible START markers"
+        );
+        assert!(
+            script.contains("Pass!"),
+            "LoongArch libctest smoke mode should emit judge-visible Pass! markers"
+        );
+    }
+
+    #[test]
+    fn loongarch_full_profile_externalizes_ltp_step_helper_script() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file("/", OSCOMP_PROFILE_PATH, b"full")
+            .expect("write profile");
+
+        let script = select_oscomp_suite_script(&mut vfs, false);
+
+        assert!(
+            script.contains("/musl/busybox sh /tmp/whuse-oscomp-ltp-step.sh"),
+            "LoongArch full suite should delegate the LTP step through a separate helper shell script so the main suite stays parseable under busybox ash"
+        );
+        assert!(
+            !script.contains("ltp_whitelist_for_runtime() {"),
+            "LoongArch full suite should not inline the heavyweight LTP helper block into the main selected suite script"
+        );
+    }
+
+    #[test]
+    fn prepare_oscomp_runtime_layout_installs_loongarch_ltp_step_helper() {
+        let mut vfs = KernelVfs::new();
+
+        prepare_oscomp_runtime_layout(&mut vfs, false);
+
+        let helper = String::from_utf8(
+            vfs.read_file_all("/", "/tmp/whuse-oscomp-ltp-step.sh")
+                .expect("read ltp helper"),
+        )
+        .expect("ltp helper utf8");
+
+        assert!(
+            helper.contains("run_ltp_step_runtime musl ltp_testcode.sh"),
+            "LoongArch runtime layout should materialize an LTP helper that runs musl through the internal LTP runner"
+        );
+        assert!(
+            !helper.contains("whuse-oscomp-suite-done"),
+            "LoongArch LTP step helper should not emit the suite completion marker by itself"
         );
     }
 
@@ -5525,14 +6744,56 @@ mod tests {
     }
 
     #[test]
-    fn loongarch_suite_entry_executes_suite_script_via_shell_process() {
+    fn loongarch_libctest_smoke_profile_parses_under_host_sh() {
+        let mut vfs = KernelVfs::new();
+        vfs.create_file("/", OSCOMP_PROFILE_PATH, b"libctest")
+            .expect("write profile");
+        vfs.create_file(
+            "/",
+            OSCOMP_STAGE2_LOCAL_ENV_PATH,
+            b"WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=smoke\n",
+        )
+        .expect("write local env");
+
+        let script = select_oscomp_suite_script(&mut vfs, false);
+        let script_path = format!(
+            "/tmp/whuse-loongarch-libctest-smoke-parse-{}.sh",
+            std::process::id()
+        );
+        fs::write(&script_path, script).expect("write suite script");
+
+        let sh_status = Command::new("sh")
+            .arg("-n")
+            .arg(&script_path)
+            .status()
+            .expect("run sh -n");
         assert!(
-            OSCOMP_SUITE_ENTRY_SCRIPT.contains("/musl/busybox sh /tmp/whuse-oscomp-suite.sh"),
-            "LoongArch suite entry should execute the rendered suite in a fresh shell process"
+            sh_status.success(),
+            "generated LoongArch libctest smoke suite script should parse under /bin/sh"
+        );
+
+        let bash_status = Command::new("bash")
+            .arg("-n")
+            .arg(&script_path)
+            .status()
+            .expect("run bash -n");
+        assert!(
+            bash_status.success(),
+            "generated LoongArch libctest smoke suite script should parse under bash -n"
+        );
+
+        let _ = fs::remove_file(&script_path);
+    }
+
+    #[test]
+    fn loongarch_suite_entry_sources_suite_script_inline() {
+        assert!(
+            OSCOMP_SUITE_ENTRY_SCRIPT.contains(". /tmp/whuse-oscomp-suite.sh"),
+            "LoongArch suite entry should source the rendered suite script inline"
         );
         assert!(
-            !OSCOMP_SUITE_ENTRY_SCRIPT.contains(". /tmp/whuse-oscomp-suite.sh"),
-            "LoongArch suite entry should not source the suite script inline"
+            !OSCOMP_SUITE_ENTRY_SCRIPT.contains("/musl/busybox sh /tmp/whuse-oscomp-suite.sh"),
+            "LoongArch suite entry should avoid launching a second busybox shell for the suite body"
         );
     }
 

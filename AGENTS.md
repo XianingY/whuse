@@ -131,58 +131,58 @@ Current recommended default for validation is real execution (`WHUSE_OSCOMP_COMP
 
 Host quick mode remains available via `WHUSE_QEMU_MODE=host`.
 
-### 4.1 Current best scored baseline (2026-04-01, commit `9ad5123`)
+### 4.1 Current site baseline (2026-04-04, commit `7f5dfce`)
 
-Current public best result comes from site submission `9ad512346bbdcb1c688a2311961b977ec239f422`.
+Current public baseline should be treated as site submission `7f5dfcec12826030f0d8ba9020d768bb84c704e1`.
 
-- Total score: **884.0**
-- Primary score source: **musl-rv = 513.0**
-- Current direction is validated: RISC-V score-first sequencing plus scorer-compatible `libctest` / `ltp` output works on the site.
+- Total score: **2116.0**
+- Lane split: **musl-rv=1750**, **glibc-rv=356**, **musl-la=10**, **glibc-la=0**
+- Practical ceiling is now control-plane stability, not only syscall coverage.
 
-Score highlights from [assist_docs/9ad512346bbdcb1c688a2311961b977ec239f422/代码执行结果.md](assist_docs/9ad512346bbdcb1c688a2311961b977ec239f422/代码执行结果.md):
+Site-observed signals:
 
-| Test | glibc-la | glibc-rv | musl-la | musl-rv | Total |
-|---|---:|---:|---:|---:|---:|
-| basic | 98 | 101 | 98 | 99 | 396 |
-| busybox | 0 | 54 | 11 | 54 | 119 |
-| libctest | - | - | 0 | 201 | 201 |
-| ltp | 0 | 0 | 0 | 133 | 133 |
-| libcbench | 0 | 0 | 0 | 17 | 17 |
-| lua | 0 | 9 | 0 | 9 | 18 |
+- RISC-V site logs showed `./run-all.sh: Permission denied` around `basic` path.
+- LoongArch site logs shrank from hundreds of lines (`9ad5123`/`7efb139`) to early-stop style short logs from `fb8a21a` onward.
+- `basic` score regressed from `396` at `9ad5123` to `10` at `7f5dfce`, while RV `ltp/libctest` increased.
+
+Historical reference (still useful for scorer-contract checks):
+
+- `9ad5123` site score: `884.0`
+- It remains a useful comparator for `basic/busybox` scorer-visible output behavior.
 
 ### 4.2 Current code per-arch full order
 
-RISC-V committed `full` order at `9ad5123`:
+RISC-V current `full` order:
 
 1. `time-test`
 2. `basic_testcode.sh`
 3. `busybox_testcode.sh`
 4. `iozone_testcode.sh` — explicit skip (`riscv-known-panic`)
-5. `ltp_testcode.sh` — `musl` runs internal score-mode LTP; `glibc` skipped
-6. `libctest_testcode.sh` — `musl` real runner; `glibc` skipped
+5. `ltp_testcode.sh` — deferred in `full` (`riscv-full-ltp-deferred`) to protect score path stability
+6. `libctest_testcode.sh` — `musl` real runner; `glibc` follows runtime filter
 7. `lua_testcode.sh`
 8. `libc-bench`
-9. `lmbench_testcode.sh`
-10. `unixbench_testcode.sh`
-11. `netperf_testcode.sh`
-12. `iperf_testcode.sh`
-13. `cyclic_testcode.sh`
+9. `lmbench_testcode.sh` — deferred (`riscv-late-benchmark-deferred`)
+10. `unixbench_testcode.sh` — deferred (`riscv-late-benchmark-deferred`)
+11. `netperf_testcode.sh` — deferred (`riscv-late-benchmark-deferred`)
+12. `iperf_testcode.sh` — deferred (`riscv-late-benchmark-deferred`)
+13. `cyclic_testcode.sh` — deferred (`riscv-late-benchmark-deferred`)
 
 LoongArch current code `full` order:
 
 1. `time-test`
 2. `basic_testcode.sh`
 3. `busybox_testcode.sh`
-4. `libctest_testcode.sh` — `musl` real execution; `glibc` explicit skip (`glibc-libctest-not-scored`)
-5. `lua_testcode.sh`
-6. `libc-bench`
-7. `ltp_testcode.sh` — `musl` real execution; `glibc` explicit skip (`glibc-ltp-not-scored`)
+4. `ltp_testcode.sh` — deferred in `full` (`loongarch-full-ltp-deferred`)
+5. `libctest_testcode.sh` — `musl` real execution; `glibc` explicit skip (`glibc-libctest-not-scored`)
+6. `lua_testcode.sh` — temporary skip (`loongarch-lua-temporary-skip`)
+7. `libc-bench` — temporary skip (`loongarch-libcbench-temporary-skip`)
 8. `iozone_testcode.sh` — explicit skip (`loongarch-iozone-not-scored`)
 9. `lmbench_testcode.sh` — explicit skip (`loongarch-lmbench-not-scored`)
-10. `unixbench_testcode.sh`
-11. `netperf_testcode.sh`
-12. `iperf_testcode.sh`
-13. `cyclic_testcode.sh`
+10. `unixbench_testcode.sh` — explicit skip (`loongarch-unixbench-not-priority`)
+11. `netperf_testcode.sh` — explicit skip (`loongarch-netperf-not-priority`)
+12. `iperf_testcode.sh` — explicit skip (`loongarch-iperf-not-priority`)
+13. `cyclic_testcode.sh` — explicit skip (`loongarch-cyclic-not-priority`)
 
 ### 4.3 Scorer-sensitive output contracts
 
@@ -192,62 +192,50 @@ The site judge is not only syscall/semantic-sensitive; it is also output-contrac
 - `libctest`: must emit judge-visible `START entry-static.exe`, `START entry-dynamic.exe`, and `Pass!`.
 - `ltp`: must emit `RUN LTP CASE <case>` and `FAIL LTP CASE <case> : <ret>`. `whuse-ltp-case-result:*` is auxiliary diagnostics, not the primary scoring contract.
 
-### 4.4 Site-proven vs current code state
+### 4.4 Site-proven vs current local state
 
-Current site-proven best is still `9ad5123`, but the current code baseline is already ahead of that on the LoongArch control plane.
+Current site reference is `7f5dfce`; current local work continues on top of it (no rollback).
 
-- Site-proven baseline:
-  - RISC-V score-first sequencing and scorer-compatible `libctest` / `ltp` output are confirmed by `9ad5123`
-  - LoongArch score remains low in the site result because that submission still used the older `full` control plane
-- Current code baseline:
-  - stage2 helper tracks per-arch `full` order instead of one shared `full_root_steps`
-  - LoongArch `full` is now score-first, with selective `glibc` skips for `busybox/libctest/ltp`
-  - low-yield LoongArch groups (`iozone/lmbench/unixbench/netperf/iperf/cyclic`) are explicit skips
-- Current earliest blocker:
-  - `loongarch full -> musl/libctest` after `basic -> busybox` is already reachable
+- Site reference (`7f5dfce`):
+  - RV `ltp/libctest` path is strong.
+  - `basic` and LoongArch control-plane stability are weak.
+- Current local state (2026-04-05):
+  - `riscv full + musl` reaches `whuse-oscomp-suite-done` with `basic -> busybox -> libctest` intact.
+  - `loongarch full + musl` reaches `whuse-oscomp-suite-done`; `ltp` stays deferred in `full` by design.
+  - `loongarch libctest + musl` reaches `whuse-oscomp-suite-done`.
+  - `rv ltp score + glibc` is stable at `pass=39, bad=0` under step-timeout `1800`.
+  - LTP high-frequency probe logs (`whuse-ltp-openat` / `whuse-ltp-exec`) are now debug-gated to reduce scorer-noise and I/O pressure.
 
-## 5) Next Focus (Post-`9ad5123`)
+## 5) Next Focus (Post-`7f5dfce`)
 
-Next stage remains **LoongArch full-chain scoring**, with RISC-V LTP expansion handled as a secondary local-only track.
+Next stage is **Stage 0 control-plane hardening first**, then lane-by-lane whitelist growth.
 
 ### 5.1 Immediate engineering goal
 
-- Keep the committed RISC-V score path unchanged and use it only as a regression guard.
-- Keep the current LoongArch score-first `full` ordering and selective runtime/step skips intact.
-- Make `full -> musl/libctest` the only active LoongArch blocker to debug.
-- Expand `musl-rv` LTP locally through curated-first discovery; do not switch the site path away from 48-case score mode.
-- Treat full-discovery as candidate generation only. Promote to curated first; keep score whitelist conservative.
+- Keep RV `musl` score path stable; do not regress `basic/busybox/libctest/ltp` scorer contracts.
+- Keep LoongArch `full` chain closing (`basic -> busybox -> libctest`) with deferred low-yield groups.
+- For `glibc-rv`, prioritize stable whitelist throughput (`bad=0`) over aggressive expansion.
+- Difficult blockers that do not impact current score paths may be deferred.
+- Do not mix large semantic expansions with control-plane fixes in one submission batch.
 
 ### 5.2 Next validation path
 
-Primary LoongArch validation sequence:
+Required local gates:
 
 ```bash
+TIMEOUT_SECS=240 WHUSE_STAGE2_IMAGE_POLICY=never WHUSE_STAGE2_USE_IMAGE_COPY=1 WHUSE_OSCOMP_PROFILE=basic tools/dev/run_oscomp_stage2.sh riscv
 TIMEOUT_SECS=240 WHUSE_STAGE2_IMAGE_POLICY=never WHUSE_STAGE2_USE_IMAGE_COPY=1 WHUSE_OSCOMP_PROFILE=full WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh loongarch
 TIMEOUT_SECS=240 WHUSE_STAGE2_IMAGE_POLICY=never WHUSE_STAGE2_USE_IMAGE_COPY=1 WHUSE_OSCOMP_PROFILE=libctest WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh loongarch
-```
-
-Acceptance goals:
-
-- `basic -> busybox` must remain reachable in `loongarch full`
-- determine whether `musl/libctest` is:
-  - a true semantic stall
-  - only too slow for the current window
-  - or missing scorer-visible output
-- if `libctest` becomes passable or skippable without losing more score than it blocks, the next target is `lua` then `libc-bench`
-
-RISC-V guardrail:
-
-```bash
 TIMEOUT_SECS=240 WHUSE_STAGE2_IMAGE_POLICY=never WHUSE_STAGE2_USE_IMAGE_COPY=1 WHUSE_OSCOMP_PROFILE=full WHUSE_OSCOMP_RUNTIME_FILTER=musl tools/dev/run_oscomp_stage2.sh riscv
+TIMEOUT_SECS=2400 WHUSE_LTP_PROFILE=score tools/dev/run_oscomp_stage2.sh ltp-riscv
 ```
 
-Must still show:
+Current target markers:
 
-- `basic_testcode.sh:0`
-- `busybox_testcode.sh:0`
-- `RUN LTP CASE ...`
-- `FAIL LTP CASE ... : 0`
+- `basic` has no `Permission denied` and no scorer-noise on `pipe/wait/waitpid/yield`.
+- `libctest` emits `START entry-static.exe`, `START entry-dynamic.exe`, `Pass!`.
+- `ltp` emits `RUN LTP CASE ...` and `FAIL LTP CASE ... : <ret>`.
+- Guarded runs reach `whuse-oscomp-suite-done` with no kernel `panic` / `pid 1 (init)` crash.
 
 ## 6) Validation Rules (Machine-Readable)
 

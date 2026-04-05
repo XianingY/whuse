@@ -30,6 +30,7 @@ RUN_ID="${TS}-$$-${RANDOM}"
 LTP_PROFILE_WAS_SET=0
 LTP_WHITELIST_WAS_SET=0
 LTP_BLACKLIST_WAS_SET=0
+LTP_STEP_TIMEOUT_WAS_SET=0
 if [[ -v WHUSE_LTP_PROFILE ]]; then
     LTP_PROFILE_WAS_SET=1
 fi
@@ -38,6 +39,34 @@ if [[ -v WHUSE_LTP_WHITELIST ]]; then
 fi
 if [[ -v WHUSE_LTP_BLACKLIST ]]; then
     LTP_BLACKLIST_WAS_SET=1
+fi
+if [[ -v WHUSE_LTP_STEP_TIMEOUT ]]; then
+    LTP_STEP_TIMEOUT_WAS_SET=1
+fi
+if [[ -v WHUSE_STAGE2_BASIC_PROFILE ]]; then
+    STAGE2_BASIC_PROFILE_WAS_SET=1
+else
+    STAGE2_BASIC_PROFILE_WAS_SET=0
+fi
+if [[ -v WHUSE_STAGE2_BUSYBOX_PROFILE ]]; then
+    STAGE2_BUSYBOX_PROFILE_WAS_SET=1
+else
+    STAGE2_BUSYBOX_PROFILE_WAS_SET=0
+fi
+if [[ -v WHUSE_STAGE2_GATE_LIBCTEST_SCOPE ]]; then
+    STAGE2_GATE_LIBCTEST_SCOPE_WAS_SET=1
+else
+    STAGE2_GATE_LIBCTEST_SCOPE_WAS_SET=0
+fi
+if [[ -v WHUSE_STAGE2_LIBCBENCH_SCOPE ]]; then
+    STAGE2_LIBCBENCH_SCOPE_WAS_SET=1
+else
+    STAGE2_LIBCBENCH_SCOPE_WAS_SET=0
+fi
+if [[ -v WHUSE_STAGE2_LMBENCH_SCOPE ]]; then
+    STAGE2_LMBENCH_SCOPE_WAS_SET=1
+else
+    STAGE2_LMBENCH_SCOPE_WAS_SET=0
 fi
 if [[ -v WHUSE_STAGE2_USE_IMAGE_COPY ]]; then
     STAGE2_USE_IMAGE_COPY_WAS_SET=1
@@ -76,9 +105,10 @@ export WHUSE_LTP_CURATED_WHITELIST_LA_MUSL="${WHUSE_LTP_CURATED_WHITELIST_LA_MUS
 export WHUSE_LTP_CURATED_BLACKLIST_LA_MUSL="${WHUSE_LTP_CURATED_BLACKLIST_LA_MUSL:-${LTP_CURATED_BLACKLIST_MUSL_LA}}"
 export WHUSE_LTP_CURATED_WHITELIST_LA_GLIBC="${WHUSE_LTP_CURATED_WHITELIST_LA_GLIBC:-${LTP_CURATED_WHITELIST_GLIBC_LA}}"
 export WHUSE_LTP_CURATED_BLACKLIST_LA_GLIBC="${WHUSE_LTP_CURATED_BLACKLIST_LA_GLIBC:-${LTP_CURATED_BLACKLIST_GLIBC_LA}}"
-export WHUSE_LTP_STEP_TIMEOUT="${WHUSE_LTP_STEP_TIMEOUT:-1800}"
+export WHUSE_LTP_STEP_TIMEOUT="${WHUSE_LTP_STEP_TIMEOUT:-300}"
 export WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT:-45}"
 export WHUSE_LTP_APPLY_CANDIDATES="${WHUSE_LTP_APPLY_CANDIDATES:-0}"
+export WHUSE_STAGE2_SKIP_RISCV_FULL_LTP="${WHUSE_STAGE2_SKIP_RISCV_FULL_LTP:-1}"
 export WHUSE_STAGE2_FULL_MAX_GROUP="${WHUSE_STAGE2_FULL_MAX_GROUP:-all}"
 export WHUSE_STAGE2_IOZONE_PROFILE="${WHUSE_STAGE2_IOZONE_PROFILE:-full}"
 export WHUSE_STAGE2_BASIC_PROFILE="${WHUSE_STAGE2_BASIC_PROFILE:-full}"
@@ -663,6 +693,7 @@ inject_oscomp_runtime_filter() {
 build_stage2_local_env() {
     cat <<EOF
 WHUSE_STAGE2_FULL_MAX_GROUP=${WHUSE_STAGE2_FULL_MAX_GROUP}
+WHUSE_STAGE2_SKIP_RISCV_FULL_LTP=${WHUSE_STAGE2_SKIP_RISCV_FULL_LTP}
 WHUSE_STAGE2_IOZONE_PROFILE=${WHUSE_STAGE2_IOZONE_PROFILE}
 WHUSE_STAGE2_BASIC_PROFILE=${WHUSE_STAGE2_BASIC_PROFILE}
 WHUSE_STAGE2_BUSYBOX_PROFILE=${WHUSE_STAGE2_BUSYBOX_PROFILE}
@@ -1205,6 +1236,35 @@ run_arch() {
     fi
     effective_profile="$(effective_oscomp_profile)"
     validate_oscomp_profile "${effective_profile}"
+    if [[ "${arch}" == "la" ]]; then
+        case "${effective_profile}" in
+        full)
+            if [[ "${STAGE2_BASIC_PROFILE_WAS_SET}" -eq 0 ]]; then
+                WHUSE_STAGE2_BASIC_PROFILE=smoke
+            fi
+            if [[ "${STAGE2_BUSYBOX_PROFILE_WAS_SET}" -eq 0 ]]; then
+                WHUSE_STAGE2_BUSYBOX_PROFILE=smoke
+            fi
+            if [[ "${STAGE2_GATE_LIBCTEST_SCOPE_WAS_SET}" -eq 0 ]]; then
+                WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=smoke
+            fi
+            if [[ "${STAGE2_LIBCBENCH_SCOPE_WAS_SET}" -eq 0 ]]; then
+                WHUSE_STAGE2_LIBCBENCH_SCOPE=smoke
+            fi
+            if [[ "${STAGE2_LMBENCH_SCOPE_WAS_SET}" -eq 0 ]]; then
+                WHUSE_STAGE2_LMBENCH_SCOPE=smoke
+            fi
+            if [[ "${LTP_STEP_TIMEOUT_WAS_SET}" -eq 0 ]]; then
+                WHUSE_LTP_STEP_TIMEOUT=120
+            fi
+            ;;
+        libctest)
+            if [[ "${STAGE2_GATE_LIBCTEST_SCOPE_WAS_SET}" -eq 0 ]]; then
+                WHUSE_STAGE2_GATE_LIBCTEST_SCOPE=smoke
+            fi
+            ;;
+        esac
+    fi
     inject_stage2_local_env "${runtime_image}"
     if [[ "${effective_profile}" == "full" || "${effective_profile}" == "ltp" ]]; then
         inject_ltp_target_score_files "${arch}" "${runtime_image}"
@@ -1453,22 +1513,44 @@ run_arch_raw_exit() {
 
 run_ltp_riscv_mode() {
     local mode="$1"
-    local log="/tmp/rv-ltp-${mode}-stage2-${RUN_ID}.log"
-    local text_log="/tmp/rv-ltp-${mode}-stage2-${RUN_ID}.strings.log"
+    local runtime_filter="${WHUSE_OSCOMP_RUNTIME_FILTER}"
+    local saved_step_timeout="${WHUSE_LTP_STEP_TIMEOUT}"
+    case "${runtime_filter}" in
+    musl | glibc)
+        ;;
+    both | "")
+        runtime_filter="musl"
+        ;;
+    *)
+        echo "[rv-ltp-${mode}] invalid runtime filter for ltp-riscv: ${runtime_filter}" >&2
+        return 2
+        ;;
+    esac
+    if [[ "${LTP_STEP_TIMEOUT_WAS_SET}" != "1" ]]; then
+        WHUSE_LTP_STEP_TIMEOUT=1800
+    fi
+    local log="/tmp/rv-ltp-${mode}-${runtime_filter}-stage2-${RUN_ID}.log"
+    local text_log="/tmp/rv-ltp-${mode}-${runtime_filter}-stage2-${RUN_ID}.strings.log"
     local runtime_image
     local suite_done_seen=0
     local terminated_by_suite_done=0
     local ltp_profile
     local ltp_whitelist
     local ltp_blacklist
-    local label="rv-ltp-${mode}"
+    local label="rv-ltp-${mode}-${runtime_filter}"
     mapfile -t ltp_config < <(resolve_ltp_mode_config "${mode}")
     ltp_profile="${ltp_config[0]}"
     ltp_whitelist="${ltp_config[1]}"
     ltp_blacklist="${ltp_config[2]}"
+    if [[ "${LTP_WHITELIST_WAS_SET}" != "1" ]]; then
+        ltp_whitelist="$(ltp_whitelist_for_target_profile "${ltp_profile}" "rv" "${runtime_filter}")"
+    fi
+    if [[ "${LTP_BLACKLIST_WAS_SET}" != "1" ]]; then
+        ltp_blacklist="$(ltp_blacklist_for_target_profile "${ltp_profile}" "rv" "${runtime_filter}")"
+    fi
     prepare_ltp_runtime_image "${RV_IMG}"
     runtime_image="${prepared_runtime_image}"
-    inject_oscomp_runtime_filter "${runtime_image}" "musl"
+    inject_oscomp_runtime_filter "${runtime_image}" "${runtime_filter}"
     inject_ltp_runtime_config "${runtime_image}" "${ltp_profile}" "${ltp_whitelist}" "${ltp_blacklist}"
 
     echo "[${label}] running ltp-only, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, profile=${ltp_profile}, whitelist=${ltp_whitelist:-none}, blacklist=${ltp_blacklist:-none}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"
@@ -1539,9 +1621,9 @@ run_ltp_riscv_mode() {
     tbrok="$(count_matches "TBROK" "${text_log}")"
     tconf="$(count_matches "TCONF" "${text_log}")"
     timeout_count="$(count_matches "whuse-oscomp-step-timeout:ltp_testcode.sh" "${text_log}")"
-    pass_candidates="/tmp/rv-ltp-${mode}-pass-candidates-${TS}.txt"
-    bad_candidates="/tmp/rv-ltp-${mode}-bad-candidates-${TS}.txt"
-    conf_candidates="/tmp/rv-ltp-${mode}-conf-candidates-${TS}.txt"
+    pass_candidates="/tmp/rv-ltp-${mode}-${runtime_filter}-pass-candidates-${TS}.txt"
+    bad_candidates="/tmp/rv-ltp-${mode}-${runtime_filter}-bad-candidates-${TS}.txt"
+    conf_candidates="/tmp/rv-ltp-${mode}-${runtime_filter}-conf-candidates-${TS}.txt"
     generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}" "${conf_candidates}" "${label}"
     echo "[${label}] pass-candidates: ${pass_candidates} ($(wc -l < "${pass_candidates}"))"
     echo "[${label}] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
@@ -1552,6 +1634,7 @@ run_ltp_riscv_mode() {
     fi
     echo "[${label}] summary: TPASS=${tpass} TFAIL=${tfail} TBROK=${tbrok} TCONF=${tconf} step-timeout=${timeout_count} suite_done_seen=${suite_done_seen} terminated_by_suite_done=${terminated_by_suite_done}"
     rg "whuse-oscomp-step-(begin|end|timeout|skip):ltp_testcode.sh|whuse-oscomp-suite-done|whuse-ltp-(skip-case|case-result):" "${text_log}" || true
+    WHUSE_LTP_STEP_TIMEOUT="${saved_step_timeout}"
     return "${ok}"
 }
 

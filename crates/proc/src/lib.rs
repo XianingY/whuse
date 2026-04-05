@@ -164,6 +164,8 @@ pub struct Process {
     pub egid: u32,
     pub groups: Vec<u32>,
     pub umask: u32,
+    rlimit_nofile_cur: u64,
+    rlimit_nofile_max: u64,
     scheduler_policy: usize,
     scheduler_priority: i32,
     pub state: ProcessState,
@@ -255,6 +257,8 @@ impl Process {
             egid: 0,
             groups: Vec::new(),
             umask: 0o022,
+            rlimit_nofile_cur: MAX_OPEN_FDS as u64,
+            rlimit_nofile_max: MAX_OPEN_FDS as u64,
             scheduler_policy: 0,
             scheduler_priority: 0,
             state: ProcessState::Ready,
@@ -294,14 +298,18 @@ impl Process {
     }
 
     pub fn add_fd(&mut self, handle: FileHandle) -> KernelResult<i32> {
+        let fd_limit = self.nofile_limit_soft();
+        if fd_limit <= 0 {
+            return Err(EMFILE);
+        }
         let mut fd = 0;
         while self.fds.contains_key(&fd) {
             fd += 1;
-            if fd >= MAX_OPEN_FDS {
+            if fd >= fd_limit {
                 return Err(EMFILE);
             }
         }
-        if fd >= MAX_OPEN_FDS {
+        if fd >= fd_limit {
             return Err(EMFILE);
         }
         self.fds.insert(fd, handle);
@@ -393,6 +401,25 @@ impl Process {
 
     pub fn set_fd_alias(&mut self, fd: i32, leader: i32) {
         self.fd_alias.insert(fd, leader);
+    }
+
+    pub fn nofile_limit_soft(&self) -> i32 {
+        self.rlimit_nofile_cur.min(MAX_OPEN_FDS as u64) as i32
+    }
+
+    pub fn nofile_limits(&self) -> (u64, u64) {
+        (self.rlimit_nofile_cur, self.rlimit_nofile_max)
+    }
+
+    pub fn set_nofile_limits(&mut self, soft: u64, hard: u64) -> KernelResult<()> {
+        if soft > hard {
+            return Err(EINVAL);
+        }
+        let clamped_hard = hard.min(MAX_OPEN_FDS as u64);
+        let clamped_soft = soft.min(clamped_hard);
+        self.rlimit_nofile_cur = clamped_soft;
+        self.rlimit_nofile_max = clamped_hard;
+        Ok(())
     }
 
     pub fn read_user_bytes(&self, addr: usize, len: usize) -> MmResult<alloc::vec::Vec<u8>> {
@@ -535,6 +562,8 @@ impl Process {
             egid: self.egid,
             groups: self.groups.clone(),
             umask: self.umask,
+            rlimit_nofile_cur: self.rlimit_nofile_cur,
+            rlimit_nofile_max: self.rlimit_nofile_max,
             scheduler_policy: self.scheduler_policy,
             scheduler_priority: self.scheduler_priority,
             state: ProcessState::Ready,
@@ -599,6 +628,8 @@ impl Process {
             egid: self.egid,
             groups: self.groups.clone(),
             umask: self.umask,
+            rlimit_nofile_cur: self.rlimit_nofile_cur,
+            rlimit_nofile_max: self.rlimit_nofile_max,
             scheduler_policy: self.scheduler_policy,
             scheduler_priority: self.scheduler_priority,
             state: ProcessState::Ready,
@@ -674,6 +705,8 @@ impl Process {
             egid: self.egid,
             groups: self.groups.clone(),
             umask: self.umask,
+            rlimit_nofile_cur: self.rlimit_nofile_cur,
+            rlimit_nofile_max: self.rlimit_nofile_max,
             scheduler_policy: self.scheduler_policy,
             scheduler_priority: self.scheduler_priority,
             state: ProcessState::Ready,

@@ -113,6 +113,12 @@ pub struct FileStat {
     pub uid: u32,
     pub gid: u32,
     pub rdev: u64,
+    pub atime_sec: i64,
+    pub atime_nsec: i64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,17 +127,44 @@ struct InodeMeta {
     nlink: u32,
     uid: u32,
     gid: u32,
+    atime_ns: u64,
+    mtime_ns: u64,
+    ctime_ns: u64,
 }
 
 impl InodeMeta {
-    const fn root(mode: u32) -> Self {
+    fn root(mode: u32) -> Self {
+        let now_ns = monotonic_now_ns();
         Self {
             mode,
             nlink: 1,
             uid: 0,
             gid: 0,
+            atime_ns: now_ns,
+            mtime_ns: now_ns,
+            ctime_ns: now_ns,
         }
     }
+}
+
+fn monotonic_now_ns() -> u64 {
+    hal().timer.monotonic_nanos().max(1)
+}
+
+fn split_ns(ns: u64) -> (i64, i64) {
+    (
+        (ns / 1_000_000_000) as i64,
+        (ns % 1_000_000_000) as i64,
+    )
+}
+
+fn compose_ns(sec: i64, nsec: i64) -> u64 {
+    if sec <= 0 {
+        return 0;
+    }
+    (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec.max(0) as u64)
 }
 
 fn stable_nonzero_hash64(input: &str) -> u64 {
@@ -600,6 +633,9 @@ impl KernelVfs {
                         nlink: 1,
                         uid,
                         gid,
+                        atime_ns: monotonic_now_ns(),
+                        mtime_ns: monotonic_now_ns(),
+                        ctime_ns: monotonic_now_ns(),
                     },
                 );
                 Ok(())
@@ -622,6 +658,9 @@ impl KernelVfs {
                         nlink: 1,
                         uid,
                         gid,
+                        atime_ns: monotonic_now_ns(),
+                        mtime_ns: monotonic_now_ns(),
+                        ctime_ns: monotonic_now_ns(),
                     },
                 );
                 Ok(())
@@ -667,6 +706,7 @@ impl KernelVfs {
         mode: Option<u32>,
     ) -> KernelResult<()> {
         let absolute = normalize_path("/", path);
+        let (now_sec, now_nsec) = split_ns(monotonic_now_ns());
         let stat = FileStat {
             dev: ext4_dev_for_path(&absolute),
             ino: stable_nonzero_hash64(&absolute),
@@ -676,6 +716,12 @@ impl KernelVfs {
             uid: 0,
             gid: 0,
             rdev: 0,
+            atime_sec: now_sec,
+            atime_nsec: now_nsec,
+            mtime_sec: now_sec,
+            mtime_nsec: now_nsec,
+            ctime_sec: now_sec,
+            ctime_nsec: now_nsec,
         };
         self.external_preloaded
             .insert(absolute.clone(), (Arc::new(contents.to_vec()), stat));
@@ -731,6 +777,9 @@ impl KernelVfs {
                     nlink: stat.nlink,
                     uid,
                     gid: inherited_gid.unwrap_or(gid),
+                    atime_ns: compose_ns(stat.atime_sec, stat.atime_nsec),
+                    mtime_ns: compose_ns(stat.mtime_sec, stat.mtime_nsec),
+                    ctime_ns: compose_ns(stat.ctime_sec, stat.ctime_nsec),
                 },
             );
         }
@@ -1405,6 +1454,9 @@ impl KernelVfs {
                 nlink: stat.nlink,
                 uid: stat.uid,
                 gid: stat.gid,
+                atime_ns: compose_ns(stat.atime_sec, stat.atime_nsec),
+                mtime_ns: compose_ns(stat.mtime_sec, stat.mtime_nsec),
+                ctime_ns: monotonic_now_ns(),
             },
         );
         Ok(())
@@ -1419,6 +1471,9 @@ impl KernelVfs {
                 nlink: stat.nlink,
                 uid: stat.uid,
                 gid: stat.gid,
+                atime_ns: compose_ns(stat.atime_sec, stat.atime_nsec),
+                mtime_ns: compose_ns(stat.mtime_sec, stat.mtime_nsec),
+                ctime_ns: monotonic_now_ns(),
             },
         );
         Ok(())
@@ -1440,6 +1495,9 @@ impl KernelVfs {
                 nlink: stat.nlink,
                 uid: uid.unwrap_or(stat.uid),
                 gid: gid.unwrap_or(stat.gid),
+                atime_ns: compose_ns(stat.atime_sec, stat.atime_nsec),
+                mtime_ns: compose_ns(stat.mtime_sec, stat.mtime_nsec),
+                ctime_ns: monotonic_now_ns(),
             },
         );
         Ok(())
@@ -1461,6 +1519,9 @@ impl KernelVfs {
                 nlink: stat.nlink,
                 uid: uid.unwrap_or(stat.uid),
                 gid: gid.unwrap_or(stat.gid),
+                atime_ns: compose_ns(stat.atime_sec, stat.atime_nsec),
+                mtime_ns: compose_ns(stat.mtime_sec, stat.mtime_nsec),
+                ctime_ns: monotonic_now_ns(),
             },
         );
         Ok(())
@@ -1480,6 +1541,69 @@ impl KernelVfs {
                 nlink: stat.nlink,
                 uid: uid.unwrap_or(stat.uid),
                 gid: gid.unwrap_or(stat.gid),
+                atime_ns: compose_ns(stat.atime_sec, stat.atime_nsec),
+                mtime_ns: compose_ns(stat.mtime_sec, stat.mtime_nsec),
+                ctime_ns: monotonic_now_ns(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn set_timestamps_path(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+    ) -> KernelResult<()> {
+        let absolute = normalize_path(cwd, path);
+        let stat = self.stat_path("/", &absolute)?;
+        let now_ns = monotonic_now_ns();
+        let current_atime = compose_ns(stat.atime_sec, stat.atime_nsec);
+        let current_mtime = compose_ns(stat.mtime_sec, stat.mtime_nsec);
+        self.mem_meta.insert(
+            absolute,
+            InodeMeta {
+                mode: stat.mode,
+                nlink: stat.nlink,
+                uid: stat.uid,
+                gid: stat.gid,
+                atime_ns: atime
+                    .map(|(sec, nsec)| compose_ns(sec, nsec))
+                    .unwrap_or(current_atime),
+                mtime_ns: mtime
+                    .map(|(sec, nsec)| compose_ns(sec, nsec))
+                    .unwrap_or(current_mtime),
+                ctime_ns: now_ns,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn set_timestamps_handle(
+        &mut self,
+        handle: &FileHandle,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+    ) -> KernelResult<()> {
+        let stat = self.stat_handle(handle)?;
+        let now_ns = monotonic_now_ns();
+        let current_atime = compose_ns(stat.atime_sec, stat.atime_nsec);
+        let current_mtime = compose_ns(stat.mtime_sec, stat.mtime_nsec);
+        self.mem_meta.insert(
+            handle.path.clone(),
+            InodeMeta {
+                mode: stat.mode,
+                nlink: stat.nlink,
+                uid: stat.uid,
+                gid: stat.gid,
+                atime_ns: atime
+                    .map(|(sec, nsec)| compose_ns(sec, nsec))
+                    .unwrap_or(current_atime),
+                mtime_ns: mtime
+                    .map(|(sec, nsec)| compose_ns(sec, nsec))
+                    .unwrap_or(current_mtime),
+                ctime_ns: now_ns,
             },
         );
         Ok(())
@@ -2305,6 +2429,7 @@ impl KernelVfs {
                 .keys()
                 .any(|entry| entry.starts_with(&dir_prefix))
         {
+            let (now_sec, now_nsec) = split_ns(monotonic_now_ns());
             if iozone_probe {
                 iozone_probe_log(&format!(
                     "whuse-la-iozone:vfs-external-stat-dir-synth absolute={}",
@@ -2320,11 +2445,18 @@ impl KernelVfs {
                 uid: 0,
                 gid: 0,
                 rdev: 0,
+                atime_sec: now_sec,
+                atime_nsec: now_nsec,
+                mtime_sec: now_sec,
+                mtime_nsec: now_nsec,
+                ctime_sec: now_sec,
+                ctime_nsec: now_nsec,
             }));
         }
 
         match mount.ext4.stat(&fs_path) {
             Ok(stat) => {
+                let (now_sec, now_nsec) = split_ns(monotonic_now_ns());
                 if iozone_probe {
                     iozone_probe_log(&format!(
                         "whuse-la-iozone:vfs-external-stat-ok absolute={} fs_path={} mode={:#o} size={}",
@@ -2340,6 +2472,12 @@ impl KernelVfs {
                     uid: 0,
                     gid: 0,
                     rdev: 0,
+                    atime_sec: now_sec,
+                    atime_nsec: now_nsec,
+                    mtime_sec: now_sec,
+                    mtime_nsec: now_nsec,
+                    ctime_sec: now_sec,
+                    ctime_nsec: now_nsec,
                 }))
             }
             Err(err) if err == ENOENT => Ok(None),
@@ -2392,6 +2530,7 @@ impl KernelVfs {
                 .any(|entry| entry.starts_with(&dir_prefix))
             || absolute == mount.target
         {
+            let (now_sec, now_nsec) = split_ns(monotonic_now_ns());
             return Ok(Some(FileStat {
                 dev: ext4_dev_for_path(absolute),
                 ino: stable_nonzero_hash64(absolute),
@@ -2401,6 +2540,12 @@ impl KernelVfs {
                 uid: 0,
                 gid: 0,
                 rdev: 0,
+                atime_sec: now_sec,
+                atime_nsec: now_nsec,
+                mtime_sec: now_sec,
+                mtime_nsec: now_nsec,
+                ctime_sec: now_sec,
+                ctime_nsec: now_nsec,
             }));
         }
         Ok(None)
@@ -2602,6 +2747,12 @@ impl KernelVfs {
                         uid: 0,
                         gid: 0,
                         rdev: 0,
+                        atime_sec: split_ns(monotonic_now_ns()).0,
+                        atime_nsec: split_ns(monotonic_now_ns()).1,
+                        mtime_sec: split_ns(monotonic_now_ns()).0,
+                        mtime_nsec: split_ns(monotonic_now_ns()).1,
+                        ctime_sec: split_ns(monotonic_now_ns()).0,
+                        ctime_nsec: split_ns(monotonic_now_ns()).1,
                     },
                 );
                 stat
@@ -2685,6 +2836,12 @@ impl KernelVfs {
                 uid: 0,
                 gid: 0,
                 rdev: 0,
+                atime_sec: split_ns(monotonic_now_ns()).0,
+                atime_nsec: split_ns(monotonic_now_ns()).1,
+                mtime_sec: split_ns(monotonic_now_ns()).0,
+                mtime_nsec: split_ns(monotonic_now_ns()).1,
+                ctime_sec: split_ns(monotonic_now_ns()).0,
+                ctime_nsec: split_ns(monotonic_now_ns()).1,
             },
         );
     }
@@ -2809,6 +2966,9 @@ impl KernelVfs {
                         nlink,
                         uid: stat.uid,
                         gid: stat.gid,
+                        atime_ns: compose_ns(stat.atime_sec, stat.atime_nsec),
+                        mtime_ns: compose_ns(stat.mtime_sec, stat.mtime_nsec),
+                        ctime_ns: monotonic_now_ns(),
                     },
                 );
             }
@@ -2945,6 +3105,16 @@ impl KernelVfs {
         let (uid, gid, nlink) = meta
             .map(|meta| (meta.uid, meta.gid, meta.nlink))
             .unwrap_or((0, 0, 1));
+        let (atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec) =
+            if let Some(meta) = meta {
+                let (atime_sec, atime_nsec) = split_ns(meta.atime_ns);
+                let (mtime_sec, mtime_nsec) = split_ns(meta.mtime_ns);
+                let (ctime_sec, ctime_nsec) = split_ns(meta.ctime_ns);
+                (atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec)
+            } else {
+                let (now_sec, now_nsec) = split_ns(monotonic_now_ns());
+                (now_sec, now_nsec, now_sec, now_nsec, now_sec, now_nsec)
+            };
         let is_ext4 = matches!(&*guard, NodeData::Ext4File(_) | NodeData::Ext4Dir(_));
         let dev = if is_ext4 {
             ext4_dev_for_path(path)
@@ -2970,6 +3140,12 @@ impl KernelVfs {
             uid,
             gid,
             rdev,
+            atime_sec,
+            atime_nsec,
+            mtime_sec,
+            mtime_nsec,
+            ctime_sec,
+            ctime_nsec,
         })
     }
 }
@@ -3039,6 +3215,7 @@ impl FileHandle {
                 NodeKind::PidFd => S_IFREG | 0o444,
             },
         };
+        let (now_sec, now_nsec) = split_ns(monotonic_now_ns());
         FileStat {
             dev: local_dev_for_path(&self.path),
             ino: synthetic_local_ino(&self.node, &self.path),
@@ -3052,6 +3229,12 @@ impl FileHandle {
             } else {
                 0
             },
+            atime_sec: now_sec,
+            atime_nsec: now_nsec,
+            mtime_sec: now_sec,
+            mtime_nsec: now_nsec,
+            ctime_sec: now_sec,
+            ctime_nsec: now_nsec,
         }
     }
 

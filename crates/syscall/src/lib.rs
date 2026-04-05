@@ -35,6 +35,7 @@ const EAFNOSUPPORT: i32 = 97;
 const EACCES: i32 = 13;
 const EAGAIN: i32 = 11;
 const EBADF: i32 = 9;
+const EMFILE: i32 = 24;
 const EFAULT: i32 = 14;
 const EINTR: i32 = 4;
 const EISDIR: i32 = 21;
@@ -75,6 +76,8 @@ const F_OK: usize = 0;
 const X_OK: usize = 1;
 const W_OK: usize = 2;
 const R_OK: usize = 4;
+const UTIME_NOW: i64 = 0x3fff_ffff;
+const UTIME_OMIT: i64 = 0x3fff_fffe;
 const AT_REMOVEDIR_FLAG: usize = 0x200;
 const MS_RDONLY: usize = 1;
 const PATH_MAX: usize = 4096;
@@ -450,6 +453,16 @@ fn glibc_ltp_probe_enabled() -> bool {
 }
 
 #[inline]
+fn ltp_openat_probe_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_LTP_OPENAT"), Some("1"))
+}
+
+#[inline]
+fn ltp_exec_probe_enabled() -> bool {
+    matches!(option_env!("WHUSE_DEBUG_LTP_EXEC"), Some("1"))
+}
+
+#[inline]
 fn busybox_probe_debug_enabled() -> bool {
     matches!(option_env!("WHUSE_DEBUG_BUSYBOX_PROBES"), Some("1"))
 }
@@ -712,13 +725,12 @@ fn is_ltp_path_debug_task(name: &str) -> bool {
     }
     matches!(
         name,
-        "readlink01" | "readlinkat02" | "fchownat02" | "link04" | "close01" | "dup01"
+        "readlink01" | "readlinkat02" | "fchownat02" | "link04" | "dup01"
     )
         || name.ends_with("/readlink01")
         || name.ends_with("/readlinkat02")
         || name.ends_with("/fchownat02")
         || name.ends_with("/link04")
-        || name.ends_with("/close01")
         || name.ends_with("/dup01")
 }
 
@@ -732,10 +744,9 @@ fn is_loongarch_ltp_bootstrap_task(name: &str) -> bool {
     }
     matches!(
         name,
-        "brk01" | "brk02" | "close01" | "close02" | "dup01" | "dup02" | "dup04" | "dup07"
+        "brk01" | "brk02" | "close02" | "dup01" | "dup02" | "dup04" | "dup07"
     ) || name.ends_with("/brk01")
         || name.ends_with("/brk02")
-        || name.ends_with("/close01")
         || name.ends_with("/close02")
         || name.ends_with("/dup01")
         || name.ends_with("/dup02")
@@ -1713,8 +1724,9 @@ impl SyscallDispatcher {
         }
         let openat_probe = stage2_openat_debug_enabled()
             && is_libctest_openat_probe_task(name.as_str(), tgid, proc_cwd.as_str());
-        let ltp_open_probe =
-            name.starts_with("/musl/ltp/testcases/bin/") || name.starts_with("/glibc/ltp/testcases/bin/");
+        let ltp_open_probe = ltp_openat_probe_enabled()
+            && (name.starts_with("/musl/ltp/testcases/bin/")
+                || name.starts_with("/glibc/ltp/testcases/bin/"));
         let busybox_testfile_probe =
             is_busybox_testfile_probe_task(name.as_str(), proc_cwd.as_str())
                 && is_busybox_testfile_probe_path(path.as_str());
@@ -1939,7 +1951,19 @@ impl SyscallDispatcher {
             ));
         }
         handle.flags = with_cloexec_flag(handle.flags, (raw_flags as usize & O_CLOEXEC) != 0);
+        if is_ltp_path_debug_task(name.as_str()) {
+            log_always(&format!(
+                "whuse-ltp:path-debug syscall=openat-before-add-fd tgid={} tid={} name={} cwd={} dirfd={} path={} resolved_cwd={} handle_path={}",
+                tgid, tid, name, proc_cwd, dirfd, path, cwd, handle.path
+            ));
+        }
         let fd = procs.current_mut()?.add_fd(handle)?;
+        if is_ltp_path_debug_task(name.as_str()) {
+            log_always(&format!(
+                "whuse-ltp:path-debug syscall=openat-after-add-fd tgid={} tid={} name={} cwd={} dirfd={} path={} resolved_cwd={} fd={}",
+                tgid, tid, name, proc_cwd, dirfd, path, cwd, fd
+            ));
+        }
         if iozone_probe {
             log_always(&format!(
                 "whuse-la-iozone:openat-exit tid={} tgid={} fd={}",
@@ -2014,10 +2038,17 @@ impl SyscallDispatcher {
         let busybox_testfile_probe =
             is_busybox_testfile_probe_task(name.as_str(), proc_cwd.as_str())
                 && handle.path == "/test.txt";
+        let ltp_path_probe = is_ltp_path_debug_task(name.as_str());
         if busybox_testfile_probe {
             log_always(&format!(
                 "whuse-busybox:close-enter tid={} tgid={} name={} fd={} path={}",
                 tid, tgid, name, fd, handle.path
+            ));
+        }
+        if ltp_path_probe {
+            log_always(&format!(
+                "whuse-ltp-close:enter tid={} tgid={} name={} cwd={} fd={} path={} flags={:#x}",
+                tid, tgid, name, proc_cwd, fd, handle.path, handle.flags
             ));
         }
         if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
@@ -2053,6 +2084,12 @@ impl SyscallDispatcher {
             log_always(&format!(
                 "whuse-glibc-ltp-close:exit tgid={} tid={} name={} cwd={} fd={} path={} wake_blocked={} released_locks={}",
                 tgid, tid, name, cwd, fd, path, wake_blocked, released_locks
+            ));
+        }
+        if ltp_path_probe {
+            log_always(&format!(
+                "whuse-ltp-close:exit tid={} tgid={} name={} cwd={} fd={} path={} wake_blocked={} released_locks={}",
+                tid, tgid, name, proc_cwd, fd, handle.path, wake_blocked, released_locks
             ));
         }
         drop(handle);
@@ -2154,6 +2191,18 @@ impl SyscallDispatcher {
                     process.cwd.clone(),
                 )
             });
+        let ltp_path_debug = procs
+            .current()
+            .ok()
+            .filter(|process| is_ltp_path_debug_task(process.name.as_str()))
+            .map(|process| {
+                (
+                    process.tgid,
+                    process.tid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                )
+            });
         let bytes = {
             let process = procs.current_mut()?;
             process.sync_fd_offset_from_alias(fd)?;
@@ -2197,6 +2246,12 @@ impl SyscallDispatcher {
                     tgid, tid, name, cwd, fd, pipe_path, count, handle.offset
                 ));
             }
+            if let Some((tid, tgid, name, cwd)) = &ltp_path_debug {
+                log_always(&format!(
+                    "whuse-ltp:path-debug syscall=read-enter tgid={} tid={} name={} cwd={} fd={} path={} count={} off={}",
+                    tgid, tid, name, cwd, fd, pipe_path, count, handle.offset
+                ));
+            }
             match vfs.read(handle, count) {
                 Ok(bytes) => {
                     if iozone_probe {
@@ -2233,6 +2288,12 @@ impl SyscallDispatcher {
                             tgid, tid, name, cwd, fd, pipe_path, bytes.len(), handle.offset
                         ));
                     }
+                    if let Some((tid, tgid, name, cwd)) = &ltp_path_debug {
+                        log_always(&format!(
+                            "whuse-ltp:path-debug syscall=read-ok tgid={} tid={} name={} cwd={} fd={} path={} bytes={} off={}",
+                            tgid, tid, name, cwd, fd, pipe_path, bytes.len(), handle.offset
+                        ));
+                    }
                     bytes
                 }
                 Err(EAGAIN) if (is_pipe || is_socket) && !nonblock => {
@@ -2266,6 +2327,12 @@ impl SyscallDispatcher {
                     if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
                         log_always(&format!(
                             "whuse-la-ltp-bootstrap syscall=read-err tgid={} tid={} name={} cwd={} fd={} path={} err={}",
+                            tgid, tid, name, cwd, fd, pipe_path, err
+                        ));
+                    }
+                    if let Some((tid, tgid, name, cwd)) = &ltp_path_debug {
+                        log_always(&format!(
+                            "whuse-ltp:path-debug syscall=read-err tgid={} tid={} name={} cwd={} fd={} path={} err={}",
                             tgid, tid, name, cwd, fd, pipe_path, err
                         ));
                     }
@@ -2313,6 +2380,18 @@ impl SyscallDispatcher {
                     process.cwd.clone(),
                 )
             });
+        let ltp_path_debug = procs
+            .current()
+            .ok()
+            .filter(|process| is_ltp_path_debug_task(process.name.as_str()))
+            .map(|process| {
+                (
+                    process.tid,
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                )
+            });
         let data = procs
             .current()?
             .read_user_bytes(buf, read_len)
@@ -2341,6 +2420,12 @@ impl SyscallDispatcher {
                     ));
                 }
             }
+            if let Some((tid, tgid, name, cwd)) = &ltp_path_debug {
+                log_always(&format!(
+                    "whuse-ltp:path-debug syscall=write-enter tgid={} tid={} name={} cwd={} fd={} path={} count={} off={}",
+                    tgid, tid, name, cwd, fd, handle.path, data.len(), handle.offset
+                ));
+            }
             let is_pipe = vfs.is_pipe(handle);
             let is_socket = vfs.is_socket(handle);
             let nonblock = (handle.flags & (O_NONBLOCK as u32)) != 0;
@@ -2352,6 +2437,12 @@ impl SyscallDispatcher {
                             tgid, tid, name, cwd, fd, handle.path, written, handle.offset
                         ));
                     }
+                    if let Some((tid, tgid, name, cwd)) = &ltp_path_debug {
+                        log_always(&format!(
+                            "whuse-ltp:path-debug syscall=write-ok tgid={} tid={} name={} cwd={} fd={} path={} written={} off={}",
+                            tgid, tid, name, cwd, fd, handle.path, written, handle.offset
+                        ));
+                    }
                     process.sync_fd_offset_to_aliases(fd)?;
                     Ok((is_pipe, is_socket, nonblock, written))
                 }
@@ -2359,6 +2450,12 @@ impl SyscallDispatcher {
                     if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
                         log_always(&format!(
                             "whuse-la-ltp-bootstrap syscall=write-err tgid={} tid={} name={} cwd={} fd={} path={} err={}",
+                            tgid, tid, name, cwd, fd, handle.path, err
+                        ));
+                    }
+                    if let Some((tid, tgid, name, cwd)) = &ltp_path_debug {
+                        log_always(&format!(
+                            "whuse-ltp:path-debug syscall=write-err tgid={} tid={} name={} cwd={} fd={} path={} err={}",
                             tgid, tid, name, cwd, fd, handle.path, err
                         ));
                     }
@@ -2819,10 +2916,28 @@ impl SyscallDispatcher {
         let fd = args.0[0] as i32;
         let stat_ptr = args.0[1];
         let glibc_ltp = glibc_ltp_probe_process(procs, Some(fd));
+        let ltp_path_debug = procs
+            .current()
+            .ok()
+            .filter(|process| is_ltp_path_debug_task(process.name.as_str()))
+            .map(|process| {
+                (
+                    process.tgid,
+                    process.tid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                )
+            });
         if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
             log_always(&format!(
                 "whuse-glibc-ltp-fstat:enter tgid={} tid={} name={} cwd={} fd={} path={}",
                 tgid, tid, name, cwd, fd, path
+            ));
+        }
+        if let Some((tgid, tid, name, cwd)) = &ltp_path_debug {
+            log_always(&format!(
+                "whuse-ltp:path-debug syscall=fstat-enter tgid={} tid={} name={} cwd={} fd={}",
+                tgid, tid, name, cwd, fd
             ));
         }
         let stat = {
@@ -2834,6 +2949,12 @@ impl SyscallDispatcher {
             log_always(&format!(
                 "whuse-glibc-ltp-fstat:ok tgid={} tid={} name={} cwd={} fd={} path={} dev={:#x} ino={:#x} rdev={:#x} mode={:#o} size={}",
                 tgid, tid, name, cwd, fd, path, stat.dev, stat.ino, stat.rdev, stat.mode, stat.size
+            ));
+        }
+        if let Some((tgid, tid, name, cwd)) = &ltp_path_debug {
+            log_always(&format!(
+                "whuse-ltp:path-debug syscall=fstat-ok tgid={} tid={} name={} cwd={} fd={} dev={:#x} ino={:#x} rdev={:#x} mode={:#o} size={}",
+                tgid, tid, name, cwd, fd, stat.dev, stat.ino, stat.rdev, stat.mode, stat.size
             ));
         }
         procs
@@ -3166,17 +3287,19 @@ impl SyscallDispatcher {
         if argv.is_empty() {
             argv.push(display_path.clone());
         }
-        let execve_ltp_timeout_probe = display_path.contains("busybox")
+        let execve_ltp_timeout_case = display_path.contains("busybox")
             && argv.get(1).map(String::as_str) == Some("timeout")
             && argv
                 .iter()
                 .any(|arg| arg.starts_with("/musl/ltp/testcases/bin/") || arg.starts_with("/glibc/ltp/testcases/bin/"));
-        let execve_musl_ltp_probe = display_path.starts_with("/musl/ltp/testcases/bin/");
-        let execve_glibc_ltp_probe = display_path.starts_with("/glibc/ltp/testcases/bin/");
-        let execve_any_ltp_probe =
-            execve_musl_ltp_probe || execve_glibc_ltp_probe || execve_ltp_timeout_probe;
+        let execve_musl_ltp_case = display_path.starts_with("/musl/ltp/testcases/bin/");
+        let execve_glibc_ltp_case = display_path.starts_with("/glibc/ltp/testcases/bin/");
+        let execve_any_ltp_case =
+            execve_musl_ltp_case || execve_glibc_ltp_case || execve_ltp_timeout_case;
+        let execve_any_ltp_probe = ltp_exec_probe_enabled() && execve_any_ltp_case;
+        let execve_glibc_ltp_probe = ltp_exec_probe_enabled() && execve_glibc_ltp_case;
         #[cfg(target_arch = "loongarch64")]
-        let skip_exec_stat_for_ltp_case = execve_musl_ltp_probe || execve_glibc_ltp_probe;
+        let skip_exec_stat_for_ltp_case = execve_musl_ltp_case || execve_glibc_ltp_case;
         #[cfg(not(target_arch = "loongarch64"))]
         let skip_exec_stat_for_ltp_case = false;
         if execve_iozone_probe {
@@ -3975,10 +4098,27 @@ impl SyscallDispatcher {
                     len.checked_sub(1)
                         .and_then(|delta| addr.checked_add(delta))
                         .map(|end| process.address_space.describe_addr(end))
-                        .unwrap_or_else(|| "<none>".to_string()),
+                    .unwrap_or_else(|| "<none>".to_string()),
                 )
             })
         });
+        let ltp_path_debug = procs
+            .current()
+            .ok()
+            .filter(|process| is_ltp_path_debug_task(process.name.as_str()))
+            .map(|process| {
+                (
+                    process.tid,
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                    process.address_space.describe_addr(addr),
+                    len.checked_sub(1)
+                        .and_then(|delta| addr.checked_add(delta))
+                        .map(|end| process.address_space.describe_addr(end))
+                        .unwrap_or_else(|| "<none>".to_string()),
+                )
+            });
         if let Some((tid, tgid, name, cwd, start_desc, end_desc)) = &glibc_ltp {
             log_always(&format!(
                 "whuse-glibc-ltp-munmap:enter tgid={} tid={} name={} cwd={} addr={:#x} len={:#x} aligned_addr={} start={} end={}",
@@ -3993,7 +4133,30 @@ impl SyscallDispatcher {
                 end_desc
             ));
         }
+        if let Some((tid, tgid, name, cwd, start_desc, end_desc)) = &ltp_path_debug {
+            log_always(&format!(
+                "whuse-ltp:path-debug syscall=munmap-enter tgid={} tid={} name={} cwd={} addr={:#x} len={:#x} start={} end={}",
+                tgid, tid, name, cwd, addr, len, start_desc, end_desc
+            ));
+        }
         procs.current_mut()?.address_space.unmap(addr, len)?;
+        if let Some((tid, tgid, name, cwd, _, _)) = &ltp_path_debug {
+            let process = procs.current()?;
+            log_always(&format!(
+                "whuse-ltp:path-debug syscall=munmap-ok tgid={} tid={} name={} cwd={} addr={:#x} len={:#x} after_start={} after_end={}",
+                tgid,
+                tid,
+                name,
+                cwd,
+                addr,
+                len,
+                process.address_space.describe_addr(addr),
+                len.checked_sub(1)
+                    .and_then(|delta| addr.checked_add(delta))
+                    .map(|end| process.address_space.describe_addr(end))
+                    .unwrap_or_else(|| "<none>".to_string())
+            ));
+        }
         if let Some((tid, tgid, name, cwd, _, _)) = &glibc_ltp {
             let process = procs.current()?;
             log_always(&format!(
@@ -4183,6 +4346,9 @@ impl SyscallDispatcher {
         let oldfd = args.0[0] as i32;
         let newfd = args.0[1] as i32;
         let flags = args.0[2];
+        if newfd < 0 || newfd >= procs.current()?.nofile_limit_soft() {
+            return Err(EBADF);
+        }
         if oldfd == newfd {
             let _ = procs.current()?.fd(oldfd)?;
             return Ok(newfd as usize);
@@ -4223,9 +4389,16 @@ impl SyscallDispatcher {
                 let mut handle = procs.current()?.fd(fd)?.clone();
                 handle.flags = with_cloexec_flag(handle.flags, cmd == F_DUPFD_CLOEXEC);
                 let process = procs.current_mut()?;
+                let fd_limit = process.nofile_limit_soft();
                 let mut newfd = arg.max(0);
+                if newfd >= fd_limit {
+                    return Err(EMFILE);
+                }
                 while process.fds.contains_key(&newfd) {
                     newfd += 1;
+                    if newfd >= fd_limit {
+                        return Err(EMFILE);
+                    }
                 }
                 process.fds.insert(newfd, handle);
                 let leader = process.fd_alias_leader(fd)?;
@@ -4486,12 +4659,14 @@ impl SyscallDispatcher {
     ) -> Result<usize, i32> {
         let fd = args.0[0] as i32;
         let iovecs = read_iovecs(procs.current()?, args.0[1], args.0[2])?;
-        let is_pipe = if fd == 1 || fd == 2 {
-            false
-        } else {
+        let (is_pipe, is_socket, nonblock) = {
             let process = procs.current()?;
             let handle = process.fd(fd)?;
-            vfs.is_pipe(handle)
+            (
+                vfs.is_pipe(handle),
+                vfs.is_socket(handle),
+                (handle.flags & (O_NONBLOCK as u32)) != 0,
+            )
         };
         let mut total = 0;
         for iov in iovecs {
@@ -4499,32 +4674,44 @@ impl SyscallDispatcher {
                 .current()?
                 .read_user_bytes(iov.iov_base, iov.iov_len)
                 .map_err(|_| EFAULT)?;
-            if fd == 1 || fd == 2 {
-                write_console_bytes(&bytes);
-                total += bytes.len();
-            } else {
-                let written_res = {
-                    let process = procs.current_mut()?;
+            let written_res = {
+                let process = procs.current_mut()?;
+                process.sync_fd_offset_from_alias(fd)?;
+                let written = {
                     let handle = process.fd_mut(fd)?;
+                    if !fd_is_writable(handle.flags) {
+                        return Err(EBADF);
+                    }
                     vfs.write(handle, &bytes)
                 };
-                match written_res {
-                    Ok(written) => total += written,
-                    Err(EPIPE) if is_pipe => {
-                        let _ = scheduler.wake_all_blocked();
-                        if let Ok(current_tgid) = procs.current_tgid() {
-                            let _ = procs.deliver_signal(current_tgid, SIGPIPE);
-                        }
-                        if total == 0 {
-                            return Err(EPIPE);
-                        }
-                        break;
+                match written {
+                    Ok(count) => {
+                        process.sync_fd_offset_to_aliases(fd)?;
+                        Ok(count)
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => Err(err),
                 }
+            };
+            match written_res {
+                Ok(written) => total += written,
+                Err(EAGAIN) if (is_pipe || is_socket) && !nonblock => {
+                    let _ = scheduler.block_current();
+                    return Err(EAGAIN);
+                }
+                Err(EPIPE) if is_pipe || is_socket => {
+                    let _ = scheduler.wake_all_blocked();
+                    if let Ok(current_tgid) = procs.current_tgid() {
+                        let _ = procs.deliver_signal(current_tgid, SIGPIPE);
+                    }
+                    if total == 0 {
+                        return Err(EPIPE);
+                    }
+                    break;
+                }
+                Err(err) => return Err(err),
             }
         }
-        if is_pipe && total != 0 {
+        if (is_pipe || is_socket) && total != 0 {
             let _ = scheduler.wake_all_blocked();
         }
         Ok(total)
@@ -5616,17 +5803,44 @@ impl SyscallDispatcher {
     }
 
     fn sys_prlimit64(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
-        let _pid = args.0[0];
+        let pid = args.0[0];
         let resource = args.0[1];
-        let _new_limit = args.0[2];
+        let new_limit = args.0[2];
         let old_limit = args.0[3];
+        if pid != 0 && pid != procs.current_tgid()? {
+            return Err(ESRCH);
+        }
+        if resource == RLIMIT_NOFILE {
+            let (soft, hard) = procs.current()?.nofile_limits();
+            if old_limit != 0 {
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&soft.to_le_bytes());
+                bytes[8..].copy_from_slice(&hard.to_le_bytes());
+                procs
+                    .current_mut()?
+                    .write_user_bytes(old_limit, &bytes)
+                    .map_err(|_| EFAULT)?;
+            }
+            if new_limit != 0 {
+                let raw = procs
+                    .current()?
+                    .read_user_bytes(new_limit, 16)
+                    .map_err(|_| EFAULT)?;
+                let mut soft_bytes = [0u8; 8];
+                let mut hard_bytes = [0u8; 8];
+                soft_bytes.copy_from_slice(&raw[..8]);
+                hard_bytes.copy_from_slice(&raw[8..16]);
+                let requested_soft = u64::from_le_bytes(soft_bytes);
+                let requested_hard = u64::from_le_bytes(hard_bytes);
+                procs
+                    .current_mut()?
+                    .set_nofile_limits(requested_soft, requested_hard)?;
+            }
+            return Ok(0);
+        }
         if old_limit != 0 {
             let mut bytes = [0u8; 16];
-            let limit = if resource == RLIMIT_NOFILE {
-                proc::MAX_OPEN_FDS as u64
-            } else {
-                u64::MAX
-            };
+            let limit = u64::MAX;
             bytes[..8].copy_from_slice(&limit.to_le_bytes());
             bytes[8..].copy_from_slice(&limit.to_le_bytes());
             procs
@@ -6785,8 +6999,46 @@ impl SyscallDispatcher {
         const AT_EMPTY_PATH: usize = 0x1000;
         let dirfd = args.0[0] as i32;
         let path_ptr = args.0[1];
-        let _times = args.0[2];
+        let times_ptr = args.0[2];
         let flags = args.0[3];
+        let allowed_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW_FLAG;
+        if (flags & !allowed_flags) != 0 {
+            return Err(EINVAL);
+        }
+        let now = wall_time_now();
+        let now_timespec = (now.tv_sec, now.tv_nsec);
+        let parse_timespec = |index: usize| -> Result<Option<(i64, i64)>, i32> {
+            let raw = procs
+                .current()?
+                .read_user_bytes(times_ptr + index * 16, 16)
+                .map_err(|_| EFAULT)?;
+            let mut sec_bytes = [0u8; 8];
+            let mut nsec_bytes = [0u8; 8];
+            sec_bytes.copy_from_slice(&raw[..8]);
+            nsec_bytes.copy_from_slice(&raw[8..16]);
+            let sec = i64::from_le_bytes(sec_bytes);
+            let nsec = i64::from_le_bytes(nsec_bytes);
+            match nsec {
+                UTIME_NOW => Ok(Some(now_timespec)),
+                UTIME_OMIT => Ok(None),
+                _ => {
+                    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+                        return Err(EINVAL);
+                    }
+                    Ok(Some((sec, nsec)))
+                }
+            }
+        };
+        let (atime, mtime) = if times_ptr == 0 {
+            (Some(now_timespec), Some(now_timespec))
+        } else {
+            (parse_timespec(0)?, parse_timespec(1)?)
+        };
+        if path_ptr == 0 {
+            let handle = procs.current()?.fd(dirfd)?.clone();
+            vfs.set_timestamps_handle(&handle, atime, mtime)?;
+            return Ok(0);
+        }
         let (tid, tgid, name, proc_cwd) = {
             let process = procs.current()?;
             (
@@ -6796,15 +7048,10 @@ impl SyscallDispatcher {
                 process.cwd.clone(),
             )
         };
-        // If path pointer is null, treat as empty path.
-        let path = if path_ptr == 0 {
-            String::new()
-        } else {
-            procs
-                .current()?
-                .read_user_cstr(path_ptr)
-                .map_err(|_| EFAULT)?
-        };
+        let path = procs
+            .current()?
+            .read_user_cstr(path_ptr)
+            .map_err(|_| EFAULT)?;
         let busybox_testfile_probe =
             is_busybox_testfile_probe_task(name.as_str(), proc_cwd.as_str())
                 && (path.is_empty() || is_busybox_testfile_probe_path(path.as_str()));
@@ -6815,10 +7062,9 @@ impl SyscallDispatcher {
             ));
         }
         if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
-            // Operate on the fd directly. We don't track timestamps, so just
-            // validate that the fd exists and return success.
             if dirfd != AT_FDCWD {
-                let _ = procs.current()?.fd(dirfd)?;
+                let handle = procs.current()?.fd(dirfd)?.clone();
+                vfs.set_timestamps_handle(&handle, atime, mtime)?;
             }
             if busybox_testfile_probe {
                 log_always(&format!(
@@ -6835,8 +7081,11 @@ impl SyscallDispatcher {
             ));
             return Ok(0);
         }
-        let cwd = procs.current()?.cwd.clone();
-        match vfs.access(&cwd, &path) {
+        if path.is_empty() {
+            return Err(ENOENT);
+        }
+        let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
+        match vfs.set_timestamps_path(&cwd, &path, atime, mtime) {
             Ok(()) => {
                 if busybox_testfile_probe {
                     log_always(&format!(
@@ -7801,7 +8050,8 @@ impl SyscallDispatcher {
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
         let family = args.0[0];
-        let sock_type = args.0[1] & 0xf;
+        let sock_type_with_flags = args.0[1];
+        let sock_type = sock_type_with_flags & 0xf;
         let protocol = args.0[2];
         if !matches!(family, 1 | 2 | 10) {
             return Err(EAFNOSUPPORT);
@@ -7809,10 +8059,19 @@ impl SyscallDispatcher {
         if !matches!(sock_type, 1 | 2 | 3 | 5) {
             return Err(EPROTOTYPE);
         }
+        if (sock_type_with_flags & !(0xf | O_CLOEXEC | O_NONBLOCK)) != 0 {
+            return Err(EINVAL);
+        }
         if sock_type == 3 && family != 10 {
             return Err(EPROTONOSUPPORT);
         }
-        let handle = vfs.create_socket(family, sock_type, protocol)?;
+        let mut handle = vfs.create_socket(family, sock_type, protocol)?;
+        handle.flags = with_cloexec_flag(handle.flags, (sock_type_with_flags & O_CLOEXEC) != 0);
+        if (sock_type_with_flags & O_NONBLOCK) != 0 {
+            handle.flags |= O_NONBLOCK as u32;
+        } else {
+            handle.flags &= !(O_NONBLOCK as u32);
+        }
         Ok(procs.current_mut()?.add_fd(handle)? as usize)
     }
 
@@ -7986,15 +8245,45 @@ impl SyscallDispatcher {
         let buf = args.0[1];
         let count = args.0[2];
         let _flags = args.0[3];
+        let dest_addr = args.0[4];
+        let dest_len = args.0[5];
         let data = procs
             .current()?
             .read_user_bytes(buf, count)
             .map_err(|_| EFAULT)?;
+        let cwd = procs.current()?.cwd.clone();
+        let connect_target = if dest_addr != 0 && dest_len != 0 {
+            let process = procs.current()?;
+            let handle = process.fd(fd)?;
+            if vfs.is_socket(handle) {
+                let family = vfs.socket_family(handle)? as u16;
+                Some(parse_sockaddr_path_with_default(
+                    process,
+                    dest_addr,
+                    dest_len,
+                    Some(family),
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let process = procs.current_mut()?;
         let handle = process.fd_mut(fd)?;
         let is_socket = vfs.is_socket(handle);
         let is_pipe = vfs.is_pipe(handle);
-        let written = vfs.write(handle, &data)?;
+        let written = match vfs.write(handle, &data) {
+            Ok(written) => written,
+            Err(EINVAL) if is_socket => {
+                let Some(path) = connect_target.as_deref() else {
+                    return Err(EINVAL);
+                };
+                vfs.connect_socket(handle, &cwd, path)?;
+                vfs.write(handle, &data)?
+            }
+            Err(err) => return Err(err),
+        };
         if (is_socket || is_pipe) && written != 0 {
             let _ = scheduler.wake_all_blocked();
         }
@@ -8027,6 +8316,10 @@ impl SyscallDispatcher {
             .current_mut()?
             .write_user_bytes(args.0[1], &bytes)
             .map_err(|_| EFAULT)?;
+        if args.0[4] != 0 && args.0[5] != 0 {
+            let peer_path = procs.current()?.fd(fd)?.path.clone();
+            write_sockaddr(procs.current_mut()?, args.0[4], args.0[5], &peer_path)?;
+        }
         Ok(bytes.len())
     }
 
@@ -8596,6 +8889,12 @@ fn stat_to_bytes(stat: FileStat) -> [u8; 128] {
     out[48..56].copy_from_slice(&stat.size.to_le_bytes());
     out[56..60].copy_from_slice(&(4096u32).to_le_bytes());
     out[64..72].copy_from_slice(&(stat.size / 512).to_le_bytes());
+    out[72..80].copy_from_slice(&stat.atime_sec.to_le_bytes());
+    out[80..88].copy_from_slice(&stat.atime_nsec.to_le_bytes());
+    out[88..96].copy_from_slice(&stat.mtime_sec.to_le_bytes());
+    out[96..104].copy_from_slice(&stat.mtime_nsec.to_le_bytes());
+    out[104..112].copy_from_slice(&stat.ctime_sec.to_le_bytes());
+    out[112..120].copy_from_slice(&stat.ctime_nsec.to_le_bytes());
     out
 }
 
@@ -10107,9 +10406,15 @@ fn uname_bytes() -> [u8; 390] {
 
 fn statfs_bytes() -> [u8; 120] {
     let mut out = [0u8; 120];
+    out[0..8].copy_from_slice(&0xef53u64.to_le_bytes());
     out[8..16].copy_from_slice(&4096u64.to_le_bytes());
-    out[80..88].copy_from_slice(&255u64.to_le_bytes());
-    out[88..96].copy_from_slice(&4096u64.to_le_bytes());
+    out[16..24].copy_from_slice(&1_048_576u64.to_le_bytes());
+    out[24..32].copy_from_slice(&524_288u64.to_le_bytes());
+    out[32..40].copy_from_slice(&524_288u64.to_le_bytes());
+    out[40..48].copy_from_slice(&262_144u64.to_le_bytes());
+    out[48..56].copy_from_slice(&131_072u64.to_le_bytes());
+    out[64..72].copy_from_slice(&255u64.to_le_bytes());
+    out[72..80].copy_from_slice(&4096u64.to_le_bytes());
     out
 }
 
@@ -10364,6 +10669,12 @@ mod tests {
             dev: 0x0102_0304_0506_0708,
             ino: 0x1112_1314_1516_1718,
             rdev: 0x2122_2324_2526_2728,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
         });
 
         assert_eq!(
@@ -10391,6 +10702,12 @@ mod tests {
             dev: 0x2000_0000_0000_0001,
             ino: 0x1112_1314_1516_1718,
             rdev: ((5u64) << 8) | 7u64,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
         });
 
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0x7ff);
@@ -10415,6 +10732,398 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[132..136].try_into().unwrap()), 7);
         assert_eq!(u32::from_le_bytes(bytes[136..140].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(bytes[140..144].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn utimensat_updates_stat_timestamps() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb300, b"/tmp/utime-target\0");
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xb300,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0);
+
+        let atime_sec = 12345i64;
+        let mtime_sec = 1i64 << 32;
+        let mut times = [0u8; 32];
+        times[0..8].copy_from_slice(&atime_sec.to_le_bytes());
+        times[8..16].copy_from_slice(&0i64.to_le_bytes());
+        times[16..24].copy_from_slice(&mtime_sec.to_le_bytes());
+        times[24..32].copy_from_slice(&0i64.to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb320, &times);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_UTIMENSAT,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xb300,
+                    0xb320,
+                    0,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb380, &[0u8; 128]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSTAT,
+                SyscallArgs([fd as usize, 0xb380, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        let raw = procs.current().unwrap().read_user_bytes(0xb380, 128).unwrap();
+        let mut atime_bytes = [0u8; 8];
+        atime_bytes.copy_from_slice(&raw[72..80]);
+        let mut mtime_bytes = [0u8; 8];
+        mtime_bytes.copy_from_slice(&raw[88..96]);
+        assert_eq!(i64::from_le_bytes(atime_bytes), atime_sec);
+        assert_eq!(i64::from_le_bytes(mtime_bytes), mtime_sec);
+    }
+
+    #[test]
+    fn utimensat_null_path_updates_fd_target_like_futimens() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb900, b"/tmp/futimens-target\0");
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xb900,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0);
+
+        let atime_sec = 0i64;
+        let mtime_sec = 1i64 << 32;
+        let mut times = [0u8; 32];
+        times[0..8].copy_from_slice(&atime_sec.to_le_bytes());
+        times[8..16].copy_from_slice(&0i64.to_le_bytes());
+        times[16..24].copy_from_slice(&mtime_sec.to_le_bytes());
+        times[24..32].copy_from_slice(&0i64.to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb940, &times);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_UTIMENSAT,
+                SyscallArgs([fd as usize, 0, 0xb940, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb980, &[0u8; 128]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSTAT,
+                SyscallArgs([fd as usize, 0xb980, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        let raw = procs.current().unwrap().read_user_bytes(0xb980, 128).unwrap();
+        let mut atime_sec_bytes = [0u8; 8];
+        atime_sec_bytes.copy_from_slice(&raw[72..80]);
+        let mut atime_nsec_bytes = [0u8; 8];
+        atime_nsec_bytes.copy_from_slice(&raw[80..88]);
+        let mut mtime_sec_bytes = [0u8; 8];
+        mtime_sec_bytes.copy_from_slice(&raw[88..96]);
+        let mut mtime_nsec_bytes = [0u8; 8];
+        mtime_nsec_bytes.copy_from_slice(&raw[96..104]);
+        assert_eq!(i64::from_le_bytes(atime_sec_bytes), atime_sec);
+        assert_eq!(i64::from_le_bytes(atime_nsec_bytes), 0);
+        assert_eq!(i64::from_le_bytes(mtime_sec_bytes), mtime_sec);
+        assert_eq!(i64::from_le_bytes(mtime_nsec_bytes), 0);
+
+        let mut omit_times = [0u8; 32];
+        omit_times[8..16].copy_from_slice(&super::UTIME_OMIT.to_le_bytes());
+        omit_times[24..32].copy_from_slice(&super::UTIME_OMIT.to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xba00, &omit_times);
+        let bad_fd_result = dispatcher.dispatch(
+            SYS_UTIMENSAT,
+            SyscallArgs([(-1i32) as usize, 0, 0xba00, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert_eq!(bad_fd_result, -(super::EBADF as isize));
+    }
+
+    #[test]
+    fn utimensat_null_path_updates_unlinked_fd_target() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xba40, b"/tmp/futimens-unlinked\0");
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xba40,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_UNLINKAT,
+                SyscallArgs([super::AT_FDCWD as usize, 0xba40, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        let atime_sec = 0i64;
+        let mtime_sec = 1i64 << 32;
+        let mut times = [0u8; 32];
+        times[0..8].copy_from_slice(&atime_sec.to_le_bytes());
+        times[8..16].copy_from_slice(&0i64.to_le_bytes());
+        times[16..24].copy_from_slice(&mtime_sec.to_le_bytes());
+        times[24..32].copy_from_slice(&0i64.to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xba80, &times);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_UTIMENSAT,
+                SyscallArgs([fd as usize, 0, 0xba80, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xbac0, &[0u8; 128]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSTAT,
+                SyscallArgs([fd as usize, 0xbac0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        let raw = procs.current().unwrap().read_user_bytes(0xbac0, 128).unwrap();
+        let mut atime_sec_bytes = [0u8; 8];
+        atime_sec_bytes.copy_from_slice(&raw[72..80]);
+        let mut mtime_sec_bytes = [0u8; 8];
+        mtime_sec_bytes.copy_from_slice(&raw[88..96]);
+        assert_eq!(i64::from_le_bytes(atime_sec_bytes), atime_sec);
+        assert_eq!(i64::from_le_bytes(mtime_sec_bytes), mtime_sec);
+    }
+
+    #[test]
+    fn utimensat_utime_now_tracks_realtime_clock() {
+        ensure_test_hal();
+        set_test_monotonic_nanos(9_500_000_000);
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xbb00, b"/tmp/futimens-realtime\0");
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xbb00,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0);
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xbb40, &[0u8; 16]);
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_CLOCK_GETTIME,
+                SyscallArgs([0, 0xbb40, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        let realtime_before = {
+            let raw = procs.current().unwrap().read_user_bytes(0xbb40, 16).unwrap();
+            let mut sec = [0u8; 8];
+            sec.copy_from_slice(&raw[..8]);
+            i64::from_le_bytes(sec)
+        };
+
+        let mut times = [0u8; 32];
+        times[8..16].copy_from_slice(&super::UTIME_NOW.to_le_bytes());
+        times[24..32].copy_from_slice(&super::UTIME_OMIT.to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xbb80, &times);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_UTIMENSAT,
+                SyscallArgs([fd as usize, 0, 0xbb80, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xbbc0, &[0u8; 128]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSTAT,
+                SyscallArgs([fd as usize, 0xbbc0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+        let raw = procs.current().unwrap().read_user_bytes(0xbbc0, 128).unwrap();
+        let mut atime_sec_bytes = [0u8; 8];
+        atime_sec_bytes.copy_from_slice(&raw[72..80]);
+        let atime_sec = i64::from_le_bytes(atime_sec_bytes);
+        assert!(atime_sec >= realtime_before);
+    }
+
+    #[test]
+    fn statfs_bytes_exposes_nonzero_blocks_files_and_namelen() {
+        let bytes = super::statfs_bytes();
+        let blocks = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let files = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+        let namelen = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+
+        assert!(blocks > 0);
+        assert!(files > 0);
+        assert!(namelen >= 255);
     }
 
     #[test]
@@ -10824,6 +11533,105 @@ mod tests {
                 &mut vfs
             ),
             -(super::EINVAL as isize)
+        );
+    }
+
+    #[test]
+    fn writev_respects_rebound_stdout_fd() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x1980, b"/tmp/writev-fd0-placeholder\0");
+        let placeholder_fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                !0usize,
+                0x1980,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert_eq!(placeholder_fd, 0);
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x1a00, b"/tmp/writev-rebound-stdout\0");
+        let fd_one = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                !0usize,
+                0x1a00,
+                (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                0o644,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert_eq!(fd_one, 1);
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x1a40, b"x");
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&0x1a40usize.to_le_bytes());
+        iov[8..16].copy_from_slice(&1usize.to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x1a80, &iov);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_WRITEV,
+                SyscallArgs([1, 0x1a80, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            1
+        );
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0x1ac0, &[0u8; 1]);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_PREAD64,
+                SyscallArgs([fd_one as usize, 0x1ac0, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            1
+        );
+        assert_eq!(
+            procs.current().unwrap().read_user_bytes(0x1ac0, 1).unwrap(),
+            b"x"
         );
     }
 
@@ -12291,6 +13099,207 @@ mod tests {
         hard.copy_from_slice(&raw[8..16]);
         assert_eq!(u64::from_le_bytes(soft), EXPECTED_LIMIT);
         assert_eq!(u64::from_le_bytes(hard), EXPECTED_LIMIT);
+    }
+
+    #[test]
+    fn prlimit64_applies_nofile_limit_to_fd_allocation() {
+        const RLIMIT_NOFILE: usize = 7;
+        const LIMIT: u64 = 42;
+
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb100, &LIMIT.to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb108, &LIMIT.to_le_bytes());
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb200, b"/tmp/rlimit-open\0");
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_PRLIMIT64,
+                SyscallArgs([0, RLIMIT_NOFILE, 0xb100, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        for _ in 0..LIMIT {
+            let rc = dispatcher.dispatch(
+                SYS_OPENAT,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xb200,
+                    (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                    0o644,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            );
+            assert!(rc >= 0, "open should succeed while below RLIMIT_NOFILE");
+        }
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_OPENAT,
+                SyscallArgs([
+                    super::AT_FDCWD as usize,
+                    0xb200,
+                    (vfs::O_CREAT | vfs::O_RDWR) as usize,
+                    0o644,
+                    0,
+                    0,
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -24
+        );
+    }
+
+    #[test]
+    fn socket_respects_creation_flags() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let fd = dispatcher.dispatch(
+            SYS_SOCKET,
+            SyscallArgs([2, 2 | super::O_CLOEXEC | super::O_NONBLOCK, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0);
+
+        let handle = procs.current().unwrap().fd(fd as i32).unwrap();
+        assert_ne!(handle.flags & vfs::HANDLE_FLAG_CLOEXEC, 0);
+        assert_ne!(handle.flags & (super::O_NONBLOCK as u32), 0);
+    }
+
+    #[test]
+    fn sendto_routes_datagram_without_prior_connect() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let server_fd = dispatcher.dispatch(
+            SYS_SOCKET,
+            SyscallArgs([2, 2, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(server_fd >= 0);
+        let client_fd = dispatcher.dispatch(
+            SYS_SOCKET,
+            SyscallArgs([2, 2, 0, 0, 0, 0]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(client_fd >= 0);
+
+        let sockaddr_in = [
+            2u8, 0, // AF_INET
+            0x23, 0x28, // port 9000 (network order)
+            127, 0, 0, 1, // 127.0.0.1
+            0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xc000, &sockaddr_in);
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xc100, b"x");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xc200, &[0u8; 1]);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_BIND,
+                SyscallArgs([server_fd as usize, 0xc000, sockaddr_in.len(), 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            0
+        );
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SENDTO,
+                SyscallArgs([
+                    client_fd as usize,
+                    0xc100,
+                    1,
+                    0,
+                    0xc000,
+                    sockaddr_in.len(),
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            1
+        );
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_RECVFROM,
+                SyscallArgs([server_fd as usize, 0xc200, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            1
+        );
+        assert_eq!(
+            procs.current().unwrap().read_user_bytes(0xc200, 1).unwrap(),
+            vec![b'x']
+        );
     }
 
     #[test]

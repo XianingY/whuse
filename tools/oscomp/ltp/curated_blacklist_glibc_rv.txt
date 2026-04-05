@@ -48,3 +48,4 @@ utime02
 brk01
 brk02
 pipe04
+close01

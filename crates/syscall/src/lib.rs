@@ -34,10 +34,12 @@ use vfs::{
 const EAFNOSUPPORT: i32 = 97;
 const EACCES: i32 = 13;
 const EAGAIN: i32 = 11;
+const EBUSY: i32 = 16;
 const EBADF: i32 = 9;
 const EMFILE: i32 = 24;
 const EFAULT: i32 = 14;
 const EINTR: i32 = 4;
+const ENOMEM: i32 = 12;
 const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
 const ENOENT: i32 = 2;
@@ -4491,7 +4493,7 @@ impl SyscallDispatcher {
                     let _ = scheduler.block_current();
                     return Err(EAGAIN);
                 }
-                return Err(EACCES);
+                return Err(EAGAIN);
             }
         }
 
@@ -5502,7 +5504,10 @@ impl SyscallDispatcher {
         let how = args.0[0];
         let set = args.0[1];
         let old = args.0[2];
-        let sigset_size = args.0[3].max(8);
+        let sigset_size = args.0[3];
+        if sigset_size != 8 {
+            return Err(EINVAL);
+        }
         let current_mask = procs.signal_mask()?;
         if old != 0 {
             procs
@@ -7778,6 +7783,42 @@ impl SyscallDispatcher {
     }
 
     fn sys_munlockall(&self, _procs: &mut ProcessTable) -> Result<usize, i32> {
+        Ok(0)
+    }
+
+    fn sys_msync(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
+        const MS_ASYNC: usize = 1;
+        const MS_INVALIDATE: usize = 2;
+        const MS_SYNC: usize = 4;
+
+        let addr = args.0[0];
+        let len = args.0[1];
+        let flags = args.0[2];
+
+        if len == 0 {
+            return Ok(0);
+        }
+        if (addr & (PAGE_SIZE - 1)) != 0 {
+            return Err(EINVAL);
+        }
+
+        let allowed = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
+        if (flags & !allowed) != 0 {
+            return Err(EINVAL);
+        }
+        if (flags & MS_ASYNC) != 0 && (flags & MS_SYNC) != 0 {
+            return Err(EINVAL);
+        }
+        if (flags & MS_INVALIDATE) != 0 {
+            return Err(EBUSY);
+        }
+
+        let end = addr.checked_add(len).ok_or(ENOMEM)?;
+        let process = procs.current()?;
+        process.read_user_bytes(addr, 1).map_err(|_| ENOMEM)?;
+        if len > 1 {
+            process.read_user_bytes(end - 1, 1).map_err(|_| ENOMEM)?;
+        }
         Ok(0)
     }
 
@@ -18153,6 +18194,129 @@ mod tests {
     }
 
     #[test]
+    fn rt_sigprocmask_rejects_invalid_sigsetsize() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SIGPROCMASK,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EINVAL as isize
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SIGPROCMASK,
+                SyscallArgs([0, 0, 0, 7, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EINVAL as isize
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SIGPROCMASK,
+                SyscallArgs([0, 0, 0, 8, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn msync_rejects_invalid_and_unmapped_ranges() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let mapped = 0x5000_0000usize;
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .map_fixed_bytes(mapped, &[0; super::PAGE_SIZE], super::PAGE_SIZE, 0b11)
+            .unwrap();
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MSYNC,
+                SyscallArgs([mapped + 1, super::PAGE_SIZE, 4, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EINVAL as isize
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MSYNC,
+                SyscallArgs([mapped, super::PAGE_SIZE, usize::MAX, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EINVAL as isize
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MSYNC,
+                SyscallArgs([mapped, super::PAGE_SIZE, 1 | 4, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EINVAL as isize
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MSYNC,
+                SyscallArgs([mapped, super::PAGE_SIZE, 2, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EBUSY as isize
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_MSYNC,
+                SyscallArgs([
+                    mapped + super::PAGE_SIZE * 2,
+                    super::PAGE_SIZE,
+                    4,
+                    0,
+                    0,
+                    0
+                ]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::ENOMEM as isize
+        );
+    }
+
+    #[test]
     fn rt_sigpending_reports_blocked_pending_signal_bits() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
@@ -19276,6 +19440,79 @@ mod tests {
         assert_eq!(lock_b.lock_type, super::F_RDLCK);
         assert_eq!(lock_b.start, 13);
         assert_eq!(lock_b.end, Some(15));
+    }
+
+    #[test]
+    fn fcntl_setlk_conflict_returns_eagain() {
+        ensure_test_hal();
+        *super::FCNTL_LOCK_STATE.lock() = super::FcntlLockState::default();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("fcntl22", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("fcntl22", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+        vfs.create_file("/", "/tmp/fcntl22.lock", b"").unwrap();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb100, b"/tmp/fcntl22.lock\0");
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xb100,
+                vfs::O_RDWR as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0, "openat failed: {}", fd);
+        let fd = fd as usize;
+
+        let child = procs.fork_process_from_current().unwrap();
+        scheduler.spawn("fcntl22-child", child, child);
+
+        const F_SETLK: usize = 6;
+        let mut lock = [0u8; 32];
+        lock[0..2].copy_from_slice(&(super::F_WRLCK as i16).to_le_bytes());
+        lock[2..4].copy_from_slice(&(super::SEEK_SET as i16).to_le_bytes());
+        lock[8..16].copy_from_slice(&0i64.to_le_bytes());
+        lock[16..24].copy_from_slice(&0i64.to_le_bytes());
+        procs.current_mut().unwrap().address_space.install_bytes(0xb180, &lock);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FCNTL,
+                SyscallArgs([fd, F_SETLK, 0xb180, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+
+        procs.set_current(child).unwrap();
+        procs.current_mut().unwrap().address_space.install_bytes(0xb180, &lock);
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FCNTL,
+                SyscallArgs([fd, F_SETLK, 0xb180, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EAGAIN as isize
+        );
+        *super::FCNTL_LOCK_STATE.lock() = super::FcntlLockState::default();
     }
 
     #[test]

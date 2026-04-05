@@ -287,3 +287,7 @@ add_key04
 atof01
 binfmt_misc_lib.sh
 dup3_02
+fcntl22
+fcntl22_64
+msync03
+rt_sigprocmask02

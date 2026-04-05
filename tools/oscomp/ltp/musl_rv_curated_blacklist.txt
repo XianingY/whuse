@@ -186,7 +186,6 @@ renameat201
 renameat202
 rmdir02
 rmdir03
-rt_sigprocmask02
 rt_sigsuspend01
 select01
 select03

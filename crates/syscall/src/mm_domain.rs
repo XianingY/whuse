@@ -14,7 +14,7 @@ pub(crate) fn dispatch(
         SYS_MMAP => ctx.dispatcher.sys_mmap(args, ctx.procs, ctx.vfs),
         SYS_MUNMAP => ctx.dispatcher.sys_munmap(args, ctx.procs),
         SYS_MPROTECT => ctx.dispatcher.sys_mprotect(args, ctx.procs),
-        SYS_MSYNC => Ok(0),
+        SYS_MSYNC => ctx.dispatcher.sys_msync(args, ctx.procs),
         SYS_MLOCK | SYS_MLOCK2 => Ok(0),
         SYS_MLOCKALL => ctx.dispatcher.sys_mlockall(args, ctx.procs),
         SYS_MUNLOCKALL => ctx.dispatcher.sys_munlockall(ctx.procs),

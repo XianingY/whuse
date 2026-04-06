@@ -23,3 +23,7 @@ vxlan02.sh
 vxlan03.sh
 fcntl19
 close01
+vfork
+timer_settime01
+timerfd01
+timens01

@@ -291,3 +291,14 @@ fcntl22
 fcntl22_64
 msync03
 rt_sigprocmask02
+waitid07
+waitid08
+sigsuspend01
+getitimer02
+mprotect04
+clock_settime01
+clock_settime02
+msgctl12
+msgget02
+semget02
+semctl02

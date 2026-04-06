@@ -70,6 +70,7 @@ Key runtime env vars:
 - `WHUSE_LTP_APPLY_CANDIDATES`: list auto-apply switch (`ltp-riscv-pending` defaults to `1` unless explicitly set).
 - `WHUSE_LTP_AUTO_PROMOTE_SCORE`: enable/disable `curated -> score` auto-promotion (`1` by default).
 - `WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX`: per-batch promotion cap for `curated -> score` (`8..16`, default `8`).
+- `WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION`: if set to `1`, allows `curated -> score` promotion even when curated has bad/conf regressions; default `0` (keep score path conservative).
 
 ## 3) Standard Command Blocks
 
@@ -125,7 +126,7 @@ LTP three-layer responsibilities:
 
 - `score`: protected site path; generic candidate-apply never rewrites it, only curated-gated promotion can update it.
 - `pending`: local work queue; pass-candidates auto-promote to `curated` and are removed from `pending` whitelist.
-- `curated`: stable regression layer; if `bad/conf=0`, auto-promotes up to `WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX` pass-cases into `score` only after a score-gate run passes; no auto-demotion.
+- `curated`: stable regression layer; if `bad/conf=0`, auto-promotes up to `WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX` pass-cases into `score` only after a score-gate run passes; no auto-demotion. Default behavior blocks promotion when curated regresses (`WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION=0`).
 
 ### 3.6 Raw exit verification (contest-style)
 
@@ -136,6 +137,14 @@ TIMEOUT_SECS=2400 tools/dev/run_oscomp_stage2.sh loongarch-raw-exit
 
 These modes disable helper-side `suite-done` termination and require the guest
 to print the shutdown marker and let QEMU exit on its own.
+
+### 3.7 Stage2 Script Self-Check
+
+```bash
+bash tools/dev/test_run_oscomp_stage2.sh
+```
+
+Use `bash ...` explicitly so permission bits on local checkouts do not affect the verification path.
 
 ## 4) Current Flow (可复现现状 / Default Today)
 
@@ -214,11 +223,13 @@ Current site reference is `7f5dfce`; current local work continues on top of it (
 - Site reference (`7f5dfce`):
   - RV `ltp/libctest` path is strong.
   - `basic` and LoongArch control-plane stability are weak.
-- Current local state (2026-04-05):
+- Current local state (2026-04-06):
   - `riscv full + musl` reaches `whuse-oscomp-suite-done` with `basic -> busybox -> libctest` intact.
   - `loongarch full + musl` reaches `whuse-oscomp-suite-done`; `ltp` stays deferred in `full` by design.
   - `loongarch libctest + musl` reaches `whuse-oscomp-suite-done`.
-  - `rv ltp score + glibc` is stable at `pass=39, bad=0` under step-timeout `1800`.
+  - RV LTP pending/curated/score pipeline is active for dual runtime (`musl` + `glibc`) with conservative score auto-promotion (`batch<=8` by default).
+  - RV LTP score gained stable syscall/signal/time/IPC cases in current local wave, including `waitid07/08`, `sigsuspend01`, `clock_settime01/02`, `msgctl12/msgget02`, `semget02/semctl02`, `msgrcv05`, `semop03`.
+  - `shmctl02` remains unresolved and intentionally stays out of score promotion.
   - LTP high-frequency probe logs (`whuse-ltp-openat` / `whuse-ltp-exec`) are now debug-gated to reduce scorer-noise and I/O pressure.
 
 ## 5) Next Focus (Post-`7f5dfce`)
@@ -469,3 +480,23 @@ These log lines are intentionally present in the current build for diagnostics. 
 **Improvement**: Moved syscall tracing from individual syscall implementations to the central `SyscallDispatcher::dispatch` in `crates/syscall/src/lib.rs`. 
 - Ensures all syscalls (including unknown/unsupported) are logged with arguments and return values.
 - Significantly improved observability into `init` and `busybox` behavior.
+
+### 10.8 SysV IPC Blocking-Restart Path for RV LTP (PARTIALLY RESOLVED)
+
+**Status**: Core fix landed; `msgrcv05`/`semop03` now pass and have been promoted into RV `musl` + `glibc` score lists. `shmctl02` is still pending.
+
+**Root issue**: Blocking SysV IPC calls returned control in a way that did not align with the kernel blocked-restart path, causing LTP queue/semaphore cases to stall or fail.
+
+**Fix applied**:
+1. `sys_msgrcv` and `sys_semop_common` now return `-EAGAIN` after registering block state, so kernel-side blocked syscall restart can re-enter correctly.
+2. `should_restart_blocked_syscall` now includes `SYS_MSGRCV` / `SYS_SEMOP` / `SYS_SEMTIMEDOP` on both RISC-V and LoongArch.
+3. `sys_shmat` now returns the mapped address instead of always returning `0`.
+4. Added syscall unit tests covering blocked-return behavior for empty message queue and unavailable semaphore resources.
+
+**Verification snapshot**:
+- `cargo test -p syscall msgrcv_empty_queue_blocks_with_eagain_and_marks_scheduler_blocked`
+- `cargo test -p syscall semop_unavailable_resource_blocks_with_eagain_and_marks_scheduler_blocked`
+- `bash tools/dev/test_run_oscomp_stage2.sh`
+
+**Known residual**:
+- `shmctl02` remains in pending investigation and is not auto-promoted to score.

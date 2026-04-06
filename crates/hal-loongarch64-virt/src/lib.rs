@@ -436,7 +436,11 @@ fn detect_timer_freq_hz() -> u64 {
 #[inline]
 fn timer_freq_hz() -> u64 {
     let hz = TIMER_FREQ_HZ.load(Ordering::Relaxed);
-    if hz == 0 { LA_TIMER_FREQ_HZ } else { hz }
+    if hz == 0 {
+        LA_TIMER_FREQ_HZ
+    } else {
+        hz
+    }
 }
 
 #[inline]

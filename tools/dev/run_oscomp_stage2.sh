@@ -119,7 +119,7 @@ export WHUSE_LTP_PENDING_WHITELIST_RV_GLIBC="${WHUSE_LTP_PENDING_WHITELIST_RV_GL
 export WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC="${WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC:-${LTP_PENDING_BLACKLIST_RV_GLIBC}}"
 export WHUSE_LTP_AUTO_PROMOTE_SCORE="${WHUSE_LTP_AUTO_PROMOTE_SCORE:-1}"
 export WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX="${WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX:-8}"
-export WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION="${WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION:-1}"
+export WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION="${WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION:-0}"
 export WHUSE_LTP_STEP_TIMEOUT="${WHUSE_LTP_STEP_TIMEOUT:-300}"
 export WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT:-45}"
 export WHUSE_LTP_APPLY_CANDIDATES="${WHUSE_LTP_APPLY_CANDIDATES:-0}"
@@ -1400,6 +1400,9 @@ run_ltp_riscv_score_gate() {
     fi
     if ! check_ltp_score_gate_candidates "${gate_label}" "${gate_whitelist}" "${pass_candidates}" "${bad_candidates}" "${conf_candidates}"; then
         gate_ok=1
+    fi
+    if [[ "${suite_done_seen}" == "0" ]] && rg -q "whuse-oscomp-suite-done" "${text_log}"; then
+        suite_done_seen=1
     fi
     echo "[${gate_label}] score-gate summary: suite_done_seen=${suite_done_seen} terminated_by_suite_done=${terminated_by_suite_done}"
 

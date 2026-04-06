@@ -1,7 +1,7 @@
 use crate::{
     DispatchContext, SyscallArgs, SYS_ACCEPT, SYS_ACCEPT4, SYS_BIND, SYS_CONNECT, SYS_GETPEERNAME,
-    SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_LISTEN, SYS_RECVFROM, SYS_RECVMSG, SYS_SENDMSG,
-    SYS_SENDTO, SYS_SETSOCKOPT, SYS_SHUTDOWN, SYS_SOCKET, SYS_SOCKETPAIR,
+    SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_LISTEN, SYS_RECVFROM, SYS_RECVMSG, SYS_SENDMMSG,
+    SYS_SENDMSG, SYS_SENDTO, SYS_SETSOCKOPT, SYS_SHUTDOWN, SYS_SOCKET, SYS_SOCKETPAIR,
 };
 
 pub(crate) fn dispatch(
@@ -34,6 +34,9 @@ pub(crate) fn dispatch(
         SYS_SENDMSG => ctx
             .dispatcher
             .sys_sendmsg(args, ctx.procs, ctx.scheduler, ctx.vfs),
+        SYS_SENDMMSG => ctx
+            .dispatcher
+            .sys_sendmmsg(args, ctx.procs, ctx.scheduler, ctx.vfs),
         SYS_RECVMSG => ctx
             .dispatcher
             .sys_recvmsg(args, ctx.procs, ctx.scheduler, ctx.vfs),

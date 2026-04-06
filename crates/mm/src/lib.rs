@@ -1063,23 +1063,42 @@ impl AddressSpace {
 
     pub fn map_shared_existing(
         &self,
-        addr: usize,
+        len: usize,
         data: alloc::sync::Arc<Mutex<Vec<u8>>>,
         prot: usize,
     ) -> KernelResult<usize> {
-        let len = data.lock().len().max(1);
-        self.insert_segment(Segment {
-            area: MappingArea {
-                start: addr,
-                len,
-                prot,
+        let (raw_ptr, data_len) = {
+            let mut guard = data.lock();
+            if guard.is_empty() {
+                guard.push(0);
+            }
+            (guard.as_mut_ptr() as usize, guard.len())
+        };
+        let len = len.max(1).min(data_len);
+        let page_offset = raw_ptr & (PAGE_SIZE - 1);
+        let span = align_up(page_offset + len, PAGE_SIZE).saturating_add(USER_MMAP_GUARD_GAP);
+        let mut inner = self.inner.lock();
+        let mut base = align_up(inner.next_mapping_base, PAGE_SIZE);
+        let start = loop {
+            let start = base.checked_add(page_offset).ok_or(ENOMEM)?;
+            if !overlaps(&inner.mappings, start, len) {
+                break start;
+            }
+            base = base.checked_add(span).ok_or(ENOMEM)?;
+        };
+        inner.next_mapping_base = base.checked_add(span).ok_or(ENOMEM)?;
+        inner.mappings.insert(
+            start,
+            Segment {
+                area: MappingArea { start, len, prot },
+                storage: SegmentStorage::Shared {
+                    bytes: data,
+                    ptr: raw_ptr,
+                },
             },
-            storage: SegmentStorage::Shared {
-                bytes: data,
-                ptr: addr,
-            },
-        })?;
-        Ok(addr)
+        );
+        inner.dirty = true;
+        Ok(start)
     }
 
     fn insert_segment(&self, segment: Segment) -> KernelResult<()> {
@@ -2117,8 +2136,9 @@ mod tests {
         loong_segment_pte_flags, map_segment_pages_cow_loongarch, map_segment_pages_cow_riscv,
         riscv_segment_pte_flags, segment_phys_base, AddressSpace, LoongPageTableBuilder,
         PageTablePage, PageTableSpace, SegmentStorage, Sv39PageTableBuilder, VmSpaceToken, EFAULT,
-        ENOEXEC, PAGE_SIZE, LA_PTE_W, RISCV_PTE_R, RISCV_PTE_W, RISCV_PTE_X,
+        ENOEXEC, LA_PTE_W, PAGE_SIZE, RISCV_PTE_R, RISCV_PTE_W, RISCV_PTE_X,
     };
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
 
     const TEST_ELF: &[u8] = &[
@@ -2251,7 +2271,9 @@ mod tests {
     #[test]
     fn read_bytes_respects_read_permission() {
         let aspace = AddressSpace::new_user();
-        aspace.map_fixed_bytes(0x5000, b"deny", PAGE_SIZE, 0).unwrap();
+        aspace
+            .map_fixed_bytes(0x5000, b"deny", PAGE_SIZE, 0)
+            .unwrap();
         assert_eq!(aspace.read_bytes(0x5000, 4), Err(EFAULT));
         assert_eq!(aspace.read_cstr(0x5000), Err(EFAULT));
     }
@@ -2651,5 +2673,27 @@ mod tests {
             leaf[pt]
         };
         assert_ne!(pte & LA_PTE_W, 0);
+    }
+
+    #[test]
+    fn map_shared_existing_uses_user_mmap_region() {
+        let aspace = AddressSpace::new_user();
+        let shared = Arc::new(super::Mutex::new(vec![0u8; 64]));
+        let addr = aspace
+            .map_shared_existing(64, shared.clone(), 0b11)
+            .unwrap();
+        assert!(addr >= super::USER_MMAP_BASE);
+    }
+
+    #[test]
+    fn map_shared_existing_writes_back_to_shared_buffer() {
+        let aspace = AddressSpace::new_user();
+        let shared = Arc::new(super::Mutex::new(vec![0u8; 64]));
+        let addr = aspace
+            .map_shared_existing(64, shared.clone(), 0b11)
+            .unwrap();
+        aspace.write_bytes(addr, b"ABCD").unwrap();
+        let data = shared.lock();
+        assert_eq!(&data[..4], b"ABCD");
     }
 }

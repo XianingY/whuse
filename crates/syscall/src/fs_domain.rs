@@ -80,7 +80,8 @@ pub(crate) fn dispatch(
         SYS_CHROOT => ctx.dispatcher.sys_chroot(args, ctx.procs, ctx.vfs),
         SYS_FCHMOD => ctx.dispatcher.sys_fchmod(args, ctx.procs, ctx.vfs),
         SYS_FCHMODAT => {
-            let legacy_args = SyscallArgs([args.0[0], args.0[1], args.0[2], 0, args.0[4], args.0[5]]);
+            let legacy_args =
+                SyscallArgs([args.0[0], args.0[1], args.0[2], 0, args.0[4], args.0[5]]);
             ctx.dispatcher.sys_fchmodat(legacy_args, ctx.procs, ctx.vfs)
         }
         SYS_FCHMODAT2 => ctx.dispatcher.sys_fchmodat(args, ctx.procs, ctx.vfs),

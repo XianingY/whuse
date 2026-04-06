@@ -152,10 +152,7 @@ fn monotonic_now_ns() -> u64 {
 }
 
 fn split_ns(ns: u64) -> (i64, i64) {
-    (
-        (ns / 1_000_000_000) as i64,
-        (ns % 1_000_000_000) as i64,
-    )
+    ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
 }
 
 fn compose_ns(sec: i64, nsec: i64) -> u64 {
@@ -173,7 +170,11 @@ fn stable_nonzero_hash64(input: &str) -> u64 {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
-    if hash == 0 { 1 } else { hash }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
 }
 
 fn local_dev_for_path(path: &str) -> u64 {
@@ -1096,10 +1097,7 @@ impl KernelVfs {
         for (fd, target) in fds {
             entries.insert(
                 fd.to_string(),
-                Arc::new(Node::symlink(
-                    &fd.to_string(),
-                    NodeData::Symlink(target),
-                )),
+                Arc::new(Node::symlink(&fd.to_string(), NodeData::Symlink(target))),
             );
         }
         Ok(())
@@ -3110,7 +3108,9 @@ impl KernelVfs {
                 let (atime_sec, atime_nsec) = split_ns(meta.atime_ns);
                 let (mtime_sec, mtime_nsec) = split_ns(meta.mtime_ns);
                 let (ctime_sec, ctime_nsec) = split_ns(meta.ctime_ns);
-                (atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec)
+                (
+                    atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec,
+                )
             } else {
                 let (now_sec, now_nsec) = split_ns(monotonic_now_ns());
                 (now_sec, now_nsec, now_sec, now_nsec, now_sec, now_nsec)
@@ -3542,7 +3542,10 @@ impl KernelObject for FileHandle {
         if matches!(self.node.kind, NodeKind::Pipe | NodeKind::Socket) {
             return Err(ESPIPE);
         }
-        if matches!(self.node.kind, NodeKind::Event | NodeKind::Epoll | NodeKind::PidFd) {
+        if matches!(
+            self.node.kind,
+            NodeKind::Event | NodeKind::Epoll | NodeKind::PidFd
+        ) {
             return Err(EINVAL);
         }
         let size = self.stat_from_locked().size as isize;
@@ -4018,8 +4021,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        KernelObject, KernelVfs, ObjectKind, O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
-        INMEM_FILE_SIZE_LIMIT, PIPE_CAPACITY, S_IFIFO,
+        KernelObject, KernelVfs, ObjectKind, INMEM_FILE_SIZE_LIMIT, O_CREAT, O_NONBLOCK, O_RDONLY,
+        O_RDWR, O_WRONLY, PIPE_CAPACITY, S_IFIFO,
     };
 
     struct VecBlockDevice {
@@ -4188,12 +4191,7 @@ mod tests {
             .unwrap();
 
         let mut created = vfs
-            .open(
-                "/",
-                "/tmp/link-dir/testfile",
-                O_CREAT | O_RDWR,
-                0o644,
-            )
+            .open("/", "/tmp/link-dir/testfile", O_CREAT | O_RDWR, 0o644)
             .unwrap();
         vfs.write(&mut created, b"ok").unwrap();
 
@@ -4490,18 +4488,19 @@ mod tests {
     fn refresh_proc_self_fd_dir_replaces_entries() {
         let mut vfs = KernelVfs::new();
 
-        vfs.refresh_proc_self_fd_dir([
-            (0, "/dev/null".to_string()),
-            (3, "/tmp/a".to_string()),
-        ])
-        .unwrap();
-        let mut dir = vfs.open("/", "/proc/self/fd", super::O_DIRECTORY, 0).unwrap();
+        vfs.refresh_proc_self_fd_dir([(0, "/dev/null".to_string()), (3, "/tmp/a".to_string())])
+            .unwrap();
+        let mut dir = vfs
+            .open("/", "/proc/self/fd", super::O_DIRECTORY, 0)
+            .unwrap();
         let entries = parse_dirent_names(&vfs.getdents(&mut dir, 4096).unwrap());
         assert_eq!(entries, vec!["0".to_string(), "3".to_string()]);
 
         vfs.refresh_proc_self_fd_dir([(1, "/dev/console".to_string())])
             .unwrap();
-        let mut dir = vfs.open("/", "/proc/self/fd", super::O_DIRECTORY, 0).unwrap();
+        let mut dir = vfs
+            .open("/", "/proc/self/fd", super::O_DIRECTORY, 0)
+            .unwrap();
         let entries = parse_dirent_names(&vfs.getdents(&mut dir, 4096).unwrap());
         assert_eq!(entries, vec!["1".to_string()]);
     }
@@ -4553,10 +4552,7 @@ mod tests {
         let mut vfs = KernelVfs::new();
         vfs.mount_ext4(device.name(), "/", device).unwrap();
 
-        assert_eq!(
-            vfs.stat_path("/", "/etc/localtime"),
-            Err(super::ENOENT)
-        );
+        assert_eq!(vfs.stat_path("/", "/etc/localtime"), Err(super::ENOENT));
         assert!(!vfs.external_stat_cache.contains_key("/etc/localtime"));
     }
 
@@ -4569,7 +4565,14 @@ mod tests {
         assert_eq!(stat.mode & super::S_IFMT, super::S_IFREG);
 
         let mut handle = vfs
-            .open_with_owner("/", "/sys/devices/system/cpu/online", super::O_RDONLY, 0, 0, 0)
+            .open_with_owner(
+                "/",
+                "/sys/devices/system/cpu/online",
+                super::O_RDONLY,
+                0,
+                0,
+                0,
+            )
             .expect("open /sys/devices/system/cpu/online");
         let bytes = vfs
             .read(&mut handle, 16)
@@ -4723,7 +4726,9 @@ mod tests {
         let cwd = vfs.chdir("/", "/bin").unwrap();
         assert_eq!(cwd, "/bin");
 
-        let mut handle = vfs.open(&cwd, "ltp-created", O_CREAT | O_RDWR, 0o644).unwrap();
+        let mut handle = vfs
+            .open(&cwd, "ltp-created", O_CREAT | O_RDWR, 0o644)
+            .unwrap();
         vfs.write(&mut handle, b"ok").unwrap();
         vfs.seek(&mut handle, 0, 0).unwrap();
         assert_eq!(vfs.read(&mut handle, 2).unwrap(), b"ok");

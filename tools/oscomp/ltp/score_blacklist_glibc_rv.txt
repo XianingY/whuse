@@ -22,17 +22,9 @@ vxlan02.sh
 vxlan03.sh
 fcntl17_64
 ftruncate04_64
-msgctl12
-msgget02
-msgrcv05
-semctl02
-semget02
-semop03
 shmctl02
-mprotect04
 openat04
 prctl06
 preadv203
-sigsuspend01
 statx09
 utime02

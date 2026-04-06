@@ -16,8 +16,9 @@ use syscall::cache_busybox_image;
 use syscall::{
     SyscallArgs, SyscallDispatcher, SIGNAL_TRAMPOLINE_BASE, SIGNAL_TRAMPOLINE_CODE,
     SYS_CLOCK_NANOSLEEP, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2, SYS_EXECVE, SYS_FUTEX, SYS_NANOSLEEP,
-    SYS_PPOLL, SYS_PSELECT6, SYS_READ, SYS_READV, SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND,
+    SYS_MSGRCV, SYS_PPOLL, SYS_PSELECT6, SYS_READ, SYS_READV, SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND,
     SYS_RT_SIGTIMEDWAIT, SYS_WAIT,
+    SYS_SEMOP, SYS_SEMTIMEDOP,
 };
 use task::Scheduler;
 use vfs::{KernelVfs, O_RDWR};
@@ -6006,6 +6007,9 @@ fn should_restart_blocked_syscall(sysno: usize, result: isize, task_blocked: boo
                 | SYS_PSELECT6
                 | SYS_EPOLL_PWAIT
                 | SYS_EPOLL_PWAIT2
+                | SYS_MSGRCV
+                | SYS_SEMOP
+                | SYS_SEMTIMEDOP
                 | SYS_NANOSLEEP
                 | SYS_CLOCK_NANOSLEEP
         )
@@ -6351,6 +6355,21 @@ mod tests {
         assert!(!super::should_restart_blocked_syscall(
             syscall::SYS_WRITEV,
             -1,
+            true
+        ));
+        assert!(super::should_restart_blocked_syscall(
+            syscall::SYS_MSGRCV,
+            super::EAGAIN_RET,
+            true
+        ));
+        assert!(super::should_restart_blocked_syscall(
+            syscall::SYS_SEMOP,
+            super::EAGAIN_RET,
+            true
+        ));
+        assert!(super::should_restart_blocked_syscall(
+            syscall::SYS_SEMTIMEDOP,
+            super::EAGAIN_RET,
             true
         ));
     }

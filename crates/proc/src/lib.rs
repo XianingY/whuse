@@ -938,6 +938,8 @@ impl ProcessTable {
     ) -> KernelResult<(usize, i32)> {
         const WUNTRACED: u32 = 2;
         const WCONTINUED: u32 = 8;
+        const WNOWAIT: u32 = 0x0100_0000;
+        let no_wait = (options & WNOWAIT) != 0;
 
         let child_tid = self
             .processes
@@ -958,9 +960,15 @@ impl ProcessTable {
                     .filter(|process| process.parent == Some(parent_tgid))
                     .filter(|process| selector_matches(selector, process))
                     .find_map(|process| {
-                        (process.state == ProcessState::Stopped)
-                            .then(|| process.wait_status_pending.take().map(|status| (process.tgid, status)))
-                            .flatten()
+                        if process.state != ProcessState::Stopped {
+                            return None;
+                        }
+                        let status = if no_wait {
+                            process.wait_status_pending
+                        } else {
+                            process.wait_status_pending.take()
+                        };
+                        status.map(|status| (process.tgid, status))
                     })
                 {
                     return Ok((child_tid, status));
@@ -975,13 +983,17 @@ impl ProcessTable {
                     .filter(|process| process.parent == Some(parent_tgid))
                     .filter(|process| selector_matches(selector, process))
                     .find_map(|process| {
-                        (process.state != ProcessState::Exited)
-                            .then(|| {
-                                (process.wait_status_pending == Some(WAIT_STATUS_CONTINUED))
-                                    .then(|| process.wait_status_pending.take().map(|status| (process.tgid, status)))
-                                    .flatten()
-                            })
-                            .flatten()
+                        if process.state == ProcessState::Exited
+                            || process.wait_status_pending != Some(WAIT_STATUS_CONTINUED)
+                        {
+                            return None;
+                        }
+                        let status = if no_wait {
+                            process.wait_status_pending
+                        } else {
+                            process.wait_status_pending.take()
+                        };
+                        status.map(|status| (process.tgid, status))
                     })
                 {
                     return Ok((child_tid, status));
@@ -1009,7 +1021,9 @@ impl ProcessTable {
         } else {
             exit_code << 8
         };
-        self.reap_thread_group(child_tid);
+        if !no_wait {
+            self.reap_thread_group(child_tid);
+        }
         Ok((child_tid, status))
     }
 
@@ -1299,9 +1313,7 @@ impl ProcessTable {
                 };
                 self.processes
                     .values()
-                    .filter(|process| {
-                        process.state != ProcessState::Exited && process.pgid == pgid
-                    })
+                    .filter(|process| process.state != ProcessState::Exited && process.pgid == pgid)
                     .map(|process| process.scheduler_priority())
                     .min()
                     .ok_or(ESRCH)
@@ -1350,9 +1362,7 @@ impl ProcessTable {
                 for process in self
                     .processes
                     .values_mut()
-                    .filter(|process| {
-                        process.state != ProcessState::Exited && process.pgid == pgid
-                    })
+                    .filter(|process| process.state != ProcessState::Exited && process.pgid == pgid)
                 {
                     process.set_scheduler_priority(priority);
                     changed = true;
@@ -2530,7 +2540,8 @@ mod tests {
         assert_eq!(status, super::wait_status_from_stop_signal(19));
 
         assert_eq!(
-            table.wait_child(leader, WaitSelector::Pid(child), WUNTRACED)
+            table
+                .wait_child(leader, WaitSelector::Pid(child), WUNTRACED)
                 .unwrap(),
             (0, 0)
         );
@@ -2543,7 +2554,8 @@ mod tests {
         assert_eq!(status, super::WAIT_STATUS_CONTINUED);
 
         assert_eq!(
-            table.wait_child(leader, WaitSelector::Pid(child), WCONTINUED)
+            table
+                .wait_child(leader, WaitSelector::Pid(child), WCONTINUED)
                 .unwrap(),
             (0, 0)
         );

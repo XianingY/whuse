@@ -16,8 +16,9 @@ use syscall::cache_busybox_image;
 use syscall::{
     SyscallArgs, SyscallDispatcher, SIGNAL_TRAMPOLINE_BASE, SIGNAL_TRAMPOLINE_CODE,
     SYS_CLOCK_NANOSLEEP, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2, SYS_EXECVE, SYS_FUTEX, SYS_NANOSLEEP,
-    SYS_PPOLL, SYS_PSELECT6, SYS_READ, SYS_READV, SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND,
+    SYS_MSGRCV, SYS_PPOLL, SYS_PSELECT6, SYS_READ, SYS_READV, SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND,
     SYS_RT_SIGTIMEDWAIT, SYS_WAIT,
+    SYS_SEMOP, SYS_SEMTIMEDOP,
 };
 use task::Scheduler;
 use vfs::{KernelVfs, O_RDWR};
@@ -2151,10 +2152,7 @@ impl Kernel {
                     if idle_ticks > 0 {
                         self.timer_irq_count = self.timer_irq_count.saturating_add(idle_ticks);
                         let now = hal().timer.monotonic_nanos();
-                        let expired_tids = self.processes.timed_wait_expired_tids(now);
-                        for tid in &expired_tids {
-                            let _ = self.scheduler.wake_task(*tid);
-                        }
+                        service_timed_events(&mut self.processes, &mut self.scheduler, now);
                         if self.scheduler.ready_count() == 0 && self.scheduler.blocked_count() > 0 {
                             let blocked_tids = self.scheduler.blocked_task_ids();
                             let all_futex =
@@ -2680,14 +2678,7 @@ impl Kernel {
                 .saturating_add(SCHED_TIME_SLICE_NS);
             hal().timer.program_oneshot(next_deadline);
             let now = hal().timer.monotonic_nanos();
-            for tid in self.processes.timed_wait_expired_tids(now) {
-                let _ = self.scheduler.wake_task(tid);
-            }
-            for tgid in self.processes.expired_itimer_real_tgids(now) {
-                self.processes.consume_itimer_real_expiry(tgid, now);
-                let _ = self.processes.deliver_signal(tgid, 14);
-                let _ = self.wake_process_group_threads(tgid);
-            }
+            service_timed_events(&mut self.processes, &mut self.scheduler, now);
 
             if self.scheduler.ready_count() == 0 && self.scheduler.blocked_count() > 0 {
                 let blocked_tids = self.scheduler.blocked_task_ids();
@@ -2840,7 +2831,9 @@ impl Kernel {
                         return;
                     }
                     Err(_) => {
-                        // COW handling failed, fall through to kill process
+                        // Non-COW store faults should terminate the faulting task
+                        // via SIGSEGV instead of unconditionally tearing down the
+                        // whole process group.
                         if cow_debug_enabled() {
                             logln(format_args!(
                                 "whuse: COW fault failed addr={:#x} pid={}",
@@ -2848,6 +2841,11 @@ impl Kernel {
                                 process.tgid
                             ));
                         }
+                        let fault_tgid = process.tgid;
+                        drop(process);
+                        let _ = self.processes.deliver_signal(fault_tgid, 11);
+                        self.dispatch_pending_signals();
+                        return;
                     }
                 }
             }
@@ -2935,14 +2933,7 @@ impl Kernel {
     }
 
     fn wake_process_group_threads(&mut self, tgid: usize) -> usize {
-        let tids = self.processes.live_tids_in_tgid(tgid);
-        let mut woke = 0usize;
-        for tid in tids {
-            if self.scheduler.wake_task(tid) {
-                woke = woke.saturating_add(1);
-            }
-        }
-        woke
+        wake_process_group_threads_with_scheduler(&self.processes, &mut self.scheduler, tgid)
     }
 
     fn dispatch_pending_signals(&mut self) {
@@ -3904,6 +3895,32 @@ fn read_oscomp_runtime_filter_default(vfs: &mut KernelVfs) -> &'static str {
     normalize_oscomp_runtime_filter_value(text)
 }
 
+fn wake_process_group_threads_with_scheduler(
+    processes: &ProcessTable,
+    scheduler: &mut Scheduler,
+    tgid: usize,
+) -> usize {
+    let tids = processes.live_tids_in_tgid(tgid);
+    let mut woke = 0usize;
+    for tid in tids {
+        if scheduler.wake_task(tid) {
+            woke = woke.saturating_add(1);
+        }
+    }
+    woke
+}
+
+fn service_timed_events(processes: &mut ProcessTable, scheduler: &mut Scheduler, now: u64) {
+    for tid in processes.timed_wait_expired_tids(now) {
+        let _ = scheduler.wake_task(tid);
+    }
+    for tgid in processes.expired_itimer_real_tgids(now) {
+        processes.consume_itimer_real_expiry(tgid, now);
+        let _ = processes.deliver_signal(tgid, 14);
+        let _ = wake_process_group_threads_with_scheduler(processes, scheduler, tgid);
+    }
+}
+
 fn should_dispatch_pending_signals_after_syscall(unmasked: u64, blocked_restart: bool) -> bool {
     if blocked_restart {
         return true;
@@ -3930,6 +3947,9 @@ fn should_restart_blocked_syscall(sysno: usize, result: isize, task_blocked: boo
                 | SYS_PSELECT6
                 | SYS_EPOLL_PWAIT
                 | SYS_EPOLL_PWAIT2
+                | SYS_MSGRCV
+                | SYS_SEMOP
+                | SYS_SEMTIMEDOP
                 | SYS_NANOSLEEP
                 | SYS_CLOCK_NANOSLEEP
         )
@@ -4175,9 +4195,11 @@ mod tests {
     use super::{
         cow_debug_enabled, idle_outcome_for_process_count, render_oscomp_official_suite_script,
         render_selected_oscomp_suite_script, select_oscomp_suite_script,
-        timer_preemption_debug_enabled, KernelIdleOutcome, OSCOMP_OFFICIAL_SUITE_SCRIPT,
-        OSCOMP_PROFILE_PATH, SCHED_TIME_SLICE_NS,
+        service_timed_events, timer_preemption_debug_enabled, KernelIdleOutcome,
+        OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH, SCHED_TIME_SLICE_NS,
     };
+    use proc::ProcessTable;
+    use task::Scheduler;
     use vfs::KernelVfs;
 
     #[test]
@@ -4896,6 +4918,21 @@ mod tests {
             -1,
             true
         ));
+        assert!(super::should_restart_blocked_syscall(
+            syscall::SYS_MSGRCV,
+            super::EAGAIN_RET,
+            true
+        ));
+        assert!(super::should_restart_blocked_syscall(
+            syscall::SYS_SEMOP,
+            super::EAGAIN_RET,
+            true
+        ));
+        assert!(super::should_restart_blocked_syscall(
+            syscall::SYS_SEMTIMEDOP,
+            super::EAGAIN_RET,
+            true
+        ));
     }
 
     #[test]
@@ -4954,6 +4991,35 @@ mod tests {
             script.contains("run_riscv_musl_libctest_script /musl/run-dynamic.sh"),
             "musl libctest runner should walk run-dynamic.sh"
         );
+    }
+
+    #[test]
+    fn timed_events_service_delivers_itimer_signal_for_blocked_task() {
+        let mut processes = ProcessTable::new();
+        let pid = processes.spawn("itimer-case", None, 0x1000);
+        processes.set_current(pid).unwrap();
+        processes
+            .set_itimer_real_current(Some(1_000_000), 0)
+            .unwrap();
+
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("itimer-case", pid, pid);
+        scheduler.start();
+        assert_eq!(scheduler.block_current(), Some(pid));
+        assert_eq!(scheduler.ready_count(), 0);
+        assert_eq!(scheduler.blocked_count(), 1);
+
+        service_timed_events(&mut processes, &mut scheduler, 1_000_000);
+
+        let signal_mask = 1u64 << (14 - 1);
+        let process = processes.find_by_tid_mut(pid).unwrap();
+        assert_ne!(
+            process.pending_signals & signal_mask,
+            0,
+            "service_timed_events should enqueue SIGALRM when ITIMER_REAL expires"
+        );
+        assert_eq!(scheduler.ready_count(), 1);
+        assert_eq!(scheduler.blocked_count(), 0);
     }
 
     #[test]

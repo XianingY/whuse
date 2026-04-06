@@ -186,6 +186,10 @@ assert_contains "${RUNNER}" "ltp_pending_blacklist_for_target()"
 assert_contains "${RUNNER}" "select_ltp_score_promotion_candidates()"
 assert_contains "${RUNNER}" "run_ltp_riscv_score_gate()"
 assert_contains "${RUNNER}" "apply_ltp_curated_to_score_promotions()"
+suite_done_fallback_count="$(grep -Fc 'if [[ "${suite_done_seen}" == "0" ]] && rg -q "whuse-oscomp-suite-done" "${text_log}"; then' "${RUNNER}")"
+if (( suite_done_fallback_count < 2 )); then
+    fail "expected suite-done fallback check in both ltp runner and score gate paths"
+fi
 assert_contains "${RUNNER}" "ltp_whitelist_for_target_profile()"
 assert_contains "${RUNNER}" "ltp_blacklist_for_target_profile()"
 assert_contains "${RUNNER}" "score_whitelist_glibc_rv.txt"

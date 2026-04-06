@@ -308,6 +308,8 @@ __whuse_kernel_trap_entry:
     sd s11, 216(sp)
     csrr a0, scause
     csrr a1, sepc
+    csrr a2, stval
+    mv   a3, ra
     call __whuse_kernel_trap_handler
     ld ra,    0(sp)
     ld t0,    8(sp)
@@ -352,7 +354,12 @@ pub static KERNEL_TRAP_HANDLER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 #[no_mangle]
-unsafe extern "C" fn __whuse_kernel_trap_handler(scause: usize, _sepc: usize) {
+unsafe extern "C" fn __whuse_kernel_trap_handler(
+    scause: usize,
+    sepc: usize,
+    stval: usize,
+    trap_ra: usize,
+) {
     let interrupt_bit = 1usize << (usize::BITS as usize - 1);
     let is_timer = (scause & interrupt_bit) != 0 && (scause & !interrupt_bit) == 5;
     if is_timer {
@@ -369,8 +376,8 @@ unsafe extern "C" fn __whuse_kernel_trap_handler(scause: usize, _sepc: usize) {
     let _ = core::fmt::Write::write_fmt(
         &mut console,
         format_args!(
-            "\nwhuse: FATAL KERNEL TRAP scause={:#x} sepc={:#x}\n",
-            scause, _sepc
+            "\nwhuse: FATAL KERNEL TRAP scause={:#x} sepc={:#x} stval={:#x} ra={:#x}\n",
+            scause, sepc, stval, trap_ra
         ),
     );
     panic!("unhandled kernel trap");

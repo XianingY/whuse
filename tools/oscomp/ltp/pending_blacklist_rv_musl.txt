@@ -1,1 +1,2 @@
-
+# Keep this file for known-bad pending cases only.
+# Current pending queue entries are allowed to execute.

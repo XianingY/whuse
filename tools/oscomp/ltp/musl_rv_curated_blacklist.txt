@@ -9,7 +9,6 @@ chown02
 chown02_16
 chown03
 chown03_16
-chown04
 chown04_16
 chown05
 chown05_16
@@ -132,7 +131,6 @@ mkdir09
 mkdirat01
 mkdirat02
 open12_child
-open13
 open14
 openat02_child
 openat03
@@ -272,23 +270,16 @@ signal06
 signalfd4_01
 signalfd4_02
 sigrelse01
-sigsuspend01
 sigtimedwait01
 sigwaitinfo01
 tgkill02
 vfork
 vfork01
 vfork02
-waitid07
-waitid08
-getitimer02
 timerfd_create01
-clock_gettime04
 sendmmsg01
 setsockopt06
 setsockopt07
-clock_settime02
-clock_settime01
 clock_settime03
 clock_nanosleep03
 timens01
@@ -305,4 +296,3 @@ timer_settime03
 timer_gettime01
 timer_delete02
 clock_gettime03
-close01

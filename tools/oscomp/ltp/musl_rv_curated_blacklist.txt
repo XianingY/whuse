@@ -296,3 +296,4 @@ timer_settime03
 timer_gettime01
 timer_delete02
 clock_gettime03
+clock_nanosleep04

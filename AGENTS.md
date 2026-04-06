@@ -229,8 +229,10 @@ Current site reference is `7f5dfce`; current local work continues on top of it (
   - `loongarch libctest + musl` reaches `whuse-oscomp-suite-done`.
   - RV LTP pending/curated/score pipeline is active for dual runtime (`musl` + `glibc`) with conservative score auto-promotion (`batch<=8` by default).
   - RV LTP score gained stable syscall/signal/time/IPC cases in current local wave, including `waitid07/08`, `sigsuspend01`, `clock_settime01/02`, `msgctl12/msgget02`, `semget02/semctl02`, `msgrcv05`, `semop03`.
+  - `clock_nanosleep04` (known TBROK) moved from curated whitelist to curated blacklist for both musl and glibc — unblocks curated→score promotion gate.
   - `shmctl02` remains unresolved and intentionally stays out of score promotion.
   - LTP high-frequency probe logs (`whuse-ltp-openat` / `whuse-ltp-exec`) are now debug-gated to reduce scorer-noise and I/O pressure.
+  - cbb8493 site regression (626.0 vs 2116.0 baseline) was caused by epoch/timeout tracking changes; fixed in post-cbb8493 commits (`6e22e67`–`cc91617`). Current code verified stable.
 
 ## 5) Next Focus (Post-`7f5dfce`)
 
@@ -500,3 +502,6 @@ These log lines are intentionally present in the current build for diagnostics. 
 
 **Known residual**:
 - `shmctl02` remains in pending investigation and is not auto-promoted to score.
+- `clock_nanosleep04` is a known TBROK case; blacklisted from curated for both musl and glibc to unblock score promotion gate.
+- Pending cases still awaiting resolution (musl-rv): `fcntl17_64`, `ftruncate04_64`, `shmctl02`, `openat04`, `prctl06`, `preadv203`, `utime02`, `vfork01`, `vfork02`, `timerfd_create01`, `sendmmsg01`, `clock_nanosleep03`, `timens01`, `timerfd01`, `timerfd04`, `timerfd_gettime01`, `timerfd_settime01`, `timerfd_settime02`, `timer_settime03`, `clock_gettime03`, `asapi_03`.
+- Pending cases still awaiting resolution (glibc-rv): `fcntl17_64`, `ftruncate04_64`, `shmctl02`, `openat04`, `prctl06`, `preadv203`, `utime02`, `pipe04`.

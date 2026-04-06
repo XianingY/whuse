@@ -1,9 +1,5 @@
 fcntl17_64
 ftruncate04_64
-msgctl12
-msgget02
-semctl02
-semget02
 shmctl02
 openat04
 prctl06

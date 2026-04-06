@@ -15,10 +15,9 @@ use proc::ProcessTable;
 use syscall::cache_busybox_image;
 use syscall::{
     SyscallArgs, SyscallDispatcher, SIGNAL_TRAMPOLINE_BASE, SIGNAL_TRAMPOLINE_CODE,
-    SYS_CLOCK_NANOSLEEP, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2, SYS_EXECVE, SYS_FUTEX, SYS_NANOSLEEP,
-    SYS_MSGRCV, SYS_PPOLL, SYS_PSELECT6, SYS_READ, SYS_READV, SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND,
-    SYS_RT_SIGTIMEDWAIT, SYS_WAIT,
-    SYS_SEMOP, SYS_SEMTIMEDOP,
+    SYS_CLOCK_NANOSLEEP, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2, SYS_EXECVE, SYS_FUTEX, SYS_MSGRCV,
+    SYS_NANOSLEEP, SYS_PPOLL, SYS_PSELECT6, SYS_READ, SYS_READV, SYS_RT_SIGRETURN,
+    SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SEMOP, SYS_SEMTIMEDOP, SYS_WAIT,
 };
 use task::Scheduler;
 use vfs::{KernelVfs, O_RDWR};
@@ -267,14 +266,7 @@ const OSCOMP_BASIC_BINARIES: [&str; 33] = [
 ];
 const OSCOMP_BASIC_EXTRA_FILES: [(&str, u32); 1] = [("text.txt", 0o100644)];
 const OSCOMP_LTP_BOOTSTRAP_CASES: [&str; 8] = [
-    "brk01",
-    "brk02",
-    "close01",
-    "close02",
-    "dup01",
-    "dup02",
-    "dup04",
-    "dup07",
+    "brk01", "brk02", "close01", "close02", "dup01", "dup02", "dup04", "dup07",
 ];
 const OSCOMP_ROOT_ALIAS_ENTRIES: [&str; 120] = [
     "arithoh",
@@ -830,8 +822,15 @@ const OSCOMP_SUITE_SCRIPT_REAL_FULL_TEMPLATE: &str = concat!(
     "        return 0\n",
     "    fi\n",
     "    echo whuse-oscomp-runtime-begin:$runtime\n",
-    "    run_step_no_timeout ${runtime}/$script /musl/busybox sh -c \"cd $root && ./$script\"\n",
+    "    if [ \"$WHUSE_HAS_TIMEOUT\" = \"1\" ]; then\n",
+    "        /musl/busybox timeout \"$timeout_s\" /musl/busybox sh -c \"cd $root && ./$script\"\n",
+    "    else\n",
+    "        /musl/busybox sh -c \"cd $root && ./$script\"\n",
+    "    fi\n",
     "    rc=$?\n",
+    "    if [ \"$rc\" = \"124\" ]; then\n",
+    "        echo whuse-oscomp-step-timeout:${runtime}/$script:$timeout_s:pid=0:tgid=0\n",
+    "    fi\n",
     "    echo whuse-oscomp-runtime-end:$runtime\n",
     "    return \"$rc\"\n",
     "}\n",
@@ -3211,15 +3210,19 @@ impl Kernel {
             );
             let exit_like_syscall = matches!(sysno, syscall::SYS_EXIT | syscall::SYS_EXIT_GROUP);
             if exit_like_syscall {
-                if self.scheduler.current_thread_id().is_none() && self.scheduler.ready_count() > 0 {
+                if self.scheduler.current_thread_id().is_none() && self.scheduler.ready_count() > 0
+                {
                     let _ = self.scheduler.yield_now();
                 }
                 return;
             }
             if let Some(tid) = trap_tid {
                 if let Ok(process) = self.processes.find_by_tid_mut(tid) {
-                    let blocked_restart =
-                        should_restart_blocked_syscall(sysno, result, self.scheduler.is_blocked(tid));
+                    let blocked_restart = should_restart_blocked_syscall(
+                        sysno,
+                        result,
+                        self.scheduler.is_blocked(tid),
+                    );
                     if !blocked_restart {
                         process.trap_frame.set_retval(result as usize);
                         if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN) || (result as i32) < 0
@@ -3269,8 +3272,7 @@ impl Kernel {
                         if cow_debug_enabled() {
                             logln(format_args!(
                                 "whuse: COW fault handled addr={:#x} pid={}",
-                                fault_addr,
-                                process.tgid
+                                fault_addr, process.tgid
                             ));
                         }
                         return;
@@ -3280,8 +3282,7 @@ impl Kernel {
                         if cow_debug_enabled() {
                             logln(format_args!(
                                 "whuse: COW fault failed addr={:#x} pid={}",
-                                fault_addr,
-                                process.tgid
+                                fault_addr, process.tgid
                             ));
                         }
                     }
@@ -3918,9 +3919,7 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs, time_test_present: bool) {
     }
     install_oscomp_root_aliases(vfs);
     install_glibc_ltp_testcase_lib_aliases(vfs);
-    for cfg_path in [
-        "/musl/.whuse_oscomp_only_step",
-    ] {
+    for cfg_path in ["/musl/.whuse_oscomp_only_step"] {
         if vfs.access("/", cfg_path).is_ok() {
             let _ = vfs.unlink("/", cfg_path);
             logln(format_args!(
@@ -3948,8 +3947,11 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs, time_test_present: bool) {
             OSCOMP_SUITE_ENTRY_PATH, err
         )),
     }
-    let ltp_step_helper_script =
-        render_oscomp_ltp_step_helper_script(read_oscomp_runtime_filter_default(vfs), time_test_present, read_oscomp_stage2_overrides(vfs));
+    let ltp_step_helper_script = render_oscomp_ltp_step_helper_script(
+        read_oscomp_runtime_filter_default(vfs),
+        time_test_present,
+        read_oscomp_stage2_overrides(vfs),
+    );
     match vfs.create_file(
         "/",
         OSCOMP_LTP_STEP_HELPER_PATH,
@@ -4009,10 +4011,7 @@ fn install_ltp_score_text_file(vfs: &mut KernelVfs, path: &str, fallback: &str, 
             "whuse: installed {} {} source={}",
             label, path, source
         )),
-        Err(err) => logln(format_args!(
-            "whuse: failed {} {} err={}",
-            label, path, err
-        )),
+        Err(err) => logln(format_args!("whuse: failed {} {} err={}", label, path, err)),
     }
 }
 
@@ -4546,9 +4545,7 @@ fn render_selected_oscomp_suite_script(
     if profile_default == "basic" {
         let basic_overrides = OscompStage2Overrides {
             full_max_group: "basic",
-            // The dedicated basic runner still has a glibc-only instability on LoongArch.
-            // Reuse the validated full-chain smoke entry to keep basic lane monotonic.
-            basic_profile: "smoke",
+            basic_profile: "full",
             ..overrides
         };
         return render_oscomp_internal_full_suite_script(
@@ -5718,8 +5715,12 @@ fn render_oscomp_ltp_step_helper_body(
     const LTP_HELPER_START: &str = "ltp_whitelist_for_runtime() {\n";
     const LTP_HELPER_END: &str = "run_busybox_case_line() {\n";
 
-    let rendered =
-        render_oscomp_official_suite_script("ltp", runtime_filter_default, time_test_present, overrides);
+    let rendered = render_oscomp_official_suite_script(
+        "ltp",
+        runtime_filter_default,
+        time_test_present,
+        overrides,
+    );
     let (_, helper_tail) = rendered
         .split_once(LTP_HELPER_START)
         .expect("loongarch official suite should contain ltp helper start");
@@ -5755,7 +5756,9 @@ fn render_oscomp_ltp_step_helper_body(
     script.push_str("esac\n");
     script.push_str("read_local_runtime_filter() {\n");
     script.push_str("    case \"${WHUSE_OSCOMP_RUNTIME_FILTER:-}\" in\n");
-    script.push_str("        musl|glibc|both) WHUSE_LOCAL_RUNTIME_FILTER=\"$WHUSE_OSCOMP_RUNTIME_FILTER\" ;;\n");
+    script.push_str(
+        "        musl|glibc|both) WHUSE_LOCAL_RUNTIME_FILTER=\"$WHUSE_OSCOMP_RUNTIME_FILTER\" ;;\n",
+    );
     script.push_str("        *) WHUSE_LOCAL_RUNTIME_FILTER=both ;;\n");
     script.push_str("    esac\n");
     script.push_str("}\n");
@@ -5798,12 +5801,16 @@ fn render_oscomp_ltp_step_helper_body(
     script.push_str("read_local_runtime_filter\n");
     script.push_str("echo whuse-oscomp-step-begin:ltp_testcode.sh\n");
     script.push_str("group_rc=0\n");
-    script.push_str("run_ltp_step_runtime musl ltp_testcode.sh \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\"\n");
+    script.push_str(
+        "run_ltp_step_runtime musl ltp_testcode.sh \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\"\n",
+    );
     script.push_str("rc=$?\n");
     script.push_str("if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n");
     script.push_str("    group_rc=\"$rc\"\n");
     script.push_str("fi\n");
-    script.push_str("run_ltp_step_runtime glibc ltp_testcode.sh \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\"\n");
+    script.push_str(
+        "run_ltp_step_runtime glibc ltp_testcode.sh \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\"\n",
+    );
     script.push_str("rc=$?\n");
     script.push_str("if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n");
     script.push_str("    group_rc=\"$rc\"\n");
@@ -6019,8 +6026,7 @@ fn should_restart_blocked_syscall(sysno: usize, result: isize, task_blocked: boo
 mod tests {
     use super::{
         cow_debug_enabled, select_oscomp_suite_script, timer_preemption_debug_enabled,
-        OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH,
-        OSCOMP_RUNTIME_FILTER_PATH,
+        OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH, OSCOMP_RUNTIME_FILTER_PATH,
     };
     use std::{fs, process::Command};
     use vfs::KernelVfs;
@@ -6252,7 +6258,8 @@ mod tests {
             "LoongArch focused busybox runs should bake the selected profile into the rendered suite"
         );
         assert!(
-            script.contains("busybox) run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh"),
+            script
+                .contains("busybox) run_runtime_dual_step busybox_testcode.sh busybox_testcode.sh"),
             "LoongArch focused busybox runs should dispatch busybox_testcode.sh directly"
         );
     }
@@ -6389,15 +6396,18 @@ mod tests {
     #[test]
     fn loongarch_busybox_runner_uses_shell_builtin_line_reader() {
         assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("while IFS= read -r probe_line || [ -n \"$probe_line\" ]; do"),
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("while IFS= read -r probe_line || [ -n \"$probe_line\" ]; do"),
             "LoongArch busybox runner should use a pure shell reader when walking busybox_cmd.txt"
         );
         assert!(
-            !OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("busybox_total_lines=\"$($busybox_bin wc -l \"$busybox_cmd_file\")\""),
+            !OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("busybox_total_lines=\"$($busybox_bin wc -l \"$busybox_cmd_file\")\""),
             "LoongArch busybox runner should not depend on busybox wc inside command substitution"
         );
         assert!(
-            !OSCOMP_OFFICIAL_SUITE_SCRIPT.contains("line=\"$($busybox_bin sed -n \"${line_no}p\" \"$busybox_cmd_file\")\""),
+            !OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("line=\"$($busybox_bin sed -n \"${line_no}p\" \"$busybox_cmd_file\")\""),
             "LoongArch busybox runner should not depend on busybox sed inside command substitution"
         );
     }
@@ -6431,10 +6441,14 @@ mod tests {
             .expect("LoongArch full suite should still include libc-bench after lua");
         let iozone = script
             .find("run_loongarch_full_skip_step iozone_testcode.sh loongarch-iozone-not-scored")
-            .expect("LoongArch full suite should explicitly skip low-value iozone in score-first mode");
+            .expect(
+                "LoongArch full suite should explicitly skip low-value iozone in score-first mode",
+            );
         let lmbench = script
             .find("run_loongarch_full_skip_step lmbench_testcode.sh loongarch-lmbench-not-scored")
-            .expect("LoongArch full suite should explicitly skip low-value lmbench in score-first mode");
+            .expect(
+                "LoongArch full suite should explicitly skip low-value lmbench in score-first mode",
+            );
 
         assert!(
             busybox < libctest,
@@ -6469,9 +6483,8 @@ mod tests {
     #[test]
     fn loongarch_full_profile_emits_explicit_skip_reasons_for_low_value_steps() {
         assert!(
-            OSCOMP_OFFICIAL_SUITE_SCRIPT.contains(
-                "skip_runtime_step_with_reason musl \"$step\" \"$reason\""
-            ),
+            OSCOMP_OFFICIAL_SUITE_SCRIPT
+                .contains("skip_runtime_step_with_reason musl \"$step\" \"$reason\""),
             "LoongArch full suite should support explicit runtime skip reasons in score-first mode"
         );
         assert!(
@@ -6733,10 +6746,7 @@ mod tests {
     fn loongarch_selected_suite_parses_under_host_sh() {
         let mut vfs = KernelVfs::new();
         let script = select_oscomp_suite_script(&mut vfs, false);
-        let script_path = format!(
-            "/tmp/whuse-loongarch-suite-parse-{}.sh",
-            std::process::id()
-        );
+        let script_path = format!("/tmp/whuse-loongarch-suite-parse-{}.sh", std::process::id());
         fs::write(&script_path, script).expect("write suite script");
 
         let sh_status = Command::new("sh")

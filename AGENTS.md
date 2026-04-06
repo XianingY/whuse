@@ -155,24 +155,28 @@ Current recommended default for validation is real execution (`WHUSE_OSCOMP_COMP
 
 Host quick mode remains available via `WHUSE_QEMU_MODE=host`.
 
-### 4.1 Current site baseline (2026-04-04, commit `7f5dfce`)
+### 4.1 Current site baseline (2026-04-06, commit `cc91617`)
 
-Current public baseline should be treated as site submission `7f5dfcec12826030f0d8ba9020d768bb84c704e1`.
+Current public baseline should be treated as site submission `cc91617dd5186d827908ec7b6b05a75325aeef77`.
 
-- Total score: **2116.0**
-- Lane split: **musl-rv=1750**, **glibc-rv=356**, **musl-la=10**, **glibc-la=0**
+- Total score: **2880.0** (up from 2116.0 at `7f5dfce`, +764 points)
+- Lane split: **musl-rv=1782**, **glibc-rv=1088**, **musl-la=10**, **glibc-la=0**
 - Practical ceiling is now control-plane stability, not only syscall coverage.
 
 Site-observed signals:
 
-- RISC-V site logs showed `./run-all.sh: Permission denied` around `basic` path.
-- LoongArch site logs shrank from hundreds of lines (`9ad5123`/`7efb139`) to early-stop style short logs from `fb8a21a` onward.
-- `basic` score regressed from `396` at `9ad5123` to `10` at `7f5dfce`, while RV `ltp/libctest` increased.
+- RISC-V `basic` fully recovered: musl-rv=90, glibc-rv=90 (was 0 at `7f5dfce`).
+- RISC-V `ltp` musl-rv=1638 (+147 from 1491), glibc-rv=944 (+651 from 293).
+- RISC-V `busybox` stable at 54 per lane.
+- RISC-V `libctest` scored 0 — site log shows run was cut off during glibc LTP (contest timeout), never reached libctest step. Local verification confirms libctest works correctly.
+- LoongArch unchanged at 10 (basic musl only).
 
-Historical reference (still useful for scorer-contract checks):
+Historical reference:
 
 - `9ad5123` site score: `884.0`
-- It remains a useful comparator for `basic/busybox` scorer-visible output behavior.
+- `7f5dfce` site score: `2116.0`
+- `cbb8493` site score: `626.0` (regression from epoch/timeout tracking, fixed in post-cbb8493)
+- `cc91617` site score: `2880.0` (current)
 
 ### 4.2 Current code per-arch full order
 
@@ -233,6 +237,8 @@ Current site reference is `7f5dfce`; current local work continues on top of it (
   - `shmctl02` remains unresolved and intentionally stays out of score promotion.
   - LTP high-frequency probe logs (`whuse-ltp-openat` / `whuse-ltp-exec`) are now debug-gated to reduce scorer-noise and I/O pressure.
   - cbb8493 site regression (626.0 vs 2116.0 baseline) was caused by epoch/timeout tracking changes; fixed in post-cbb8493 commits (`6e22e67`–`cc91617`). Current code verified stable.
+  - cc91617 site score: 2880.0 (+764 vs 7f5dfce). glibc-rv LTP jumped from 293→944 (+651). musl-rv LTP from 1491→1638 (+147).
+  - libctest scored 0 at cc91617 site — NOT a regression; site run was cut off during glibc LTP phase (contest timeout), never reached libctest step. Local verification confirms libctest works correctly.
 
 ## 5) Next Focus (Post-`7f5dfce`)
 

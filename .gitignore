@@ -24,3 +24,4 @@ kernel-rv
 assist_docs/
 tmp/
 .sisyphus/
+.worktrees/

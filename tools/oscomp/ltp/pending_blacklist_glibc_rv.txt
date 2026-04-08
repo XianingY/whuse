@@ -1,11 +1,9 @@
-write01
 assign_password.sh
 ask_password.sh
 add_ipv6addr
 ar01.sh
 arping01.sh
 asapi_01
-asapi_02
 asapi_03
 keyctl07
 tpm_getpubek_tests_exp01.sh
@@ -22,8 +20,6 @@ geneve02.sh
 gre02.sh
 vxlan02.sh
 vxlan03.sh
-fcntl19
-close01
 vfork
 timer_settime01
 timerfd01

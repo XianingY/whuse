@@ -842,7 +842,7 @@ impl HalTimer for VirtTimer {
 
             let mut ecfg: usize;
             core::arch::asm!("csrrd {}, 0x4", out(reg) ecfg);
-            ecfg |= ECFG_TI;
+            ecfg |= ECFG_TI | ECFG_HWI1;
             core::arch::asm!("csrwr {}, 0x4", in(reg) ecfg);
 
             let tcfg_init = init_val.min((usize::MAX >> 2) as u64) as usize;

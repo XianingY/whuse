@@ -20,14 +20,6 @@ geneve02.sh
 gre02.sh
 vxlan02.sh
 vxlan03.sh
-fcntl17_64
-ftruncate04_64
 msgrcv05
 semop03
-openat04
-prctl06
-preadv203
-statx09
-utime02
-pipe04
 clock_nanosleep04

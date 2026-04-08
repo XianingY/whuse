@@ -339,6 +339,14 @@ pub const SYS_COPY_FILE_RANGE: usize = 285;
 pub const SYS_PREADV2: usize = 286;
 pub const SYS_PWRITEV2: usize = 287;
 pub const SYS_STATX: usize = 291;
+pub const SYS_TIMERFD_CREATE: usize = 271;
+pub const SYS_TIMERFD_SETTIME: usize = 272;
+pub const SYS_TIMERFD_GETTIME: usize = 273;
+pub const SYS_TIMER_CREATE: usize = 223;
+pub const SYS_TIMER_DELETE: usize = 224;
+pub const SYS_TIMER_GETTIME: usize = 225;
+pub const SYS_TIMER_SETTIME: usize = 226;
+pub const SYS_TIMER_GETOVERRUN: usize = 227;
 pub const SYS_PIDFD_SEND_SIGNAL: usize = 424;
 pub const SYS_CLONE3: usize = 435;
 pub const SYS_PIDFD_OPEN: usize = 434;
@@ -362,6 +370,9 @@ const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
 const CLONE_CHILD_SETTID: usize = 0x0100_0000;
 const CLONE_NEWTIME: usize = 0x0000_0080;
 const TIMER_ABSTIME: usize = 1;
+const TFD_TIMER_ABSTIME: usize = 1;
+const TFD_NONBLOCK: usize = 0o4000;
+const TFD_CLOEXEC: usize = 0o2000000;
 // CLONE_SYSVSEM (0x0004_0000) is NOT a namespace flag; excluding it here
 // ensures pthread_create (which sets CLONE_SYSVSEM) is not rejected with EINVAL.
 const CLONE_NAMESPACE_MASK: usize =
@@ -1016,7 +1027,13 @@ pub(crate) struct ShmSegment {
 }
 
 impl ShmSegment {
-    pub(crate) fn new(key: i32, size: usize, owner_uid: u32, mode: u16, creator_pid: usize) -> Self {
+    pub(crate) fn new(
+        key: i32,
+        size: usize,
+        owner_uid: u32,
+        mode: u16,
+        creator_pid: usize,
+    ) -> Self {
         ShmSegment {
             data: alloc::sync::Arc::new(Mutex::new(vec![0; size.max(1)])),
             key,
@@ -1206,7 +1223,13 @@ fn busybox_image_cache() -> Option<Vec<u8>> {
     BUSYBOX_IMAGE_CACHE.lock().as_ref().cloned()
 }
 
-pub(crate) fn ipc_access_allowed(mode: u16, owner_uid: u32, caller_uid: u32, read: bool, write: bool) -> bool {
+pub(crate) fn ipc_access_allowed(
+    mode: u16,
+    owner_uid: u32,
+    caller_uid: u32,
+    read: bool,
+    write: bool,
+) -> bool {
     if caller_uid == 0 {
         return true;
     }
@@ -7357,6 +7380,93 @@ impl SyscallDispatcher {
         Ok(procs.current_mut()?.add_fd(handle)? as usize)
     }
 
+    fn sys_timerfd_create(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        vfs: &mut KernelVfs,
+    ) -> Result<usize, i32> {
+        let clock_id = args.0[0];
+        if clock_id != 0 && clock_id != 1 {
+            return Err(EINVAL);
+        }
+        let handle = vfs.create_timerfd(clock_id)?;
+        Ok(procs.current_mut()?.add_fd(handle)? as usize)
+    }
+
+    fn sys_timerfd_settime(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        vfs: &mut KernelVfs,
+    ) -> Result<usize, i32> {
+        let fd = args.0[0] as i32;
+        let flags = args.0[1];
+        let new_value_ptr = args.0[2];
+        let old_value_ptr = args.0[3];
+
+        let new_value = if new_value_ptr != 0 {
+            let process = procs.current()?;
+            read_timerfd_settime(&process, new_value_ptr)?
+        } else {
+            TimerFdSettime {
+                flags: 0,
+                expiration_ns: 0,
+                interval_ns: 0,
+            }
+        };
+
+        let vfs_new_value = vfs::TimerFdSettimeVal {
+            expiration_ns: new_value.expiration_ns,
+            interval_ns: new_value.interval_ns,
+        };
+
+        let mut process = procs.current_mut()?;
+        let handle = process.fd_mut(fd)?;
+        let old_value = vfs.timerfd_settime(handle, flags as u64, vfs_new_value)?;
+
+        if old_value_ptr != 0 {
+            let old_timer_value = TimerFdSettime {
+                flags: 0,
+                expiration_ns: old_value.expiration_ns,
+                interval_ns: old_value.interval_ns,
+            };
+            process
+                .write_user_bytes(old_value_ptr, &timerfd_settime_to_bytes(old_timer_value))
+                .map_err(|_| EFAULT)?;
+        }
+
+        Ok(0)
+    }
+
+    fn sys_timerfd_gettime(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        vfs: &KernelVfs,
+    ) -> Result<usize, i32> {
+        let fd = args.0[0] as i32;
+        let curr_value_ptr = args.0[1];
+
+        let process = procs.current()?;
+        let handle = process.fd(fd)?;
+
+        let curr_value = vfs.timerfd_gettime(handle)?;
+
+        let timer_value = TimerFdSettime {
+            flags: 0,
+            expiration_ns: curr_value.expiration_ns,
+            interval_ns: curr_value.interval_ns,
+        };
+
+        let mut process_mut = procs.current_mut()?;
+        process_mut
+            .write_user_bytes(curr_value_ptr, &timerfd_settime_to_bytes(timer_value))
+            .map_err(|_| EFAULT)?;
+
+        Ok(0)
+    }
+
     fn sys_epoll_create1(
         &self,
         args: SyscallArgs,
@@ -9741,6 +9851,36 @@ fn read_timespec_ns(process: &proc::Process, addr: usize) -> Result<u64, i32> {
     Ok((sec as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(nsec as u64))
+}
+
+#[repr(C)]
+struct TimerFdSettime {
+    flags: u64,
+    expiration_ns: u64,
+    interval_ns: u64,
+}
+
+fn read_timerfd_settime(process: &proc::Process, addr: usize) -> Result<TimerFdSettime, i32> {
+    let raw = process.read_user_bytes(addr, 24).map_err(|_| EFAULT)?;
+    let mut flags = [0u8; 8];
+    let mut expiration_ns = [0u8; 8];
+    let mut interval_ns = [0u8; 8];
+    flags.copy_from_slice(&raw[..8]);
+    expiration_ns.copy_from_slice(&raw[8..16]);
+    interval_ns.copy_from_slice(&raw[16..24]);
+    Ok(TimerFdSettime {
+        flags: u64::from_le_bytes(flags),
+        expiration_ns: u64::from_le_bytes(expiration_ns),
+        interval_ns: u64::from_le_bytes(interval_ns),
+    })
+}
+
+fn timerfd_settime_to_bytes(value: TimerFdSettime) -> [u8; 24] {
+    let mut buf = [0u8; 24];
+    buf[..8].copy_from_slice(&value.flags.to_le_bytes());
+    buf[8..16].copy_from_slice(&value.expiration_ns.to_le_bytes());
+    buf[16..24].copy_from_slice(&value.interval_ns.to_le_bytes());
+    buf
 }
 
 fn stat_to_bytes(stat: FileStat) -> [u8; 128] {
@@ -20735,7 +20875,10 @@ mod tests {
             ),
             retval as isize
         );
-        assert_eq!(procs.current().unwrap().sigaltstack, Some((0x9000, 0x1000, 1)));
+        assert_eq!(
+            procs.current().unwrap().sigaltstack,
+            Some((0x9000, 0x1000, 1))
+        );
     }
 
     #[test]

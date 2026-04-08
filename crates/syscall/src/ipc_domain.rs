@@ -1,11 +1,11 @@
 use crate::{
-    DispatchContext, EACCES, EAGAIN, EFAULT, EIDRM, EINTR, EINVAL, ENOENT, ENOMSG, EPERM,
-    EEXIST, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_NOWAIT, IPC_PRIVATE, IPC_RMID, IPC_SET,
-    IPC_STAT, MSG_INFO, MSG_STATE, MSG_STAT, SEMCTL_SETVAL, SEMMSL_LIMIT, SEM_STATE,
-    SHM_LOCK, SHM_STATE, SHM_UNLOCK, SYS_MSGCTL, SYS_MSGGET, SYS_MSGRCV, SYS_MSGSND,
-    SYS_SEMCTL, SYS_SEMGET, SYS_SEMOP, SYS_SEMTIMEDOP, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT,
-    SYS_SHMGET, MsgEntry, MsgQueue, SemBufOp, SemSet, ShmAttachment, ShmSegment, ShmidDs,
-    SyscallArgs, has_unmasked_pending_signal, ipc_access_allowed, wake_tasks_by_tid,
+    has_unmasked_pending_signal, ipc_access_allowed, wake_tasks_by_tid, DispatchContext, MsgEntry,
+    MsgQueue, SemBufOp, SemSet, ShmAttachment, ShmSegment, ShmidDs, SyscallArgs, EACCES, EAGAIN,
+    EEXIST, EFAULT, EIDRM, EINTR, EINVAL, ENOENT, ENOMSG, EPERM, IPC_CREAT, IPC_EXCL, IPC_INFO,
+    IPC_NOWAIT, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, MSG_INFO, MSG_STAT, MSG_STATE,
+    SEMCTL_SETVAL, SEMMSL_LIMIT, SEM_STATE, SHM_LOCK, SHM_STATE, SHM_UNLOCK, SYS_MSGCTL,
+    SYS_MSGGET, SYS_MSGRCV, SYS_MSGSND, SYS_SEMCTL, SYS_SEMGET, SYS_SEMOP, SYS_SEMTIMEDOP,
+    SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET,
 };
 use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec;
@@ -161,7 +161,10 @@ pub(crate) fn sys_msgrcv(
             let mut out = Vec::with_capacity(size_of::<isize>() + copy_len);
             out.extend_from_slice(&msg.mtype.to_le_bytes());
             out.extend_from_slice(&msg.payload[..copy_len]);
-            procs.current_mut()?.write_user_bytes(msgp, &out).map_err(|_| EFAULT)?;
+            procs
+                .current_mut()?
+                .write_user_bytes(msgp, &out)
+                .map_err(|_| EFAULT)?;
             return Ok(copy_len);
         }
         let _ = scheduler.block_current();
@@ -350,7 +353,10 @@ fn read_semop_entries(
     let mut ops = Vec::with_capacity(count);
     for i in 0..count {
         let off = addr + i * 6;
-        let raw = procs.current()?.read_user_bytes(off, 6).map_err(|_| EFAULT)?;
+        let raw = procs
+            .current()?
+            .read_user_bytes(off, 6)
+            .map_err(|_| EFAULT)?;
         let sem_num = u16::from_le_bytes([raw[0], raw[1]]);
         let sem_op = i16::from_le_bytes([raw[2], raw[3]]);
         let sem_flg = i16::from_le_bytes([raw[4], raw[5]]);
@@ -474,7 +480,13 @@ pub(crate) fn sys_shmget(args: SyscallArgs, procs: &mut ProcessTable) -> Result<
             if (flags & IPC_CREAT) != 0 && (flags & IPC_EXCL) != 0 {
                 return Err(EEXIST);
             }
-            if !ipc_access_allowed(segment.mode, segment.owner_uid, caller_uid, req_read, req_write) {
+            if !ipc_access_allowed(
+                segment.mode,
+                segment.owner_uid,
+                caller_uid,
+                req_read,
+                req_write,
+            ) {
                 return Err(EACCES);
             }
             return Ok(id);
@@ -511,10 +523,11 @@ pub(crate) fn sys_shmat(args: SyscallArgs, procs: &mut ProcessTable) -> Result<u
     let data_len = data_arc.lock().len();
     drop(state);
 
-    let addr = procs
-        .current_mut()?
-        .address_space
-        .map_shared_existing(data_len, data_arc.clone(), 0b11)?;
+    let addr =
+        procs
+            .current_mut()?
+            .address_space
+            .map_shared_existing(data_len, data_arc.clone(), 0b11)?;
 
     let mut state = SHM_STATE.lock();
     if let Some(segment) = state.segments.get_mut(&id) {

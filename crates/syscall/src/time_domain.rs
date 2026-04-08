@@ -1,7 +1,8 @@
 use crate::{
     DispatchContext, SyscallArgs, SYS_ADJTIMEX, SYS_CLOCK_GETRES, SYS_CLOCK_GETTIME,
     SYS_CLOCK_NANOSLEEP, SYS_CLOCK_SETTIME, SYS_GETITIMER, SYS_GETTIMEOFDAY, SYS_SETITIMER,
-    SYS_SLEEP, SYS_TIMES,
+    SYS_SLEEP, SYS_TIMERFD_CREATE, SYS_TIMERFD_GETTIME, SYS_TIMERFD_SETTIME, SYS_TIMER_CREATE,
+    SYS_TIMER_DELETE, SYS_TIMER_GETOVERRUN, SYS_TIMER_GETTIME, SYS_TIMER_SETTIME, SYS_TIMES,
 };
 
 pub(crate) fn dispatch(
@@ -22,6 +23,9 @@ pub(crate) fn dispatch(
             .sys_clock_nanosleep(args, ctx.procs, ctx.scheduler),
         SYS_TIMES => ctx.dispatcher.sys_times(args, ctx.procs),
         SYS_GETTIMEOFDAY => ctx.dispatcher.sys_gettimeofday(args, ctx.procs),
+        SYS_TIMERFD_CREATE => ctx.dispatcher.sys_timerfd_create(args, ctx.procs, ctx.vfs),
+        SYS_TIMERFD_SETTIME => ctx.dispatcher.sys_timerfd_settime(args, ctx.procs, ctx.vfs),
+        SYS_TIMERFD_GETTIME => ctx.dispatcher.sys_timerfd_gettime(args, ctx.procs, ctx.vfs),
         _ => return None,
     })
 }

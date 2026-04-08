@@ -27,6 +27,14 @@ pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const HANDLE_FLAG_CLOEXEC: u32 = 1 << 31;
 
+const TFD_TIMER_ABSTIME: u64 = 1;
+
+#[derive(Clone, Copy)]
+pub struct TimerFdSettimeVal {
+    pub expiration_ns: u64,
+    pub interval_ns: u64,
+}
+
 const ENOENT: i32 = 2;
 const ENXIO: i32 = 6;
 const EPERM: i32 = 1;
@@ -101,6 +109,7 @@ pub enum NodeKind {
     Epoll,
     Socket,
     PidFd,
+    Timer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,6 +347,13 @@ struct RawSocketState {
     inbox: VecDeque<Vec<u8>>,
 }
 
+struct TimerFdState {
+    clock_id: usize,
+    expiration_ns: u64,
+    interval_ns: u64,
+    expirations: u64,
+}
+
 #[derive(Clone, Default)]
 struct SparseFileState {
     size: usize,
@@ -473,6 +489,7 @@ enum NodeData {
     },
     SocketRaw(RawSocketState),
     PidFd(usize),
+    TimerFd(TimerFdState),
 }
 
 #[derive(Clone)]
@@ -1708,7 +1725,8 @@ impl KernelVfs {
             | NodeData::SocketPending(_)
             | NodeData::SocketConnected { .. }
             | NodeData::SocketRaw(_)
-            | NodeData::PidFd(_) => Err(EINVAL),
+            | NodeData::PidFd(_)
+            | NodeData::TimerFd(_) => Err(EINVAL),
         }
     }
 
@@ -1784,6 +1802,77 @@ impl KernelVfs {
             flags: O_RDWR,
             path,
             pipe_end: PipeEnd::None,
+        })
+    }
+
+    pub fn create_timerfd(&mut self, clock_id: usize) -> KernelResult<FileHandle> {
+        let path = format!("timerfd:[{}]", self.next_pipe_id);
+        self.next_pipe_id += 1;
+        Ok(FileHandle {
+            node: Arc::new(Node::timerfd(&path, clock_id)),
+            offset: 0,
+            flags: O_RDWR,
+            path,
+            pipe_end: PipeEnd::None,
+        })
+    }
+
+    pub fn timerfd_settime(
+        &mut self,
+        handle: &mut FileHandle,
+        flags: u64,
+        new_value: TimerFdSettimeVal,
+    ) -> KernelResult<TimerFdSettimeVal> {
+        let mut guard = handle.node.data.lock();
+        let state = match &mut *guard {
+            NodeData::TimerFd(state) => state,
+            _ => return Err(EINVAL),
+        };
+
+        let now_ns = monotonic_now_ns() as u64;
+
+        let (exp_ns, interval_ns) = if (flags & TFD_TIMER_ABSTIME) != 0 {
+            (new_value.expiration_ns, new_value.interval_ns)
+        } else {
+            (
+                now_ns.saturating_add(new_value.expiration_ns),
+                new_value.interval_ns,
+            )
+        };
+
+        let old = TimerFdSettimeVal {
+            expiration_ns: state.expiration_ns,
+            interval_ns: state.interval_ns,
+        };
+
+        state.expiration_ns = exp_ns;
+        state.interval_ns = interval_ns;
+        state.expirations = 0;
+
+        Ok(old)
+    }
+
+    pub fn timerfd_gettime(&self, handle: &FileHandle) -> KernelResult<TimerFdSettimeVal> {
+        let guard = handle.node.data.lock();
+        let state = match &*guard {
+            NodeData::TimerFd(state) => state,
+            _ => return Err(EINVAL),
+        };
+
+        let now_ns = monotonic_now_ns() as u64;
+        let expirations = state.expirations;
+        let interval_ns = state.interval_ns;
+        let expiration_ns = if expirations > 0 && now_ns >= state.expiration_ns {
+            0
+        } else if state.expiration_ns > now_ns {
+            state.expiration_ns - now_ns
+        } else {
+            0
+        };
+
+        Ok(TimerFdSettimeVal {
+            expiration_ns,
+            interval_ns,
         })
     }
 
@@ -3153,6 +3242,7 @@ impl KernelVfs {
             NodeKind::Epoll => Node::epoll(name),
             NodeKind::Socket => Node::socket_pending(name, 1, 1),
             NodeKind::PidFd => Node::pidfd(name, 0),
+            NodeKind::Timer => Node::timerfd(name, 0),
         });
         entries.insert(name.to_string(), node);
         Ok(())
@@ -3177,6 +3267,7 @@ impl KernelVfs {
             NodeData::SocketRaw(state) => state.inbox.len() as u64,
             NodeData::PidFd(_) => 0,
             NodeData::CharDevice => 0,
+            NodeData::TimerFd(_) => 8,
         };
         let meta = self.mem_meta.get(path).copied();
         let mode = match &*guard {
@@ -3188,7 +3279,9 @@ impl KernelVfs {
                 NodeKind::CharDevice => S_IFCHR | 0o600,
                 NodeKind::Pipe => S_IFIFO | 0o644,
                 NodeKind::Symlink => S_IFLNK | 0o777,
-                NodeKind::Event | NodeKind::Epoll | NodeKind::Socket => S_IFSOCK | 0o644,
+                NodeKind::Event | NodeKind::Epoll | NodeKind::Socket | NodeKind::Timer => {
+                    S_IFSOCK | 0o644
+                }
                 NodeKind::PidFd => S_IFREG | 0o444,
             }),
         };
@@ -3293,6 +3386,7 @@ impl FileHandle {
             NodeData::SocketRaw(state) => state.inbox.len() as u64,
             NodeData::PidFd(_) => 0,
             NodeData::CharDevice => 0,
+            NodeData::TimerFd(_) => 8,
         };
         let mode = match &*guard {
             NodeData::Ext4File(state) => state.mode,
@@ -3303,7 +3397,9 @@ impl FileHandle {
                 NodeKind::CharDevice => S_IFCHR | 0o600,
                 NodeKind::Pipe => S_IFIFO | 0o644,
                 NodeKind::Symlink => S_IFLNK | 0o777,
-                NodeKind::Event | NodeKind::Epoll | NodeKind::Socket => S_IFSOCK | 0o644,
+                NodeKind::Event | NodeKind::Epoll | NodeKind::Socket | NodeKind::Timer => {
+                    S_IFSOCK | 0o644
+                }
                 NodeKind::PidFd => S_IFREG | 0o444,
             },
         };
@@ -3384,6 +3480,7 @@ impl KernelObject for FileHandle {
             NodeKind::Epoll => ObjectKind::Epoll,
             NodeKind::Socket => ObjectKind::SocketLocal,
             NodeKind::PidFd => ObjectKind::PidFd,
+            NodeKind::Timer => ObjectKind::EventFd,
         }
     }
 
@@ -3473,7 +3570,10 @@ impl KernelObject for FileHandle {
                 *counter = 0;
                 Ok(value.to_le_bytes().to_vec())
             }
-            NodeData::Epoll(_) | NodeData::SocketPending(_) | NodeData::PidFd(_) => Err(EINVAL),
+            NodeData::Epoll(_)
+            | NodeData::SocketPending(_)
+            | NodeData::PidFd(_)
+            | NodeData::TimerFd(_) => Err(EINVAL),
             NodeData::SocketConnected { channel, side, .. } => {
                 let mut guard = channel.lock();
                 let inbox = &mut guard.inbox[*side];
@@ -3597,7 +3697,8 @@ impl KernelObject for FileHandle {
             | NodeData::Epoll(_)
             | NodeData::SocketPending(_)
             | NodeData::SocketRaw(_)
-            | NodeData::PidFd(_) => Err(EINVAL),
+            | NodeData::PidFd(_)
+            | NodeData::TimerFd(_) => Err(EINVAL),
             NodeData::Event(counter) => {
                 if data.len() < 8 {
                     return Err(EINVAL);
@@ -3679,6 +3780,7 @@ impl KernelObject for FileHandle {
             }
             NodeData::SocketRaw(state) => !state.inbox.is_empty(),
             NodeData::PidFd(_) => true,
+            NodeData::TimerFd(state) => state.expirations > 0,
         }
     }
 
@@ -3809,6 +3911,19 @@ impl Node {
             _name: name.to_string(),
             kind: NodeKind::Epoll,
             data: Mutex::new(NodeData::Epoll(Vec::new())),
+        }
+    }
+
+    fn timerfd(name: &str, clock_id: usize) -> Self {
+        Self {
+            _name: name.to_string(),
+            kind: NodeKind::Timer,
+            data: Mutex::new(NodeData::TimerFd(TimerFdState {
+                clock_id,
+                expiration_ns: 0,
+                interval_ns: 0,
+                expirations: 0,
+            })),
         }
     }
 

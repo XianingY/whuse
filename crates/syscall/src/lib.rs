@@ -42,6 +42,7 @@ const EINTR: i32 = 4;
 const ENOMEM: i32 = 12;
 const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
+const EDEADLK: i32 = 35;
 const ENOENT: i32 = 2;
 const ENXIO: i32 = 6;
 const ENOTDIR: i32 = 20;
@@ -82,6 +83,11 @@ const W_OK: usize = 2;
 const R_OK: usize = 4;
 const UTIME_NOW: i64 = 0x3fff_ffff;
 const UTIME_OMIT: i64 = 0x3fff_fffe;
+const CLOCK_REALTIME: usize = 0;
+const CLOCK_MONOTONIC: usize = 1;
+const CLOCK_MONOTONIC_RAW: usize = 4;
+const CLOCK_MONOTONIC_COARSE: usize = 6;
+const CLOCK_BOOTTIME: usize = 7;
 const AT_REMOVEDIR_FLAG: usize = 0x200;
 const MS_RDONLY: usize = 1;
 const PATH_MAX: usize = 4096;
@@ -146,6 +152,8 @@ const IPC_NOWAIT: usize = 0o4000;
 const IPC_RMID: i32 = 0;
 const IPC_SET: i32 = 1;
 const IPC_STAT: i32 = 2;
+const SHM_LOCK: i32 = 11;
+const SHM_UNLOCK: i32 = 12;
 const IPC_INFO: i32 = 3;
 const MSG_STAT: i32 = 11;
 const MSG_INFO: i32 = 12;
@@ -352,6 +360,7 @@ const CLONE_SETTLS: usize = 0x0008_0000;
 const CLONE_PARENT_SETTID: usize = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
 const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+const CLONE_NEWTIME: usize = 0x0000_0080;
 const TIMER_ABSTIME: usize = 1;
 // CLONE_SYSVSEM (0x0004_0000) is NOT a namespace flag; excluding it here
 // ensures pthread_create (which sets CLONE_SYSVSEM) is not rejected with EINVAL.
@@ -821,6 +830,41 @@ fn is_glibc_ltp_task(name: &str) -> bool {
     glibc_ltp_probe_enabled() && name.starts_with("/glibc/ltp/testcases/bin/")
 }
 
+fn is_glibc_basic_exec_path(path: &str) -> bool {
+    path.starts_with("/glibc/basic/")
+}
+
+fn is_glibc_basic_task(name: &str) -> bool {
+    name.starts_with("/glibc/basic/")
+}
+
+fn is_glibc_basic_fstat_task(name: &str) -> bool {
+    name == "/glibc/basic/fstat"
+}
+
+fn is_oscomp_suite_shell(process: &proc::Process) -> bool {
+    process.name == "/musl/busybox" && process.cwd == "/"
+}
+
+fn is_glibc_basic_shell_process(name: &str, cwd: &str) -> bool {
+    name == "/musl/busybox" && matches!(cwd, "/" | "/glibc" | "/glibc/basic")
+}
+
+fn should_trace_glibc_basic_shell(process: &Process) -> bool {
+    is_glibc_basic_shell_process(process.name.as_str(), process.cwd.as_str())
+        || matches!(
+            process.name.as_str(),
+            "/tmp/whuse-oscomp-entry.sh"
+                | "/tmp/whuse-oscomp-suite.sh"
+                | "/glibc/basic_testcode.sh"
+                | "/glibc/basic/run-all.sh"
+        )
+}
+
+fn should_trace_glibc_basic_phase(process: &Process) -> bool {
+    should_trace_glibc_basic_shell(process) || is_glibc_basic_task(process.name.as_str())
+}
+
 fn glibc_ltp_probe_process(
     procs: &ProcessTable,
     fd: Option<i32>,
@@ -927,15 +971,15 @@ struct MsgHdr {
 
 /// shmid_ds structure for shmctl IPC_STAT
 #[repr(C)]
-struct ShmidDs {
-    shm_segsz: usize,  // size of segment
-    shm_nattch: usize, // number of attaches
-    shm_cpid: usize,   // pid of creator
-    shm_lpid: usize,   // pid of last operator
-    shm_atime: usize,  // last attach time
-    shm_dtime: usize,  // last detach time
-    shm_ctime: usize,  // last change time
-    _pad: [u64; 3],
+pub(crate) struct ShmidDs {
+    pub(crate) shm_segsz: usize,  // size of segment
+    pub(crate) shm_nattch: usize, // number of attaches
+    pub(crate) shm_cpid: usize,   // pid of creator
+    pub(crate) shm_lpid: usize,   // pid of last operator
+    pub(crate) shm_atime: usize,  // last attach time
+    pub(crate) shm_dtime: usize,  // last detach time
+    pub(crate) shm_ctime: usize,  // last change time
+    pub(crate) _pad: [u64; 3],
 }
 
 impl Default for ShmidDs {
@@ -954,26 +998,30 @@ impl Default for ShmidDs {
 }
 
 /// Track attached address for each process
-struct ShmAttachment {
-    addr: usize,
-    id: usize,
+pub(crate) struct ShmAttachment {
+    pub(crate) addr: usize,
+    pub(crate) id: usize,
 }
 
 /// Segment with attachment tracking
-struct ShmSegment {
-    data: alloc::sync::Arc<Mutex<Vec<u8>>>,
-    key: i32,
-    creator_pid: usize,
-    attach_count: usize,
-    attachments: Vec<ShmAttachment>,
-    destroyed: bool,
+pub(crate) struct ShmSegment {
+    pub(crate) data: alloc::sync::Arc<Mutex<Vec<u8>>>,
+    pub(crate) key: i32,
+    pub(crate) owner_uid: u32,
+    pub(crate) mode: u16,
+    pub(crate) creator_pid: usize,
+    pub(crate) attach_count: usize,
+    pub(crate) attachments: Vec<ShmAttachment>,
+    pub(crate) destroyed: bool,
 }
 
 impl ShmSegment {
-    fn new(key: i32, size: usize, creator_pid: usize) -> Self {
+    pub(crate) fn new(key: i32, size: usize, owner_uid: u32, mode: u16, creator_pid: usize) -> Self {
         ShmSegment {
             data: alloc::sync::Arc::new(Mutex::new(vec![0; size.max(1)])),
             key,
+            owner_uid,
+            mode,
             creator_pid,
             attach_count: 0,
             attachments: Vec::new(),
@@ -982,55 +1030,55 @@ impl ShmSegment {
     }
 }
 
-struct MsgEntry {
-    mtype: isize,
-    payload: Vec<u8>,
+pub(crate) struct MsgEntry {
+    pub(crate) mtype: isize,
+    pub(crate) payload: Vec<u8>,
 }
 
-struct MsgQueue {
-    key: i32,
-    owner_uid: u32,
-    mode: u16,
-    entries: VecDeque<MsgEntry>,
-    waiters: BTreeSet<usize>,
-    destroyed: bool,
+pub(crate) struct MsgQueue {
+    pub(crate) key: i32,
+    pub(crate) owner_uid: u32,
+    pub(crate) mode: u16,
+    pub(crate) entries: VecDeque<MsgEntry>,
+    pub(crate) waiters: BTreeSet<usize>,
+    pub(crate) destroyed: bool,
 }
 
 #[derive(Default)]
-struct MessageQueueState {
-    next_id: usize,
-    keys: BTreeMap<i32, usize>,
-    queues: BTreeMap<usize, MsgQueue>,
+pub(crate) struct MessageQueueState {
+    pub(crate) next_id: usize,
+    pub(crate) keys: BTreeMap<i32, usize>,
+    pub(crate) queues: BTreeMap<usize, MsgQueue>,
 }
 
 #[derive(Clone, Copy)]
-struct SemBufOp {
-    sem_num: u16,
-    sem_op: i16,
-    sem_flg: i16,
+pub(crate) struct SemBufOp {
+    pub(crate) sem_num: u16,
+    pub(crate) sem_op: i16,
+    pub(crate) sem_flg: i16,
 }
 
-struct SemSet {
-    key: i32,
-    owner_uid: u32,
-    mode: u16,
-    values: Vec<i32>,
-    waiters: BTreeSet<usize>,
-    destroyed: bool,
-}
-
-#[derive(Default)]
-struct SemaphoreState {
-    next_id: usize,
-    keys: BTreeMap<i32, usize>,
-    sets: BTreeMap<usize, SemSet>,
+pub(crate) struct SemSet {
+    pub(crate) key: i32,
+    pub(crate) owner_uid: u32,
+    pub(crate) mode: u16,
+    pub(crate) values: Vec<i32>,
+    pub(crate) waiters: BTreeSet<usize>,
+    pub(crate) destroyed: bool,
 }
 
 #[derive(Default)]
-struct SharedMemoryState {
-    next_id: usize,
-    keys: BTreeMap<i32, usize>,
-    segments: BTreeMap<usize, ShmSegment>,
+pub(crate) struct SemaphoreState {
+    pub(crate) next_id: usize,
+    pub(crate) keys: BTreeMap<i32, usize>,
+    pub(crate) sets: BTreeMap<usize, SemSet>,
+}
+
+#[derive(Default)]
+pub(crate) struct SharedMemoryState {
+    pub(crate) next_id: usize,
+    pub(crate) keys: BTreeMap<i32, usize>,
+    pub(crate) segments: BTreeMap<usize, ShmSegment>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1072,17 +1120,17 @@ struct AcctRecordMeta {
     group_exited: bool,
 }
 
-static SHM_STATE: Mutex<SharedMemoryState> = Mutex::new(SharedMemoryState {
+pub(crate) static SHM_STATE: Mutex<SharedMemoryState> = Mutex::new(SharedMemoryState {
     next_id: 1,
     keys: BTreeMap::new(),
     segments: BTreeMap::new(),
 });
-static MSG_STATE: Mutex<MessageQueueState> = Mutex::new(MessageQueueState {
+pub(crate) static MSG_STATE: Mutex<MessageQueueState> = Mutex::new(MessageQueueState {
     next_id: 1,
     keys: BTreeMap::new(),
     queues: BTreeMap::new(),
 });
-static SEM_STATE: Mutex<SemaphoreState> = Mutex::new(SemaphoreState {
+pub(crate) static SEM_STATE: Mutex<SemaphoreState> = Mutex::new(SemaphoreState {
     next_id: 1,
     keys: BTreeMap::new(),
     sets: BTreeMap::new(),
@@ -1116,6 +1164,7 @@ struct FlockRequest {
 struct FcntlRecordLock {
     path: String,
     owner_tgid: usize,
+    owner_pid: i32,
     lock_type: i16,
     start: u64,
     end: Option<u64>,
@@ -1157,7 +1206,7 @@ fn busybox_image_cache() -> Option<Vec<u8>> {
     BUSYBOX_IMAGE_CACHE.lock().as_ref().cloned()
 }
 
-fn ipc_access_allowed(mode: u16, owner_uid: u32, caller_uid: u32, read: bool, write: bool) -> bool {
+pub(crate) fn ipc_access_allowed(mode: u16, owner_uid: u32, caller_uid: u32, read: bool, write: bool) -> bool {
     if caller_uid == 0 {
         return true;
     }
@@ -1175,11 +1224,11 @@ fn ipc_access_allowed(mode: u16, owner_uid: u32, caller_uid: u32, read: bool, wr
     true
 }
 
-fn has_unmasked_pending_signal(process: &Process) -> bool {
+pub(crate) fn has_unmasked_pending_signal(process: &Process) -> bool {
     (process.pending_signals & !process.signal_mask) != 0 || process.signal_frame_pending
 }
 
-fn wake_tasks_by_tid(waiters: &BTreeSet<usize>, scheduler: &mut Scheduler) {
+pub(crate) fn wake_tasks_by_tid(waiters: &BTreeSet<usize>, scheduler: &mut Scheduler) {
     for tid in waiters {
         let _ = scheduler.wake_task(*tid);
     }
@@ -1313,10 +1362,45 @@ impl FcntlLockState {
             .cloned()
     }
 
+    fn lock_would_deadlock(
+        &self,
+        path: &str,
+        owner_tgid: usize,
+        start: u64,
+        end: Option<u64>,
+    ) -> bool {
+        let Some(waiting_on) = self
+            .locks
+            .iter()
+            .find(|lock| {
+                lock.path == path
+                    && lock.owner_tgid != owner_tgid
+                    && lock.lock_type == F_WRLCK
+                    && range_overlaps(lock.start, lock.end, start, end)
+            })
+            .map(|lock| lock.owner_tgid)
+        else {
+            return false;
+        };
+
+        self.locks.iter().any(|lock| {
+            lock.path == path
+                && lock.owner_tgid == owner_tgid
+                && lock.lock_type == F_WRLCK
+                && self.locks.iter().any(|other| {
+                    other.path == path
+                        && other.owner_tgid == waiting_on
+                        && other.lock_type == F_WRLCK
+                        && range_overlaps(lock.start, lock.end, other.start, other.end)
+                })
+        })
+    }
+
     fn apply_lock(
         &mut self,
         path: &str,
         owner_tgid: usize,
+        owner_pid: i32,
         lock_type: i16,
         start: u64,
         end: Option<u64>,
@@ -1342,6 +1426,7 @@ impl FcntlLockState {
                 next.push(FcntlRecordLock {
                     path: lock.path.clone(),
                     owner_tgid: lock.owner_tgid,
+                    owner_pid: lock.owner_pid,
                     lock_type: lock.lock_type,
                     start: lock_start as u64,
                     end: if cut_start == u128::MAX {
@@ -1355,6 +1440,7 @@ impl FcntlLockState {
                 next.push(FcntlRecordLock {
                     path: lock.path,
                     owner_tgid: lock.owner_tgid,
+                    owner_pid: lock.owner_pid,
                     lock_type: lock.lock_type,
                     start: cut_end as u64,
                     end: if lock_end == u128::MAX {
@@ -1371,6 +1457,7 @@ impl FcntlLockState {
             next.push(FcntlRecordLock {
                 path: path.to_string(),
                 owner_tgid,
+                owner_pid,
                 lock_type,
                 start,
                 end,
@@ -1446,6 +1533,7 @@ impl SyscallDispatcher {
         let mut busybox_bracket_trace_process: Option<(usize, usize)> = None;
         let mut execve03_trace_process: Option<(usize, String)> = None;
         let mut execve03_setup_trace_process: Option<(usize, String, String)> = None;
+        let mut glibc_basic_phase_trace_process: Option<(usize, usize, String, String)> = None;
         if syscall_trace_enabled() {
             if let Ok(process) = ctx.procs.current() {
                 trace_line(&format!(
@@ -1525,6 +1613,28 @@ impl SyscallDispatcher {
                     args.0[5]
                 ));
             }
+            if should_trace_glibc_basic_phase(process) {
+                glibc_basic_phase_trace_process = Some((
+                    process.tid,
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                ));
+                log_always(&format!(
+                    "whuse-glibc-phase:syscall-enter tid={} tgid={} name={} cwd={} sysno={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    process.tid,
+                    process.tgid,
+                    process.name,
+                    process.cwd,
+                    sysno,
+                    args.0[0],
+                    args.0[1],
+                    args.0[2],
+                    args.0[3],
+                    args.0[4],
+                    args.0[5]
+                ));
+            }
         }
         let result = fs_domain::dispatch(&mut ctx, sysno, args)
             .or_else(|| io_mpx_domain::dispatch(&mut ctx, sysno, args))
@@ -1563,6 +1673,12 @@ impl SyscallDispatcher {
             Ok(value) => value as isize,
             Err(errno) => -(errno as isize),
         };
+        if let Some((tid, tgid, name, cwd)) = glibc_basic_phase_trace_process {
+            log_always(&format!(
+                "whuse-glibc-phase:syscall-exit tid={} tgid={} name={} cwd={} sysno={} res={}",
+                tid, tgid, name, cwd, sysno, res
+            ));
+        }
         if syscall_trace_enabled() {
             if let Ok(process) = procs.current() {
                 trace_line(&format!(
@@ -1842,6 +1958,9 @@ impl SyscallDispatcher {
         let busybox_cp_probe = is_busybox_cp_probe_tgid(tgid, name.as_str());
         let busybox_resource_copy_probe =
             is_busybox_resource_copy_probe(name.as_str(), path.as_str());
+        let glibc_basic_shell_probe =
+            is_glibc_basic_shell_process(name.as_str(), proc_cwd.as_str());
+        let glibc_basic_fstat_probe = is_glibc_basic_fstat_task(name.as_str());
         if openat_probe {
             log_always(&format!(
                 "whuse-libctest:openat-enter tid={} tgid={} name={} dirfd={} cwd={} path={} raw_flags={:#x} flags={:#x}",
@@ -1872,12 +1991,30 @@ impl SyscallDispatcher {
                 tid, tgid, dirfd, proc_cwd, path, raw_flags, flags
             ));
         }
+        if glibc_basic_shell_probe || glibc_basic_fstat_probe {
+            log_always(&format!(
+                "whuse-glibc-basic-openat:enter tid={} tgid={} name={} cwd={} dirfd={} path={} raw_flags={:#x} flags={:#x}",
+                tid, tgid, name, proc_cwd, dirfd, path, raw_flags, flags
+            ));
+        }
         let (current_euid, current_egid, current_groups) = {
             let process = procs.current()?;
             (process.euid, process.egid, process.groups.clone())
         };
+        if glibc_basic_fstat_probe {
+            log_always(&format!(
+                "whuse-glibc-basic-openat:pre-resolve tid={} tgid={} name={} proc_cwd={} dirfd={} path={}",
+                tid, tgid, name, proc_cwd, dirfd, path
+            ));
+        }
         let cwd = resolve_at_cwd(procs.current()?, vfs, dirfd, &path)?;
         let absolute = vfs.absolute_path(&cwd, &path);
+        if glibc_basic_fstat_probe {
+            log_always(&format!(
+                "whuse-glibc-basic-openat:post-resolve tid={} tgid={} name={} resolved_cwd={} absolute={}",
+                tid, tgid, name, cwd, absolute
+            ));
+        }
         if ltp_open_probe {
             log_always(&format!(
                 "whuse-ltp-openat:resolved tid={} tgid={} name={} dirfd={} proc_cwd={} resolved_cwd={} path={} absolute={} flags={:#x}",
@@ -1892,8 +2029,20 @@ impl SyscallDispatcher {
                 tid, tgid, name, absolute
             ));
         }
+        if glibc_basic_fstat_probe {
+            log_always(&format!(
+                "whuse-glibc-basic-openat:before-proc-helpers tid={} tgid={} absolute={}",
+                tid, tgid, absolute
+            ));
+        }
         ensure_proc_pid_stat_file(procs, scheduler, vfs, absolute.as_str())?;
         ensure_proc_self_fd_dir(procs, vfs, absolute.as_str())?;
+        if glibc_basic_fstat_probe {
+            log_always(&format!(
+                "whuse-glibc-basic-openat:after-proc-helpers tid={} tgid={} absolute={}",
+                tid, tgid, absolute
+            ));
+        }
         if is_ltp_path_debug_task(name.as_str()) {
             log_always(&format!(
                 "whuse-ltp:path-debug syscall=openat-resolved tgid={} tid={} name={} cwd={} dirfd={} path={} resolved_cwd={} raw_flags={:#x} flags={:#x}",
@@ -1915,6 +2064,15 @@ impl SyscallDispatcher {
         } else {
             vfs.stat_path_open_probe(&cwd, &path, flags)
         };
+        if glibc_basic_fstat_probe {
+            log_always(&format!(
+                "whuse-glibc-basic-openat:after-existing-stat tid={} tgid={} absolute={} hit={}",
+                tid,
+                tgid,
+                absolute,
+                existing_stat.is_some()
+            ));
+        }
         if let Some(stat) = existing_stat {
             let is_dir = (stat.mode & 0o170000) == 0o040000;
             if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
@@ -1993,6 +2151,12 @@ impl SyscallDispatcher {
                 tid, tgid, cwd, path
             ));
         }
+        if glibc_basic_shell_probe || glibc_basic_fstat_probe {
+            log_always(&format!(
+                "whuse-glibc-basic-openat:vfs-open-begin tid={} tgid={} name={} cwd={} path={} absolute={}",
+                tid, tgid, name, cwd, path, absolute
+            ));
+        }
         if ltp_open_probe {
             log_always(&format!(
                 "whuse-ltp-openat:vfs-open-begin tid={} tgid={} cwd={} path={} absolute={}",
@@ -2045,6 +2209,12 @@ impl SyscallDispatcher {
                             tid, tgid, err, cwd, path
                         ));
                 }
+                if glibc_basic_shell_probe || glibc_basic_fstat_probe {
+                    log_always(&format!(
+                        "whuse-glibc-basic-openat:vfs-open-err tid={} tgid={} name={} err={} cwd={} path={} absolute={}",
+                        tid, tgid, name, err, cwd, path, absolute
+                    ));
+                }
                 if ltp_open_probe {
                     log_always(&format!(
                             "whuse-ltp-openat:vfs-open-err tid={} tgid={} err={} cwd={} path={} absolute={}",
@@ -2088,6 +2258,12 @@ impl SyscallDispatcher {
             log_always(&format!(
                 "whuse-busybox-copy:openat-vfs-open-ok tid={} tgid={} resolved={}",
                 tid, tgid, handle.path
+            ));
+        }
+        if glibc_basic_shell_probe || glibc_basic_fstat_probe {
+            log_always(&format!(
+                "whuse-glibc-basic-openat:vfs-open-ok tid={} tgid={} name={} resolved={}",
+                tid, tgid, name, handle.path
             ));
         }
         if ltp_open_probe {
@@ -2140,6 +2316,12 @@ impl SyscallDispatcher {
                 tid, tgid, fd
             ));
         }
+        if glibc_basic_shell_probe || glibc_basic_fstat_probe {
+            log_always(&format!(
+                "whuse-glibc-basic-openat:exit tid={} tgid={} name={} fd={}",
+                tid, tgid, name, fd
+            ));
+        }
         if ltp_open_probe {
             log_always(&format!(
                 "whuse-ltp-openat:exit tid={} tgid={} fd={}",
@@ -2184,11 +2366,19 @@ impl SyscallDispatcher {
         let busybox_testfile_probe =
             is_busybox_testfile_probe_task(name.as_str(), proc_cwd.as_str())
                 && handle.path == "/test.txt";
+        let suite_script_probe =
+            is_oscomp_suite_shell(procs.current()?) && handle.path == "/tmp/whuse-oscomp-suite.sh";
         let ltp_path_probe = is_ltp_path_debug_task(name.as_str());
         if busybox_testfile_probe {
             log_always(&format!(
                 "whuse-busybox:close-enter tid={} tgid={} name={} fd={} path={}",
                 tid, tgid, name, fd, handle.path
+            ));
+        }
+        if suite_script_probe {
+            log_always(&format!(
+                "whuse-oscomp-suite-close:enter tid={} tgid={} name={} fd={} path={} flags={:#x}",
+                tid, tgid, name, fd, handle.path, handle.flags
             ));
         }
         if ltp_path_probe {
@@ -2217,6 +2407,12 @@ impl SyscallDispatcher {
         if busybox_testfile_probe {
             log_always(&format!(
                 "whuse-busybox:close-exit tid={} tgid={} name={} fd={} path={} wake_blocked={} released_locks={}",
+                tid, tgid, name, fd, handle.path, wake_blocked, released_locks
+            ));
+        }
+        if suite_script_probe {
+            log_always(&format!(
+                "whuse-oscomp-suite-close:exit tid={} tgid={} name={} fd={} path={} wake_blocked={} released_locks={}",
                 tid, tgid, name, fd, handle.path, wake_blocked, released_locks
             ));
         }
@@ -2294,9 +2490,34 @@ impl SyscallDispatcher {
         let offset = args.0[1] as isize;
         let whence = args.0[2] as u32;
         let glibc_ltp = glibc_ltp_probe_process(procs, Some(fd));
+        let suite_script_probe = procs.current().ok().and_then(|process| {
+            if is_oscomp_suite_shell(process) {
+                process
+                    .fd(fd)
+                    .ok()
+                    .filter(|handle| handle.path == "/tmp/whuse-oscomp-suite.sh")
+                    .map(|handle| {
+                        (
+                            process.tid,
+                            process.tgid,
+                            process.name.clone(),
+                            process.cwd.clone(),
+                            handle.path.clone(),
+                        )
+                    })
+            } else {
+                None
+            }
+        });
         if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
             log_always(&format!(
                 "whuse-glibc-ltp-lseek:enter tgid={} tid={} name={} cwd={} fd={} path={} offset={} whence={}",
+                tgid, tid, name, cwd, fd, path, offset, whence
+            ));
+        }
+        if let Some((tid, tgid, name, cwd, path)) = &suite_script_probe {
+            log_always(&format!(
+                "whuse-oscomp-suite-lseek:enter tgid={} tid={} name={} cwd={} fd={} path={} offset={} whence={}",
                 tgid, tid, name, cwd, fd, path, offset, whence
             ));
         }
@@ -2308,6 +2529,12 @@ impl SyscallDispatcher {
         if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
             log_always(&format!(
                 "whuse-glibc-ltp-lseek:ok tgid={} tid={} name={} cwd={} fd={} path={} position={}",
+                tgid, tid, name, cwd, fd, path, position
+            ));
+        }
+        if let Some((tid, tgid, name, cwd, path)) = &suite_script_probe {
+            log_always(&format!(
+                "whuse-oscomp-suite-lseek:ok tgid={} tid={} name={} cwd={} fd={} path={} position={}",
                 tgid, tid, name, cwd, fd, path, position
             ));
         }
@@ -2361,6 +2588,8 @@ impl SyscallDispatcher {
             let is_socket = vfs.is_socket(handle);
             let nonblock = (handle.flags & (O_NONBLOCK as u32)) != 0;
             let pipe_path = handle.path.clone();
+            let suite_script_probe =
+                proc_name == "/musl/busybox" && pipe_path == "/tmp/whuse-oscomp-suite.sh";
             if !fd_is_readable(handle.flags) {
                 return Err(EBADF);
             }
@@ -2377,6 +2606,12 @@ impl SyscallDispatcher {
             if probe {
                 log_always(&format!(
                     "whuse-libctest:read-enter tid={} tgid={} fd={} path={} count={} off={}",
+                    proc_tid, proc_tgid, fd, pipe_path, count, handle.offset
+                ));
+            }
+            if suite_script_probe {
+                log_always(&format!(
+                    "whuse-oscomp-suite-read:enter tid={} tgid={} fd={} path={} count={} off={}",
                     proc_tid, proc_tgid, fd, pipe_path, count, handle.offset
                 ));
             }
@@ -2414,6 +2649,17 @@ impl SyscallDispatcher {
                     if probe {
                         log_always(&format!(
                             "whuse-libctest:read-ok tid={} tgid={} fd={} path={} bytes={} off={}",
+                            proc_tid,
+                            proc_tgid,
+                            fd,
+                            pipe_path,
+                            bytes.len(),
+                            handle.offset
+                        ));
+                    }
+                    if suite_script_probe {
+                        log_always(&format!(
+                            "whuse-oscomp-suite-read:ok tid={} tgid={} fd={} path={} bytes={} off={}",
                             proc_tid,
                             proc_tgid,
                             fd,
@@ -2461,6 +2707,12 @@ impl SyscallDispatcher {
                     if probe {
                         log_always(&format!(
                             "whuse-libctest:read-err tid={} tgid={} fd={} path={} err={}",
+                            proc_tid, proc_tgid, fd, pipe_path, err
+                        ));
+                    }
+                    if suite_script_probe {
+                        log_always(&format!(
+                            "whuse-oscomp-suite-read:err tid={} tgid={} fd={} path={} err={}",
                             proc_tid, proc_tgid, fd, pipe_path, err
                         ));
                     }
@@ -2538,6 +2790,20 @@ impl SyscallDispatcher {
                     process.cwd.clone(),
                 )
             });
+        let glibc_basic_shell = procs
+            .current()
+            .ok()
+            .filter(|process| {
+                is_glibc_basic_shell_process(process.name.as_str(), process.cwd.as_str())
+            })
+            .map(|process| {
+                (
+                    process.tid,
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                )
+            });
         let data = procs
             .current()?
             .read_user_bytes(buf, read_len)
@@ -2572,6 +2838,20 @@ impl SyscallDispatcher {
                     tgid, tid, name, cwd, fd, handle.path, data.len(), handle.offset
                 ));
             }
+            if let Some((tid, tgid, name, cwd)) = &glibc_basic_shell {
+                log_always(&format!(
+                    "whuse-glibc-basic-shell:write-enter tgid={} tid={} name={} cwd={} fd={} path={} count={} off={} preview={}",
+                    tgid,
+                    tid,
+                    name,
+                    cwd,
+                    fd,
+                    handle.path,
+                    data.len(),
+                    handle.offset,
+                    debug_payload_preview(&data, 96)
+                ));
+            }
             let is_pipe = vfs.is_pipe(handle);
             let is_socket = vfs.is_socket(handle);
             let nonblock = (handle.flags & (O_NONBLOCK as u32)) != 0;
@@ -2589,6 +2869,12 @@ impl SyscallDispatcher {
                             tgid, tid, name, cwd, fd, handle.path, written, handle.offset
                         ));
                     }
+                    if let Some((tid, tgid, name, cwd)) = &glibc_basic_shell {
+                        log_always(&format!(
+                            "whuse-glibc-basic-shell:write-ok tgid={} tid={} name={} cwd={} fd={} path={} written={} off={}",
+                            tgid, tid, name, cwd, fd, handle.path, written, handle.offset
+                        ));
+                    }
                     process.sync_fd_offset_to_aliases(fd)?;
                     Ok((is_pipe, is_socket, nonblock, written))
                 }
@@ -2602,6 +2888,12 @@ impl SyscallDispatcher {
                     if let Some((tid, tgid, name, cwd)) = &ltp_path_debug {
                         log_always(&format!(
                             "whuse-ltp:path-debug syscall=write-err tgid={} tid={} name={} cwd={} fd={} path={} err={}",
+                            tgid, tid, name, cwd, fd, handle.path, err
+                        ));
+                    }
+                    if let Some((tid, tgid, name, cwd)) = &glibc_basic_shell {
+                        log_always(&format!(
+                            "whuse-glibc-basic-shell:write-err tgid={} tid={} name={} cwd={} fd={} path={} err={}",
                             tgid, tid, name, cwd, fd, handle.path, err
                         ));
                     }
@@ -2723,6 +3015,9 @@ impl SyscallDispatcher {
     }
 
     fn sys_unshare(&self, _args: SyscallArgs) -> Result<usize, i32> {
+        if _args.0[0] & (CLONE_NAMESPACE_MASK | CLONE_NEWTIME) != 0 {
+            return Err(EINVAL);
+        }
         Ok(0)
     }
 
@@ -2738,10 +3033,12 @@ impl SyscallDispatcher {
     fn sys_clock_gettime(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
         let clock_id = args.0[0];
         let buf = args.0[1];
-        let ts = if clock_id == 0 {
-            wall_time_now()
-        } else {
-            hal().timer.monotonic_time()
+        let ts = match clock_id {
+            CLOCK_REALTIME => wall_time_now(),
+            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
+                hal().timer.monotonic_time()
+            }
+            _ => return Err(EINVAL),
         };
         procs
             .current_mut()?
@@ -2919,6 +3216,20 @@ impl SyscallDispatcher {
                     process.cwd.clone(),
                 )
             });
+        let glibc_basic_shell = procs
+            .current()
+            .ok()
+            .filter(|process| {
+                is_glibc_basic_shell_process(process.name.as_str(), process.cwd.as_str())
+            })
+            .map(|process| {
+                (
+                    process.tid,
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                )
+            });
         let wake_blocked_after_exit = current_process_has_pipe_or_socket_fd(procs, vfs);
         let libcbench_leader = procs
             .current()
@@ -2934,6 +3245,12 @@ impl SyscallDispatcher {
         if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
             log_always(&format!(
                 "whuse-la-ltp-bootstrap syscall=exit-enter tgid={} tid={} name={} cwd={} exit_group={} code={}",
+                tgid, tid, name, cwd, exit_group, args.0[0] as i32
+            ));
+        }
+        if let Some((tid, tgid, name, cwd)) = &glibc_basic_shell {
+            log_always(&format!(
+                "whuse-glibc-basic-shell:exit-enter tgid={} tid={} name={} cwd={} exit_group={} code={}",
                 tgid, tid, name, cwd, exit_group, args.0[0] as i32
             ));
         }
@@ -2982,6 +3299,12 @@ impl SyscallDispatcher {
         if let Some((tid, tgid, name, cwd)) = &bootstrap_ltp {
             log_always(&format!(
                 "whuse-la-ltp-bootstrap syscall=exit-result tgid={} tid={} name={} cwd={} group_exited={} parent_tgid={:?}",
+                tgid, tid, name, cwd, exit.group_exited, exit.parent_tgid
+            ));
+        }
+        if let Some((tid, tgid, name, cwd)) = &glibc_basic_shell {
+            log_always(&format!(
+                "whuse-glibc-basic-shell:exit-result tgid={} tid={} name={} cwd={} group_exited={} parent_tgid={:?}",
                 tgid, tid, name, cwd, exit.group_exited, exit.parent_tgid
             ));
         }
@@ -3094,6 +3417,22 @@ impl SyscallDispatcher {
         let fd = args.0[0] as i32;
         let stat_ptr = args.0[1];
         let glibc_ltp = glibc_ltp_probe_process(procs, Some(fd));
+        let glibc_basic = procs.current().ok().and_then(|process| {
+            if is_glibc_basic_task(process.name.as_str()) {
+                Some((
+                    process.tid,
+                    process.tgid,
+                    process.name.clone(),
+                    process.cwd.clone(),
+                    process
+                        .fd(fd)
+                        .map(|h| h.path.clone())
+                        .unwrap_or_else(|_| format!("<fd:{}-unresolved>", fd)),
+                ))
+            } else {
+                None
+            }
+        });
         let ltp_path_debug = procs
             .current()
             .ok()
@@ -3109,6 +3448,12 @@ impl SyscallDispatcher {
         if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp {
             log_always(&format!(
                 "whuse-glibc-ltp-fstat:enter tgid={} tid={} name={} cwd={} fd={} path={}",
+                tgid, tid, name, cwd, fd, path
+            ));
+        }
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_basic {
+            log_always(&format!(
+                "whuse-glibc-basic-fstat:enter tgid={} tid={} name={} cwd={} fd={} path={}",
                 tgid, tid, name, cwd, fd, path
             ));
         }
@@ -3129,6 +3474,12 @@ impl SyscallDispatcher {
                 tgid, tid, name, cwd, fd, path, stat.dev, stat.ino, stat.rdev, stat.mode, stat.size
             ));
         }
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_basic {
+            log_always(&format!(
+                "whuse-glibc-basic-fstat:ok tgid={} tid={} name={} cwd={} fd={} path={} dev={:#x} ino={:#x} rdev={:#x} mode={:#o} size={}",
+                tgid, tid, name, cwd, fd, path, stat.dev, stat.ino, stat.rdev, stat.mode, stat.size
+            ));
+        }
         if let Some((tgid, tid, name, cwd)) = &ltp_path_debug {
             log_always(&format!(
                 "whuse-ltp:path-debug syscall=fstat-ok tgid={} tid={} name={} cwd={} fd={} dev={:#x} ino={:#x} rdev={:#x} mode={:#o} size={}",
@@ -3139,6 +3490,12 @@ impl SyscallDispatcher {
             .current_mut()?
             .write_user_bytes(stat_ptr, &stat_to_bytes(stat))
             .map_err(|_| EFAULT)?;
+        if let Some((tid, tgid, name, cwd, path)) = &glibc_basic {
+            log_always(&format!(
+                "whuse-glibc-basic-fstat:write-ok tgid={} tid={} name={} cwd={} fd={} path={} stat_ptr={:#x}",
+                tgid, tid, name, cwd, fd, path, stat_ptr
+            ));
+        }
         Ok(0)
     }
 
@@ -3459,12 +3816,36 @@ impl SyscallDispatcher {
             procs.current_tgid().unwrap_or(0),
             path
         ));
+        if cfg!(target_arch = "loongarch64") {
+            let current = procs.current()?;
+            if current.name.ends_with("/execve") || path == "test_echo" || path == "/test_echo" {
+                log_always(&format!(
+                    "whuse-la-execve-debug:enter tgid={} tid={} name={} cwd={} path={} argv_ptr={:#x} envp_ptr={:#x}",
+                    current.tgid,
+                    current.tid,
+                    current.name,
+                    current.cwd,
+                    path,
+                    args.0[1],
+                    args.0[2]
+                ));
+            }
+        }
         let cwd = procs.current()?.cwd.clone();
         let mut display_path = vfs.absolute_path(&cwd, &path);
         let mut argv = read_string_vector(procs.current()?, args.0[1])?;
         if argv.is_empty() {
             argv.push(display_path.clone());
         }
+        let nested_execve_debug = cfg!(target_arch = "loongarch64")
+            && (procs.current()?.name.ends_with("/execve")
+                || path == "test_echo"
+                || display_path == "/test_echo"
+                || display_path == "/musl/test_echo"
+                || display_path == "/glibc/busybox"
+                || path == "/glibc/busybox"
+                || (path.contains("busybox") && argv.get(1).map(String::as_str) == Some("echo")));
+
         let execve_ltp_timeout_case = display_path.contains("busybox")
             && argv.get(1).map(String::as_str) == Some("timeout")
             && argv.iter().any(|arg| {
@@ -3473,6 +3854,7 @@ impl SyscallDispatcher {
             });
         let execve_musl_ltp_case = display_path.starts_with("/musl/ltp/testcases/bin/");
         let execve_glibc_ltp_case = display_path.starts_with("/glibc/ltp/testcases/bin/");
+        let execve_glibc_basic_case = is_glibc_basic_exec_path(display_path.as_str());
         let execve_any_ltp_case =
             execve_musl_ltp_case || execve_glibc_ltp_case || execve_ltp_timeout_case;
         let execve_any_ltp_probe = ltp_exec_probe_enabled() && execve_any_ltp_case;
@@ -3507,6 +3889,15 @@ impl SyscallDispatcher {
                 argv.first().map(String::as_str).unwrap_or("")
             ));
         }
+        if execve_glibc_basic_case {
+            log_always(&format!(
+                "whuse-glibc-basic-exec:enter tgid={} cwd={} display={} argv0={}",
+                procs.current_tgid().unwrap_or(0),
+                cwd,
+                display_path,
+                argv.first().map(String::as_str).unwrap_or("")
+            ));
+        }
         if let Some(shell_cmd) = shell_exec_command(path.as_str(), &argv) {
             if let Some((resolved_path, resolved_argv)) =
                 resolve_simple_shell_exec(vfs, &cwd, shell_cmd)
@@ -3521,6 +3912,20 @@ impl SyscallDispatcher {
             }
         }
         let envp = read_string_vector(procs.current()?, args.0[2])?;
+        if cfg!(target_arch = "loongarch64") {
+            let current = procs.current()?;
+            if current.name.ends_with("/execve") || path == "test_echo" || path == "/test_echo" {
+                log_always(&format!(
+                    "whuse-la-execve-debug:vectors tgid={} tid={} name={} display={} argv={:?} envp={:?}",
+                    current.tgid,
+                    current.tid,
+                    current.name,
+                    display_path,
+                    argv,
+                    envp
+                ));
+            }
+        }
         if is_pipe2_02_copy_command(path.as_str(), display_path.as_str(), &argv) {
             log_always(&format!(
                 "whuse-pipe2_02:execve tgid={} cwd={} path={} display={} argv={:?}",
@@ -3619,6 +4024,12 @@ impl SyscallDispatcher {
                         display_path, path, stat.mode, stat.size
                     ));
                 }
+                if execve_glibc_basic_case {
+                    log_always(&format!(
+                        "whuse-glibc-basic-exec:stat-ok display={} path={} mode={:#o} size={}",
+                        display_path, path, stat.mode, stat.size
+                    ));
+                }
                 let mode = stat.mode & 0o170000;
                 if mode == 0o040000 {
                     return Err(EACCES);
@@ -3639,6 +4050,24 @@ impl SyscallDispatcher {
                 Ok(data) => data,
                 Err(err) => return Err(err),
             };
+            if nested_execve_debug {
+                let prefix_len = core::cmp::min(file_data.len(), 16);
+                log_always(&format!(
+                    "whuse-la-execve-debug:image-bytes display={} path={} len={} prefix={:02x?}",
+                    display_path,
+                    path,
+                    file_data.len(),
+                    &file_data[..prefix_len]
+                ));
+            }
+            if execve_glibc_basic_case {
+                log_always(&format!(
+                    "whuse-glibc-basic-exec:image-loaded display={} path={} bytes={}",
+                    display_path,
+                    path,
+                    file_data.len()
+                ));
+            }
             if execve_any_ltp_probe {
                 log_always(&format!(
                     "whuse-ltp-exec:image-loaded display={} path={} bytes={}",
@@ -3664,6 +4093,15 @@ impl SyscallDispatcher {
                 ));
             }
             if let Some((mut interp_path, mut interp_arg)) = parse_shebang_line(&file_data) {
+                if nested_execve_debug {
+                    log_always(&format!(
+                        "whuse-la-execve-debug:shebang display={} path={} interp={} arg={}",
+                        display_path,
+                        path,
+                        interp_path,
+                        interp_arg.as_deref().unwrap_or("")
+                    ));
+                }
                 trace_line(&format!(
                     "whuse: execve stage shebang path={} interp={} arg={}",
                     path,
@@ -3712,6 +4150,14 @@ impl SyscallDispatcher {
                 argv = next_argv;
                 shebang_hops += 1;
                 continue;
+            }
+            if nested_execve_debug {
+                log_always(&format!(
+                    "whuse-la-execve-debug:no-shebang display={} path={} elf_magic={}",
+                    display_path,
+                    path,
+                    file_data.starts_with(b"\x7fELF")
+                ));
             }
             if path.ends_with(".sh") {
                 if shebang_hops >= 4 {
@@ -3797,6 +4243,12 @@ impl SyscallDispatcher {
                 let mut interp_loaded: Option<(String, Vec<u8>)> = None;
                 for candidate in exec_interp_candidates(display_path.as_str(), interp_path.as_str())
                 {
+                    if execve_glibc_basic_case {
+                        log_always(&format!(
+                            "whuse-glibc-basic-exec:interp-candidate display={} candidate={}",
+                            display_path, candidate
+                        ));
+                    }
                     if execve_iozone_probe {
                         log_always(&format!(
                             "whuse-la-iozone:execve-interp-candidate path={} candidate={}",
@@ -3821,6 +4273,23 @@ impl SyscallDispatcher {
                     ));
                     match read_exec_file_image(vfs, "/", candidate.as_str()) {
                         Ok(image) => {
+                            if nested_execve_debug {
+                                log_always(&format!(
+                                    "whuse-la-execve-debug:interp-ok name={} display={} candidate={} bytes={}",
+                                    procs.current()?.name,
+                                    display_path,
+                                    candidate,
+                                    image.len()
+                                ));
+                            }
+                            if execve_glibc_basic_case {
+                                log_always(&format!(
+                                    "whuse-glibc-basic-exec:interp-ok display={} candidate={} bytes={}",
+                                    display_path,
+                                    candidate,
+                                    image.len()
+                                ));
+                            }
                             if execve_iozone_probe {
                                 log_always(&format!(
                                     "whuse-la-iozone:execve-interp-ok path={} candidate={} bytes={}",
@@ -3855,6 +4324,21 @@ impl SyscallDispatcher {
                             break;
                         }
                         Err(err) => {
+                            if nested_execve_debug {
+                                log_always(&format!(
+                                    "whuse-la-execve-debug:interp-err name={} display={} candidate={} err={}",
+                                    procs.current()?.name,
+                                    display_path,
+                                    candidate,
+                                    err
+                                ));
+                            }
+                            if execve_glibc_basic_case {
+                                log_always(&format!(
+                                    "whuse-glibc-basic-exec:interp-err display={} candidate={} err={}",
+                                    display_path, candidate, err
+                                ));
+                            }
                             if execve_iozone_probe {
                                 log_always(&format!(
                                     "whuse-la-iozone:execve-interp-err path={} candidate={} err={}",
@@ -3881,6 +4365,12 @@ impl SyscallDispatcher {
                     }
                 }
                 let Some((interp_path, interp_image)) = interp_loaded else {
+                    if execve_glibc_basic_case {
+                        log_always(&format!(
+                            "whuse-glibc-basic-exec:interp-missing display={}",
+                            display_path
+                        ));
+                    }
                     if execve_iozone_probe {
                         log_always(&format!(
                             "whuse-la-iozone:execve-interp-missing path={}",
@@ -3890,6 +4380,12 @@ impl SyscallDispatcher {
                     return Err(ENOENT);
                 };
                 if interp_image.is_empty() {
+                    if execve_glibc_basic_case {
+                        log_always(&format!(
+                            "whuse-glibc-basic-exec:interp-empty display={} interp={}",
+                            display_path, interp_path
+                        ));
+                    }
                     if execve_iozone_probe {
                         log_always(&format!(
                             "whuse-la-iozone:execve-interp-empty path={} interp={}",
@@ -3919,8 +4415,22 @@ impl SyscallDispatcher {
                     interp_path,
                     interp_image.len()
                 ));
+                if execve_glibc_basic_case {
+                    log_always(&format!(
+                        "whuse-glibc-basic-exec:interp-image display={} interp={} bytes={}",
+                        display_path,
+                        interp_path,
+                        interp_image.len()
+                    ));
+                }
                 Some((interp_path, interp_image))
             } else {
+                if execve_glibc_basic_case {
+                    log_always(&format!(
+                        "whuse-glibc-basic-exec:interp-none display={}",
+                        display_path
+                    ));
+                }
                 if execve_iozone_probe {
                     log_always(&format!(
                         "whuse-la-iozone:execve-interp-none path={}",
@@ -3940,6 +4450,17 @@ impl SyscallDispatcher {
                 "whuse: execve stage elf-reset-done tgid={}",
                 procs.current_tgid().unwrap_or(0)
             ));
+            if nested_execve_debug {
+                log_always(&format!(
+                    "whuse-la-execve-debug:load-elf-begin tgid={} name={} display={} path={} argv={:?} envp={:?}",
+                    procs.current_tgid().unwrap_or(0),
+                    procs.current()?.name,
+                    display_path,
+                    path,
+                    argv,
+                    envp
+                ));
+            }
             trace_line(&format!(
                 "whuse: execve stage load-elf-begin tgid={} path={} argv={} env={}",
                 procs.current_tgid().unwrap_or(0),
@@ -3967,6 +4488,15 @@ impl SyscallDispatcher {
                 ) {
                     Ok(loaded) => loaded,
                     Err(err) => {
+                        if nested_execve_debug {
+                            log_always(&format!(
+                                "whuse-la-execve-debug:load-elf-err tgid={} name={} display={} err={}",
+                                process.tgid,
+                                process.name,
+                                display_path,
+                                err
+                            ));
+                        }
                         if execve_iozone_probe {
                             log_always(&format!(
                                 "whuse-la-iozone:execve-load-elf-err tgid={} name={} err={}",
@@ -3981,6 +4511,15 @@ impl SyscallDispatcher {
                     }
                 }
             };
+            if execve_glibc_basic_case {
+                log_always(&format!(
+                    "whuse-glibc-basic-exec:load-elf-done display={} entry={:#x} dyn={} interp_base={:#x}",
+                    display_path,
+                    loaded.entry,
+                    loaded.is_dyn,
+                    loaded.interp_base
+                ));
+            }
             trace_line(&format!(
                     "whuse: execve stage load-elf-done tgid={} entry={:#x} sp={:#x} dyn={} interp_base={:#x}",
                     procs.current_tgid().unwrap_or(0),
@@ -4024,6 +4563,18 @@ impl SyscallDispatcher {
             process.trap_frame.sepc = loaded.entry;
             process.trap_frame.regs[2] = loaded.stack_pointer;
             process.name = display_path;
+            if nested_execve_debug {
+                log_always(&format!(
+                    "whuse-la-execve-debug:load-elf-done tgid={} name={} entry={:#x} program_entry={:#x} interp_base={:#x} interp_entry={:#x} sp={:#x}",
+                    process.tgid,
+                    process.name,
+                    loaded.entry,
+                    loaded.program_entry,
+                    loaded.interp_base,
+                    loaded.interp_entry,
+                    loaded.stack_pointer
+                ));
+            }
             if execve_glibc_ltp_probe {
                 log_always(&format!(
                     "whuse-glibc-ltp-exec:interp-window display={} interp_base={:#x} window={}",
@@ -4633,6 +5184,7 @@ impl SyscallDispatcher {
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
         let owner_tgid = procs.current_tgid()?;
+        let owner_pid = procs.current()?.pid as i32;
         let handle = procs.current()?.fd(fd)?.clone();
         let mut request = read_flock_request(procs.current()?, arg_ptr)?;
         if !matches!(request.l_type, F_RDLCK | F_WRLCK | F_UNLCK) {
@@ -4657,7 +5209,7 @@ impl SyscallDispatcher {
                 request.l_whence = SEEK_SET;
                 request.l_start = lock.start as i64;
                 request.l_len = lock_range_len(lock.start, lock.end);
-                request.l_pid = lock.owner_tgid as i32;
+                request.l_pid = lock.owner_pid;
             } else {
                 request.l_type = F_UNLCK;
                 request.l_pid = 0;
@@ -4667,15 +5219,16 @@ impl SyscallDispatcher {
         }
 
         if request.l_type != F_UNLCK {
-            let conflict = FCNTL_LOCK_STATE.lock().first_conflict(
-                &handle.path,
-                owner_tgid,
-                request.l_type,
-                start,
-                end,
-            );
+            let state = FCNTL_LOCK_STATE.lock();
+            let conflict =
+                state.first_conflict(&handle.path, owner_tgid, request.l_type, start, end);
             if conflict.is_some() {
                 if cmd == F_SETLKW {
+                    if request.l_type == F_WRLCK
+                        && state.lock_would_deadlock(&handle.path, owner_tgid, start, end)
+                    {
+                        return Err(EDEADLK);
+                    }
                     let _ = scheduler.block_current();
                     return Err(EAGAIN);
                 }
@@ -4686,6 +5239,7 @@ impl SyscallDispatcher {
         let changed = FCNTL_LOCK_STATE.lock().apply_lock(
             &handle.path,
             owner_tgid,
+            owner_pid,
             request.l_type,
             start,
             end,
@@ -6690,9 +7244,6 @@ impl SyscallDispatcher {
                     ));
                 }
                 for tid in &woke {
-                    if let Ok(process) = procs.find_by_tid_mut(*tid) {
-                        process.cancellation_in_progress = false;
-                    }
                     let _ = scheduler.wake_task(*tid);
                 }
                 if libcbench_task && !woke.is_empty() && scheduler.ready_count() > 0 {
@@ -7625,7 +8176,15 @@ impl SyscallDispatcher {
     }
 
     fn sys_clock_getres(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
-        let _clock_id = args.0[0];
+        let clock_id = args.0[0];
+        match clock_id {
+            CLOCK_REALTIME
+            | CLOCK_MONOTONIC
+            | CLOCK_MONOTONIC_RAW
+            | CLOCK_MONOTONIC_COARSE
+            | CLOCK_BOOTTIME => {}
+            _ => return Err(EINVAL),
+        }
         procs
             .current_mut()?
             .write_user_bytes(
@@ -7923,6 +8482,7 @@ impl SyscallDispatcher {
         const UCONTEXT_OFF: usize = 128;
         const UC_SIGMASK_OFF: usize = UCONTEXT_OFF + 40;
         const MCTX_OFF: usize = UCONTEXT_OFF + 168;
+        const SS_ONSTACK: u32 = 1;
         const MCTX_FP_OFF: usize = MCTX_OFF + 32 * 8;
         const MCTX_D_FCSR_OFF: usize = MCTX_FP_OFF + 32 * 8;
 
@@ -7980,6 +8540,13 @@ impl SyscallDispatcher {
         let restore_mask = process.sigsuspend_saved_mask.take().unwrap_or(saved_mask);
         process.signal_mask = restore_mask;
         process.signal_frame_pending = false;
+        if let Some((base, size, flags)) = process.sigaltstack {
+            let onstack_start = base;
+            let onstack_end = base.saturating_add(size);
+            if size != 0 && frame_sp >= onstack_start && frame_sp < onstack_end {
+                process.sigaltstack = Some((base, size, flags & !SS_ONSTACK));
+            }
+        }
         process.arm_cancellation_persistent();
         process.trap_frame.sepc = saved_pc;
         #[cfg(target_arch = "riscv64")]
@@ -8253,632 +8820,6 @@ impl SyscallDispatcher {
         }
         procs.setgroups_current(&groups)?;
         Ok(0)
-    }
-
-    fn sys_msgget(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
-        let key = args.0[0] as i32;
-        let flags = args.0[1];
-        let caller_uid = procs.current()?.euid;
-        let req_read = (flags & 0o400) != 0;
-        let req_write = (flags & 0o200) != 0;
-        let mut state = MSG_STATE.lock();
-
-        if key != IPC_PRIVATE {
-            if let Some(id) = state.keys.get(&key).copied() {
-                let queue = state.queues.get(&id).ok_or(EINVAL)?;
-                if queue.destroyed {
-                    return Err(EIDRM);
-                }
-                if (flags & IPC_CREAT) != 0 && (flags & IPC_EXCL) != 0 {
-                    return Err(EEXIST);
-                }
-                if !ipc_access_allowed(queue.mode, queue.owner_uid, caller_uid, req_read, req_write)
-                {
-                    return Err(EACCES);
-                }
-                return Ok(id);
-            }
-            if (flags & IPC_CREAT) == 0 {
-                return Err(ENOENT);
-            }
-        }
-
-        let id = state.next_id;
-        state.next_id += 1;
-        let mode = (flags & 0o777) as u16;
-        state.queues.insert(
-            id,
-            MsgQueue {
-                key,
-                owner_uid: caller_uid,
-                mode,
-                entries: VecDeque::new(),
-                waiters: BTreeSet::new(),
-                destroyed: false,
-            },
-        );
-        if key != IPC_PRIVATE {
-            state.keys.insert(key, id);
-        }
-        Ok(id)
-    }
-
-    fn sys_msgsnd(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-        scheduler: &mut Scheduler,
-    ) -> Result<usize, i32> {
-        let id = args.0[0];
-        let msgp = args.0[1];
-        let msgsz = args.0[2];
-        let process = procs.current()?;
-        let mtype_raw = process
-            .read_user_bytes(msgp, size_of::<isize>())
-            .map_err(|_| EFAULT)?;
-        let mut mtype_bytes = [0u8; size_of::<isize>()];
-        mtype_bytes.copy_from_slice(&mtype_raw[..size_of::<isize>()]);
-        let mtype = isize::from_le_bytes(mtype_bytes);
-        if mtype <= 0 {
-            return Err(EINVAL);
-        }
-        let payload = process
-            .read_user_bytes(msgp + size_of::<isize>(), msgsz)
-            .map_err(|_| EFAULT)?;
-        let caller_uid = process.euid;
-        let waiters = {
-            let mut state = MSG_STATE.lock();
-            let queue = state.queues.get_mut(&id).ok_or(EINVAL)?;
-            if queue.destroyed {
-                return Err(EIDRM);
-            }
-            if !ipc_access_allowed(queue.mode, queue.owner_uid, caller_uid, false, true) {
-                return Err(EACCES);
-            }
-            queue.entries.push_back(MsgEntry { mtype, payload });
-            queue.waiters.clone()
-        };
-        wake_tasks_by_tid(&waiters, scheduler);
-        Ok(0)
-    }
-
-    fn sys_msgrcv(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-        scheduler: &mut Scheduler,
-    ) -> Result<usize, i32> {
-        let id = args.0[0];
-        let msgp = args.0[1];
-        let msgsz = args.0[2];
-        let msgtyp = args.0[3] as isize;
-        let msgflg = args.0[4];
-        let tid = procs.current_tid()?;
-
-        loop {
-            if has_unmasked_pending_signal(procs.current()?) {
-                let mut state = MSG_STATE.lock();
-                if let Some(queue) = state.queues.get_mut(&id) {
-                    queue.waiters.remove(&tid);
-                }
-                return Err(EINTR);
-            }
-
-            let mut maybe_msg = None;
-            let mut removed = false;
-            {
-                let mut state = MSG_STATE.lock();
-                let queue = state.queues.get_mut(&id).ok_or(EINVAL)?;
-                if queue.destroyed {
-                    queue.waiters.remove(&tid);
-                    removed = true;
-                } else {
-                    let idx = if msgtyp == 0 {
-                        if queue.entries.is_empty() {
-                            None
-                        } else {
-                            Some(0)
-                        }
-                    } else if msgtyp > 0 {
-                        queue.entries.iter().position(|msg| msg.mtype == msgtyp)
-                    } else {
-                        let limit = -msgtyp;
-                        queue.entries.iter().position(|msg| msg.mtype <= limit)
-                    };
-                    if let Some(i) = idx {
-                        maybe_msg = queue.entries.remove(i);
-                        queue.waiters.remove(&tid);
-                    } else if (msgflg & IPC_NOWAIT) != 0 {
-                        queue.waiters.remove(&tid);
-                        return Err(ENOMSG);
-                    } else {
-                        queue.waiters.insert(tid);
-                    }
-                }
-            }
-
-            if removed {
-                return Err(EIDRM);
-            }
-            if let Some(msg) = maybe_msg {
-                let copy_len = msg.payload.len().min(msgsz);
-                let mut out = Vec::with_capacity(size_of::<isize>() + copy_len);
-                out.extend_from_slice(&msg.mtype.to_le_bytes());
-                out.extend_from_slice(&msg.payload[..copy_len]);
-                procs
-                    .current_mut()?
-                    .write_user_bytes(msgp, &out)
-                    .map_err(|_| EFAULT)?;
-                return Ok(copy_len);
-            }
-            let _ = scheduler.block_current();
-            return Err(EAGAIN);
-        }
-    }
-
-    fn sys_msgctl(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-        scheduler: &mut Scheduler,
-    ) -> Result<usize, i32> {
-        let id = args.0[0];
-        let cmd = args.0[1] as i32;
-        let caller_uid = procs.current()?.euid;
-        match cmd {
-            IPC_RMID => {
-                let waiters = {
-                    let mut state = MSG_STATE.lock();
-                    let key = {
-                        let queue = state.queues.get_mut(&id).ok_or(EINVAL)?;
-                        queue.destroyed = true;
-                        queue.waiters.clone()
-                    };
-                    let key_to_remove = state
-                        .queues
-                        .get(&id)
-                        .and_then(|queue| (queue.key != IPC_PRIVATE).then_some(queue.key));
-                    if let Some(key) = key_to_remove {
-                        state.keys.remove(&key);
-                    }
-                    key
-                };
-                wake_tasks_by_tid(&waiters, scheduler);
-                Ok(0)
-            }
-            IPC_INFO | MSG_INFO => {
-                let state = MSG_STATE.lock();
-                if !state.queues.contains_key(&id) {
-                    return Err(EINVAL);
-                }
-                Ok(id)
-            }
-            MSG_STAT | IPC_STAT => {
-                let state = MSG_STATE.lock();
-                let queue = state.queues.get(&id).ok_or(EINVAL)?;
-                if queue.destroyed {
-                    return Err(EIDRM);
-                }
-                if !ipc_access_allowed(queue.mode, queue.owner_uid, caller_uid, true, false) {
-                    return Err(EACCES);
-                }
-                Ok(id)
-            }
-            IPC_SET => Ok(0),
-            _ => Err(EINVAL),
-        }
-    }
-
-    fn sys_semget(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
-        let key = args.0[0] as i32;
-        let nsems = args.0[1] as i64;
-        let flags = args.0[2];
-        let caller_uid = procs.current()?.euid;
-        let req_read = (flags & 0o400) != 0;
-        let req_write = (flags & 0o200) != 0;
-
-        if nsems < 0 {
-            return Err(EINVAL);
-        }
-        let nsems = nsems as usize;
-        let mut state = SEM_STATE.lock();
-        if key != IPC_PRIVATE {
-            if let Some(id) = state.keys.get(&key).copied() {
-                let sem = state.sets.get(&id).ok_or(EINVAL)?;
-                if sem.destroyed {
-                    return Err(EIDRM);
-                }
-                if (flags & IPC_CREAT) != 0 && (flags & IPC_EXCL) != 0 {
-                    return Err(EEXIST);
-                }
-                if nsems > 0 && nsems > sem.values.len() {
-                    return Err(EINVAL);
-                }
-                if !ipc_access_allowed(sem.mode, sem.owner_uid, caller_uid, req_read, req_write) {
-                    return Err(EACCES);
-                }
-                return Ok(id);
-            }
-            if (flags & IPC_CREAT) == 0 {
-                return Err(ENOENT);
-            }
-        }
-
-        if nsems == 0 || nsems > SEMMSL_LIMIT {
-            return Err(EINVAL);
-        }
-        let id = state.next_id;
-        state.next_id += 1;
-        let mode = (flags & 0o777) as u16;
-        state.sets.insert(
-            id,
-            SemSet {
-                key,
-                owner_uid: caller_uid,
-                mode,
-                values: vec![0; nsems],
-                waiters: BTreeSet::new(),
-                destroyed: false,
-            },
-        );
-        if key != IPC_PRIVATE {
-            state.keys.insert(key, id);
-        }
-        Ok(id)
-    }
-
-    fn sys_semctl(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-        scheduler: &mut Scheduler,
-    ) -> Result<usize, i32> {
-        let id = args.0[0];
-        let semnum = args.0[1];
-        let cmd = args.0[2] as i32;
-        let arg = args.0[3] as i32;
-        let caller_uid = procs.current()?.euid;
-        match cmd {
-            IPC_RMID => {
-                let waiters = {
-                    let mut state = SEM_STATE.lock();
-                    let waiters = {
-                        let sem = state.sets.get_mut(&id).ok_or(EINVAL)?;
-                        sem.destroyed = true;
-                        sem.waiters.clone()
-                    };
-                    let key_to_remove = state
-                        .sets
-                        .get(&id)
-                        .and_then(|sem| (sem.key != IPC_PRIVATE).then_some(sem.key));
-                    if let Some(key) = key_to_remove {
-                        state.keys.remove(&key);
-                    }
-                    waiters
-                };
-                wake_tasks_by_tid(&waiters, scheduler);
-                Ok(0)
-            }
-            SEMCTL_SETVAL => {
-                let waiters = {
-                    let mut state = SEM_STATE.lock();
-                    let sem = state.sets.get_mut(&id).ok_or(EINVAL)?;
-                    if sem.destroyed {
-                        return Err(EIDRM);
-                    }
-                    if semnum >= sem.values.len() {
-                        return Err(EINVAL);
-                    }
-                    sem.values[semnum] = arg;
-                    sem.waiters.clone()
-                };
-                wake_tasks_by_tid(&waiters, scheduler);
-                Ok(0)
-            }
-            IPC_STAT => {
-                let state = SEM_STATE.lock();
-                let sem = state.sets.get(&id).ok_or(EINVAL)?;
-                if sem.destroyed {
-                    return Err(EIDRM);
-                }
-                if !ipc_access_allowed(sem.mode, sem.owner_uid, caller_uid, true, false) {
-                    return Err(EACCES);
-                }
-                Ok(0)
-            }
-            IPC_INFO | MSG_INFO => Ok(0),
-            _ => Err(EINVAL),
-        }
-    }
-
-    fn read_semop_entries(
-        &self,
-        procs: &mut ProcessTable,
-        addr: usize,
-        count: usize,
-    ) -> Result<Vec<SemBufOp>, i32> {
-        let mut ops = Vec::with_capacity(count);
-        for i in 0..count {
-            let off = addr + i * 6;
-            let raw = procs
-                .current()?
-                .read_user_bytes(off, 6)
-                .map_err(|_| EFAULT)?;
-            let sem_num = u16::from_le_bytes([raw[0], raw[1]]);
-            let sem_op = i16::from_le_bytes([raw[2], raw[3]]);
-            let sem_flg = i16::from_le_bytes([raw[4], raw[5]]);
-            ops.push(SemBufOp {
-                sem_num,
-                sem_op,
-                sem_flg,
-            });
-        }
-        Ok(ops)
-    }
-
-    fn sys_semop_common(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-        scheduler: &mut Scheduler,
-    ) -> Result<usize, i32> {
-        let id = args.0[0];
-        let sops = args.0[1];
-        let nsops = args.0[2];
-        if nsops == 0 || nsops > 64 {
-            return Err(EINVAL);
-        }
-        let ops = self.read_semop_entries(procs, sops, nsops)?;
-        let tid = procs.current_tid()?;
-        loop {
-            if has_unmasked_pending_signal(procs.current()?) {
-                let mut state = SEM_STATE.lock();
-                if let Some(sem) = state.sets.get_mut(&id) {
-                    sem.waiters.remove(&tid);
-                }
-                return Err(EINTR);
-            }
-
-            let mut should_block = false;
-            let mut removed = false;
-            {
-                let mut state = SEM_STATE.lock();
-                let sem = state.sets.get_mut(&id).ok_or(EINVAL)?;
-                if sem.destroyed {
-                    sem.waiters.remove(&tid);
-                    removed = true;
-                } else {
-                    let mut can_apply = true;
-                    let mut nowait = false;
-                    for op in &ops {
-                        let idx = op.sem_num as usize;
-                        if idx >= sem.values.len() {
-                            return Err(EINVAL);
-                        }
-                        let cur = sem.values[idx];
-                        if op.sem_op == 0 {
-                            if cur != 0 {
-                                can_apply = false;
-                            }
-                        } else if op.sem_op < 0 && cur < -(op.sem_op as i32) {
-                            can_apply = false;
-                        }
-                        if (op.sem_flg as usize & IPC_NOWAIT) != 0 {
-                            nowait = true;
-                        }
-                    }
-                    if can_apply {
-                        for op in &ops {
-                            let idx = op.sem_num as usize;
-                            sem.values[idx] = sem.values[idx].saturating_add(op.sem_op as i32);
-                        }
-                        sem.waiters.remove(&tid);
-                        return Ok(0);
-                    }
-                    if nowait {
-                        sem.waiters.remove(&tid);
-                        return Err(EAGAIN);
-                    }
-                    sem.waiters.insert(tid);
-                    should_block = true;
-                }
-            }
-            if removed {
-                return Err(EIDRM);
-            }
-            if !should_block {
-                return Ok(0);
-            }
-            let _ = scheduler.block_current();
-            return Err(EAGAIN);
-        }
-    }
-
-    fn sys_semop(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-        scheduler: &mut Scheduler,
-    ) -> Result<usize, i32> {
-        self.sys_semop_common(args, procs, scheduler)
-    }
-
-    fn sys_semtimedop(
-        &self,
-        args: SyscallArgs,
-        procs: &mut ProcessTable,
-        scheduler: &mut Scheduler,
-    ) -> Result<usize, i32> {
-        self.sys_semop_common(args, procs, scheduler)
-    }
-
-    fn sys_shmget(&self, args: SyscallArgs) -> Result<usize, i32> {
-        let key = args.0[0] as i32;
-        let size = args.0[1];
-        let flags = args.0[2];
-        let mut state = SHM_STATE.lock();
-
-        if key != 0 {
-            if let Some(id) = state.keys.get(&key).copied() {
-                if flags & 0x8000 != 0 {
-                    return Err(EEXIST);
-                }
-                return Ok(id);
-            }
-        }
-
-        let id = state.next_id;
-        state.next_id += 1;
-        let segment = ShmSegment::new(key, size, 0);
-        state.segments.insert(id, segment);
-        if key != 0 {
-            state.keys.insert(key, id);
-        }
-        Ok(id)
-    }
-
-    fn sys_shmat(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
-        let id = args.0[0];
-        let _addr = args.0[1];
-        let _flags = args.0[2];
-
-        let mut state = SHM_STATE.lock();
-        let segment = state.segments.get_mut(&id).ok_or(ENOENT)?;
-
-        if segment.destroyed && segment.attach_count == 0 {
-            return Err(EIDRM);
-        }
-
-        let data_arc = {
-            let segment = match state.segments.get(&id) {
-                Some(s) => s,
-                None => return Err(ENOENT),
-            };
-            if segment.destroyed && segment.attach_count == 0 {
-                return Err(EIDRM);
-            }
-            segment.data.clone()
-        };
-
-        let data_len = data_arc.lock().len();
-        drop(state);
-
-        let addr = procs.current_mut()?.address_space.map_shared_existing(
-            data_len,
-            data_arc.clone(),
-            0b11,
-        )?;
-
-        let mut state = SHM_STATE.lock();
-        if let Some(segment) = state.segments.get_mut(&id) {
-            segment.attach_count += 1;
-            segment.attachments.push(ShmAttachment { addr, id });
-        }
-        drop(state);
-
-        Ok(addr)
-    }
-
-    fn sys_shmctl(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
-        let id = args.0[0];
-        let cmd = args.0[1] as i32;
-        let buf = args.0[2];
-
-        let mut state = SHM_STATE.lock();
-        match cmd {
-            0 => {
-                let (key, attach_count) = {
-                    let segment = match state.segments.get(&id) {
-                        Some(s) => s,
-                        None => return Err(ENOENT),
-                    };
-                    (segment.key, segment.attach_count)
-                };
-                let segment = match state.segments.get_mut(&id) {
-                    Some(s) => s,
-                    None => return Err(ENOENT),
-                };
-                segment.destroyed = true;
-                if key != 0 {
-                    drop(segment);
-                    state.keys.remove(&key);
-                    if attach_count == 0 {
-                        state.segments.remove(&id);
-                    }
-                } else if attach_count == 0 {
-                    state.segments.remove(&id);
-                }
-            }
-            2 => {
-                if buf == 0 {
-                    return Err(EFAULT);
-                }
-                let segment = match state.segments.get(&id) {
-                    Some(s) => s,
-                    None => return Err(ENOENT),
-                };
-
-                let info = ShmidDs {
-                    shm_segsz: segment.data.lock().len(),
-                    shm_nattch: segment.attach_count,
-                    shm_cpid: segment.creator_pid,
-                    shm_lpid: 0,
-                    shm_atime: 0,
-                    shm_dtime: 0,
-                    shm_ctime: 0,
-                    _pad: [0; 3],
-                };
-
-                let bytes: &[u8] = unsafe {
-                    core::slice::from_raw_parts(
-                        &info as *const ShmidDs as *const u8,
-                        core::mem::size_of::<ShmidDs>(),
-                    )
-                };
-                procs
-                    .current_mut()?
-                    .write_user_bytes(buf, bytes)
-                    .map_err(|_| EFAULT)?;
-            }
-            _ => {
-                return Err(EINVAL);
-            }
-        }
-        Ok(0)
-    }
-
-    fn sys_shmdt(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
-        let addr = args.0[0];
-
-        let segment_info = {
-            let state = SHM_STATE.lock();
-            state
-                .segments
-                .values()
-                .find(|s| s.attachments.iter().any(|a| a.addr == addr))
-                .map(|s| s.data.lock().len())
-        };
-
-        if let Some(len) = segment_info {
-            procs.current_mut()?.address_space.unmap(addr, len)?;
-        }
-
-        let mut state = SHM_STATE.lock();
-        for segment in state.segments.values_mut() {
-            if let Some(pos) = segment.attachments.iter().position(|a| a.addr == addr) {
-                segment.attachments.remove(pos);
-                segment.attach_count = segment.attach_count.saturating_sub(1);
-
-                if segment.destroyed && segment.attach_count == 0 {
-                    state
-                        .segments
-                        .retain(|_, s| s.attach_count > 0 || !s.destroyed);
-                }
-                return Ok(0);
-            }
-        }
-
-        Err(EINVAL)
     }
 
     fn sys_socket(
@@ -10570,7 +10511,7 @@ fn exec_interp_candidates(display_path: &str, interp_path: &str) -> Vec<String> 
 }
 
 fn read_exec_file_image(vfs: &mut KernelVfs, cwd: &str, path: &str) -> Result<Vec<u8>, i32> {
-    if path.contains("busybox") {
+    if path == "/musl/busybox" {
         if let Some(bytes) = busybox_image_cache() {
             return Ok(bytes);
         }
@@ -11397,6 +11338,12 @@ fn statx_bytes(stat: FileStat) -> [u8; 256] {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     use super::{
         collect_ready_epoll_events, exec_interp_candidates, pollfds_to_bytes, PollFd, SyscallArgs,
@@ -11438,6 +11385,11 @@ mod tests {
     struct TestInterrupt;
     struct TestLifecycle;
     struct TestNet;
+    struct TestBlockDevice {
+        data: Vec<u8>,
+        ready: bool,
+        sector_size: usize,
+    }
 
     static TEST_CPU: TestCpu = TestCpu;
     static TEST_MEMORY: TestMemory = TestMemory;
@@ -11573,6 +11525,43 @@ mod tests {
         }
     }
 
+    impl TestBlockDevice {
+        fn from_image(path: &Path) -> Self {
+            Self {
+                data: fs::read(path).unwrap(),
+                ready: false,
+                sector_size: 512,
+            }
+        }
+    }
+
+    impl HalBlockDevice for TestBlockDevice {
+        fn name(&self) -> &'static str {
+            "syscall-test-blk0"
+        }
+        fn init(&self) -> Result<(), i32> {
+            Ok(())
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn sector_size(&self) -> usize {
+            self.sector_size
+        }
+        fn sector_count(&self) -> usize {
+            self.data.len() / self.sector_size
+        }
+        fn read_sector(&self, sector: usize, buf: &mut [u8]) -> Result<(), i32> {
+            let start = sector * self.sector_size;
+            let end = start + buf.len();
+            buf.copy_from_slice(self.data.get(start..end).ok_or(5)?);
+            Ok(())
+        }
+        fn write_sector(&self, _sector: usize, _buf: &[u8]) -> Result<(), i32> {
+            Err(30)
+        }
+    }
+
     fn ensure_test_hal() {
         INIT_HAL.call_once(|| {
             let _ = register_hal(HalBundle {
@@ -11588,6 +11577,40 @@ mod tests {
             });
         });
         TEST_NOW_NS.store(1_000_000_000, AtomicOrdering::Relaxed);
+    }
+
+    fn build_test_image() -> PathBuf {
+        let tempdir = std::env::temp_dir();
+        let image = tempdir.join(format!("whuse-syscall-vfs-{}.img", std::process::id()));
+        let file_path = tempdir.join(format!("whuse-syscall-vfs-{}.txt", std::process::id()));
+        fs::write(&file_path, b"hello from ext4").unwrap();
+        let _ = fs::remove_file(&image);
+        let status = Command::new("truncate")
+            .args(["-s", "8M", image.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("mke2fs")
+            .args(["-q", "-t", "ext4", "-F", image.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("debugfs")
+            .args(["-w", "-R", &format!("mkdir /bin"), image.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("debugfs")
+            .args([
+                "-w",
+                "-R",
+                &format!("write {} /bin/hello", file_path.to_str().unwrap()),
+                image.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        image
     }
 
     fn set_test_monotonic_nanos(nanos: u64) {
@@ -12315,6 +12338,166 @@ mod tests {
     }
 
     #[test]
+    fn clock_gettime_rejects_unsupported_clock_ids() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xbc80, &[0u8; 16]);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_CLOCK_GETTIME,
+                SyscallArgs([99, 0xbc80, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EINVAL as isize)
+        );
+    }
+
+    #[test]
+    fn clock_gettime_supports_monotonic_family_clock_ids() {
+        ensure_test_hal();
+        set_test_monotonic_nanos(2_000_000_000);
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        for clock_id in [
+            super::CLOCK_MONOTONIC,
+            super::CLOCK_BOOTTIME,
+            super::CLOCK_MONOTONIC_RAW,
+            super::CLOCK_MONOTONIC_COARSE,
+        ] {
+            procs
+                .current_mut()
+                .unwrap()
+                .address_space
+                .install_bytes(0xbcc0, &[0u8; 16]);
+
+            assert_eq!(
+                dispatcher.dispatch(
+                    super::SYS_CLOCK_GETTIME,
+                    SyscallArgs([clock_id, 0xbcc0, 0, 0, 0, 0]),
+                    &mut procs,
+                    &mut scheduler,
+                    &mut vfs
+                ),
+                0,
+                "clock_id {} should succeed",
+                clock_id
+            );
+
+            let raw = procs
+                .current()
+                .unwrap()
+                .read_user_bytes(0xbcc0, 16)
+                .unwrap();
+            let mut sec = [0u8; 8];
+            let mut nsec = [0u8; 8];
+            sec.copy_from_slice(&raw[..8]);
+            nsec.copy_from_slice(&raw[8..16]);
+            let ts = Timespec {
+                tv_sec: i64::from_le_bytes(sec),
+                tv_nsec: i64::from_le_bytes(nsec),
+            };
+            assert_eq!(ts.tv_sec, 2);
+            assert_eq!(ts.tv_nsec, 0);
+        }
+    }
+
+    #[test]
+    fn clock_getres_matches_clock_gettime_supported_clock_ids() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        for clock_id in [
+            super::CLOCK_REALTIME,
+            super::CLOCK_MONOTONIC,
+            super::CLOCK_BOOTTIME,
+            super::CLOCK_MONOTONIC_RAW,
+            super::CLOCK_MONOTONIC_COARSE,
+        ] {
+            procs
+                .current_mut()
+                .unwrap()
+                .address_space
+                .install_bytes(0xbd00, &[0u8; 16]);
+            assert_eq!(
+                dispatcher.dispatch(
+                    super::SYS_CLOCK_GETRES,
+                    SyscallArgs([clock_id, 0xbd00, 0, 0, 0, 0]),
+                    &mut procs,
+                    &mut scheduler,
+                    &mut vfs
+                ),
+                0,
+                "clock_getres should support clock_id {}",
+                clock_id
+            );
+        }
+
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_CLOCK_GETRES,
+                SyscallArgs([99, 0xbd00, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EINVAL as isize)
+        );
+    }
+
+    #[test]
+    fn unshare_rejects_time_namespace_requests() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        assert_eq!(
+            dispatcher.dispatch(
+                super::SYS_UNSHARE,
+                SyscallArgs([super::CLONE_NEWTIME, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs
+            ),
+            -(super::EINVAL as isize)
+        );
+    }
+
+    #[test]
     fn statfs_bytes_exposes_nonzero_blocks_files_and_namelen() {
         let bytes = super::statfs_bytes();
         let blocks = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
@@ -12429,6 +12612,28 @@ mod tests {
         assert_eq!(
             candidates.first().map(String::as_str),
             Some("/lib/ld-linux-riscv64-lp64d.so.1")
+        );
+    }
+
+    #[test]
+    fn loongarch_glibc_exec_interp_candidates_include_lib64_loader() {
+        let candidates =
+            exec_interp_candidates("/glibc/basic/brk", "/lib64/ld-linux-loongarch-lp64d.so.1");
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some("/lib64/ld-linux-loongarch-lp64d.so.1")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == "/glibc/lib/ld-linux-loongarch-lp64d.so.1"),
+            "LoongArch glibc exec candidates should retain the preloaded /glibc/lib fallback"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == "/lib64/ld-linux-loongarch-lp64d.so.1"),
+            "LoongArch glibc exec candidates should preserve the ELF-declared /lib64 loader path"
         );
     }
 
@@ -15964,6 +16169,74 @@ mod tests {
             .read_user_bytes(0xb480, 128)
             .unwrap();
         assert_eq!(u32::from_le_bytes(stat[20..24].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn fstat_reports_ext4_regular_file_metadata_for_open_handle() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(TestBlockDevice::from_image(&image)));
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        procs.current_mut().unwrap().cwd = "/bin".to_string();
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb500, b"hello\0");
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xb580, &[0u8; 128]);
+
+        let fd = dispatcher.dispatch(
+            SYS_OPENAT,
+            SyscallArgs([
+                super::AT_FDCWD as usize,
+                0xb500,
+                vfs::O_RDONLY as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(fd >= 0, "open ext4 file failed: {}", fd);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FSTAT,
+                SyscallArgs([fd as usize, 0xb580, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+
+        let stat = procs
+            .current()
+            .unwrap()
+            .read_user_bytes(0xb580, 128)
+            .unwrap();
+        assert_eq!(
+            u64::from_le_bytes(stat[48..56].try_into().unwrap()),
+            b"hello from ext4".len() as u64
+        );
+        assert_eq!(u32::from_le_bytes(stat[20..24].try_into().unwrap()), 1);
     }
 
     #[test]
@@ -20265,6 +20538,65 @@ mod tests {
     }
 
     #[test]
+    fn futex_cancel_interrupt_stays_persistent_across_wake() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(0xa400, &0i32.to_le_bytes());
+        {
+            let process = procs.current_mut().unwrap();
+            process.mark_cancel_signal_dispatched();
+            process.arm_cancellation_persistent();
+        }
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FUTEX,
+                SyscallArgs([0xa400, super::FUTEX_WAIT, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EINTR as isize
+        );
+        assert!(procs.current().unwrap().is_cancellation_in_progress());
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FUTEX,
+                SyscallArgs([0xa400, super::FUTEX_WAKE, 1, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            1
+        );
+        assert!(procs.current().unwrap().is_cancellation_in_progress());
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_FUTEX,
+                SyscallArgs([0xa400, super::FUTEX_WAIT, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -super::EINTR as isize
+        );
+        assert!(procs.current().unwrap().is_cancellation_in_progress());
+    }
+
+    #[test]
     fn queued_sigcancel_alone_does_not_interrupt_futex_wait() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
@@ -20300,6 +20632,110 @@ mod tests {
             -super::EAGAIN as isize
         );
         assert_eq!(procs.current().unwrap().futex_wait_addr, Some(0xa800));
+    }
+
+    #[test]
+    fn rt_sigreturn_clears_altstack_onstack_flag_for_frame() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        const FRAME_SIZE: usize = 816;
+        const UCONTEXT_OFF: usize = 128;
+        const UC_SIGMASK_OFF: usize = UCONTEXT_OFF + 40;
+        const MCTX_OFF: usize = UCONTEXT_OFF + 168;
+        let altstack_base = 0x7000usize;
+        let altstack_size = 0x2000usize;
+        let frame_sp = altstack_base + altstack_size - FRAME_SIZE;
+        let saved_mask = 0x1234_5678_u64;
+        let saved_pc = 0x4001_2000_u64;
+        let retval = 77u64;
+
+        let mut frame = [0u8; FRAME_SIZE];
+        frame[UC_SIGMASK_OFF + 8..UC_SIGMASK_OFF + 128].fill(0xff);
+        frame[UC_SIGMASK_OFF..UC_SIGMASK_OFF + 8].copy_from_slice(&saved_mask.to_le_bytes());
+        frame[MCTX_OFF..MCTX_OFF + 8].copy_from_slice(&saved_pc.to_le_bytes());
+        let a0_off = MCTX_OFF + 10 * 8;
+        frame[a0_off..a0_off + 8].copy_from_slice(&retval.to_le_bytes());
+
+        {
+            let process = procs.current_mut().unwrap();
+            process.signal_frame_pending = true;
+            process.signal_mask = 0xffff;
+            process.sigaltstack = Some((altstack_base, altstack_size, 1));
+            process.trap_frame.regs[2] = frame_sp;
+            process.address_space.install_bytes(frame_sp, &frame);
+        }
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_RT_SIGRETURN,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            retval as isize
+        );
+        let process = procs.current().unwrap();
+        assert_eq!(process.signal_mask, saved_mask);
+        assert_eq!(process.sigaltstack, Some((altstack_base, altstack_size, 0)));
+    }
+
+    #[test]
+    fn rt_sigreturn_keeps_altstack_flag_for_non_altstack_frame() {
+        ensure_test_hal();
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        const FRAME_SIZE: usize = 816;
+        const UCONTEXT_OFF: usize = 128;
+        const UC_SIGMASK_OFF: usize = UCONTEXT_OFF + 40;
+        const MCTX_OFF: usize = UCONTEXT_OFF + 168;
+        let frame_sp = 0x7d00usize;
+        let saved_mask = 0x1234_5678_u64;
+        let saved_pc = 0x4001_2000_u64;
+        let retval = 77u64;
+
+        let mut frame = [0u8; FRAME_SIZE];
+        frame[UC_SIGMASK_OFF + 8..UC_SIGMASK_OFF + 128].fill(0xff);
+        frame[UC_SIGMASK_OFF..UC_SIGMASK_OFF + 8].copy_from_slice(&saved_mask.to_le_bytes());
+        frame[MCTX_OFF..MCTX_OFF + 8].copy_from_slice(&saved_pc.to_le_bytes());
+        let a0_off = MCTX_OFF + 10 * 8;
+        frame[a0_off..a0_off + 8].copy_from_slice(&retval.to_le_bytes());
+
+        {
+            let process = procs.current_mut().unwrap();
+            process.signal_frame_pending = true;
+            process.signal_mask = 0xffff;
+            process.sigaltstack = Some((0x9000, 0x1000, 1));
+            process.trap_frame.regs[2] = frame_sp;
+            process.address_space.install_bytes(frame_sp, &frame);
+        }
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_RT_SIGRETURN,
+                SyscallArgs([0, 0, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            retval as isize
+        );
+        assert_eq!(procs.current().unwrap().sigaltstack, Some((0x9000, 0x1000, 1)));
     }
 
     #[test]
@@ -20983,6 +21419,273 @@ mod tests {
     }
 
     #[test]
+    fn shmctl_reports_einval_for_invalid_or_removed_ids() {
+        ensure_test_hal();
+        *super::SHM_STATE.lock() = super::SharedMemoryState {
+            next_id: 1,
+            keys: BTreeMap::new(),
+            segments: BTreeMap::new(),
+        };
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let shmid = dispatcher.dispatch(
+            SYS_SHMGET,
+            SyscallArgs([
+                super::IPC_PRIVATE as usize,
+                4096,
+                (super::IPC_CREAT | 0o600) as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(shmid > 0);
+        let shmid = shmid as usize;
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SHMCTL,
+                SyscallArgs([usize::MAX, super::IPC_STAT as usize, 0x4000, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINVAL as isize)
+        );
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SHMCTL,
+                SyscallArgs([shmid, super::IPC_RMID as usize, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            0
+        );
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SHMCTL,
+                SyscallArgs([shmid, super::IPC_STAT as usize, 0x4000, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EINVAL as isize)
+        );
+    }
+
+    #[test]
+    fn shmctl_ipc_set_rejects_invalid_user_buffer_with_efault() {
+        ensure_test_hal();
+        *super::SHM_STATE.lock() = super::SharedMemoryState {
+            next_id: 1,
+            keys: BTreeMap::new(),
+            segments: BTreeMap::new(),
+        };
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let shmid = dispatcher.dispatch(
+            SYS_SHMGET,
+            SyscallArgs([
+                super::IPC_PRIVATE as usize,
+                4096,
+                (super::IPC_CREAT | 0o600) as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(shmid > 0);
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SHMCTL,
+                SyscallArgs([shmid as usize, super::IPC_SET as usize, usize::MAX, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EFAULT as isize)
+        );
+    }
+
+    #[test]
+    fn shmctl_rejects_non_owner_access_to_root_owned_segment() {
+        ensure_test_hal();
+        *super::SHM_STATE.lock() = super::SharedMemoryState {
+            next_id: 1,
+            keys: BTreeMap::new(),
+            segments: BTreeMap::new(),
+        };
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let shmid = dispatcher.dispatch(
+            SYS_SHMGET,
+            SyscallArgs([
+                super::IPC_PRIVATE as usize,
+                4096,
+                (super::IPC_CREAT | 0o600) as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(shmid > 0);
+        let shmid = shmid as usize;
+
+        let stat_buf = 0x5000;
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(stat_buf, &[0u8; core::mem::size_of::<super::ShmidDs>()]);
+        {
+            let process = procs.current_mut().unwrap();
+            process.uid = 1000;
+            process.euid = 1000;
+            process.gid = 1000;
+            process.egid = 1000;
+            process.groups.clear();
+        }
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SHMCTL,
+                SyscallArgs([shmid, super::IPC_STAT as usize, stat_buf, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EACCES as isize)
+        );
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SHMCTL,
+                SyscallArgs([shmid, super::IPC_RMID as usize, 0, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EPERM as isize)
+        );
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SHMCTL,
+                SyscallArgs([shmid, super::IPC_SET as usize, stat_buf, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EPERM as isize)
+        );
+    }
+
+    #[test]
+    fn shmctl_reports_eperm_for_shm_lock_and_unlock_without_privilege() {
+        ensure_test_hal();
+        *super::SHM_STATE.lock() = super::SharedMemoryState {
+            next_id: 1,
+            keys: BTreeMap::new(),
+            segments: BTreeMap::new(),
+        };
+        let dispatcher = SyscallDispatcher::new();
+        let mut procs = ProcessTable::new();
+        let init = procs.spawn_init("init", 0x1000);
+        procs.set_current(init).unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.spawn("init", init, init);
+        scheduler.start();
+        let mut vfs = KernelVfs::new();
+
+        let shmid = dispatcher.dispatch(
+            SYS_SHMGET,
+            SyscallArgs([
+                super::IPC_PRIVATE as usize,
+                4096,
+                (super::IPC_CREAT | 0o600) as usize,
+                0,
+                0,
+                0,
+            ]),
+            &mut procs,
+            &mut scheduler,
+            &mut vfs,
+        );
+        assert!(shmid > 0);
+        let shmid = shmid as usize;
+
+        let stat_buf = 0x6000;
+        procs
+            .current_mut()
+            .unwrap()
+            .address_space
+            .install_bytes(stat_buf, &[0u8; core::mem::size_of::<super::ShmidDs>()]);
+        {
+            let process = procs.current_mut().unwrap();
+            process.uid = 1000;
+            process.euid = 1000;
+            process.gid = 1000;
+            process.egid = 1000;
+            process.groups.clear();
+        }
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SHMCTL,
+                SyscallArgs([shmid, 11usize, stat_buf, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EPERM as isize)
+        );
+
+        assert_eq!(
+            dispatcher.dispatch(
+                SYS_SHMCTL,
+                SyscallArgs([shmid, 12usize, stat_buf, 0, 0, 0]),
+                &mut procs,
+                &mut scheduler,
+                &mut vfs,
+            ),
+            -(super::EPERM as isize)
+        );
+    }
+
+    #[test]
     fn openat_proc_self_fd_exposes_current_fd_entries() {
         ensure_test_hal();
         let dispatcher = SyscallDispatcher::new();
@@ -21142,8 +21845,8 @@ mod tests {
     #[test]
     fn fcntl_lock_state_splits_overlaps_for_same_owner() {
         let mut state = super::FcntlLockState::default();
-        assert!(state.apply_lock("/tmp/fcntl21", 100, super::F_RDLCK, 10, Some(15)));
-        assert!(state.apply_lock("/tmp/fcntl21", 100, super::F_WRLCK, 5, Some(13)));
+        assert!(state.apply_lock("/tmp/fcntl21", 100, 1001, super::F_RDLCK, 10, Some(15)));
+        assert!(state.apply_lock("/tmp/fcntl21", 100, 1001, super::F_WRLCK, 5, Some(13)));
 
         let lock_a = state
             .first_conflict("/tmp/fcntl21", 200, super::F_WRLCK, 0, None)
@@ -21244,9 +21947,9 @@ mod tests {
     #[test]
     fn fcntl_lock_state_unlock_and_owner_clear() {
         let mut state = super::FcntlLockState::default();
-        state.apply_lock("/tmp/a", 10, super::F_WRLCK, 0, None);
-        state.apply_lock("/tmp/b", 10, super::F_RDLCK, 5, Some(12));
-        state.apply_lock("/tmp/a", 11, super::F_RDLCK, 0, Some(3));
+        state.apply_lock("/tmp/a", 10, 10, super::F_WRLCK, 0, None);
+        state.apply_lock("/tmp/b", 10, 10, super::F_RDLCK, 5, Some(12));
+        state.apply_lock("/tmp/a", 11, 11, super::F_RDLCK, 0, Some(3));
 
         assert!(state.clear_for_owner_path(10, "/tmp/b"));
         assert!(state

@@ -1,6 +1,6 @@
+clock_gettime04
 fcntl17_64
 ftruncate04_64
-shmctl02
 openat04
 prctl06
 preadv203

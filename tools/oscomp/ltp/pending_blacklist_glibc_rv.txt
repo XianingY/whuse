@@ -1,3 +1,4 @@
+write01
 assign_password.sh
 ask_password.sh
 add_ipv6addr

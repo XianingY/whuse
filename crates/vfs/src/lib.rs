@@ -760,15 +760,34 @@ impl KernelVfs {
         gid: u32,
     ) -> KernelResult<FileHandle> {
         let absolute = normalize_path(cwd, path);
+        write_console_line(&format!(
+            "whuse-la-basic:vfs-open-with-owner-start cwd={} path={} absolute={} flags={:#x}",
+            cwd, path, absolute, flags
+        ));
         let existed = self.stat_path_open_probe(cwd, path, flags).is_some();
-        let inherited_gid = if !existed && (flags & O_CREAT) != 0 {
-            let (parent_path, _) = split_parent(&absolute)?;
-            let parent_stat = self.stat_path("/", &parent_path)?;
-            ((parent_stat.mode & 0o2000) != 0).then_some(parent_stat.gid)
-        } else {
-            None
-        };
+        let inherited_gid =
+            if !existed && (flags & O_CREAT) != 0 && !cfg!(target_arch = "loongarch64") {
+                let (parent_path, _) = split_parent(&absolute)?;
+                let parent_stat = self.stat_path("/", &parent_path).ok();
+                parent_stat
+                    .filter(|s| (s.mode & 0o2000) != 0)
+                    .map(|s| s.gid)
+            } else {
+                None
+            };
+        if cfg!(target_arch = "loongarch64") && (flags & O_CREAT) != 0 {
+            write_console_line(&format!(
+                "whuse-la-basic:vfs-open-with-owner-before-open cwd={} path={}",
+                cwd, path
+            ));
+        }
         let handle = self.open(cwd, path, flags, mode)?;
+        if cfg!(target_arch = "loongarch64") && (flags & O_CREAT) != 0 {
+            write_console_line(&format!(
+                "whuse-la-basic:vfs-open-with-owner-after-open cwd={} path={}",
+                cwd, path
+            ));
+        }
         if !existed && (flags & O_CREAT) != 0 {
             let stat = self.stat_handle(&handle)?;
             self.mem_meta.insert(
@@ -795,6 +814,12 @@ impl KernelVfs {
         mode: u32,
     ) -> KernelResult<FileHandle> {
         let absolute = normalize_path(cwd, path);
+        if cfg!(target_arch = "loongarch64") && absolute.contains("test_close") {
+            write_console_line(&format!(
+                "whuse-la-basic:vfs-open-enter absolute={} flags={:#x}",
+                absolute, flags
+            ));
+        }
         let ltp_create_probe = is_ltp_create_probe_path(path);
         if ltp_create_probe {
             write_console_line(&format!(
@@ -803,13 +828,26 @@ impl KernelVfs {
             ));
         }
         let iozone_probe = is_iozone_probe_path(absolute.as_str());
+        let suite_script_probe = absolute == "/tmp/whuse-oscomp-suite.sh";
         if iozone_probe {
             iozone_probe_log(&format!(
                 "whuse-la-iozone:vfs-open-enter cwd={} path={} absolute={} flags={:#x}",
                 cwd, path, absolute, flags
             ));
         }
+        if suite_script_probe {
+            write_console_line(&format!(
+                "whuse-oscomp-suite-open:enter cwd={} path={} absolute={} flags={:#x} mode={:#o}",
+                cwd, path, absolute, flags, mode
+            ));
+        }
         if let Some(handle) = self.try_open_external(&absolute, flags)? {
+            if suite_script_probe {
+                write_console_line(&format!(
+                    "whuse-oscomp-suite-open:external-ok absolute={} resolved={} flags={:#x}",
+                    absolute, handle.path, flags
+                ));
+            }
             if iozone_probe {
                 iozone_probe_log(&format!(
                     "whuse-la-iozone:vfs-open-external-ok absolute={} resolved={}",
@@ -824,7 +862,25 @@ impl KernelVfs {
                 absolute
             ));
         }
+        if suite_script_probe {
+            write_console_line(&format!(
+                "whuse-oscomp-suite-open:fallback-mem absolute={} flags={:#x}",
+                absolute, flags
+            ));
+        }
         let result = self.open_mem(&absolute, flags, mode);
+        if suite_script_probe {
+            match &result {
+                Ok(handle) => write_console_line(&format!(
+                    "whuse-oscomp-suite-open:mem-result-ok absolute={} resolved={} flags={:#x}",
+                    absolute, handle.path, flags
+                )),
+                Err(err) => write_console_line(&format!(
+                    "whuse-oscomp-suite-open:mem-result-err absolute={} flags={:#x} err={}",
+                    absolute, flags, err
+                )),
+            }
+        }
         if ltp_create_probe {
             match &result {
                 Ok(handle) => write_console_line(&format!(
@@ -870,8 +926,13 @@ impl KernelVfs {
             }
             Err(err) => return Err(err),
         };
-        let node = if node.kind == NodeKind::Symlink {
+        let mut node = node;
+        let mut symlink_depth = 0usize;
+        while node.kind == NodeKind::Symlink {
             if (flags & O_NOFOLLOW) != 0 {
+                return Err(ELOOP);
+            }
+            if symlink_depth >= 16 {
                 return Err(ELOOP);
             }
             let target = match &*node.data.lock() {
@@ -880,7 +941,7 @@ impl KernelVfs {
             };
             let parent = split_parent(&resolved)?.0;
             resolved = normalize_path(&parent, &target);
-            match self.lookup_abs(&resolved) {
+            node = match self.lookup_abs(&resolved) {
                 Ok(node) => node,
                 Err(err) if err == ENOENT => {
                     if let Some(handle) = self.try_open_external(&resolved, flags)? {
@@ -889,10 +950,9 @@ impl KernelVfs {
                     return Err(err);
                 }
                 Err(err) => return Err(err),
-            }
-        } else {
-            node
-        };
+            };
+            symlink_depth = symlink_depth.saturating_add(1);
+        }
 
         if (flags & O_DIRECTORY) != 0 && node.kind != NodeKind::Directory {
             return Err(ENOTDIR);
@@ -1143,6 +1203,15 @@ impl KernelVfs {
 
     pub fn stat_path_open_probe(&self, cwd: &str, path: &str, flags: u32) -> Option<FileStat> {
         let absolute = normalize_path(cwd, path);
+        if (flags & O_CREAT) != 0
+            && self.lookup_abs(&absolute).is_err()
+            && !self.external_preloaded.contains_key(&absolute)
+            && !self.external_stat_cache.contains_key(&absolute)
+            && !self.external_deletions.contains(&absolute)
+            && self.resolve_external_path(&absolute).is_some()
+        {
+            return None;
+        }
         if should_use_statless_external_open(&absolute, flags) {
             return match self.stat_path_follow_cached_only(&absolute, 0) {
                 Ok(stat) => Some(stat),
@@ -2347,37 +2416,52 @@ impl KernelVfs {
 
     fn external_stat_path(&self, absolute: &str) -> KernelResult<Option<FileStat>> {
         let iozone_probe = is_iozone_probe_path(absolute);
-        if iozone_probe {
+        let basic_probe = cfg!(target_arch = "loongarch64")
+            && (absolute.starts_with("/musl/basic/") || absolute.starts_with("/glibc/basic/"));
+        let test_probe = cfg!(target_arch = "loongarch64")
+            && (absolute.contains("/basic/") || absolute.contains("/test_"));
+        let probe_enabled = iozone_probe || basic_probe || test_probe;
+        if probe_enabled {
             iozone_probe_log(&format!(
-                "whuse-la-iozone:vfs-external-stat-enter absolute={}",
+                "whuse-la-vfs:external-stat-enter absolute={}",
                 absolute
             ));
         }
         if is_shell_token_path(absolute) {
             return Ok(None);
         }
-        if self.lookup_abs(absolute).is_ok() {
-            if iozone_probe {
-                iozone_probe_log(&format!(
-                    "whuse-la-iozone:vfs-external-stat-mem-hit absolute={}",
-                    absolute
-                ));
+        match self.lookup_abs(absolute) {
+            Ok(_) => {
+                if probe_enabled {
+                    iozone_probe_log(&format!(
+                        "whuse-la-vfs:external-stat-mem-hit absolute={}",
+                        absolute
+                    ));
+                }
+                return Ok(None);
             }
-            return Ok(None);
+            Err(err) => {
+                if probe_enabled {
+                    iozone_probe_log(&format!(
+                        "whuse-la-vfs:external-stat-mem-miss absolute={} err={}",
+                        absolute, err
+                    ));
+                }
+            }
         }
         if self.is_memory_preferred_path(absolute) {
-            if iozone_probe {
+            if probe_enabled {
                 iozone_probe_log(&format!(
-                    "whuse-la-iozone:vfs-external-stat-memory-preferred absolute={}",
+                    "whuse-la-vfs:external-stat-memory-preferred absolute={}",
                     absolute
                 ));
             }
             return Ok(None);
         }
         if let Some((_, stat)) = self.external_preloaded.get(absolute) {
-            if iozone_probe {
+            if probe_enabled {
                 iozone_probe_log(&format!(
-                    "whuse-la-iozone:vfs-external-stat-preloaded absolute={} mode={:#o} size={}",
+                    "whuse-la-vfs:external-stat-preloaded absolute={} mode={:#o} size={}",
                     absolute, stat.mode, stat.size
                 ));
             }
@@ -2387,9 +2471,9 @@ impl KernelVfs {
             return Ok(None);
         }
         if let Some(stat) = self.external_stat_cache.get(absolute) {
-            if iozone_probe {
+            if probe_enabled {
                 iozone_probe_log(&format!(
-                    "whuse-la-iozone:vfs-external-stat-cache-hit absolute={} mode={:#o} size={}",
+                    "whuse-la-vfs:external-stat-cache-hit absolute={} mode={:#o} size={}",
                     absolute, stat.mode, stat.size
                 ));
             }
@@ -2455,9 +2539,9 @@ impl KernelVfs {
         match mount.ext4.stat(&fs_path) {
             Ok(stat) => {
                 let (now_sec, now_nsec) = split_ns(monotonic_now_ns());
-                if iozone_probe {
+                if probe_enabled {
                     iozone_probe_log(&format!(
-                        "whuse-la-iozone:vfs-external-stat-ok absolute={} fs_path={} mode={:#o} size={}",
+                        "whuse-la-vfs:external-stat-ok absolute={} fs_path={} mode={:#o} size={}",
                         absolute, fs_path, stat.mode, stat.size
                     ));
                 }
@@ -2478,11 +2562,19 @@ impl KernelVfs {
                     ctime_nsec: now_nsec,
                 }))
             }
-            Err(err) if err == ENOENT => Ok(None),
-            Err(err) => {
-                if iozone_probe {
+            Err(err) if err == ENOENT => {
+                if probe_enabled {
                     iozone_probe_log(&format!(
-                        "whuse-la-iozone:vfs-external-stat-err absolute={} fs_path={} err={}",
+                        "whuse-la-vfs:external-stat-enoent absolute={} fs_path={}",
+                        absolute, fs_path
+                    ));
+                }
+                Ok(None)
+            }
+            Err(err) => {
+                if probe_enabled {
+                    iozone_probe_log(&format!(
+                        "whuse-la-vfs:external-stat-err absolute={} fs_path={} err={}",
                         absolute, fs_path, err
                     ));
                 }
@@ -4013,8 +4105,14 @@ fn is_libctest_probe_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use hal_api::HalBlockDevice;
+    use hal_api::{
+        register_hal, HalBundle, HalCharDevice, HalCpu, HalInterrupt, HalMemory, HalPlatform,
+        HalPlatformLifecycle, HalTimer, MemoryRegion, PlatformArch, Timespec, TrapFrame,
+        VmSpaceToken,
+    };
+    use spin::Once;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -4025,10 +4123,42 @@ mod tests {
         O_RDWR, O_WRONLY, PIPE_CAPACITY, S_IFIFO,
     };
 
+    struct TestCpu;
+    struct TestMemory;
+    struct TestTimer;
+    struct TestConsole;
+    struct TestPlatform;
+    struct TestLifecycle;
+    struct TestInterrupt;
+
+    static TEST_CPU: TestCpu = TestCpu;
+    static TEST_MEMORY: TestMemory = TestMemory;
+    static TEST_TIMER: TestTimer = TestTimer;
+    static TEST_CONSOLE: TestConsole = TestConsole;
+    static TEST_PLATFORM: TestPlatform = TestPlatform;
+    static TEST_LIFECYCLE: TestLifecycle = TestLifecycle;
+    static TEST_INTERRUPT: TestInterrupt = TestInterrupt;
+    static TEST_NOW_NS: AtomicUsize = AtomicUsize::new(1_000_000_000usize);
+    static TEST_REGIONS: [MemoryRegion; 1] = [MemoryRegion {
+        start: 0x8000_0000,
+        size: 0x100000,
+        usable: true,
+    }];
+    static TEST_BLOCKS: [&'static dyn HalBlockDevice; 0] = [];
+    static TEST_NETS: [&'static dyn hal_api::HalNetDevice; 0] = [];
+    static INIT_HAL: Once<()> = Once::new();
+
     struct VecBlockDevice {
         ready: AtomicBool,
         data: Vec<u8>,
         sector_size: usize,
+    }
+
+    struct CountingVecBlockDevice {
+        ready: AtomicBool,
+        data: Vec<u8>,
+        sector_size: usize,
+        reads: AtomicUsize,
     }
 
     impl VecBlockDevice {
@@ -4039,6 +4169,128 @@ mod tests {
                 sector_size: 512,
             }
         }
+    }
+
+    impl CountingVecBlockDevice {
+        fn from_image(path: &Path) -> Self {
+            Self {
+                ready: AtomicBool::new(false),
+                data: fs::read(path).unwrap(),
+                sector_size: 512,
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn reset_reads(&self) {
+            self.reads.store(0, Ordering::Relaxed);
+        }
+
+        fn read_count(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+    }
+
+    impl HalCpu for TestCpu {
+        fn cpu_id(&self) -> usize {
+            0
+        }
+        fn enable_interrupts(&self) {}
+        fn disable_interrupts(&self) {}
+        fn interrupts_enabled(&self) -> bool {
+            false
+        }
+        fn switch_address_space(&self, _token: VmSpaceToken) {}
+        fn wait_for_interrupt(&self) {}
+        fn run_user(&self, _frame: &mut TrapFrame) {}
+        fn set_kernel_timer_callback(&self, _cb: fn()) {}
+    }
+
+    impl HalMemory for TestMemory {
+        fn memory_regions(&self) -> &'static [MemoryRegion] {
+            &TEST_REGIONS
+        }
+        fn phys_to_virt(&self, phys: usize) -> usize {
+            phys
+        }
+        fn virt_to_phys(&self, virt: usize) -> usize {
+            virt
+        }
+        fn mmio_base(&self) -> usize {
+            0x1000_0000
+        }
+    }
+
+    impl HalTimer for TestTimer {
+        fn monotonic_time(&self) -> Timespec {
+            Timespec::from_nanos(self.monotonic_nanos())
+        }
+        fn monotonic_nanos(&self) -> u64 {
+            TEST_NOW_NS.load(Ordering::Relaxed) as u64
+        }
+        fn program_oneshot(&self, _deadline_nanos: u64) {}
+    }
+
+    impl HalCharDevice for TestConsole {
+        fn name(&self) -> &'static str {
+            "test-console"
+        }
+        fn put_byte(&self, _byte: u8) {}
+        fn get_byte(&self) -> Option<u8> {
+            None
+        }
+    }
+
+    impl HalPlatform for TestPlatform {
+        fn platform_name(&self) -> &'static str {
+            "test-platform"
+        }
+        fn architecture(&self) -> PlatformArch {
+            PlatformArch::Riscv64
+        }
+    }
+
+    impl HalPlatformLifecycle for TestLifecycle {
+        fn supports_userspace(&self) -> bool {
+            true
+        }
+        fn idle(&self) -> ! {
+            panic!("test lifecycle idle should never be entered")
+        }
+        fn shutdown(&self, reason: hal_api::ShutdownReason) -> ! {
+            panic!(
+                "test lifecycle shutdown should never be entered: {:?}",
+                reason
+            )
+        }
+    }
+
+    impl HalInterrupt for TestInterrupt {
+        fn name(&self) -> &'static str {
+            "test-interrupt"
+        }
+        fn enable_irq(&self, _irq: usize) {}
+        fn disable_irq(&self, _irq: usize) {}
+        fn ack_irq(&self, _irq: usize) {}
+        fn next_pending(&self) -> Option<usize> {
+            None
+        }
+    }
+
+    fn ensure_test_hal() {
+        INIT_HAL.call_once(|| {
+            let _ = register_hal(HalBundle {
+                platform: &TEST_PLATFORM,
+                lifecycle: &TEST_LIFECYCLE,
+                interrupt: &TEST_INTERRUPT,
+                cpu: &TEST_CPU,
+                memory: &TEST_MEMORY,
+                timer: &TEST_TIMER,
+                console: &TEST_CONSOLE,
+                block_devices: &TEST_BLOCKS,
+                net_devices: &TEST_NETS,
+            });
+        });
+        TEST_NOW_NS.store(1_000_000_000usize, Ordering::Relaxed);
     }
 
     impl HalBlockDevice for VecBlockDevice {
@@ -4072,6 +4324,41 @@ mod tests {
 
         fn write_sector(&self, _sector: usize, _buf: &[u8]) -> Result<(), i32> {
             Err(95)
+        }
+    }
+
+    impl HalBlockDevice for CountingVecBlockDevice {
+        fn name(&self) -> &'static str {
+            "countblk0"
+        }
+
+        fn init(&self) -> Result<(), i32> {
+            self.ready.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn is_ready(&self) -> bool {
+            self.ready.load(Ordering::Relaxed)
+        }
+
+        fn sector_size(&self) -> usize {
+            self.sector_size
+        }
+
+        fn sector_count(&self) -> usize {
+            self.data.len() / self.sector_size
+        }
+
+        fn read_sector(&self, sector: usize, buf: &mut [u8]) -> Result<(), i32> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let start = sector * self.sector_size;
+            let end = start + buf.len();
+            buf.copy_from_slice(self.data.get(start..end).ok_or(5)?);
+            Ok(())
+        }
+
+        fn write_sector(&self, _sector: usize, _buf: &[u8]) -> Result<(), i32> {
+            Err(30)
         }
     }
 
@@ -4125,6 +4412,7 @@ mod tests {
 
     #[test]
     fn vfs_file_round_trip() {
+        ensure_test_hal();
         let mut vfs = KernelVfs::new();
         let mut file = vfs
             .open("/", "/tmp/hello.txt", O_CREAT | O_RDWR, 0o644)
@@ -4428,6 +4716,12 @@ mod tests {
                 uid: 0,
                 gid: 0,
                 rdev: 0,
+                atime_sec: 0,
+                atime_nsec: 0,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+                ctime_sec: 0,
+                ctime_nsec: 0,
             })
         );
     }
@@ -4450,6 +4744,30 @@ mod tests {
         assert_ne!(stat_a.ino, 0);
         assert_eq!(stat_a.dev, stat_b.dev);
         assert_eq!(stat_a.ino, stat_b.ino);
+    }
+
+    #[test]
+    fn ext4_relative_helper_file_opens_and_stats_from_basic_cwd() {
+        ensure_test_hal();
+        let image = build_test_image();
+        let device =
+            std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+        vfs.preload_external_file(
+            "/musl/basic/text.txt",
+            b"hello from ext4 helper file\n",
+            Some(0o100644),
+        )
+        .unwrap();
+
+        let handle = vfs.open("/musl/basic", "./text.txt", O_RDONLY, 0).unwrap();
+        let stat = vfs.stat_handle(&handle).unwrap();
+
+        assert_eq!(stat.mode, super::S_IFREG | 0o644);
+        assert_eq!(stat.nlink, 1);
+        assert_eq!(stat.size, b"hello from ext4 helper file\n".len() as u64);
     }
 
     #[test]
@@ -4541,6 +4859,26 @@ mod tests {
             None
         );
         assert!(!vfs.external_stat_cache.contains_key("/etc/localtime"));
+    }
+
+    #[test]
+    fn stat_path_open_probe_skips_full_stat_for_missing_external_create_target() {
+        ensure_test_hal();
+        let image = build_test_image();
+        let device = std::boxed::Box::leak(std::boxed::Box::new(
+            CountingVecBlockDevice::from_image(&image),
+        ));
+
+        let mut vfs = KernelVfs::new();
+        vfs.mount_ext4(device.name(), "/", device).unwrap();
+
+        device.reset_reads();
+        assert_eq!(
+            vfs.stat_path_open_probe("/", "/bin/not-created-yet", super::O_CREAT | super::O_RDWR),
+            None
+        );
+        assert_eq!(device.read_count(), 0);
+        assert!(!vfs.external_stat_cache.contains_key("/bin/not-created-yet"));
     }
 
     #[test]
@@ -4739,6 +5077,7 @@ mod tests {
 
     #[test]
     fn open_with_owner_on_external_missing_path_assigns_requested_uid() {
+        ensure_test_hal();
         let image = build_test_image();
         let device =
             std::boxed::Box::leak(std::boxed::Box::new(VecBlockDevice::from_image(&image)));

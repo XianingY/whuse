@@ -440,7 +440,7 @@ fn copy_tree(src: &PathBuf, dst: &PathBuf) -> io::Result<()> {
 }
 
 fn oscomp_riscv() -> ExitCode {
-    let image_status = prepare_oscomp_images();
+    let image_status = prepare_oscomp_images_for_arch("rv");
     if image_status != ExitCode::SUCCESS {
         return image_status;
     }
@@ -451,7 +451,7 @@ fn oscomp_riscv() -> ExitCode {
 }
 
 fn oscomp_loongarch() -> ExitCode {
-    let image_status = prepare_oscomp_images();
+    let image_status = prepare_oscomp_images_for_arch("la");
     if image_status != ExitCode::SUCCESS {
         return image_status;
     }
@@ -905,6 +905,14 @@ fn testsuits_root() -> PathBuf {
 }
 
 fn prepare_oscomp_images() -> ExitCode {
+    prepare_oscomp_images_for_arches(&["rv", "la"])
+}
+
+fn prepare_oscomp_images_for_arch(tag: &str) -> ExitCode {
+    prepare_oscomp_images_for_arches(&[tag])
+}
+
+fn prepare_oscomp_images_for_arches(tags: &[&str]) -> ExitCode {
     let testsuits = testsuits_root();
     if !testsuits.exists() {
         eprintln!(
@@ -915,28 +923,13 @@ fn prepare_oscomp_images() -> ExitCode {
     }
 
     if env::var("WHUSE_OSCOMP_SKIP_BUILD").is_err() {
-        if !build_oscomp_sdcard(&testsuits) {
+        if !build_oscomp_sdcard(&testsuits, tags) {
             eprintln!(
                 "warning: oscomp sdcard build failed; will try to use existing images under {}",
                 testsuits.display()
             );
         }
     }
-
-    let src_rv = match ensure_oscomp_source_image(&testsuits, "rv") {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("{err}");
-            return ExitCode::from(1);
-        }
-    };
-    let src_la = match ensure_oscomp_source_image(&testsuits, "la") {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("{err}");
-            return ExitCode::from(1);
-        }
-    };
 
     let target_dir = repo_root().join("target").join("oscomp");
     if let Err(err) = fs::create_dir_all(&target_dir) {
@@ -946,24 +939,6 @@ fn prepare_oscomp_images() -> ExitCode {
         );
         return ExitCode::from(1);
     }
-    let dst_rv = oscomp_image_path("rv");
-    let dst_la = oscomp_image_path("la");
-    if let Err(err) = refresh_oscomp_image(&src_rv, &dst_rv) {
-        eprintln!("{err}");
-        return ExitCode::from(1);
-    }
-    if let Err(err) = refresh_oscomp_image(&src_la, &dst_la) {
-        eprintln!("{err}");
-        return ExitCode::from(1);
-    }
-    if let Err(err) = purge_runtime_oscomp_overrides(&dst_rv) {
-        eprintln!("{err}");
-        return ExitCode::from(1);
-    }
-    if let Err(err) = purge_runtime_oscomp_overrides(&dst_la) {
-        eprintln!("{err}");
-        return ExitCode::from(1);
-    }
     let repo_profile = match load_repo_oscomp_profile() {
         Ok(profile) => profile,
         Err(err) => {
@@ -971,25 +946,45 @@ fn prepare_oscomp_images() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if let Err(err) = debugfs_write_text(&dst_rv, OSCOMP_PROFILE_IMAGE_PATH, &repo_profile) {
-        eprintln!("{err}");
-        return ExitCode::from(1);
-    }
-    if let Err(err) = debugfs_write_text(&dst_la, OSCOMP_PROFILE_IMAGE_PATH, &repo_profile) {
-        eprintln!("{err}");
-        return ExitCode::from(1);
+
+    for &tag in tags {
+        let src = match ensure_oscomp_source_image(&testsuits, tag) {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::from(1);
+            }
+        };
+        let dst = oscomp_image_path(tag);
+        if let Err(err) = refresh_oscomp_image(&src, &dst) {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+        if let Err(err) = purge_runtime_oscomp_overrides(&dst) {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+        if let Err(err) = debugfs_write_text(&dst, OSCOMP_PROFILE_IMAGE_PATH, &repo_profile) {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+        let arch = match tag {
+            "rv" => "riscv64",
+            "la" => "loongarch64",
+            other => {
+                eprintln!("unknown oscomp image tag: {other}");
+                return ExitCode::from(1);
+            }
+        };
+        if !validate_oscomp_full_image(&dst, arch) {
+            return ExitCode::from(1);
+        }
     }
 
-    let rv_ok = validate_oscomp_full_image(&dst_rv, "riscv64");
-    let la_ok = validate_oscomp_full_image(&dst_la, "loongarch64");
-    if !rv_ok || !la_ok {
-        return ExitCode::from(1);
+    println!("prepared oscomp images:");
+    for &tag in tags {
+        println!("  {}", oscomp_image_path(tag).display());
     }
-    println!(
-        "prepared oscomp images:\n  {}\n  {}",
-        dst_rv.display(),
-        dst_la.display()
-    );
     ExitCode::SUCCESS
 }
 
@@ -1640,7 +1635,7 @@ fn load_repo_oscomp_profile() -> Result<String, String> {
     validate_oscomp_profile_value(&contents).map(|profile| profile.to_string())
 }
 
-fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
+fn build_oscomp_sdcard(testsuits: &PathBuf, tags: &[&str]) -> bool {
     let docker_image = env::var("WHUSE_OSCOMP_DOCKER_IMAGE")
         .unwrap_or_else(|_| "docker.educg.net/cg/os-contest:20260104".to_string());
     let host_first = env::var("WHUSE_OSCOMP_HOST_FIRST")
@@ -1648,7 +1643,7 @@ fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
         .unwrap_or(false);
 
     if !host_first {
-        if run_make_sdcard_docker(testsuits, &docker_image) {
+        if run_make_sdcard_docker(testsuits, &docker_image, tags) {
             return true;
         }
         eprintln!(
@@ -1657,7 +1652,7 @@ fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
         );
     }
 
-    if run_make_sdcard_host(testsuits) {
+    if run_make_sdcard_host(testsuits, tags) {
         return true;
     }
 
@@ -1666,21 +1661,24 @@ fn build_oscomp_sdcard(testsuits: &PathBuf) -> bool {
             "host make sdcard failed in {}, trying docker fallback",
             testsuits.display()
         );
-        return run_make_sdcard_docker(testsuits, &docker_image);
+        return run_make_sdcard_docker(testsuits, &docker_image, tags);
     }
     false
 }
 
-fn run_make_sdcard_host(testsuits: &PathBuf) -> bool {
+fn run_make_sdcard_host(testsuits: &PathBuf, tags: &[&str]) -> bool {
+    let target = oscomp_sdcard_make_target(tags);
     let status = Command::new("make")
-        .arg("sdcard")
+        .arg(&target)
+        .arg("OSCOMP_COMPRESS_IMAGE=0")
         .current_dir(testsuits)
         .status();
     match status {
         Ok(status) if status.success() => true,
         Ok(status) => {
             eprintln!(
-                "host make sdcard failed in {} (exit code {:?})",
+                "host make {} failed in {} (exit code {:?})",
+                target,
                 testsuits.display(),
                 status.code()
             );
@@ -1688,7 +1686,8 @@ fn run_make_sdcard_host(testsuits: &PathBuf) -> bool {
         }
         Err(err) => {
             eprintln!(
-                "failed to execute host make sdcard in {} ({err})",
+                "failed to execute host make {} in {} ({err})",
+                target,
                 testsuits.display()
             );
             false
@@ -1696,14 +1695,17 @@ fn run_make_sdcard_host(testsuits: &PathBuf) -> bool {
     }
 }
 
-fn run_make_sdcard_docker(testsuits: &PathBuf, docker_image: &str) -> bool {
+fn run_make_sdcard_docker(testsuits: &PathBuf, docker_image: &str, tags: &[&str]) -> bool {
     let mount_root = fs::canonicalize(testsuits).unwrap_or_else(|_| testsuits.clone());
     let mount_arg = format!("{}:/code", mount_root.display());
+    let target = oscomp_sdcard_make_target(tags);
     eprintln!(
-        "building oscomp image in docker {} with workspace {}",
+        "building oscomp image in docker {} with workspace {} using target {}",
         docker_image,
-        mount_root.display()
+        mount_root.display(),
+        target
     );
+    let command = format!("make {target} OSCOMP_COMPRESS_IMAGE=0");
     let status = Command::new("docker")
         .args([
             "run",
@@ -1717,14 +1719,15 @@ fn run_make_sdcard_docker(testsuits: &PathBuf, docker_image: &str) -> bool {
             "--privileged",
             docker_image,
             "-lc",
-            "make sdcard",
+            command.as_str(),
         ])
         .status();
     match status {
         Ok(status) if status.success() => true,
         Ok(status) => {
             eprintln!(
-                "docker make sdcard failed in {} (exit code {:?})",
+                "docker make {} failed in {} (exit code {:?})",
+                target,
                 mount_root.display(),
                 status.code()
             );
@@ -1732,10 +1735,24 @@ fn run_make_sdcard_docker(testsuits: &PathBuf, docker_image: &str) -> bool {
         }
         Err(err) => {
             eprintln!(
-                "failed to execute docker make sdcard in {} ({err})",
+                "failed to execute docker make {} in {} ({err})",
+                target,
                 mount_root.display()
             );
             false
+        }
+    }
+}
+
+fn oscomp_sdcard_make_target(tags: &[&str]) -> String {
+    match tags {
+        ["rv"] => "sdcard-rv".to_string(),
+        ["la"] => "sdcard-la".to_string(),
+        ["rv", "la"] => "sdcard".to_string(),
+        ["la", "rv"] => "sdcard".to_string(),
+        _ => {
+            let joined = tags.join(",");
+            panic!("unsupported oscomp sdcard tag set: {joined}");
         }
     }
 }

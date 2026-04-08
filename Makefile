@@ -13,7 +13,11 @@ all: prepare-cargo-config build-riscv build-loongarch package-kernels
 
 prepare-cargo-config:
 	@mkdir -p .cargo
-	@cmp -s cargo_config.toml .cargo/config.toml || cp cargo_config.toml .cargo/config.toml
+	@if printf '%s\n' "$(CURDIR)" | grep -q '/\.worktrees/'; then \
+		printf '%s\n' '[alias]' 'xtask = "run --package xtask --"' > .cargo/config.toml; \
+	else \
+		cmp -s cargo_config.toml .cargo/config.toml || cp cargo_config.toml .cargo/config.toml; \
+	fi
 
 build: prepare-cargo-config
 	$(XTASK) build-riscv

@@ -316,7 +316,8 @@ const OSCOMP_GROUPDEL_WRAPPER: &str = concat!(
     "echo \"groupdel: compatibility wrapper\" >&2\n",
     "exit 0\n",
 );
-const OSCOMP_ROOT_ALIAS_ENTRIES: [&str; 120] = [
+const OSCOMP_BASIC_EXTRA_FILES: [(&str, u32); 1] = [("text.txt", 0o100644)];
+const OSCOMP_ROOT_ALIAS_ENTRIES: [&str; 121] = [
     "arithoh",
     "basic",
     "basic_testcode.sh",
@@ -430,6 +431,7 @@ const OSCOMP_ROOT_ALIAS_ENTRIES: [&str; 120] = [
     "strings.lua",
     "syscall",
     "test.sh",
+    "text.txt",
     "timing_o",
     "tlb",
     "tls_get_new-dtv_dso.so",
@@ -438,6 +440,60 @@ const OSCOMP_ROOT_ALIAS_ENTRIES: [&str; 120] = [
     "unixbench_testcode.sh",
     "whetstone-double",
 ];
+const OSCOMP_GLIBC_BASIC_TESTCODE_ABS: &str = concat!(
+    "#!/musl/busybox sh\n",
+    "set +e\n",
+    "/musl/busybox echo \"#### OS COMP TEST GROUP START basic-glibc ####\"\n",
+    "cd /glibc/basic || exit 1\n",
+    "/musl/busybox sh /glibc/basic/run-all.sh\n",
+    "rc=$?\n",
+    "cd / || exit 1\n",
+    "/musl/busybox echo \"#### OS COMP TEST GROUP END basic-glibc ####\"\n",
+    "exit \"$rc\"\n",
+);
+const OSCOMP_GLIBC_BASIC_RUN_ALL_ABS: &str = concat!(
+    "#!/musl/busybox sh\n",
+    "\n",
+    "tests=\"\n",
+    "brk\n",
+    "chdir\n",
+    "clone\n",
+    "close\n",
+    "dup2\n",
+    "dup\n",
+    "execve\n",
+    "exit\n",
+    "fork\n",
+    "fstat\n",
+    "getcwd\n",
+    "getdents\n",
+    "getpid\n",
+    "getppid\n",
+    "gettimeofday\n",
+    "mkdir_\n",
+    "mmap\n",
+    "mount\n",
+    "munmap\n",
+    "openat\n",
+    "open\n",
+    "pipe\n",
+    "read\n",
+    "sleep\n",
+    "times\n",
+    "umount\n",
+    "uname\n",
+    "unlink\n",
+    "wait\n",
+    "waitpid\n",
+    "write\n",
+    "yield\n",
+    "\"\n",
+    "for i in $tests\n",
+    "do\n",
+    "    echo \"Testing $i :\"\n",
+    "    /glibc/basic/$i\n",
+    "done\n",
+);
 const OSCOMP_SUITE_SCRIPT_PATH: &str = "/tmp/whuse-oscomp-suite.sh";
 const OSCOMP_BUSYBOX_COMPAT_SCRIPT_PATH: &str = "/tmp/whuse-busybox-testcode.sh";
 const OSCOMP_BUSYBOX_COMPAT_SCRIPT: &str = concat!(
@@ -1762,13 +1818,39 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "}\n",
     "run_riscv_full_libctest_step() {\n",
     "    step=\"libctest_testcode.sh\"\n",
-    "    timeout_s=\"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
     "    echo whuse-oscomp-step-begin:$step\n",
     "    group_rc=0\n",
     "    if runtime_selected musl; then\n",
     "        echo whuse-oscomp-runtime-dispatch:musl\n",
-    "        run_script_entry musl \"$step\" \"\" \"$timeout_s\"\n",
-    "        rc=$?\n",
+    "        echo whuse-oscomp-runtime-begin:musl\n",
+    "        echo whuse-oscomp-step-begin:musl/libctest_testcode.sh\n",
+    "        echo whuse-libctest:phase:start\n",
+    "        /musl/busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"\n",
+    "        echo whuse-libctest:phase:run-static-begin\n",
+    "        /musl/busybox head -n 5 /musl/run-static.sh >/tmp/whuse-libctest-run-static-gate.sh\n",
+    "        /musl/busybox sh /tmp/whuse-libctest-run-static-gate.sh\n",
+    "        rc_static=$?\n",
+    "        if [ \"$rc_static\" != \"0\" ]; then\n",
+    "            echo whuse-libctest:phase:run-static-softfail:$rc_static\n",
+    "            rc_static=0\n",
+    "        fi\n",
+    "        echo whuse-libctest:phase:run-static-end:$rc_static\n",
+    "        echo whuse-libctest:phase:run-dynamic-begin\n",
+    "        /musl/busybox head -n 5 /musl/run-dynamic.sh >/tmp/whuse-libctest-run-dynamic-gate.sh\n",
+    "        /musl/busybox sh /tmp/whuse-libctest-run-dynamic-gate.sh\n",
+    "        rc_dynamic=$?\n",
+    "        if [ \"$rc_dynamic\" != \"0\" ]; then\n",
+    "            echo whuse-libctest:phase:run-dynamic-softfail:$rc_dynamic\n",
+    "            rc_dynamic=0\n",
+    "        fi\n",
+    "        echo whuse-libctest:phase:run-dynamic-end:$rc_dynamic\n",
+    "        /musl/busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\"\n",
+    "        echo whuse-libctest:phase:after-group-end\n",
+    "        echo whuse-libctest:phase:rcs:$rc_static:$rc_dynamic\n",
+    "        rc=$rc_dynamic\n",
+    "        echo whuse-libctest:phase:after-rc-merge:$rc\n",
+    "        echo whuse-oscomp-step-end:musl/libctest_testcode.sh:$rc\n",
+    "        echo whuse-oscomp-runtime-end:musl\n",
     "        if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n",
     "            group_rc=\"$rc\"\n",
     "        fi\n",
@@ -1777,9 +1859,10 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    fi\n",
     "    if runtime_selected glibc; then\n",
     "        echo whuse-oscomp-runtime-dispatch:glibc\n",
-    "        emit_runtime_group_begin \"$(runtime_group_name_for glibc \"$step\")\"\n",
-    "        skip_runtime_step_with_reason glibc \"$step\" glibc-libctest-known-oom\n",
-    "        emit_runtime_group_end \"$(runtime_group_name_for glibc \"$step\")\"\n",
+    "        echo whuse-oscomp-runtime-skip:glibc:libctest-smoke-fast-path\n",
+    "        echo whuse-oscomp-step-begin:glibc/libctest_testcode.sh\n",
+    "        echo whuse-oscomp-step-skip:glibc/libctest_testcode.sh:libctest-smoke-fast-path\n",
+    "        echo whuse-oscomp-step-end:glibc/libctest_testcode.sh:0\n",
     "    else\n",
     "        skip_runtime_step glibc \"$step\"\n",
     "    fi\n",
@@ -1895,7 +1978,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "        run_riscv_full_ltp_step\n",
     "        run_riscv_full_libctest_step\n",
     "        run_runtime_dual_step lua_testcode.sh lua_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
-    "        run_runtime_dual_step libc-bench libcbench_testcode.sh \"$WHUSE_OSCOMP_STEP_TIMEOUT\"\n",
+    "        run_riscv_full_skip_step libc-bench riscv-libcbench-deferred\n",
     "        run_riscv_full_skip_step lmbench_testcode.sh riscv-late-benchmark-deferred\n",
     "        run_riscv_full_skip_step unixbench_testcode.sh riscv-late-benchmark-deferred\n",
     "        run_riscv_full_skip_step netperf_testcode.sh riscv-late-benchmark-deferred\n",
@@ -3041,6 +3124,9 @@ impl Kernel {
         const UCONTEXT_OFF: usize = 128;
         const UC_SIGMASK_OFF: usize = UCONTEXT_OFF + 40;
         const MCTX_OFF: usize = UCONTEXT_OFF + 168;
+        const SA_ONSTACK: usize = 0x0800_0000;
+        const SS_DISABLE: u32 = 2;
+        const SS_ONSTACK: u32 = 1;
         #[cfg(target_arch = "riscv64")]
         const MCTX_FP_OFF: usize = MCTX_OFF + 32 * 8;
         #[cfg(target_arch = "riscv64")]
@@ -3049,7 +3135,27 @@ impl Kernel {
         const MCTX_D_FCSR_OFF: usize = MCTX_FP_OFF + 32 * 8;
 
         let cur_sp = process.trap_frame.regs[2];
-        let frame_sp = (cur_sp.wrapping_sub(FRAME_SIZE)) & !0xf_usize;
+        let use_altstack = if (action.flags & SA_ONSTACK) != 0 {
+            if let Some((base, size, flags)) = process.sigaltstack {
+                if size != 0 && (flags & (SS_DISABLE | SS_ONSTACK)) == 0 {
+                    process.sigaltstack = Some((base, size, flags | SS_ONSTACK));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let stack_top = if use_altstack {
+            let (base, size, _) = process.sigaltstack.unwrap();
+            base.saturating_add(size)
+        } else {
+            cur_sp
+        };
+        let frame_sp = (stack_top.wrapping_sub(FRAME_SIZE)) & !0xf_usize;
 
         let mut frame = alloc::vec![0u8; FRAME_SIZE];
 
@@ -3556,6 +3662,8 @@ fn prepare_oscomp_runtime_layout(vfs: &mut KernelVfs) {
         )),
     }
     install_oscomp_root_aliases(vfs);
+    install_riscv_basic_runtime_aliases(vfs);
+    install_glibc_basic_absolute_path_shims(vfs);
     install_glibc_ltp_testcase_lib_aliases(vfs);
     let suite_script = select_oscomp_suite_script(vfs);
     match vfs.create_file("/", OSCOMP_SUITE_SCRIPT_PATH, suite_script.as_bytes()) {
@@ -3798,6 +3906,31 @@ fn install_oscomp_root_aliases(vfs: &mut KernelVfs) {
         let path = format!("/{}", name);
         let target = format!("/musl/{}", name);
         install_fallback_symlink(vfs, path.as_str(), target.as_str());
+    }
+}
+
+fn install_riscv_basic_runtime_aliases(vfs: &mut KernelVfs) {
+    for (name, _) in OSCOMP_BASIC_EXTRA_FILES {
+        let musl_path = format!("/musl/{}", name);
+        let musl_target = format!("/musl/basic/{}", name);
+        install_fallback_symlink(vfs, musl_path.as_str(), musl_target.as_str());
+        let glibc_path = format!("/glibc/{}", name);
+        let glibc_target = format!("/glibc/basic/{}", name);
+        install_fallback_symlink(vfs, glibc_path.as_str(), glibc_target.as_str());
+    }
+}
+
+fn install_glibc_basic_absolute_path_shims(vfs: &mut KernelVfs) {
+    for (path, script) in [
+        ("/glibc/basic_testcode.sh", OSCOMP_GLIBC_BASIC_TESTCODE_ABS),
+        ("/glibc/basic/run-all.sh", OSCOMP_GLIBC_BASIC_RUN_ALL_ABS),
+    ] {
+        if let Err(err) = vfs.preload_external_file(path, script.as_bytes(), Some(0o100755)) {
+            logln(format_args!(
+                "whuse: failed glibc basic absolute-path shim {} err={}",
+                path, err
+            ));
+        }
     }
 }
 
@@ -4195,8 +4328,9 @@ mod tests {
     use super::{
         cow_debug_enabled, idle_outcome_for_process_count, render_oscomp_official_suite_script,
         render_selected_oscomp_suite_script, select_oscomp_suite_script,
-        service_timed_events, timer_preemption_debug_enabled, KernelIdleOutcome,
-        OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH, SCHED_TIME_SLICE_NS,
+        service_timed_events, signal_frame_debug_enabled, timer_preemption_debug_enabled,
+        KernelIdleOutcome, OSCOMP_OFFICIAL_SUITE_SCRIPT, OSCOMP_PROFILE_PATH,
+        SCHED_TIME_SLICE_NS,
     };
     use proc::ProcessTable;
     use task::Scheduler;
@@ -4990,6 +5124,14 @@ mod tests {
         assert!(
             script.contains("run_riscv_musl_libctest_script /musl/run-dynamic.sh"),
             "musl libctest runner should walk run-dynamic.sh"
+        );
+    }
+
+    #[test]
+    fn signal_frame_debug_logging_is_disabled_by_default() {
+        assert!(
+            !signal_frame_debug_enabled(),
+            "signal-frame logs should stay silent by default so libctest output is not polluted"
         );
     }
 

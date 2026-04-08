@@ -56,11 +56,25 @@ const CSR_SAVE1: u32 = 0x31; // Scratch register 1
 
 // Timer interrupt bit in ECFG/ESTAT (bit 11)
 const ECFG_TI: usize = 1 << 11;
+const ECFG_HWI1: usize = 1 << 3;
 
 // LoongArch timer frequency (100 MHz on QEMU virt)
 const LA_TIMER_FREQ_HZ: u64 = 100_000_000;
 const LOONGARCH_VIRT_GED_REG_BASE: usize = 0x100e001c;
 const LOONGARCH_VIRT_GED_S5_SLEEP_CTL: u8 = 0x34;
+const LOONGARCH_VIRT_PLATIC_INTERRUPT: usize = 3;
+const PCH_PIC_MASK: usize = 0x20;
+const PCH_PIC_EDGE: usize = 0x60;
+const PCH_PIC_POL: usize = 0x3e0;
+const PCH_INT_HTVEC: usize = 0x200;
+const EIOINTC_REG_NODEMAP: usize = 0x14a0;
+const EIOINTC_REG_IPMAP: usize = 0x14c0;
+const EIOINTC_REG_ENABLE: usize = 0x1600;
+const EIOINTC_REG_BOUNCE: usize = 0x1680;
+const EIOINTC_REG_ISR: usize = 0x1800;
+const EIOINTC_REG_ROUTE: usize = 0x1c00;
+const EIOINTC_VEC_REG_COUNT: usize = 4;
+const EIOINTC_VEC_COUNT: usize = EIOINTC_VEC_REG_COUNT * 64;
 static TIMER_FREQ_HZ: AtomicU64 = AtomicU64::new(LA_TIMER_FREQ_HZ);
 
 #[cfg(target_arch = "loongarch64")]
@@ -525,6 +539,7 @@ struct VirtioBlockDevice {
     init_error: AtomicI32,
     capacity_sectors: AtomicUsize,
     readonly: AtomicBool,
+    irq: AtomicUsize,
 }
 
 struct VirtioNetStub;
@@ -585,6 +600,11 @@ impl VirtInterruptController {
     fn configure(&self, discovery: &LoongArchVirtioDiscovery) {
         if let Some(config) = discovery.interrupt {
             self.base.store(config.pch_pic_base, Ordering::Relaxed);
+            #[cfg(target_arch = "loongarch64")]
+            unsafe {
+                init_eiointc();
+                init_pch_pic(config.pch_pic_base);
+            }
         }
     }
 
@@ -602,14 +622,48 @@ impl HalInterrupt for VirtInterruptController {
         }
     }
 
-    fn enable_irq(&self, _irq: usize) {}
+    fn enable_irq(&self, irq: usize) {
+        #[cfg(target_arch = "loongarch64")]
+        if self.is_ready() {
+            unsafe {
+                pch_pic_enable_irq(self.base.load(Ordering::Relaxed), irq);
+                eiointc_enable_irq(irq);
+            }
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        let _ = irq;
+    }
 
-    fn disable_irq(&self, _irq: usize) {}
+    fn disable_irq(&self, irq: usize) {
+        #[cfg(target_arch = "loongarch64")]
+        if self.is_ready() {
+            unsafe {
+                pch_pic_disable_irq(self.base.load(Ordering::Relaxed), irq);
+                eiointc_disable_irq(irq);
+            }
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        let _ = irq;
+    }
 
-    fn ack_irq(&self, _irq: usize) {}
+    fn ack_irq(&self, irq: usize) {
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            eiointc_complete_irq(irq);
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        let _ = irq;
+    }
 
     fn next_pending(&self) -> Option<usize> {
-        None
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            return eiointc_claim_irq();
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            None
+        }
     }
 }
 
@@ -634,10 +688,19 @@ impl HalCpu for VirtCpu {
             crmd |= 1 << 2; // Set IE bit
             core::arch::asm!("csrwr {}, 0x0", in(reg) crmd);
 
+            let mut ecfg: usize;
+            core::arch::asm!("csrrd {}, 0x4", out(reg) ecfg);
+            ecfg |= ECFG_TI | ECFG_HWI1;
+            core::arch::asm!("csrwr {}, 0x4", in(reg) ecfg);
+
             use core::fmt::Write;
             use hal_api::ConsoleWriter;
             let mut console = ConsoleWriter;
-            let _ = write!(console, "whuse-debug: enable_interrupts CRMD={:#x}\n", crmd);
+            let _ = write!(
+                console,
+                "whuse-debug: enable_interrupts CRMD={:#x} ECFG={:#x}\n",
+                crmd, ecfg
+            );
         }
         self.interrupts_enabled.store(true, Ordering::Relaxed);
     }
@@ -836,6 +899,7 @@ impl VirtioBlockDevice {
             init_error: AtomicI32::new(ENODEV),
             capacity_sectors: AtomicUsize::new(0),
             readonly: AtomicBool::new(false),
+            irq: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -871,25 +935,31 @@ impl VirtioBlockDevice {
                 let transport =
                     PciTransport::new::<LoongArchVirtioHal, _>(&mut cfg_root, device_function)
                         .map_err(|_| ENODEV)?;
+                let irq = pci_interrupt_line(raw_cam.read_word(device_function, 0x3c));
                 let mut driver =
                     VirtIOBlk::<LoongArchVirtioHal, _>::new(SomeTransport::from(transport))
                         .map_err(virtio_error_to_errno)?;
-                // LoongArch virt platform currently does not wire a functional IRQ controller
-                // in this HAL; keep virtio-blk in polling mode to avoid blocking forever on
-                // completion paths that wait for queue interrupts.
+                if irq.is_some() {
+                    driver.enable_interrupts();
+                }
                 let info = VirtioBlockConfig {
                     transport: hal_virtio::TransportKind::Pci,
-                    irq: None,
+                    irq,
                     capacity_sectors: driver.capacity() as usize,
                     readonly: driver.readonly(),
                 };
                 self.capacity_sectors
                     .store(info.capacity_sectors, Ordering::Relaxed);
                 self.readonly.store(info.readonly, Ordering::Relaxed);
+                self.irq
+                    .store(info.irq.unwrap_or(usize::MAX), Ordering::Relaxed);
                 self.init_error.store(0, Ordering::Relaxed);
                 let _ = self
                     .state
                     .call_once(|| Mutex::new(VirtioBlockState { driver }));
+                if let Some(irq) = info.irq {
+                    INTERRUPT.enable_irq(irq);
+                }
                 return Ok(());
             }
         }
@@ -927,6 +997,11 @@ impl HalBlockDevice for VirtioBlockDevice {
         self.capacity_sectors.load(Ordering::Relaxed)
     }
 
+    fn irq_line(&self) -> Option<usize> {
+        let irq = self.irq.load(Ordering::Relaxed);
+        (irq != usize::MAX).then_some(irq)
+    }
+
     fn ack_interrupt(&self) -> bool {
         let Ok(state) = self.with_state() else {
             return false;
@@ -946,9 +1021,13 @@ impl HalBlockDevice for VirtioBlockDevice {
             return Err(EINVAL);
         }
         let state = self.with_state()?;
-        for _ in 0..3 {
+        const MAX_RETRIES: usize = 10000;
+        for retry in 0..MAX_RETRIES {
             if state.lock().driver.read_blocks(sector, buf).is_ok() {
                 return Ok(());
+            }
+            if retry < MAX_RETRIES - 1 {
+                core::hint::spin_loop();
             }
         }
         Err(EIO)
@@ -975,9 +1054,13 @@ impl HalBlockDevice for VirtioBlockDevice {
             return Err(EINVAL);
         }
         let state = self.with_state()?;
-        for _ in 0..3 {
+        const MAX_RETRIES: usize = 10000;
+        for retry in 0..MAX_RETRIES {
             if state.lock().driver.write_blocks(sector, buf).is_ok() {
                 return Ok(());
+            }
+            if retry < MAX_RETRIES - 1 {
+                core::hint::spin_loop();
             }
         }
         Err(EIO)
@@ -1139,6 +1222,120 @@ fn align_up_u32(value: u32, align: u32) -> u32 {
     (value + align - 1) & !(align - 1)
 }
 
+fn pci_interrupt_line(word: u32) -> Option<usize> {
+    let line = (word & 0xff) as u8;
+    (line != 0xff).then_some(line as usize)
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline]
+unsafe fn iocsr_read_d(addr: usize) -> u64 {
+    let value: u64;
+    core::arch::asm!("iocsrrd.d {}, {}", out(reg) value, in(reg) addr);
+    value
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline]
+unsafe fn iocsr_write_d(addr: usize, value: u64) {
+    core::arch::asm!("iocsrwr.d {}, {}", in(reg) value, in(reg) addr);
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline]
+unsafe fn iocsr_write_w(addr: usize, value: u32) {
+    core::arch::asm!("iocsrwr.w {}, {}", in(reg) value, in(reg) addr);
+}
+
+#[cfg(target_arch = "loongarch64")]
+unsafe fn init_pch_pic(base: usize) {
+    write_volatile((base + PCH_PIC_EDGE) as *mut u32, 0);
+    write_volatile((base + PCH_PIC_POL) as *mut u32, 0);
+}
+
+#[cfg(target_arch = "loongarch64")]
+unsafe fn pch_pic_enable_irq(base: usize, irq: usize) {
+    let offset = (irq / 32) * 4;
+    let bit = 1u32 << (irq % 32);
+    let mask_ptr = (base + PCH_PIC_MASK + offset) as *mut u32;
+    let current = read_volatile(mask_ptr);
+    write_volatile(mask_ptr, current & !bit);
+    write_volatile((base + PCH_INT_HTVEC + irq) as *mut u8, irq as u8);
+}
+
+#[cfg(target_arch = "loongarch64")]
+unsafe fn pch_pic_disable_irq(base: usize, irq: usize) {
+    let offset = (irq / 32) * 4;
+    let bit = 1u32 << (irq % 32);
+    let mask_ptr = (base + PCH_PIC_MASK + offset) as *mut u32;
+    let current = read_volatile(mask_ptr);
+    write_volatile(mask_ptr, current | bit);
+}
+
+#[cfg(target_arch = "loongarch64")]
+unsafe fn init_eiointc() {
+    const IOCSR_MISC_FUNC: usize = 0x420;
+    const IOCSR_MISC_FUNC_EXT_IOI_EN: u64 = 1 << 48;
+
+    let misc = iocsr_read_d(IOCSR_MISC_FUNC);
+    iocsr_write_d(IOCSR_MISC_FUNC, misc | IOCSR_MISC_FUNC_EXT_IOI_EN);
+
+    let index = 0usize;
+    for i in 0..(EIOINTC_VEC_COUNT / 32) {
+        let data = ((1 << (i * 2 + 1)) << 16) | (1 << (i * 2));
+        iocsr_write_w(EIOINTC_REG_NODEMAP + i * 4, data as u32);
+    }
+    for i in 0..(EIOINTC_VEC_COUNT / 32 / 4) {
+        let bit = 1u32 << (1 + index);
+        let data = bit | (bit << 8) | (bit << 16) | (bit << 24);
+        iocsr_write_w(EIOINTC_REG_IPMAP + i * 4, data);
+    }
+    for i in 0..(EIOINTC_VEC_COUNT / 4) {
+        let bit = 1u32;
+        let data = bit | (bit << 8) | (bit << 16) | (bit << 24);
+        iocsr_write_w(EIOINTC_REG_ROUTE + i * 4, data);
+    }
+    for i in 0..(EIOINTC_VEC_COUNT / 32) {
+        iocsr_write_w(EIOINTC_REG_BOUNCE + i * 4, u32::MAX);
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+unsafe fn eiointc_enable_irq(irq: usize) {
+    let offset = (irq / 64) * 8;
+    let bit = 1u64 << (irq % 64);
+    for base in [EIOINTC_REG_ENABLE, EIOINTC_REG_BOUNCE] {
+        let addr = base + offset;
+        iocsr_write_d(addr, iocsr_read_d(addr) | bit);
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+unsafe fn eiointc_disable_irq(irq: usize) {
+    let offset = (irq / 64) * 8;
+    let bit = 1u64 << (irq % 64);
+    let addr = EIOINTC_REG_ENABLE + offset;
+    iocsr_write_d(addr, iocsr_read_d(addr) & !bit);
+}
+
+#[cfg(target_arch = "loongarch64")]
+unsafe fn eiointc_claim_irq() -> Option<usize> {
+    for i in 0..(EIOINTC_VEC_COUNT / 64) {
+        let flags = iocsr_read_d(EIOINTC_REG_ISR + i * 8);
+        if flags != 0 {
+            return Some(flags.trailing_zeros() as usize + 64 * i);
+        }
+    }
+    None
+}
+
+#[cfg(target_arch = "loongarch64")]
+unsafe fn eiointc_complete_irq(irq: usize) {
+    let offset = (irq / 64) * 8;
+    let bit = 1u64 << (irq % 64);
+    iocsr_write_d(EIOINTC_REG_ISR + offset, bit);
+}
+
 unsafe impl VirtioHal for LoongArchVirtioHal {
     fn dma_alloc(
         pages: usize,
@@ -1250,7 +1447,7 @@ fn loongarch_shutdown_byte(_reason: ShutdownReason) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{loongarch_shutdown_byte, loongarch_shutdown_register_base};
+    use super::{loongarch_shutdown_byte, loongarch_shutdown_register_base, pci_interrupt_line};
     use hal_api::ShutdownReason;
 
     #[test]
@@ -1262,5 +1459,14 @@ mod tests {
     #[test]
     fn failure_shutdown_uses_same_poweroff_sequence() {
         assert_eq!(loongarch_shutdown_byte(ShutdownReason::Failure), 0x34);
+    }
+
+    #[test]
+    fn pci_interrupt_line_reads_low_byte_and_treats_ff_as_absent() {
+        assert_eq!(pci_interrupt_line(0x0000_0003), Some(3));
+        assert_eq!(pci_interrupt_line(0x0000_0011), Some(0x11));
+        assert_eq!(pci_interrupt_line(0x0000_00ff), None);
+        assert_eq!(pci_interrupt_line(0x1234_56ff), None);
+        assert_eq!(pci_interrupt_line(0xabcd_ef02), Some(2));
     }
 }

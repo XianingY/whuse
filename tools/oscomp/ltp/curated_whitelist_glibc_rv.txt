@@ -204,3 +204,4 @@ msgctl12
 msgget02
 semget02
 semctl02
+shmctl02

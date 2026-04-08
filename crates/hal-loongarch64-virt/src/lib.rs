@@ -694,7 +694,7 @@ impl HalCpu for VirtCpu {
 
             let mut ecfg: usize;
             core::arch::asm!("csrrd {}, 0x4", out(reg) ecfg);
-            ecfg |= ECFG_TI | ECFG_HWI1;
+            ecfg |= ECFG_TI;
             core::arch::asm!("csrwr {}, 0x4", in(reg) ecfg);
 
             use core::fmt::Write;

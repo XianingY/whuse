@@ -84,6 +84,11 @@ global_asm!(
     .globl __whuse_kernel_trap_entry
     .align 4
 __whuse_kernel_trap_entry:
+    // First, restore kernel sp from SAVE1 (CSR 0x31) before doing anything else
+    // This is critical because idle 0 may have clobbered the user sp
+    csrrd $t0, 0x31
+    move $sp, $t0
+
     // Save caller-saved registers we'll use
     addi.d $sp, $sp, -144
     st.d $ra,   $sp, 0
@@ -224,7 +229,7 @@ __whuse_run_user:
 1:
     li.d $t1, -4
     and $t0, $t0, $t1
-    ori $t0, $t0, 0xb   # PPLV=3, PIE=1 (enable interrupts in user mode)
+    ori $t0, $t0, 0x3
     csrwr $t0, 0x1
     ld.d $t0, $a0, 80
     csrwr $t0, 0x30
@@ -234,15 +239,13 @@ __whuse_run_user:
     ld.d $t0, $a0, 40
     ld.d $t1, $a0, 48
     ld.d $t2, $a0, 56
+    csrwr $a0, 0x30
     ertn
 
     .align 4
     .globl __whuse_user_trap_entry
 __whuse_user_trap_entry:
-    # Save t1 to kernel stack (temporary, will be restored after SAVE0 read)
-    st.d $t1, $sp, -8
     csrwr $a0, 0x30
-    csrrd $t1, 0x30
 
     st.d $ra, $a0, 8
     st.d $sp, $a0, 16
@@ -275,8 +278,8 @@ __whuse_user_trap_entry:
     st.d $r20, $a0, 240
     st.d $r21, $a0, 248
 
-    st.d $t1, $a0, 80
-    ld.d $t1, $sp, -8
+    csrrd $t0, 0x30
+    st.d $t0, $a0, 80
     csrrd $sp, 0x31
     csrrd $t0, 0x6
     st.d $t0, $a0, 256
@@ -842,7 +845,7 @@ impl HalTimer for VirtTimer {
 
             let mut ecfg: usize;
             core::arch::asm!("csrrd {}, 0x4", out(reg) ecfg);
-            ecfg |= ECFG_TI | ECFG_HWI1;
+            ecfg |= ECFG_TI;
             core::arch::asm!("csrwr {}, 0x4", in(reg) ecfg);
 
             let tcfg_init = init_val.min((usize::MAX >> 2) as u64) as usize;

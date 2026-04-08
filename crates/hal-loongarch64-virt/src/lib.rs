@@ -239,8 +239,10 @@ __whuse_run_user:
     .align 4
     .globl __whuse_user_trap_entry
 __whuse_user_trap_entry:
+    # Save t1 to kernel stack (temporary, will be restored after SAVE0 read)
+    st.d $t1, $sp, -8
     csrwr $a0, 0x30
-    st.d $a0, $a0, 80
+    csrrd $t1, 0x30
 
     st.d $ra, $a0, 8
     st.d $sp, $a0, 16
@@ -273,8 +275,8 @@ __whuse_user_trap_entry:
     st.d $r20, $a0, 240
     st.d $r21, $a0, 248
 
-    csrrd $t0, 0x30
-    st.d $t0, $a0, 80
+    st.d $t1, $a0, 80
+    ld.d $t1, $sp, -8
     csrrd $sp, 0x31
     csrrd $t0, 0x6
     st.d $t0, $a0, 256

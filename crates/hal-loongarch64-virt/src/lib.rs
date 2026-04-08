@@ -234,7 +234,6 @@ __whuse_run_user:
     ld.d $t0, $a0, 40
     ld.d $t1, $a0, 48
     ld.d $t2, $a0, 56
-    csrwr $a0, 0x30
     ertn
 
     .align 4

@@ -1,0 +1,2 @@
+# LoongArch LA pending blacklist - cases that fail and need evaluation
+# before moving to curated blacklist

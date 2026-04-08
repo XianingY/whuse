@@ -1,0 +1,3 @@
+# LoongArch LA pending whitelist - candidates for promotion to curated
+# These tests have been observed to pass in LA QEMU runs
+# Add cases as they are confirmed passing

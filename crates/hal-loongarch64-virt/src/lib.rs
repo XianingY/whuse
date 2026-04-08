@@ -224,7 +224,7 @@ __whuse_run_user:
 1:
     li.d $t1, -4
     and $t0, $t0, $t1
-    ori $t0, $t0, 0x3
+    ori $t0, $t0, 0xb   # PPLV=3, PIE=1 (enable interrupts in user mode)
     csrwr $t0, 0x1
     ld.d $t0, $a0, 80
     csrwr $t0, 0x30

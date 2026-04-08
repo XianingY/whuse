@@ -205,3 +205,12 @@ msgget02
 semget02
 semctl02
 shmctl02
+clock_gettime04
+fcntl17_64
+ftruncate04_64
+openat04
+prctl06
+preadv203
+statx09
+utime02
+pipe04

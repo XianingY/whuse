@@ -1,32 +1,13 @@
+# RISC-V musl pending whitelist - candidates for promotion to curated
+# These tests have been observed to pass but need verification
+# Only include tests NOT already in curated_blacklist
+
+# Candidates - NOT in curated_blacklist (verified by agent analysis):
 fcntl17_64
-ftruncate04_64
-shmctl02
-openat04
 prctl06
-preadv203
+shmctl02
 statx09
 utime02
-vfork
-vfork01
-vfork02
-timerfd_create01
-sendmmsg01
-setsockopt06
-setsockopt07
-clock_settime03
-clock_nanosleep03
-timens01
-timerfd01
-timerfd04
-timerfd_gettime01
-timerfd_settime01
-timerfd_settime02
-timer_delete01
-timer_getoverrun01
-timer_settime01
-timer_settime02
-timer_settime03
-timer_gettime01
-timer_delete02
-clock_gettime03
-asapi_03
+
+# Note: 27 other tests in this file were duplicates with curated_blacklist
+# and have been removed. The above 5 are the only ones not in curated_blacklist.

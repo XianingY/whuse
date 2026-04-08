@@ -240,6 +240,7 @@ __whuse_run_user:
     .globl __whuse_user_trap_entry
 __whuse_user_trap_entry:
     csrwr $a0, 0x30
+    st.d $a0, $a0, 80
 
     st.d $ra, $a0, 8
     st.d $sp, $a0, 16

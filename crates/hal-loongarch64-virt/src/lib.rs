@@ -230,6 +230,7 @@ __whuse_run_user:
     li.d $t1, -4
     and $t0, $t0, $t1
     ori $t0, $t0, 0x3
+    ori $t0, $t0, 0x8   // Set PGIE (bit 3) = 1
     csrwr $t0, 0x1
     ld.d $t0, $a0, 80
     csrwr $t0, 0x30

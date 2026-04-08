@@ -2478,7 +2478,7 @@ const OSCOMP_SUITE_ENTRY_SCRIPT: &str = concat!(
     "#!/musl/busybox sh\n",
     "echo whuse-oscomp-shell-entered\n",
     "echo whuse-oscomp-shell-suite-begin\n",
-    "/musl/busybox sh /tmp/whuse-oscomp-suite.sh\n",
+    ". /tmp/whuse-oscomp-suite.sh\n",
     "rc=$?\n",
     "echo whuse-oscomp-shell-suite-end:$rc\n",
     "if [ -x /musl/basic/exit ]; then exec /musl/basic/exit; fi\n",

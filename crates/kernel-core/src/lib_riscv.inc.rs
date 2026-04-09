@@ -2842,7 +2842,10 @@ impl Kernel {
             );
             let exit_like_syscall = matches!(sysno, syscall::SYS_EXIT | syscall::SYS_EXIT_GROUP);
             if exit_like_syscall {
-                if self.scheduler.current_thread_id().is_none() && self.scheduler.ready_count() > 0 {
+                // Clear the scheduler's current pointer when task exits,
+                // so the next schedule_next() picks a new task
+                self.scheduler.exit_current();
+                if self.scheduler.ready_count() > 0 {
                     let _ = self.scheduler.yield_now();
                 }
                 return;

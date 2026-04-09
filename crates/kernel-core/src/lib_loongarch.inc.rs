@@ -6722,12 +6722,14 @@ fn render_oscomp_ltp_step_helper_body(
     script.push_str(LTP_HELPER_START);
     script.push_str(ltp_helpers);
     script.push_str("read_local_runtime_filter\n");
+    script.push_str("echo whuse-oscomp-helper-loaded:$$\n");
     script.push_str("echo whuse-oscomp-step-begin:ltp_testcode.sh\n");
     script.push_str("group_rc=0\n");
     script.push_str(
         "run_ltp_step_runtime musl ltp_testcode.sh \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\"\n",
     );
     script.push_str("rc=$?\n");
+    script.push_str("echo whuse-oscomp-musl-ltp-rc:$rc\n");
     script.push_str("if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n");
     script.push_str("    group_rc=\"$rc\"\n");
     script.push_str("fi\n");
@@ -6735,6 +6737,7 @@ fn render_oscomp_ltp_step_helper_body(
         "run_ltp_step_runtime glibc ltp_testcode.sh \"${WHUSE_LTP_STEP_TIMEOUT:-1800}\"\n",
     );
     script.push_str("rc=$?\n");
+    script.push_str("echo whuse-oscomp-glibc-ltp-rc:$rc\n");
     script.push_str("if [ \"$group_rc\" = \"0\" ] && [ \"$rc\" != \"0\" ]; then\n");
     script.push_str("    group_rc=\"$rc\"\n");
     script.push_str("fi\n");
@@ -6750,10 +6753,13 @@ fn render_oscomp_internal_ltp_suite_script(
     let mut script = String::new();
     script.push_str("set +e\n");
     script.push_str("echo whuse-oscomp-script-start\n");
+    script.push_str("echo whuse-oscomp-ltp-helper-start:$$\n");
     script.push_str("/musl/busybox sh ");
     script.push_str(OSCOMP_LTP_STEP_HELPER_PATH);
     script.push_str("\n");
-    script.push_str("echo whuse-oscomp-suite-done\n");
+    script.push_str("ltp_rc=$?\n");
+    script.push_str("echo whuse-oscomp-ltp-helper-end:$ltp_rc\n");
+    script.push_str("echo whuse-oscomp-suite-done:$ltp_rc\n");
     script
 }
 

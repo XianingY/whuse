@@ -1,3 +1,143 @@
 # RISC-V glibc pending whitelist - candidates for promotion to curated
 # These tests have been observed to pass in RV QEMU runs
 # Add cases as they are confirmed passing
+# Promoted to curated:
+#   timerfd_create01, timerfd01, timerfd04, timerfd_gettime01, timerfd_settime01, timerfd_settime02
+
+# NEW CANDIDATES (110 tests) - identified 2026-04-09
+# Focus: timer, process/thread, IPC (shm), file ops, signal handling
+# Not in score_whitelist, not in blacklists, verified available in LTP
+
+# TIMER RELATED (11)
+clock_nanosleep01
+clock_getres01
+clock_gettime02
+getitimer01
+getitimer02
+setitimer01
+setitimer02
+nanosleep02
+nanosleep04
+alarm05
+alarm07
+
+# PROCESS/THREAD RELATED (19)
+clone01
+clone02
+clone03
+clone06
+clone07
+fork04
+fork07
+fork08
+fork10
+exit02
+exit_group01
+sbrk01
+sbrk02
+kill03
+kill07
+kill11
+tgkill03
+tkill01
+tkill02
+waitpid01
+
+# SIGNAL RELATED (12)
+signal01
+signal02
+signal03
+signal04
+signal05
+sigpending02
+sigwait01
+sigaltstack02
+rt_sigaction03
+rt_sigprocmask01
+rt_sigsuspend01
+futex_wait01
+
+# FUTEX WAIT (3)
+futex_wait02
+futex_wait03
+futex_wait04
+
+# IPC RELATED - SHARED MEMORY (14)
+shmctl01
+shmctl03
+shmctl07
+shmctl08
+shmget02
+shmget03
+shmget04
+shmget05
+shmget06
+shmat01
+shmat02
+shmat03
+shmdt01
+shmdt02
+
+# FILE OPERATIONS (19)
+mkdir02
+mkdir04
+mkdirat02
+rmdir02
+chown02
+chown03
+fchmod02
+fchmod05
+fchown02
+fchown03
+link08
+unlink08
+unlink09
+llseek01
+llseek02
+lseek11
+readlink03
+readlinkat01
+symlink04
+
+# STAT/FSTAT/LSTAT VARIANTS (10)
+stat01_64
+stat03
+stat03_64
+fstat03
+fstat03_64
+lstat01
+lstat01_64
+lstat02
+lstat02_64
+statvfs01
+
+# PIPE/EVENTFD (6)
+pipe12
+pipe13
+pipe2_02
+eventfd01
+eventfd02
+eventfd2_01
+
+# PREAD/PWRITE VARIANTS (8)
+pread01_64
+pread02_64
+preadv01_64
+preadv201
+pwrite01_64
+pwrite02_64
+pwritev01
+pwritev201
+
+# EXEC VARIANTS (5)
+execl01
+execle01
+execv01
+execve01
+execvp01
+
+# SOCKET BASIC (1)
+recvmsg01
+
+# WRITE VARIANT (1)
+write05

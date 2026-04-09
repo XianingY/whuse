@@ -212,6 +212,7 @@ stat01
 stat01_64
 stat02
 stat02_64
+statx09
 symlink02
 symlink04
 tgkill01
@@ -223,6 +224,7 @@ unlink05
 unlink07
 unlink08
 unlinkat01
+utime02
 wait01
 wait02
 wait401

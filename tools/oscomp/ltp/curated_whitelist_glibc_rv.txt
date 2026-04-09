@@ -214,3 +214,10 @@ preadv203
 statx09
 utime02
 pipe04
+timerfd_create01
+timerfd01
+timerfd04
+timerfd_gettime01
+timerfd_settime01
+timerfd_settime02
+vfork

@@ -4796,6 +4796,17 @@ impl SyscallDispatcher {
         }
         let mut handle = procs.current()?.fd(fd as i32)?.clone();
         handle.offset = offset;
+
+        // Check file mode compatibility with mmap flags
+        // MAP_SHARED with PROT_WRITE requires O_RDWR (not O_WRONLY)
+        // PROT_WRITE = 2 on Linux
+        if mapping_type == MAP_SHARED && (prot & 0x2 != 0) {
+            let file_mode = handle.flags & 0b11;
+            if file_mode == O_WRONLY {
+                return Err(EBADF);
+            }
+        }
+
         let data = vfs.read(&mut handle, len)?;
         if let Some((tid, tgid, name, cwd, path)) = &glibc_ltp_mmap {
             log_always(&format!(
@@ -7809,6 +7820,10 @@ impl SyscallDispatcher {
         procs: &mut ProcessTable,
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
+        // chroot is a privileged operation - only root can call it
+        if procs.current()?.euid != 0 {
+            return Err(EPERM);
+        }
         let path = procs
             .current()?
             .read_user_cstr(args.0[0])

@@ -3583,10 +3583,7 @@ impl Kernel {
                     // Use same logic as RISC-V: prevent sepc advancement when blocked syscall should restart
                     if should_advance_sepc_after_syscall(sysno, result, blocked_restart) {
                         process.trap_frame.set_retval(result as usize);
-                        if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN) || (result as i32) < 0
-                        {
-                            process.trap_frame.sepc = sepc + 4;
-                        }
+                        process.trap_frame.sepc = sepc + 4;
                     } else if !blocked_restart {
                         process.trap_frame.set_retval(result as usize);
                     }
@@ -3595,9 +3592,7 @@ impl Kernel {
                 let blocked_restart = should_restart_blocked_syscall(sysno, result, false);
                 if should_advance_sepc_after_syscall(sysno, result, blocked_restart) {
                     process.trap_frame.set_retval(result as usize);
-                    if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN) || (result as i32) < 0 {
-                        process.trap_frame.sepc = sepc + 4;
-                    }
+                    process.trap_frame.sepc = sepc + 4;
                 } else if !blocked_restart {
                     process.trap_frame.set_retval(result as usize);
                 }

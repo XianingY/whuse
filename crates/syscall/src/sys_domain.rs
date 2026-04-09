@@ -1,9 +1,10 @@
 use crate::{
     DispatchContext, SyscallArgs, SYS_ACCT, SYS_ADD_KEY, SYS_GETEGID, SYS_GETEUID, SYS_GETGID,
     SYS_GETGROUPS, SYS_GETRANDOM, SYS_GETUID, SYS_KEYCTL, SYS_MEMBARRIER, SYS_MEMFD_CREATE,
-    SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL, SYS_PRCTL, SYS_RISCV_FLUSH_ICACHE,
-    SYS_SECCOMP, SYS_SETGID, SYS_SETGROUPS, SYS_SETREGID, SYS_SETRESGID, SYS_SETRESUID,
-    SYS_SETREUID, SYS_SETUID, SYS_SYSINFO, SYS_UMASK, SYS_UNAME, SYS_UNSHARE,
+    SYS_PIDFD_GETFD, SYS_PIDFD_OPEN, SYS_PIDFD_SEND_SIGNAL, SYS_POSIX_FADVISE, SYS_PRCTL,
+    SYS_RISCV_FLUSH_ICACHE, SYS_SCHED_GETAFFINITY, SYS_SECCOMP, SYS_SETGID, SYS_SETGROUPS,
+    SYS_SETREGID, SYS_SETRESGID, SYS_SETRESUID, SYS_SETREUID, SYS_SETUID, SYS_SYSINFO,
+    SYS_UMASK, SYS_UNAME, SYS_UNSHARE, SYS_USERFAULTFD,
 };
 
 pub(crate) fn dispatch(
@@ -42,6 +43,9 @@ pub(crate) fn dispatch(
         SYS_PIDFD_GETFD => ctx.dispatcher.sys_pidfd_getfd(args, ctx.procs, ctx.vfs),
         SYS_SECCOMP => Ok(0),
         SYS_RISCV_FLUSH_ICACHE => Ok(0),
+        SYS_SCHED_GETAFFINITY => ctx.dispatcher.sys_sched_getaffinity(args, ctx.procs),
+        SYS_POSIX_FADVISE => ctx.dispatcher.sys_posix_fadvise(args, ctx.procs),
+        SYS_USERFAULTFD => ctx.dispatcher.sys_userfaultfd(args, ctx.procs),
         _ => return None,
     })
 }

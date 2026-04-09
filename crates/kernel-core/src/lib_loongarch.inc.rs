@@ -3345,6 +3345,30 @@ impl Kernel {
                     }
                 }
             }
+            // SYS_MKNODAT (33): LA libc may call this as legacy "mknod(path, mode, dev)"
+            // mknodat is (dirfd, path, mode, dev) but LA libc may call mknod with (path, mode, dev)
+            SYS_MKNODAT => {
+                let a0 = args.0[0];
+                if !looks_like_fd(a0) && looks_like_pathname(a0) {
+                    // Convert: (path, mode, dev) -> (AT_FDCWD, path, mode, dev)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // path
+                        args.0[1], // mode
+                        args.0[2], // dev
+                        args.0[3],
+                        args.0[4],
+                    ]);
+                    let result = self.syscalls.dispatch(
+                        SYS_MKNODAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
             _ => {}
         }
         None

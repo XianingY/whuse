@@ -1352,12 +1352,36 @@ unsafe fn eiointc_complete_irq(irq: usize) {
     iocsr_write_d(EIOINTC_REG_ISR + offset, bit);
 }
 
+/// Convert a kernel virtual address to a physical address for DMA.
+/// On LA with DMW1, kernel VA 0x9xxxxxxx maps to PA 0x0xxxxxxx.
+fn kernel_va_to_dma_pa(va: usize) -> u64 {
+    if va >= 0x8000000000000000 {
+        (va & 0x7FFFFFFFFF) as u64
+    } else {
+        va as u64
+    }
+}
+
+/// Convert a physical address back to kernel VA for DMA deallocation.
+fn dma_pa_to_kernel_va(pa: u64) -> usize {
+    let pa = pa as usize;
+    // For DMW1 mapping: PA 0x0xxxxxxx maps to VA 0x9xxxxxxx (set bit 63)
+    if pa < 0x80000000 {
+        pa | 0x8000000000000000
+    } else {
+        pa
+    }
+}
+
 unsafe impl VirtioHal for LoongArchVirtioHal {
     fn dma_alloc(
         pages: usize,
         _direction: BufferDirection,
     ) -> (virtio_drivers::PhysAddr, NonNull<u8>) {
-        DMA_ARENA.alloc(pages).unwrap_or((0, NonNull::dangling()))
+        DMA_ARENA.alloc(pages).map(|(paddr, vaddr)| {
+            // Convert kernel VA to physical address for DMA
+            (kernel_va_to_dma_pa(paddr as usize), vaddr)
+        }).unwrap_or((0, NonNull::dangling()))
     }
 
     unsafe fn dma_dealloc(
@@ -1365,10 +1389,14 @@ unsafe impl VirtioHal for LoongArchVirtioHal {
         _vaddr: NonNull<u8>,
         pages: usize,
     ) -> i32 {
-        DMA_ARENA.dealloc(paddr, pages)
+        // Convert PA back to kernel VA for deallocation
+        let va = dma_pa_to_kernel_va(paddr);
+        DMA_ARENA.dealloc(va as u64, pages)
     }
 
     unsafe fn mmio_phys_to_virt(paddr: virtio_drivers::PhysAddr, _size: usize) -> NonNull<u8> {
+        // For LA PCI MMIO, the address is already a physical address
+        // that maps directly via page tables, not DMW1
         NonNull::new(paddr as usize as *mut u8).unwrap()
     }
 
@@ -1387,7 +1415,8 @@ unsafe impl VirtioHal for LoongArchVirtioHal {
         ) {
             core::ptr::copy_nonoverlapping(buffer.as_ptr().cast::<u8>(), vaddr.as_ptr(), len);
         }
-        paddr
+        // Convert kernel VA to physical address for device DMA
+        kernel_va_to_dma_pa(paddr as usize)
     }
 
     unsafe fn unshare(
@@ -1400,15 +1429,17 @@ unsafe impl VirtioHal for LoongArchVirtioHal {
             return;
         }
         let pages = len.div_ceil(hal_virtio::DMA_PAGE_SIZE);
+        // Convert PA back to kernel VA for DMA arena operations
+        let va = dma_pa_to_kernel_va(paddr);
         if matches!(
             direction,
             BufferDirection::DeviceToDriver | BufferDirection::Both
         ) {
-            if let Some(vaddr) = DMA_ARENA.phys_to_virt(paddr) {
+            if let Some(vaddr) = DMA_ARENA.phys_to_virt(va as u64) {
                 core::ptr::copy_nonoverlapping(vaddr.as_ptr(), buffer.as_ptr().cast::<u8>(), len);
             }
         }
-        let _ = DMA_ARENA.dealloc(paddr, pages);
+        let _ = DMA_ARENA.dealloc(va as u64, pages);
     }
 }
 

@@ -25,6 +25,8 @@ LTP_PENDING_WHITELIST_RV_MUSL="${REPO_ROOT}/tools/oscomp/ltp/pending_whitelist_r
 LTP_PENDING_BLACKLIST_RV_MUSL="${REPO_ROOT}/tools/oscomp/ltp/pending_blacklist_rv_musl.txt"
 LTP_PENDING_WHITELIST_RV_GLIBC="${REPO_ROOT}/tools/oscomp/ltp/pending_whitelist_glibc_rv.txt"
 LTP_PENDING_BLACKLIST_RV_GLIBC="${REPO_ROOT}/tools/oscomp/ltp/pending_blacklist_glibc_rv.txt"
+LTP_PENDING_WHITELIST_LA_GLIBC="${REPO_ROOT}/tools/oscomp/ltp/pending_whitelist_glibc_la.txt"
+LTP_PENDING_BLACKLIST_LA_GLIBC="${REPO_ROOT}/tools/oscomp/ltp/pending_blacklist_glibc_la.txt"
 
 MODE="${1:-riscv}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-3600}"
@@ -117,6 +119,8 @@ export WHUSE_LTP_PENDING_WHITELIST_RV_MUSL="${WHUSE_LTP_PENDING_WHITELIST_RV_MUS
 export WHUSE_LTP_PENDING_BLACKLIST_RV_MUSL="${WHUSE_LTP_PENDING_BLACKLIST_RV_MUSL:-${LTP_PENDING_BLACKLIST_RV_MUSL}}"
 export WHUSE_LTP_PENDING_WHITELIST_RV_GLIBC="${WHUSE_LTP_PENDING_WHITELIST_RV_GLIBC:-${LTP_PENDING_WHITELIST_RV_GLIBC}}"
 export WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC="${WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC:-${LTP_PENDING_BLACKLIST_RV_GLIBC}}"
+export WHUSE_LTP_PENDING_WHITELIST_LA_GLIBC="${WHUSE_LTP_PENDING_WHITELIST_LA_GLIBC:-${LTP_PENDING_WHITELIST_LA_GLIBC}}"
+export WHUSE_LTP_PENDING_BLACKLIST_LA_GLIBC="${WHUSE_LTP_PENDING_BLACKLIST_LA_GLIBC:-${LTP_PENDING_BLACKLIST_LA_GLIBC}}"
 export WHUSE_LTP_AUTO_PROMOTE_SCORE="${WHUSE_LTP_AUTO_PROMOTE_SCORE:-1}"
 export WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX="${WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX:-8}"
 export WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION="${WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION:-0}"
@@ -549,9 +553,12 @@ ensure_oscomp_images() {
     ltp-riscv) requested_arches=("rv") ;;
     ltp-riscv-curated) requested_arches=("rv") ;;
     ltp-riscv-pending) requested_arches=("rv") ;;
+    ltp-la) requested_arches=("la") ;;
+    ltp-la-curated) requested_arches=("la") ;;
+    ltp-la-pending) requested_arches=("la") ;;
     both | both-raw-exit) requested_arches=("rv" "la") ;;
     *)
-        echo "usage: $0 [riscv|riscv-raw-exit|loongarch|loongarch-raw-exit|ltp-riscv|ltp-riscv-curated|ltp-riscv-pending|both|both-raw-exit]" >&2
+        echo "usage: $0 [riscv|riscv-raw-exit|loongarch|loongarch-raw-exit|ltp-riscv|ltp-riscv-curated|ltp-riscv-pending|ltp-la|ltp-la-curated|ltp-la-pending|both|both-raw-exit]" >&2
         exit 2
         ;;
     esac
@@ -983,6 +990,7 @@ ltp_pending_whitelist_for_target() {
     case "${arch}:${runtime}" in
     rv:musl) printf '%s\n' "${WHUSE_LTP_PENDING_WHITELIST_RV_MUSL}" ;;
     rv:glibc) printf '%s\n' "${WHUSE_LTP_PENDING_WHITELIST_RV_GLIBC}" ;;
+    la:glibc) printf '%s\n' "${WHUSE_LTP_PENDING_WHITELIST_LA_GLIBC}" ;;
     *)
         echo "unsupported ltp pending whitelist target: ${arch}:${runtime}" >&2
         return 1
@@ -996,6 +1004,7 @@ ltp_pending_blacklist_for_target() {
     case "${arch}:${runtime}" in
     rv:musl) printf '%s\n' "${WHUSE_LTP_PENDING_BLACKLIST_RV_MUSL}" ;;
     rv:glibc) printf '%s\n' "${WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC}" ;;
+    la:glibc) printf '%s\n' "${WHUSE_LTP_PENDING_BLACKLIST_LA_GLIBC}" ;;
     *)
         echo "unsupported ltp pending blacklist target: ${arch}:${runtime}" >&2
         return 1
@@ -1041,6 +1050,12 @@ is_protected_score_path() {
         "${WHUSE_LTP_SCORE_BLACKLIST_LA_MUSL}"
         "${WHUSE_LTP_SCORE_WHITELIST_LA_GLIBC}"
         "${WHUSE_LTP_SCORE_BLACKLIST_LA_GLIBC}"
+        "${WHUSE_LTP_PENDING_WHITELIST_RV_MUSL}"
+        "${WHUSE_LTP_PENDING_BLACKLIST_RV_MUSL}"
+        "${WHUSE_LTP_PENDING_WHITELIST_RV_GLIBC}"
+        "${WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC}"
+        "${WHUSE_LTP_PENDING_WHITELIST_LA_GLIBC}"
+        "${WHUSE_LTP_PENDING_BLACKLIST_LA_GLIBC}"
     )
     for candidate in "${protected_paths[@]}"; do
         [[ -n "${candidate}" ]] || continue
@@ -2225,6 +2240,204 @@ run_ltp_riscv_pending() {
     return "${rc}"
 }
 
+run_ltp_la_mode() {
+    local mode="$1"
+    local runtime_filter="${WHUSE_OSCOMP_RUNTIME_FILTER}"
+    local saved_step_timeout="${WHUSE_LTP_STEP_TIMEOUT}"
+    case "${runtime_filter}" in
+    musl | glibc)
+        ;;
+    both | "")
+        runtime_filter="glibc"
+        ;;
+    *)
+        echo "[la-ltp-${mode}] invalid runtime filter for ltp-la: ${runtime_filter}" >&2
+        return 2
+        ;;
+    esac
+    if [[ "${LTP_STEP_TIMEOUT_WAS_SET}" != "1" ]]; then
+        WHUSE_LTP_STEP_TIMEOUT=1800
+    fi
+    local log="/tmp/la-ltp-${mode}-${runtime_filter}-stage2-${RUN_ID}.log"
+    local text_log="/tmp/la-ltp-${mode}-${runtime_filter}-stage2-${RUN_ID}.strings.log"
+    local runtime_image
+    local suite_done_seen=0
+    local terminated_by_suite_done=0
+    local ltp_profile
+    local ltp_whitelist
+    local ltp_blacklist
+    local label="la-ltp-${mode}-${runtime_filter}"
+    mapfile -t ltp_config < <(resolve_ltp_mode_config "${mode}")
+    ltp_profile="${ltp_config[0]}"
+    ltp_whitelist="${ltp_config[1]}"
+    ltp_blacklist="${ltp_config[2]}"
+    if [[ "${LTP_WHITELIST_WAS_SET}" != "1" ]]; then
+        ltp_whitelist="$(ltp_whitelist_for_target_profile "${ltp_profile}" "la" "${runtime_filter}")"
+    fi
+    if [[ "${LTP_BLACKLIST_WAS_SET}" != "1" ]]; then
+        ltp_blacklist="$(ltp_blacklist_for_target_profile "${ltp_profile}" "la" "${runtime_filter}")"
+    fi
+    prepare_ltp_runtime_image "${LA_IMG}"
+    runtime_image="${prepared_runtime_image}"
+    inject_oscomp_runtime_filter "${runtime_image}" "${runtime_filter}"
+    inject_ltp_runtime_config "${runtime_image}" "${ltp_profile}" "${ltp_whitelist}" "${ltp_blacklist}" "${runtime_filter}"
+
+    echo "[${label}] running ltp-only, timeout=${TIMEOUT_SECS}s, image=${runtime_image}, profile=${ltp_profile}, whitelist=${ltp_whitelist:-none}, blacklist=${ltp_blacklist:-none}, stop-on-suite-done=${WHUSE_STAGE2_STOP_ON_SUITE_DONE}"
+    if [[ "${WHUSE_STAGE2_STOP_ON_SUITE_DONE}" == "1" ]]; then
+        local runner_pid
+        setsid timeout "${TIMEOUT_SECS}s" env \
+            WHUSE_DISK_IMAGE="${runtime_image}" \
+            WHUSE_LTP_PROFILE="${ltp_profile}" \
+            WHUSE_LTP_WHITELIST="${ltp_whitelist}" \
+            WHUSE_LTP_BLACKLIST="${ltp_blacklist}" \
+            WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT}" \
+            "${XTASK_CMD[@]}" qemu-loongarch >"${log}" 2>&1 &
+        runner_pid=$!
+        while kill -0 "${runner_pid}" 2>/dev/null; do
+            if [[ -f "${log}" ]] && grep -a -q "whuse-oscomp-suite-done" "${log}"; then
+                suite_done_seen=1
+                terminated_by_suite_done=1
+                kill -TERM -- "-${runner_pid}" 2>/dev/null || true
+                for _ in $(seq 1 10); do
+                    if ! kill -0 "${runner_pid}" 2>/dev/null; then
+                        break
+                    fi
+                    sleep 1
+                done
+                kill -KILL -- "-${runner_pid}" 2>/dev/null || true
+                break
+            fi
+            sleep 2
+        done
+        wait "${runner_pid}" 2>/dev/null || true
+    else
+        timeout "${TIMEOUT_SECS}s" env \
+            WHUSE_DISK_IMAGE="${runtime_image}" \
+            WHUSE_LTP_PROFILE="${ltp_profile}" \
+            WHUSE_LTP_WHITELIST="${ltp_whitelist}" \
+            WHUSE_LTP_BLACKLIST="${ltp_blacklist}" \
+            WHUSE_LTP_CASE_TIMEOUT="${WHUSE_LTP_CASE_TIMEOUT}" \
+            "${XTASK_CMD[@]}" qemu-loongarch >"${log}" 2>&1 || true
+    fi
+
+    strings "${log}" >"${text_log}" || true
+    echo "[${label}] log: ${log}"
+
+    if has_kernel_panic_or_init_crash "${text_log}"; then
+        echo "[${label}] detected kernel panic or init crash" >&2
+        print_kernel_panic_or_init_crash_matches "${text_log}" >&2
+        return 1
+    fi
+
+    local ok=0
+    if rg -q "whuse-oscomp-step-begin:ltp_testcode.sh" "${text_log}"; then
+        echo "[${label}] step-begin ok: ltp_testcode.sh"
+    else
+        echo "[${label}] missing step-begin: ltp_testcode.sh" >&2
+        ok=1
+    fi
+    if rg -q "whuse-oscomp-step-end:ltp_testcode.sh:" "${text_log}" || rg -q "whuse-oscomp-step-timeout:ltp_testcode.sh" "${text_log}"; then
+        echo "[${label}] step-close ok: ltp_testcode.sh"
+    else
+        echo "[${label}] missing step-close: ltp_testcode.sh" >&2
+        ok=1
+    fi
+
+    local tpass tfail tbrok tconf timeout_count
+    local pass_candidates bad_candidates conf_candidates
+    tpass="$(count_matches "TPASS" "${text_log}")"
+    tfail="$(count_matches "TFAIL" "${text_log}")"
+    tbrok="$(count_matches "TBROK" "${text_log}")"
+    tconf="$(count_matches "TCONF" "${text_log}")"
+    timeout_count="$(count_matches "whuse-oscomp-step-timeout:ltp_testcode.sh" "${text_log}")"
+    pass_candidates="/tmp/la-ltp-${mode}-${runtime_filter}-pass-candidates-${TS}.txt"
+    bad_candidates="/tmp/la-ltp-${mode}-${runtime_filter}-bad-candidates-${TS}.txt"
+    conf_candidates="/tmp/la-ltp-${mode}-${runtime_filter}-conf-candidates-${TS}.txt"
+    generate_ltp_candidate_lists "${text_log}" "${pass_candidates}" "${bad_candidates}" "${conf_candidates}" "${label}"
+    echo "[${label}] pass-candidates: ${pass_candidates} ($(wc -l < "${pass_candidates}"))"
+    echo "[${label}] bad-candidates:  ${bad_candidates} ($(wc -l < "${bad_candidates}"))"
+    echo "[${label}] conf-candidates: ${conf_candidates} ($(wc -l < "${conf_candidates}"))"
+    case "${mode}" in
+    pending)
+        apply_ltp_pending_promotions \
+            "${label}" \
+            "${pass_candidates}" \
+            "${bad_candidates}" \
+            "${conf_candidates}" \
+            "${ltp_whitelist}" \
+            "$(ltp_curated_whitelist_for_target "la" "${runtime_filter}")" \
+            "$(ltp_curated_blacklist_for_target "la" "${runtime_filter}")" || ok=1
+        ;;
+    curated)
+        local curated_regression=0
+        if ! check_ltp_curated_stability "${label}" "${bad_candidates}" "${conf_candidates}"; then
+            ok=1
+            curated_regression=1
+        fi
+        if [[ "${curated_regression}" -eq 0 || "${WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION}" == "1" ]]; then
+            apply_ltp_curated_to_score_promotions \
+                "${label}" \
+                "${runtime_filter}" \
+                "${pass_candidates}" \
+                "$(ltp_score_whitelist_for_target "la" "${runtime_filter}")" \
+                "$(ltp_score_blacklist_for_target "la" "${runtime_filter}")" || ok=1
+        else
+            echo "[${label}] skip curated->score promotion: curated regression present and WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION=${WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION}"
+        fi
+        ;;
+    *)
+        local score_review_out
+        score_review_out="/tmp/${label}-score-review-${RUN_ID}.txt"
+        write_ltp_review_file "${label}-score" "${bad_candidates}" "${conf_candidates}" "${score_review_out}"
+        if [[ -s "${score_review_out}" ]]; then
+            echo "[${label}] score alarm: bad/conf cases detected; review ${score_review_out}" >&2
+        fi
+        apply_ltp_candidate_lists "${label}" "${pass_candidates}" "${bad_candidates}" "${ltp_whitelist}" "${ltp_blacklist}" || ok=1
+        ;;
+    esac
+    if [[ "${suite_done_seen}" == "0" ]] && rg -q "whuse-oscomp-suite-done" "${text_log}"; then
+        suite_done_seen=1
+    fi
+    echo "[${label}] summary: TPASS=${tpass} TFAIL=${tfail} TBROK=${tbrok} TCONF=${tconf} step-timeout=${timeout_count} suite_done_seen=${suite_done_seen} terminated_by_suite_done=${terminated_by_suite_done}"
+    rg "whuse-oscomp-step-(begin|end|timeout|skip):ltp_testcode.sh|whuse-oscomp-suite-done|whuse-ltp-(skip-case|case-result):" "${text_log}" || true
+    WHUSE_LTP_STEP_TIMEOUT="${saved_step_timeout}"
+    return "${ok}"
+}
+
+run_ltp_la() {
+    run_ltp_la_mode "score"
+}
+
+run_ltp_la_curated() {
+    local prev_apply_candidates="${WHUSE_LTP_APPLY_CANDIDATES}"
+    local rc=0
+    if [[ "${LTP_APPLY_CANDIDATES_WAS_SET}" != "1" ]]; then
+        WHUSE_LTP_APPLY_CANDIDATES=1
+    fi
+    if run_ltp_la_mode "curated"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    WHUSE_LTP_APPLY_CANDIDATES="${prev_apply_candidates}"
+    return "${rc}"
+}
+
+run_ltp_la_pending() {
+    local prev_apply_candidates="${WHUSE_LTP_APPLY_CANDIDATES}"
+    local rc=0
+    if [[ "${LTP_APPLY_CANDIDATES_WAS_SET}" != "1" ]]; then
+        WHUSE_LTP_APPLY_CANDIDATES=1
+    fi
+    if run_ltp_la_mode "pending"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    WHUSE_LTP_APPLY_CANDIDATES="${prev_apply_candidates}"
+    return "${rc}"
+}
+
 count_matches() {
     local pattern="$1"
     local log_file="$2"
@@ -2267,6 +2480,15 @@ ltp-riscv-curated)
 ltp-riscv-pending)
     run_ltp_riscv_pending
     ;;
+ltp-la)
+    run_ltp_la
+    ;;
+ltp-la-curated)
+    run_ltp_la_curated
+    ;;
+ltp-la-pending)
+    run_ltp_la_pending
+    ;;
 both)
     run_arch "rv" "${RV_IMG}" "qemu-riscv"
     run_arch "la" "${LA_IMG}" "qemu-loongarch"
@@ -2276,7 +2498,7 @@ both-raw-exit)
     run_arch_raw_exit "la" "${LA_IMG}" "qemu-loongarch"
     ;;
 *)
-    echo "usage: $0 [riscv|riscv-raw-exit|loongarch|loongarch-raw-exit|ltp-riscv|ltp-riscv-curated|ltp-riscv-pending|both|both-raw-exit]" >&2
+    echo "usage: $0 [riscv|riscv-raw-exit|loongarch|loongarch-raw-exit|ltp-riscv|ltp-riscv-curated|ltp-riscv-pending|ltp-la|ltp-la-curated|ltp-la-pending|both|both-raw-exit]" >&2
     exit 2
     ;;
 esac

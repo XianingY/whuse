@@ -800,11 +800,22 @@ impl HalMemory for VirtMemory {
     }
 
     fn phys_to_virt(&self, phys: usize) -> usize {
-        phys
+        // DMW1 maps physical 0x0xxx to VA 0x9xxx (by setting bit 63)
+        if phys < 0x80000000 {
+            phys | 0x8000000000000000
+        } else {
+            phys
+        }
     }
 
     fn virt_to_phys(&self, virt: usize) -> usize {
-        virt
+        // DMW1 maps VA 0x9xxx to physical 0x0xxx (by clearing bit 63)
+        // This works for kernel addresses in the DMW1 range (0x8000000000000000+)
+        if virt >= 0x8000000000000000 {
+            virt & 0x7FFFFFFFFF
+        } else {
+            virt
+        }
     }
 
     fn mmio_base(&self) -> usize {

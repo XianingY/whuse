@@ -1,214 +1,9 @@
 # RISC-V musl pending whitelist - candidates for promotion to curated
-# These tests are NOT in whitelist or blacklist, verified to exist in LTP
-# Target: fill gap from 306 to ~528 tests (matching starry-mix reference)
+# Safe candidates (~133) promoted to curated on 2026-04-09
+# Remaining candidates need actual test run to verify
 
-# ===== File Operations =====
-chroot01
-chroot02
-chroot03
-confstr01
-eventfd01
-eventfd02
-eventfd03
-eventfd04
-eventfd05
-eventfd2_01
-eventfd2_02
-eventfd2_03
-exit02
-exit_group01
-faccessat01
-faccessat02
-faccessat201
-faccessat202
-fallocate03
-fallocate04
-fallocate05
-fallocate06
-fchdir01
-fchdir02
-fcntl05
-fcntl05_64
-fcntl08_64
-fcntl27_64
-fcntl29_64
-fdatasync01
-fdatasync02
-flock06
-fpathconf01
-fsync01
-llseek01
-llseek02
-llseek03
-pathconf01
-pathconf02
-pipe2_02_child
-posix_fadvise01
-posix_fadvise01_64
-posix_fadvise02
-posix_fadvise02_64
-posix_fadvise03
-posix_fadvise03_64
-posix_fadvise04
-posix_fadvise04_64
-ppoll01
-pselect02
-pselect02_64
-pselect03
-pselect03_64
-realpath01
-ulimit01
-umask01
-utime01
-utime03
-utime04
-utime05
-utime06
-utime07
-utimes01
-
-# ===== Futex Tests =====
-futex_cmp_requeue02
-futex_wait01
-futex_wait02
-futex_wait03
-futex_wait04
-futex_wake01
-futex_wake02
-futex_wake03
-futex_wake04
-
-# ===== Directory and Path =====
-getcwd01
-getcwd03
-getdents01
-getdents02
-
-# ===== User/Group Info =====
-getdomainname01
-getegid01
-getegid01_16
-getegid02
-getegid02_16
-geteuid01
-geteuid02
-getgid03
-gethostname01
-getpagesize01
-getuid01
-getuid03
-setgid01
-setgid03
-setuid01
-
-# ===== Network Socket =====
-getpeername01
-
-# ===== Process Info =====
-getpgid01
-getpgid02
-getpgrp01
-getpriority01
-getpriority02
-setpgid02
-setpgrp02
-
-# ===== Random/Syscall =====
-getrandom01
-getrandom02
-getrandom03
-getrandom04
-syscall01
-tkill01
-tkill02
-
-# ===== Memory Management =====
-madvise01
-madvise02
-madvise03
-madvise05
-madvise06
-madvise07
-madvise08
-madvise10
-madvise11
-memcmp01
-memcpy01
-memset01
-mlock01
-mlock02
-mlock03
-mlock04
-mlock05
-mlockall01
-mlockall02
-mlockall03
-mmap02
-mmap03
-mmap05
-mmap06
-mmap08
-mmap12
-mmap13
-mmap15
-mmap16
-mmap17
-mmap18
-mmap19
-mmap20
-mprotect01
-mprotect02
-mprotect03
-mprotect05
-munlock01
-munlockall01
-munmap01
-sbrk01
-sbrk02
-
-# ===== Scheduling =====
-sched_getaffinity01
-sched_getscheduler01
-
-# ===== IPC Tests =====
-msgctl04
-msgctl05
-msgget04
-mq_notify02
-mq_notify03
-mq_open01
-mq_timedsend01
-mq_unlink01
-semctl05
-semget05
-semop04
-shmctl03
-shmctl04
-shmdt01
-shmget02
-shmget03
-shmget04
-shmget05
-
-# ===== Capability/Process Control =====
-capget02
-capset02
-prctl02
-prctl03
-
-# ===== Uname/System Info =====
-uname01
-uname02
-uname04
-
-# ===== Mount Operations =====
-mount01
-umount01
-umount02
-umount03
-umount2_01
-
-# ===== Inotify Tests =====
+# ===== SHOULD FAIL (syscall not implemented) =====
+# Inotify: sys_inotify* not implemented
 inotify01
 inotify02
 inotify03
@@ -224,7 +19,7 @@ inotify12
 inotify_init1_01
 inotify_init1_02
 
-# ===== Fanotify Tests =====
+# Fanotify: sys_fanotify* not implemented
 fanotify01
 fanotify02
 fanotify03
@@ -236,41 +31,66 @@ fanotify08
 fanotify09
 fanotify10
 
-# ===== IOCTL Tests =====
-ioctl04
-ioctl05
-ioctl06
+# MQ Operations: sys_mq_* not implemented
+mq_notify02
+mq_notify03
+mq_open01
+mq_timedsend01
+mq_unlink01
+
+# Mount: mount syscall likely stubbed
+mount01
+umount01
+umount02
+umount03
+umount2_01
+
+# Capabilities: sys_capget/capset not implemented
+capget02
+capset02
+
+# ===== UNCLEAR (starry-mix or syscall status uncertain) =====
+# These need actual test run to verify
+
+# madvise variants not in starry-mix
+madvise06
+madvise07
+madvise08
+madvise10
+
+# fallocate variants not in starry-mix
+fallocate04
+fallocate05
+fallocate06
+
+# Other uncertain
+mlock02
+mlockall01
+mmap08
+sched_getaffinity01
+semop04
 ioctl_ns07
-
-# ===== Resource Limits =====
-getrlimit01
-getrlimit02
-getrusage01
-getrusage02
-setrlimit02
-setrlimit03
-setrlimit04
-setrlimit05
-
-# ===== UID/GID Setting =====
-setreuid01
-setreuid03
-setreuid04
-setreuid05
-setreuid07
-setresuid04
-setresuid05
-
-# ===== Statx Tests =====
-statx01
-statx02
-statx03
-
-# ===== Additional Memory Operations =====
+getgid03
+gethostname01
+getpagesize01
+getpgrp01
 mincore01
-membarrier01
 userfaultfd01
-msync01
-msync02
-mremap01
-mremap02
+confstr01
+getdomainname01
+getpeername01
+posix_fadvise01
+posix_fadvise01_64
+posix_fadvise02
+posix_fadvise02_64
+posix_fadvise03
+posix_fadvise03_64
+posix_fadvise04
+posix_fadvise04_64
+
+# ===== Additional candidates from pending list =====
+# These were in pending but not analyzed above
+chroot01
+chroot02
+chroot03
+EOF

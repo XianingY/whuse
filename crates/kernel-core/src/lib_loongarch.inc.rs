@@ -3262,21 +3262,26 @@ impl Kernel {
                         result,
                         self.scheduler.is_blocked(tid),
                     );
-                    if !blocked_restart {
+                    // Use same logic as RISC-V: prevent sepc advancement when blocked syscall should restart
+                    if should_advance_sepc_after_syscall(sysno, result, blocked_restart) {
                         process.trap_frame.set_retval(result as usize);
                         if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN) || (result as i32) < 0
                         {
                             process.trap_frame.sepc = sepc + 4;
                         }
+                    } else if !blocked_restart {
+                        process.trap_frame.set_retval(result as usize);
                     }
                 }
             } else if let Ok(process) = self.processes.current_mut() {
                 let blocked_restart = should_restart_blocked_syscall(sysno, result, false);
-                if !blocked_restart {
+                if should_advance_sepc_after_syscall(sysno, result, blocked_restart) {
                     process.trap_frame.set_retval(result as usize);
                     if (sysno != SYS_EXECVE && sysno != SYS_RT_SIGRETURN) || (result as i32) < 0 {
                         process.trap_frame.sepc = sepc + 4;
                     }
+                } else if !blocked_restart {
+                    process.trap_frame.set_retval(result as usize);
                 }
             }
             self.dispatch_pending_signals();
@@ -6472,6 +6477,19 @@ fn should_restart_blocked_syscall(sysno: usize, result: isize, task_blocked: boo
                 | SYS_NANOSLEEP
                 | SYS_CLOCK_NANOSLEEP
         )
+}
+
+fn should_advance_sepc_after_syscall(sysno: usize, result: isize, blocked_restart: bool) -> bool {
+    if blocked_restart {
+        return false;
+    }
+    if sysno == SYS_RT_SIGRETURN {
+        return false;
+    }
+    if sysno == SYS_EXECVE && result >= 0 {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]

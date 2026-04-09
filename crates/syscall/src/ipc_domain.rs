@@ -2,10 +2,11 @@ use crate::{
     has_unmasked_pending_signal, ipc_access_allowed, wake_tasks_by_tid, DispatchContext, MsgEntry,
     MsgQueue, SemBufOp, SemSet, ShmAttachment, ShmSegment, ShmidDs, SyscallArgs, EACCES, EAGAIN,
     EEXIST, EFAULT, EIDRM, EINTR, EINVAL, ENOENT, ENOMSG, EPERM, IPC_CREAT, IPC_EXCL, IPC_INFO,
-    IPC_NOWAIT, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, MSG_INFO, MSG_STAT, MSG_STATE,
-    SEMCTL_SETVAL, SEMMSL_LIMIT, SEM_STATE, SHM_LOCK, SHM_STATE, SHM_UNLOCK, SYS_MSGCTL,
-    SYS_MSGGET, SYS_MSGRCV, SYS_MSGSND, SYS_SEMCTL, SYS_SEMGET, SYS_SEMOP, SYS_SEMTIMEDOP,
-    SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET,
+    IPC_NOWAIT, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, LA_SYS_MSGCTL, LA_SYS_MSGGET,
+    LA_SYS_MSGRCV, LA_SYS_MSGSND, LA_SYS_SEMCTL, LA_SYS_SEMGET, LA_SYS_SEMOP, LA_SYS_SEMTIMEDOP,
+    MSG_INFO, MSG_STAT, MSG_STATE, SEMCTL_SETVAL, SEMMSL_LIMIT, SEM_STATE, SHM_LOCK, SHM_STATE,
+    SHM_UNLOCK, SYS_MSGCTL, SYS_MSGGET, SYS_MSGRCV, SYS_MSGSND, SYS_SEMCTL, SYS_SEMGET,
+    SYS_SEMOP, SYS_SEMTIMEDOP, SYS_SHMAT, SYS_SHMCTL, SYS_SHMDT, SYS_SHMGET,
 };
 use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec;
@@ -686,14 +687,14 @@ pub(crate) fn dispatch(
     args: SyscallArgs,
 ) -> Option<Result<usize, i32>> {
     Some(match sysno {
-        SYS_MSGGET => sys_msgget(args, ctx.procs),
-        SYS_MSGSND => sys_msgsnd(args, ctx.procs, ctx.scheduler),
-        SYS_MSGRCV => sys_msgrcv(args, ctx.procs, ctx.scheduler),
-        SYS_MSGCTL => sys_msgctl(args, ctx.procs, ctx.scheduler),
-        SYS_SEMGET => sys_semget(args, ctx.procs),
-        SYS_SEMCTL => sys_semctl(args, ctx.procs, ctx.scheduler),
-        SYS_SEMOP => sys_semop(args, ctx.procs, ctx.scheduler),
-        SYS_SEMTIMEDOP => sys_semtimedop(args, ctx.procs, ctx.scheduler),
+        SYS_MSGGET | LA_SYS_MSGGET => sys_msgget(args, ctx.procs),
+        SYS_MSGSND | LA_SYS_MSGSND => sys_msgsnd(args, ctx.procs, ctx.scheduler),
+        SYS_MSGRCV | LA_SYS_MSGRCV => sys_msgrcv(args, ctx.procs, ctx.scheduler),
+        SYS_MSGCTL | LA_SYS_MSGCTL => sys_msgctl(args, ctx.procs, ctx.scheduler),
+        SYS_SEMGET | LA_SYS_SEMGET => sys_semget(args, ctx.procs),
+        SYS_SEMCTL | LA_SYS_SEMCTL => sys_semctl(args, ctx.procs, ctx.scheduler),
+        SYS_SEMOP | LA_SYS_SEMOP => sys_semop(args, ctx.procs, ctx.scheduler),
+        SYS_SEMTIMEDOP | LA_SYS_SEMTIMEDOP => sys_semtimedop(args, ctx.procs, ctx.scheduler),
         SYS_SHMGET => sys_shmget(args, ctx.procs),
         SYS_SHMAT => sys_shmat(args, ctx.procs),
         SYS_SHMCTL => sys_shmctl(args, ctx.procs),

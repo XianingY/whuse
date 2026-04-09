@@ -297,6 +297,17 @@ pub const SYS_SHMGET: usize = 194;
 pub const SYS_SHMCTL: usize = 195;
 pub const SYS_SHMAT: usize = 196;
 pub const SYS_SHMDT: usize = 197;
+
+// LoongArch64 syscall numbers for IPC (different from RISC-V)
+pub const LA_SYS_MSGGET: usize = 1000;
+pub const LA_SYS_MSGCTL: usize = 1001;
+pub const LA_SYS_MSGRCV: usize = 1002;
+pub const LA_SYS_MSGSND: usize = 1003;
+pub const LA_SYS_SEMGET: usize = 1004;
+pub const LA_SYS_SEMCTL: usize = 1005;
+pub const LA_SYS_SEMOP: usize = 1006;
+pub const LA_SYS_SEMTIMEDOP: usize = 1007;
+
 pub const SYS_SOCKET: usize = 198;
 pub const SYS_SOCKETPAIR: usize = 199;
 pub const SYS_BIND: usize = 200;

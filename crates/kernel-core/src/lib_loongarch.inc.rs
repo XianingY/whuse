@@ -15,9 +15,16 @@ use proc::ProcessTable;
 use syscall::cache_busybox_image;
 use syscall::{
     SyscallArgs, SyscallDispatcher, SIGNAL_TRAMPOLINE_BASE, SIGNAL_TRAMPOLINE_CODE,
-    SYS_CLOCK_NANOSLEEP, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2, SYS_EXECVE, SYS_FUTEX, SYS_MSGRCV,
-    SYS_NANOSLEEP, SYS_PPOLL, SYS_PSELECT6, SYS_READ, SYS_READV, SYS_RT_SIGRETURN,
-    SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SEMOP, SYS_SEMTIMEDOP, SYS_WAIT,
+    SYS_CHMOD, SYS_CHDIR, SYS_CLOCK_NANOSLEEP, SYS_CLONE, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2,
+    SYS_EXECVE, SYS_FCHMODAT, SYS_FORK, SYS_FSTATAT, SYS_FUTEX, SYS_GETDENTS64, SYS_LINKAT,
+    SYS_LSEEK, SYS_MKDIRAT, SYS_MKNODAT, SYS_MOUNT, SYS_MSGRCV, SYS_MUNMAP, SYS_NANOSLEEP,
+    SYS_OPENAT, SYS_PIPE2, SYS_PPOLL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PSELECT6,
+    SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_READLINKAT, SYS_READV, SYS_RENAMEAT,
+    SYS_RENAMEAT2, SYS_RT_SIGRETURN, SYS_RT_SIGSUSPEND, SYS_RT_SIGTIMEDWAIT, SYS_SEMGET,
+    SYS_SEMCTL, SYS_SEMOP, SYS_SEMTIMEDOP, SYS_SENDFILE, SYS_SET_TID_ADDRESS, SYS_SHMCTL,
+    SYS_SHMDT, SYS_SHMGET, SYS_SHMAT, SYS_SPLICE, SYS_STATFS, SYS_STATX, SYS_SYNC, SYS_SYMLINKAT,
+    SYS_TRUNCATE, SYS_UMOUNT2, SYS_UNLINKAT, SYS_UTIMENSAT, SYS_WAIT, SYS_WRITE, SYS_WRITEV,
+    LA_SYS_MSGRCV, LA_SYS_SEMGET, LA_SYS_SEMCTL, LA_SYS_SEMOP, LA_SYS_SEMTIMEDOP,
 };
 use task::Scheduler;
 use vfs::{KernelVfs, O_RDWR};
@@ -3067,6 +3074,282 @@ impl Kernel {
         self.handle_trap();
     }
 
+    /// LA-specific syscall wrapper dispatcher.
+    /// Converts legacy non-*at syscalls to *at variants with AT_FDCWD.
+    /// Returns `None` if the syscall doesn't need LA-specific handling.
+    fn dispatch_la_syscall_wrapper(
+        &self,
+        sysno: usize,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        scheduler: &mut Scheduler,
+        vfs: &mut KernelVfs,
+    ) -> Option<isize> {
+        const AT_FDCWD: usize = -100isize as usize;
+        const SIGCHLD: usize = 17;
+
+        // Helper to check if an argument looks like a pathname pointer (user address).
+        // On LA, user addresses are typically in the range 0x0xxx_xxxx to 0x7fff_xxxx.
+        let looks_like_pathname = |arg: usize| -> bool {
+            // Valid pathname pointers are typically in user space
+            // Check if it looks like a user-space address (non-kernel, non-null)
+            arg != 0 && arg < 0x7fff_ffff
+        };
+
+        // Helper to check if an argument looks like a small file descriptor or AT_FDCWD
+        let looks_like_fd = |arg: usize| -> bool {
+            arg == AT_FDCWD || arg <= 1024
+        };
+
+        match sysno {
+            // SYS_OPENAT (56): LA libc may call this as legacy "open(path, flags, mode)"
+            // If first arg looks like pathname instead of fd, convert to openat
+            SYS_OPENAT => {
+                let a0 = args.0[0];
+                if !looks_like_fd(a0) && looks_like_pathname(a0) {
+                    // LA calling open(path, flags, mode) as openat(dirfd=path, path=flags, ...)
+                    // Convert: (path, flags, mode) -> (AT_FDCWD, path, flags, mode)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // path
+                        args.0[1], // flags
+                        args.0[2], // mode
+                        args.0[3],
+                        args.0[4],
+                    ]);
+                    let result = self.syscalls.dispatch(
+                        SYS_OPENAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_MKDIRAT (34): LA libc may call this as legacy "mkdir(path, mode)"
+            SYS_MKDIRAT => {
+                let a0 = args.0[0];
+                if !looks_like_fd(a0) && looks_like_pathname(a0) {
+                    // Convert: (path, mode) -> (AT_FDCWD, path, mode)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // path
+                        args.0[1], // mode
+                        args.0[2],
+                        args.0[3],
+                        args.0[4],
+                    ]);
+                    let result = self.syscalls.dispatch(
+                        SYS_MKDIRAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_LINKAT (37): LA libc may call this as 3-arg "link(oldpath, newpath, flags)"
+            // instead of 5-arg linkat(dirfd1, oldpath, dirfd2, newpath, flags)
+            SYS_LINKAT => {
+                let a0 = args.0[0];
+                let a2 = args.0[2];
+                // If first arg looks like pathname (oldpath) and third arg looks like pathname (newpath)
+                // instead of being a fd, this is the 3-arg form
+                if looks_like_pathname(a0) && looks_like_pathname(a2) {
+                    // Convert: (oldpath, newpath, flags) -> (AT_FDCWD, oldpath, AT_FDCWD, newpath, flags)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // oldpath
+                        AT_FDCWD,
+                        args.0[2], // newpath
+                        args.0[3], // flags
+                        args.0[4],
+                    ]);
+                    let result = self.syscalls.dispatch(
+                        SYS_LINKAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_UNLINKAT (35): LA libc may call this as legacy "unlink(path)"
+            SYS_UNLINKAT => {
+                let a0 = args.0[0];
+                if !looks_like_fd(a0) && looks_like_pathname(a0) {
+                    // Convert: (path, flags) -> (AT_FDCWD, path, flags)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // path
+                        args.0[1], // flags
+                        args.0[2],
+                        args.0[3],
+                        args.0[4],
+                    ]);
+                    let result = self.syscalls.dispatch(
+                        SYS_UNLINKAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_READLINKAT (78): LA libc may call this as legacy "readlink(path, buf, bufsize)"
+            SYS_READLINKAT => {
+                let a0 = args.0[0];
+                if !looks_like_fd(a0) && looks_like_pathname(a0) {
+                    // Convert: (path, buf, bufsize) -> (AT_FDCWD, path, buf, bufsize)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // path
+                        args.0[1], // buf
+                        args.0[2], // bufsize
+                        args.0[3],
+                        args.0[4],
+                    ]);
+                    let result = self.syscalls.dispatch(
+                        SYS_READLINKAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_RENAMEAT (38): LA libc may call this as legacy "rename(oldpath, newpath)"
+            SYS_RENAMEAT => {
+                let a0 = args.0[0];
+                let a2 = args.0[2];
+                // If first and third args look like pathnames, this is the 2-arg form
+                if looks_like_pathname(a0) && looks_like_pathname(a2) {
+                    // Convert: (oldpath, newpath) -> (AT_FDCWD, oldpath, AT_FDCWD, newpath)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // oldpath
+                        AT_FDCWD,
+                        args.0[2], // newpath
+                        args.0[3],
+                        args.0[4],
+                    ]);
+                    let result = self.syscalls.dispatch(
+                        SYS_RENAMEAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_FSTATAT (79): LA libc may call this as legacy "stat(path, statbuf)"
+            SYS_FSTATAT => {
+                let a0 = args.0[0];
+                if !looks_like_fd(a0) && looks_like_pathname(a0) {
+                    // Convert: (path, statbuf, flags) -> (AT_FDCWD, path, statbuf, flags)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // path
+                        args.0[1], // statbuf
+                        args.0[2], // flags
+                        args.0[3],
+                        args.0[4],
+                    ]);
+                    let result = self.syscalls.dispatch(
+                        SYS_FSTATAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_FCHMODAT (53): LA libc may call this as legacy "chmod(path, mode)"
+            SYS_FCHMODAT => {
+                let a0 = args.0[0];
+                if !looks_like_fd(a0) && looks_like_pathname(a0) {
+                    // Convert: (path, mode, flags) -> (AT_FDCWD, path, mode, flags)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // path
+                        args.0[1], // mode
+                        args.0[2], // flags
+                        args.0[3],
+                        args.0[4],
+                    ]);
+                    let result = self.syscalls.dispatch(
+                        SYS_FCHMODAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_PIPE2 (59): LA libc may call this as legacy "pipe(buf)"
+            // pipe2 is called with (buf, flags), so we just ensure flags=0
+            SYS_PIPE2 => {
+                // Already correct format for pipe2(buf, flags=0)
+                // Just ensure flags is 0 if caller didn't set it
+                let new_args = SyscallArgs([
+                    args.0[0], // buf
+                    0,         // flags = 0 for legacy pipe
+                    args.0[2],
+                    args.0[3],
+                    args.0[4],
+                    args.0[5],
+                ]);
+                let result = self.syscalls.dispatch(
+                    SYS_PIPE2,
+                    new_args,
+                    procs,
+                    scheduler,
+                    vfs,
+                );
+                return Some(result);
+            }
+            // SYS_CLONE (220): LA libc may call this as legacy "fork()"
+            // clone(args) = clone(flags, stack, parent_tid, child_tls, stack_size)
+            // fork() = clone(SIGCHLD, 0, 0, 0, 0)
+            SYS_CLONE => {
+                let flags = args.0[0];
+                // If flags is 0 or SIGCHLD, this might be a fork call
+                if flags == 0 || flags == SIGCHLD {
+                    // Check if this looks like fork (all other args are 0)
+                    if args.0[1] == 0 && args.0[2] == 0 && args.0[3] == 0 && args.0[4] == 0 {
+                        // This is fork - convert to clone(SIGCHLD, 0, 0, 0, 0)
+                        let new_args = SyscallArgs([
+                            SIGCHLD, // SIGCHLD flag
+                            0,       // stack = 0
+                            0,       // parent_tid = 0
+                            0,       // child_tls = 0
+                            0,       // stack_size = 0
+                            args.0[5],
+                        ]);
+                        let result = self.syscalls.dispatch(
+                            SYS_CLONE,
+                            new_args,
+                            procs,
+                            scheduler,
+                            vfs,
+                        );
+                        return Some(result);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     fn handle_trap(&mut self) {
         let (sysno, args, scause, sepc, pid) = match self.processes.current() {
             Ok(process) => (
@@ -3240,13 +3523,24 @@ impl Kernel {
 
         if is_syscall {
             let trap_tid = self.processes.current_tid().ok();
-            let result = self.syscalls.dispatch(
+            // Try LA-specific syscall wrapper handling first
+            let result = if let Some(result) = self.dispatch_la_syscall_wrapper(
                 sysno,
                 SyscallArgs(args),
                 &mut self.processes,
                 &mut self.scheduler,
                 &mut self.vfs,
-            );
+            ) {
+                result
+            } else {
+                self.syscalls.dispatch(
+                    sysno,
+                    SyscallArgs(args),
+                    &mut self.processes,
+                    &mut self.scheduler,
+                    &mut self.vfs,
+                )
+            };
             let exit_like_syscall = matches!(sysno, syscall::SYS_EXIT | syscall::SYS_EXIT_GROUP);
             if exit_like_syscall {
                 if self.scheduler.current_thread_id().is_none() && self.scheduler.ready_count() > 0
@@ -6472,8 +6766,11 @@ fn should_restart_blocked_syscall(sysno: usize, result: isize, task_blocked: boo
                 | SYS_EPOLL_PWAIT
                 | SYS_EPOLL_PWAIT2
                 | SYS_MSGRCV
+                | LA_SYS_MSGRCV
                 | SYS_SEMOP
+                | LA_SYS_SEMOP
                 | SYS_SEMTIMEDOP
+                | LA_SYS_SEMTIMEDOP
                 | SYS_NANOSLEEP
                 | SYS_CLOCK_NANOSLEEP
         )

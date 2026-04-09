@@ -177,9 +177,9 @@ unsafe extern "C" fn __whuse_kernel_trap_handler(estat: usize, _era: usize) {
     panic!("unhandled kernel trap");
 }
 
-#[cfg(target_arch = "loongarch64")]
-global_asm!(
-    r#"
+macro_rules! loongarch_user_context_asm {
+    () => {
+        r#"
     .section .text
     .globl __whuse_run_user
 __whuse_run_user:
@@ -192,6 +192,8 @@ __whuse_run_user:
 
     move $t0, $sp
     csrwr $t0, 0x31
+    move $fp, $a0
+    csrwr $fp, 0x30
 
     ld.d $ra, $a0, 8
     ld.d $sp, $a0, 16
@@ -232,14 +234,13 @@ __whuse_run_user:
     ori $t0, $t0, 0x3
     ori $t0, $t0, 0x8   // Set PGIE (bit 3) = 1
     csrwr $t0, 0x1
-    ld.d $t0, $a0, 80
-    csrwr $t0, 0x30
     // Enable user extension units (FPU/SX/ASX) before entering userspace.
     li.d $t2, 0x7
     csrwr $t2, 0x2
     ld.d $t0, $a0, 40
     ld.d $t1, $a0, 48
     ld.d $t2, $a0, 56
+    ld.d $a0, $a0, 80
     ertn
 
     .align 4
@@ -347,7 +348,14 @@ __whuse_tlb_refill_entry:
     csrrd   $t0, 0x8b
     ertn
 "#
-);
+    };
+}
+
+#[cfg(test)]
+const LOONGARCH_USER_CONTEXT_ASM: &str = loongarch_user_context_asm!();
+
+#[cfg(target_arch = "loongarch64")]
+global_asm!(loongarch_user_context_asm!());
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
@@ -1452,7 +1460,10 @@ fn loongarch_shutdown_byte(_reason: ShutdownReason) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{loongarch_shutdown_byte, loongarch_shutdown_register_base, pci_interrupt_line};
+    use super::{
+        loongarch_shutdown_byte, loongarch_shutdown_register_base, pci_interrupt_line,
+        LOONGARCH_USER_CONTEXT_ASM,
+    };
     use hal_api::ShutdownReason;
 
     #[test]
@@ -1473,5 +1484,25 @@ mod tests {
         assert_eq!(pci_interrupt_line(0x0000_00ff), None);
         assert_eq!(pci_interrupt_line(0x1234_56ff), None);
         assert_eq!(pci_interrupt_line(0xabcd_ef02), Some(2));
+    }
+
+    #[test]
+    fn loongarch_run_user_primes_save0_with_trap_frame_pointer() {
+        assert!(
+            LOONGARCH_USER_CONTEXT_ASM.contains("move $fp, $a0\n    csrwr $fp, 0x30"),
+            "run_user should keep the trap-frame pointer in SAVE0 while userspace runs"
+        );
+        assert!(
+            !LOONGARCH_USER_CONTEXT_ASM.contains("ld.d $t0, $a0, 80\n    csrwr $t0, 0x30"),
+            "run_user must not overwrite SAVE0 with the trap-frame a0 slot"
+        );
+    }
+
+    #[test]
+    fn loongarch_run_user_restores_user_a0_before_ertn() {
+        assert!(
+            LOONGARCH_USER_CONTEXT_ASM.contains("ld.d $a0, $a0, 80\n    ertn"),
+            "run_user should restore user a0 from the trap frame immediately before ertn"
+        );
     }
 }

@@ -22,3 +22,5 @@ vxlan02.sh
 vxlan03.sh
 timer_settime01
 timens01
+alarm05
+alarm07

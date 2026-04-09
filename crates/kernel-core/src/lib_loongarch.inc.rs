@@ -16,7 +16,7 @@ use syscall::cache_busybox_image;
 use syscall::{
     SyscallArgs, SyscallDispatcher, SIGNAL_TRAMPOLINE_BASE, SIGNAL_TRAMPOLINE_CODE,
     SYS_CHDIR, SYS_CLOCK_NANOSLEEP, SYS_CLONE, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2,
-    SYS_EXECVE, SYS_FCHMODAT, SYS_FCHOWNAT, SYS_FORK, SYS_FSTATAT, SYS_FUTEX, SYS_GETDENTS64, SYS_LINKAT,
+    SYS_EXECVE, SYS_FACCESSAT, SYS_FCHMODAT, SYS_FCHOWNAT, SYS_FORK, SYS_FSTATAT, SYS_FUTEX, SYS_GETDENTS64, SYS_LINKAT,
     SYS_LSEEK, SYS_MKDIRAT, SYS_MKNODAT, SYS_MOUNT, SYS_MSGRCV, SYS_MUNMAP, SYS_NANOSLEEP,
     SYS_OPENAT, SYS_PIPE2, SYS_PPOLL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PSELECT6,
     SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_READLINKAT, SYS_READV, SYS_RENAMEAT,
@@ -3385,6 +3385,86 @@ impl Kernel {
                     ]);
                     let result = syscalls.dispatch(
                         SYS_MKNODAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_FACCESSAT (48): LA libc may call this as legacy "access(path, mode)"
+            // faccessat is (dirfd, path, mode, flags) but LA libc may call access with (path, mode)
+            SYS_FACCESSAT => {
+                let a0 = args.0[0];
+                // If first arg looks like pathname and second looks like mode (not AT_FDCWD or fd)
+                if !looks_like_fd(a0) && looks_like_pathname(a0) && a0 != 0 && a0 < 0x7fff_ffff {
+                    // Also check second arg looks like a mode value (typically 0-1023 for access modes)
+                    let a1 = args.0[1];
+                    if a1 <= 1024 {
+                        // Convert: (path, mode) -> (AT_FDCWD, path, mode, 0)
+                        let new_args = SyscallArgs([
+                            AT_FDCWD,
+                            args.0[0], // path
+                            args.0[1], // mode
+                            0,         // flags
+                            args.0[3],
+                            args.0[4],
+                        ]);
+                        let result = syscalls.dispatch(
+                            SYS_FACCESSAT,
+                            new_args,
+                            procs,
+                            scheduler,
+                            vfs,
+                        );
+                        return Some(result);
+                    }
+                }
+            }
+            // SYS_SYMLINKAT (36): LA libc may call this as legacy "symlink(target, linkpath)"
+            // symlinkat is (target, dirfd, linkpath) but LA libc may call symlink with (target, linkpath)
+            SYS_SYMLINKAT => {
+                let a1 = args.0[1];
+                // If second arg looks like pathname (should be fd for symlinkat), this is legacy form
+                if looks_like_pathname(a1) {
+                    // Convert: (target, linkpath) -> (target, AT_FDCWD, linkpath)
+                    let new_args = SyscallArgs([
+                        args.0[0], // target
+                        AT_FDCWD,
+                        args.0[1], // linkpath
+                        args.0[2],
+                        args.0[3],
+                        args.0[4],
+                    ]);
+                    let result = syscalls.dispatch(
+                        SYS_SYMLINKAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_UTIMENSAT (88): LA libc may call this as legacy "utimensat(path, times)"
+            // utimensat is (dirfd, path, times, flags) but LA libc may call with (path, times)
+            SYS_UTIMENSAT => {
+                let a0 = args.0[0];
+                // If first arg looks like pathname, this is legacy form
+                if !looks_like_fd(a0) && looks_like_pathname(a0) {
+                    // Convert: (path, times, flags?) -> (AT_FDCWD, path, times, flags?)
+                    // Handle both 2-arg (path, times) and 3-arg (path, times, flags) forms
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // path
+                        args.0[1], // times
+                        args.0[2], // flags (or unused if 2-arg form)
+                        args.0[3],
+                        args.0[4],
+                    ]);
+                    let result = syscalls.dispatch(
+                        SYS_UTIMENSAT,
                         new_args,
                         procs,
                         scheduler,

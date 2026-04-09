@@ -27,6 +27,8 @@ LTP_PENDING_WHITELIST_RV_GLIBC="${REPO_ROOT}/tools/oscomp/ltp/pending_whitelist_
 LTP_PENDING_BLACKLIST_RV_GLIBC="${REPO_ROOT}/tools/oscomp/ltp/pending_blacklist_glibc_rv.txt"
 LTP_PENDING_WHITELIST_LA_GLIBC="${REPO_ROOT}/tools/oscomp/ltp/pending_whitelist_glibc_la.txt"
 LTP_PENDING_BLACKLIST_LA_GLIBC="${REPO_ROOT}/tools/oscomp/ltp/pending_blacklist_glibc_la.txt"
+LTP_PENDING_WHITELIST_LA_MUSL="${REPO_ROOT}/tools/oscomp/ltp/pending_whitelist_musl_la.txt"
+LTP_PENDING_BLACKLIST_LA_MUSL="/dev/null"
 
 MODE="${1:-riscv}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-3600}"
@@ -121,6 +123,8 @@ export WHUSE_LTP_PENDING_WHITELIST_RV_GLIBC="${WHUSE_LTP_PENDING_WHITELIST_RV_GL
 export WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC="${WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC:-${LTP_PENDING_BLACKLIST_RV_GLIBC}}"
 export WHUSE_LTP_PENDING_WHITELIST_LA_GLIBC="${WHUSE_LTP_PENDING_WHITELIST_LA_GLIBC:-${LTP_PENDING_WHITELIST_LA_GLIBC}}"
 export WHUSE_LTP_PENDING_BLACKLIST_LA_GLIBC="${WHUSE_LTP_PENDING_BLACKLIST_LA_GLIBC:-${LTP_PENDING_BLACKLIST_LA_GLIBC}}"
+export WHUSE_LTP_PENDING_WHITELIST_LA_MUSL="${WHUSE_LTP_PENDING_WHITELIST_LA_MUSL:-${LTP_PENDING_WHITELIST_LA_MUSL}}"
+export WHUSE_LTP_PENDING_BLACKLIST_LA_MUSL="${WHUSE_LTP_PENDING_BLACKLIST_LA_MUSL:-${LTP_PENDING_BLACKLIST_LA_MUSL}}"
 export WHUSE_LTP_AUTO_PROMOTE_SCORE="${WHUSE_LTP_AUTO_PROMOTE_SCORE:-1}"
 export WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX="${WHUSE_LTP_SCORE_PROMOTE_BATCH_MAX:-8}"
 export WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION="${WHUSE_LTP_PROMOTE_ON_CURATED_REGRESSION:-0}"
@@ -991,6 +995,7 @@ ltp_pending_whitelist_for_target() {
     rv:musl) printf '%s\n' "${WHUSE_LTP_PENDING_WHITELIST_RV_MUSL}" ;;
     rv:glibc) printf '%s\n' "${WHUSE_LTP_PENDING_WHITELIST_RV_GLIBC}" ;;
     la:glibc) printf '%s\n' "${WHUSE_LTP_PENDING_WHITELIST_LA_GLIBC}" ;;
+    la:musl) printf '%s\n' "${WHUSE_LTP_PENDING_WHITELIST_LA_MUSL}" ;;
     *)
         echo "unsupported ltp pending whitelist target: ${arch}:${runtime}" >&2
         return 1
@@ -1005,6 +1010,7 @@ ltp_pending_blacklist_for_target() {
     rv:musl) printf '%s\n' "${WHUSE_LTP_PENDING_BLACKLIST_RV_MUSL}" ;;
     rv:glibc) printf '%s\n' "${WHUSE_LTP_PENDING_BLACKLIST_RV_GLIBC}" ;;
     la:glibc) printf '%s\n' "${WHUSE_LTP_PENDING_BLACKLIST_LA_GLIBC}" ;;
+    la:musl) printf '%s\n' "${WHUSE_LTP_PENDING_BLACKLIST_LA_MUSL}" ;;
     *)
         echo "unsupported ltp pending blacklist target: ${arch}:${runtime}" >&2
         return 1

@@ -15,7 +15,7 @@ use proc::ProcessTable;
 use syscall::cache_busybox_image;
 use syscall::{
     SyscallArgs, SyscallDispatcher, SIGNAL_TRAMPOLINE_BASE, SIGNAL_TRAMPOLINE_CODE,
-    SYS_CHMOD, SYS_CHDIR, SYS_CLOCK_NANOSLEEP, SYS_CLONE, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2,
+    SYS_CHDIR, SYS_CLOCK_NANOSLEEP, SYS_CLONE, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2,
     SYS_EXECVE, SYS_FCHMODAT, SYS_FORK, SYS_FSTATAT, SYS_FUTEX, SYS_GETDENTS64, SYS_LINKAT,
     SYS_LSEEK, SYS_MKDIRAT, SYS_MKNODAT, SYS_MOUNT, SYS_MSGRCV, SYS_MUNMAP, SYS_NANOSLEEP,
     SYS_OPENAT, SYS_PIPE2, SYS_PPOLL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PSELECT6,
@@ -3078,7 +3078,7 @@ impl Kernel {
     /// Converts legacy non-*at syscalls to *at variants with AT_FDCWD.
     /// Returns `None` if the syscall doesn't need LA-specific handling.
     fn dispatch_la_syscall_wrapper(
-        &self,
+        syscalls: &SyscallDispatcher,
         sysno: usize,
         args: SyscallArgs,
         procs: &mut ProcessTable,
@@ -3117,7 +3117,7 @@ impl Kernel {
                         args.0[3],
                         args.0[4],
                     ]);
-                    let result = self.syscalls.dispatch(
+                    let result = syscalls.dispatch(
                         SYS_OPENAT,
                         new_args,
                         procs,
@@ -3140,7 +3140,7 @@ impl Kernel {
                         args.0[3],
                         args.0[4],
                     ]);
-                    let result = self.syscalls.dispatch(
+                    let result = syscalls.dispatch(
                         SYS_MKDIRAT,
                         new_args,
                         procs,
@@ -3167,7 +3167,7 @@ impl Kernel {
                         args.0[3], // flags
                         args.0[4],
                     ]);
-                    let result = self.syscalls.dispatch(
+                    let result = syscalls.dispatch(
                         SYS_LINKAT,
                         new_args,
                         procs,
@@ -3190,7 +3190,7 @@ impl Kernel {
                         args.0[3],
                         args.0[4],
                     ]);
-                    let result = self.syscalls.dispatch(
+                    let result = syscalls.dispatch(
                         SYS_UNLINKAT,
                         new_args,
                         procs,
@@ -3213,7 +3213,7 @@ impl Kernel {
                         args.0[3],
                         args.0[4],
                     ]);
-                    let result = self.syscalls.dispatch(
+                    let result = syscalls.dispatch(
                         SYS_READLINKAT,
                         new_args,
                         procs,
@@ -3238,7 +3238,7 @@ impl Kernel {
                         args.0[3],
                         args.0[4],
                     ]);
-                    let result = self.syscalls.dispatch(
+                    let result = syscalls.dispatch(
                         SYS_RENAMEAT,
                         new_args,
                         procs,
@@ -3261,7 +3261,7 @@ impl Kernel {
                         args.0[3],
                         args.0[4],
                     ]);
-                    let result = self.syscalls.dispatch(
+                    let result = syscalls.dispatch(
                         SYS_FSTATAT,
                         new_args,
                         procs,
@@ -3284,7 +3284,7 @@ impl Kernel {
                         args.0[3],
                         args.0[4],
                     ]);
-                    let result = self.syscalls.dispatch(
+                    let result = syscalls.dispatch(
                         SYS_FCHMODAT,
                         new_args,
                         procs,
@@ -3307,7 +3307,7 @@ impl Kernel {
                     args.0[4],
                     args.0[5],
                 ]);
-                let result = self.syscalls.dispatch(
+                let result = syscalls.dispatch(
                     SYS_PIPE2,
                     new_args,
                     procs,
@@ -3334,7 +3334,7 @@ impl Kernel {
                             0,       // stack_size = 0
                             args.0[5],
                         ]);
-                        let result = self.syscalls.dispatch(
+                        let result = syscalls.dispatch(
                             SYS_CLONE,
                             new_args,
                             procs,
@@ -3359,7 +3359,7 @@ impl Kernel {
                         args.0[3],
                         args.0[4],
                     ]);
-                    let result = self.syscalls.dispatch(
+                    let result = syscalls.dispatch(
                         SYS_MKNODAT,
                         new_args,
                         procs,
@@ -3548,7 +3548,8 @@ impl Kernel {
         if is_syscall {
             let trap_tid = self.processes.current_tid().ok();
             // Try LA-specific syscall wrapper handling first
-            let result = if let Some(result) = self.dispatch_la_syscall_wrapper(
+            let result = if let Some(result) = Self::dispatch_la_syscall_wrapper(
+                &self.syscalls,
                 sysno,
                 SyscallArgs(args),
                 &mut self.processes,

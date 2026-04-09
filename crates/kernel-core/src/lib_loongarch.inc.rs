@@ -3340,6 +3340,8 @@ impl Kernel {
                         vfs,
                     );
                     return Some(result);
+                } else {
+                    return None;
                 }
             }
             // SYS_CHOWN (6): LA libc may call this directly as legacy "chown(path, owner, group)"
@@ -3364,6 +3366,8 @@ impl Kernel {
                         vfs,
                     );
                     return Some(result);
+                } else {
+                    return None;
                 }
             }
             // SYS_PIPE2 (59): LA libc may call this as legacy "pipe(buf)"

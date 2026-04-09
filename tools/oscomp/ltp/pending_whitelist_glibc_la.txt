@@ -1,0 +1,105 @@
+# LA kernel pending whitelist - core syscalls likely to work
+# Generated 2026-04-09
+# Based on analysis of glibc-la score whitelist and available LTP tests
+
+# File operations - basic
+chmod01
+chmod03
+chown01
+chown02
+dup03
+fchmod01
+fchmod02
+fchown01
+fchown02
+fcntl01
+fcntl02
+fcntl03
+fcntl04
+fcntl05
+fcntl07
+fcntl08
+fcntl09
+fcntl10
+fcntl11
+fcntl12
+fcntl13
+fcntl14
+fcntl15
+fcntl16
+fcntl17
+fcntl18
+fork01
+fstat02
+fsync01
+fsync02
+ftruncate01
+ftruncate03
+getcwd01
+link02
+lseek01
+mkdir02
+open01
+open02
+pipe01
+pread01
+pwrite01
+read01
+read02
+readlink01
+rename01
+rmdir01
+stat01
+sync01
+truncate02
+unlink05
+write01
+write02
+
+# Process operations
+clone01
+clone02
+execve01
+exit01
+fork03
+getpid01
+getuid01
+kill02
+signal01
+sigaction01
+wait01
+wait02
+
+# Memory operations
+mmap01
+mmap02
+mprotect01
+mprotect02
+munmap01
+
+# IPC - message queues
+msgctl01
+msgctl02
+msgctl03
+msgget01
+msgrcv01
+
+# IPC - semaphores
+semctl01
+semget01
+semop01
+
+# IPC - shared memory
+shmat01
+shmdt01
+shmctl01
+shmget02
+
+# Time
+clock_gettime01
+nanosleep01
+time01
+
+# Other
+getrlimit01
+setrlimit01

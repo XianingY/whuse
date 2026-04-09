@@ -20,7 +20,5 @@ geneve02.sh
 gre02.sh
 vxlan02.sh
 vxlan03.sh
-vfork
 timer_settime01
-timerfd01
 timens01

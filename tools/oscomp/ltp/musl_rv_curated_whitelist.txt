@@ -301,8 +301,10 @@ mprotect04
 clock_settime01
 clock_settime02
 msgctl12
+msgrcv05
 msgget02
 semget02
+semop03
 semctl02
 eventfd01
 eventfd02

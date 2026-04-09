@@ -57,6 +57,18 @@ const LOONGARCH_MMIO_SIZE: usize = 0x1000_0000;
 const LOONGARCH_PHYS_BASE: usize = 0x9000_0000;
 const LOONGARCH_PHYS_SIZE: usize = 512 * 1024 * 1024;
 
+/// Convert a kernel virtual address to physical address on LoongArch64.
+/// DMW1 maps kernel VA 0x9xxxxxxx to physical 0x0xxxxxxx (by clearing bit 63).
+/// This is the inverse of how HalLoongArch64::virt_to_phys works.
+#[inline]
+const fn la_kernel_va_to_pa(va: usize) -> usize {
+    if va >= 0x8000000000000000 {
+        va & 0x7FFFFFFFFF
+    } else {
+        va
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MappingArea {
     pub start: usize,
@@ -1362,7 +1374,7 @@ struct LoongPageTableBuilder {
 impl LoongPageTableBuilder {
     fn new() -> Self {
         let mut root = alloc::boxed::Box::new(PageTablePage::new());
-        let root_phys = (&mut *root as *mut PageTablePage) as usize;
+        let root_phys = la_kernel_va_to_pa((&mut *root as *mut PageTablePage) as usize);
         Self {
             root_phys,
             pages: vec![root],
@@ -1435,7 +1447,7 @@ impl LoongPageTableBuilder {
         let existing = self.table_mut(table_phys)[index];
         if existing == 0 {
             let mut next = alloc::boxed::Box::new(PageTablePage::new());
-            let next_phys = (&mut *next as *mut PageTablePage) as usize;
+            let next_phys = la_kernel_va_to_pa((&mut *next as *mut PageTablePage) as usize);
             self.pages.push(next);
             self.table_mut(table_phys)[index] = loong_make_table_pte(next_phys);
             return next_phys;
@@ -1611,11 +1623,22 @@ fn loong_pte_flags(read: bool, write: bool, exec: bool, user: bool, device: bool
 fn segment_phys_base(segment: &Segment) -> Option<usize> {
     let page_offset = segment.area.start & (PAGE_SIZE - 1);
     match segment.storage {
-        SegmentStorage::Owned { ptr, .. } => Some(ptr.saturating_sub(page_offset)),
-        SegmentStorage::Shared { ptr, .. } => Some(ptr.saturating_sub(page_offset)),
-        SegmentStorage::CowParent { ptr, .. } => Some(ptr.saturating_sub(page_offset)),
+        SegmentStorage::Owned { ptr, .. } => {
+            let base = ptr.saturating_sub(page_offset);
+            // On LoongArch, kernel VA must be converted to PA for page table entries
+            Some(la_kernel_va_to_pa(base))
+        }
+        SegmentStorage::Shared { ptr, .. } => {
+            let base = ptr.saturating_sub(page_offset);
+            Some(la_kernel_va_to_pa(base))
+        }
+        SegmentStorage::CowParent { ptr, .. } => {
+            let base = ptr.saturating_sub(page_offset);
+            Some(la_kernel_va_to_pa(base))
+        }
         SegmentStorage::Host { ptr, .. } => {
-            ((ptr & (PAGE_SIZE - 1)) == page_offset).then_some(ptr.saturating_sub(page_offset))
+            let base = ptr.saturating_sub(page_offset);
+            ((ptr & (PAGE_SIZE - 1)) == page_offset).then_some(la_kernel_va_to_pa(base))
         }
     }
 }

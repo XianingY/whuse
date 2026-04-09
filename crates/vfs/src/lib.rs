@@ -486,6 +486,7 @@ enum NodeData {
         family: usize,
         sock_type: usize,
         multicast_joined: bool,
+        peer_path: Option<String>,
     },
     SocketRaw(RawSocketState),
     PidFd(usize),
@@ -1986,6 +1987,13 @@ impl KernelVfs {
         }
     }
 
+    pub fn socket_peer_path(&self, handle: &FileHandle) -> KernelResult<Option<String>> {
+        match &*handle.node.data.lock() {
+            NodeData::SocketConnected { peer_path, .. } => Ok(peer_path.clone()),
+            _ => Err(ENOTSOCK),
+        }
+    }
+
     pub fn create_socket(
         &mut self,
         family: usize,
@@ -2026,6 +2034,7 @@ impl KernelVfs {
                     1,
                     1,
                     false,
+                    Some(format!("{}:1", path)),
                 )),
                 offset: 0,
                 flags: O_RDWR,
@@ -2033,7 +2042,15 @@ impl KernelVfs {
                 pipe_end: PipeEnd::None,
             },
             FileHandle {
-                node: Arc::new(Node::socket_connected(&path, channel, 1, 1, 1, false)),
+                node: Arc::new(Node::socket_connected(
+                    &path,
+                    channel,
+                    1,
+                    1,
+                    1,
+                    false,
+                    Some(format!("{}:0", path)),
+                )),
                 offset: 0,
                 flags: O_RDWR,
                 path: format!("{}:1", path),
@@ -2179,6 +2196,7 @@ impl KernelVfs {
                 family,
                 sock_type,
                 false,
+                Some(path.to_string()),
             )));
         } else {
             let mut guard = listener.data.lock();
@@ -2191,6 +2209,7 @@ impl KernelVfs {
                 family,
                 sock_type,
                 multicast_joined: false,
+                peer_path: Some(path.to_string()),
             };
         }
         *handle.node.data.lock() = NodeData::SocketConnected {
@@ -2199,6 +2218,7 @@ impl KernelVfs {
             family,
             sock_type,
             multicast_joined: false,
+            peer_path: Some(absolute.clone()),
         };
         handle.path = absolute;
         Ok(())
@@ -3965,6 +3985,7 @@ impl Node {
         family: usize,
         sock_type: usize,
         multicast_joined: bool,
+        peer_path: Option<String>,
     ) -> Self {
         Self {
             _name: name.to_string(),
@@ -3975,6 +3996,7 @@ impl Node {
                 family,
                 sock_type,
                 multicast_joined,
+                peer_path,
             }),
         }
     }
@@ -4021,10 +4043,17 @@ fn open_existing_directory_should_fail(flags: u32) -> bool {
 
 fn normalize_path(cwd: &str, path: &str) -> String {
     let mut components = Vec::new();
-    let source = if path.starts_with('/') {
-        path.to_string()
-    } else if cwd == "/" {
-        format!("/{}", path)
+    let source = if cwd == "/" {
+        // If cwd is root, use path directly (possibly with leading /)
+        if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{}", path)
+        }
+    } else if path.starts_with('/') {
+        // Chroot case: cwd is not root, path is absolute
+        // Prepend cwd (without trailing /) to path (without leading /)
+        format!("{}/{}", cwd.trim_end_matches('/'), &path[1..])
     } else {
         format!("{}/{}", cwd.trim_end_matches('/'), path)
     };

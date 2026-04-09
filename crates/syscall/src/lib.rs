@@ -7804,6 +7804,7 @@ impl SyscallDispatcher {
             .map_err(|_| EFAULT)?;
         let cwd = procs.current()?.cwd.clone();
         let new_root = vfs.chdir(&cwd, &path)?;
+        procs.current_mut()?.root = new_root.clone();
         procs.current_mut()?.cwd = new_root;
         Ok(0)
     }
@@ -8695,6 +8696,57 @@ impl SyscallDispatcher {
         Ok(procs.getpriority(which, who)? as usize)
     }
 
+    fn sys_mlock(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
+        let addr = args.0[0];
+        let len = args.0[1];
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let page_addr = addr & !(PAGE_SIZE - 1);
+        let end = page_addr.checked_add(len).ok_or(ENOMEM)?;
+        let process = procs.current()?;
+
+        // Touch first page to verify it's accessible
+        process.read_user_bytes(page_addr, 1).map_err(|_| ENOMEM)?;
+        // Touch last page if different from first
+        if end > page_addr + 1 {
+            process.read_user_bytes(end - 1, 1).map_err(|_| ENOMEM)?;
+        }
+
+        Ok(0)
+    }
+
+    fn sys_mlock2(&self, args: SyscallArgs, procs: &mut ProcessTable) -> Result<usize, i32> {
+        const MLOCK_ONFAULT: usize = 1;
+
+        let addr = args.0[0];
+        let len = args.0[1];
+        let flags = args.0[2];
+
+        if flags & !MLOCK_ONFAULT != 0 {
+            return Err(EINVAL);
+        }
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let page_addr = addr & !(PAGE_SIZE - 1);
+        let end = page_addr.checked_add(len).ok_or(ENOMEM)?;
+        let process = procs.current()?;
+
+        // Touch first page to verify it's accessible
+        process.read_user_bytes(page_addr, 1).map_err(|_| ENOMEM)?;
+        // Touch last page if different from first
+        if end > page_addr + 1 {
+            process.read_user_bytes(end - 1, 1).map_err(|_| ENOMEM)?;
+        }
+
+        Ok(0)
+    }
+
     fn sys_mlockall(&self, args: SyscallArgs, _procs: &mut ProcessTable) -> Result<usize, i32> {
         const MCL_CURRENT: usize = 1;
         const MCL_FUTURE: usize = 2;
@@ -9120,6 +9172,20 @@ impl SyscallDispatcher {
         let fd = args.0[0] as i32;
         let path = procs.current()?.fd(fd)?.path.clone();
         write_sockaddr(procs.current_mut()?, args.0[1], args.0[2], &path)?;
+        Ok(0)
+    }
+
+    fn sys_getpeername(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        vfs: &mut KernelVfs,
+    ) -> Result<usize, i32> {
+        let fd = args.0[0] as i32;
+        let handle = procs.current()?.fd(fd)?;
+        let peer_path = vfs.socket_peer_path(handle)?;
+        let peer_path = peer_path.ok_or(107)?; // ENOTCONN
+        write_sockaddr(procs.current_mut()?, args.0[1], args.0[2], &peer_path)?;
         Ok(0)
     }
 
@@ -9644,8 +9710,11 @@ fn resolve_at_cwd(
     dirfd: i32,
     path: &str,
 ) -> Result<String, i32> {
-    if path.starts_with('/') || dirfd == AT_FDCWD {
-        return Ok(process.cwd.clone());
+    if path.starts_with('/') {
+        return Ok(process.root.clone());
+    }
+    if dirfd == AT_FDCWD {
+        return Ok(process.root.clone());
     }
     let handle = process.fd(dirfd)?;
     let stat = vfs.stat_handle(handle)?;

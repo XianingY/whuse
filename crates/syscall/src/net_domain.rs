@@ -21,7 +21,8 @@ pub(crate) fn dispatch(
         SYS_CONNECT => ctx
             .dispatcher
             .sys_connect(args, ctx.procs, ctx.scheduler, ctx.vfs),
-        SYS_GETSOCKNAME | SYS_GETPEERNAME => ctx.dispatcher.sys_getsockname(args, ctx.procs),
+        SYS_GETSOCKNAME => ctx.dispatcher.sys_getsockname(args, ctx.procs),
+        SYS_GETPEERNAME => ctx.dispatcher.sys_getpeername(args, ctx.procs, ctx.vfs),
         SYS_SENDTO => ctx
             .dispatcher
             .sys_sendto(args, ctx.procs, ctx.scheduler, ctx.vfs),

@@ -1,83 +1,25 @@
 # RISC-V musl pending whitelist - candidates for promotion to curated
+# Updated 2026-04-09: Moved SHOULD FAIL tests to pending_blacklist
 # Safe candidates (~133) promoted to curated on 2026-04-09
-# Remaining candidates need actual test run to verify
-
-# ===== SHOULD FAIL (syscall not implemented) =====
-# Inotify: sys_inotify* not implemented
-inotify01
-inotify02
-inotify03
-inotify04
-inotify05
-inotify06
-inotify07
-inotify08
-inotify09
-inotify10
-inotify11
-inotify12
-inotify_init1_01
-inotify_init1_02
-
-# Fanotify: sys_fanotify* not implemented
-fanotify01
-fanotify02
-fanotify03
-fanotify04
-fanotify05
-fanotify06
-fanotify07
-fanotify08
-fanotify09
-fanotify10
-
-# MQ Operations: sys_mq_* not implemented
-mq_notify02
-mq_notify03
-mq_open01
-mq_timedsend01
-mq_unlink01
-
-# Mount: mount syscall likely stubbed
-mount01
-umount01
-umount02
-umount03
-umount2_01
-
-# Capabilities: sys_capget/capset not implemented
-capget02
-capset02
-
 # ===== UNCLEAR (starry-mix or syscall status uncertain) =====
 # These need actual test run to verify
-
 # madvise variants not in starry-mix
 madvise06
 madvise07
 madvise08
 madvise10
-
 # fallocate variants not in starry-mix
 fallocate04
 fallocate05
 fallocate06
-
 # Other uncertain
 mlock02
-mlockall01
 mmap08
 sched_getaffinity01
 semop04
 ioctl_ns07
-getgid03
-gethostname01
-getpagesize01
-getpgrp01
 mincore01
 userfaultfd01
-confstr01
-getdomainname01
 getpeername01
 posix_fadvise01
 posix_fadvise01_64
@@ -87,10 +29,8 @@ posix_fadvise03
 posix_fadvise03_64
 posix_fadvise04
 posix_fadvise04_64
-
 # ===== Additional candidates from pending list =====
 # These were in pending but not analyzed above
 chroot01
 chroot02
 chroot03
-EOF

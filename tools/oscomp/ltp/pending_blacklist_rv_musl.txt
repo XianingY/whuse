@@ -1,2 +1,45 @@
 # Keep this file for known-bad pending cases only.
 # Current pending queue entries are allowed to execute.
+
+# ===== SHOULD FAIL (syscall not implemented) =====
+# Inotify: sys_inotify* not implemented
+inotify01
+inotify02
+inotify03
+inotify04
+inotify05
+inotify06
+inotify07
+inotify08
+inotify09
+inotify10
+inotify11
+inotify12
+inotify_init1_01
+inotify_init1_02
+# Fanotify: sys_fanotify* not implemented
+fanotify01
+fanotify02
+fanotify03
+fanotify04
+fanotify05
+fanotify06
+fanotify07
+fanotify08
+fanotify09
+fanotify10
+# MQ Operations: sys_mq_* not implemented
+mq_notify02
+mq_notify03
+mq_open01
+mq_timedsend01
+mq_unlink01
+# Mount: mount syscall likely stubbed
+mount01
+umount01
+umount02
+umount03
+umount2_01
+# Capabilities: sys_capget/capset not implemented
+capget02
+capset02

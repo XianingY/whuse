@@ -160,6 +160,8 @@ const MSG_INFO: i32 = 12;
 const SEMCTL_SETVAL: i32 = 16;
 const SEMMSL_LIMIT: usize = 32_000;
 
+pub const SYS_CHMOD: usize = 5;
+pub const SYS_CHOWN: usize = 6;
 pub const SYS_FGETXATTR: usize = 10;
 pub const SYS_EVENTFD2: usize = 19;
 pub const SYS_EPOLL_CREATE1: usize = 20;
@@ -3556,6 +3558,51 @@ impl SyscallDispatcher {
             &format!("path={} old_cwd={} new_cwd={}", path, cwd, new_cwd),
         );
         procs.current_mut()?.cwd = new_cwd;
+        Ok(0)
+    }
+
+    fn sys_chmod(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        vfs: &mut KernelVfs,
+    ) -> Result<usize, i32> {
+        let path_ptr = args.0[0];
+        let mode = args.0[1] as u32;
+        let path = procs
+            .current()?
+            .read_user_cstr(path_ptr)
+            .map_err(|_| EFAULT)?;
+        let cwd = procs.current()?.cwd.clone();
+        vfs.chmod_path(&cwd, &path, mode)?;
+        log_ltp_path_debug(
+            procs.current()?,
+            "chmod",
+            &format!("path={} mode={:#o}", path, mode),
+        );
+        Ok(0)
+    }
+
+    fn sys_chown(
+        &self,
+        args: SyscallArgs,
+        procs: &mut ProcessTable,
+        vfs: &mut KernelVfs,
+    ) -> Result<usize, i32> {
+        let path_ptr = args.0[0];
+        let owner = parse_optional_uid(args.0[1]);
+        let group = parse_optional_uid(args.0[2]);
+        let path = procs
+            .current()?
+            .read_user_cstr(path_ptr)
+            .map_err(|_| EFAULT)?;
+        let cwd = procs.current()?.cwd.clone();
+        vfs.chown_path(&cwd, &path, owner, group)?;
+        log_ltp_path_debug(
+            procs.current()?,
+            "chown",
+            &format!("path={} owner={:?} group={:?}", path, owner, group),
+        );
         Ok(0)
     }
 

@@ -1,5 +1,5 @@
 use crate::{
-    DispatchContext, SyscallArgs, SYS_CHDIR, SYS_CHROOT, SYS_CLOSE, SYS_CLOSE_RANGE,
+    DispatchContext, SyscallArgs, SYS_CHDIR, SYS_CHMOD, SYS_CHOWN, SYS_CHROOT, SYS_CLOSE, SYS_CLOSE_RANGE,
     SYS_COPY_FILE_RANGE, SYS_DUP, SYS_DUP2, SYS_FACCESSAT, SYS_FACCESSAT2, SYS_FALLOCATE,
     SYS_FCHDIR, SYS_FCHMOD, SYS_FCHMODAT, SYS_FCHMODAT2, SYS_FCHOWN, SYS_FCHOWNAT, SYS_FCNTL,
     SYS_FDATASYNC, SYS_FGETXATTR, SYS_FLOCK, SYS_FSTAT, SYS_FSTATAT, SYS_FSTATFS, SYS_FSYNC,
@@ -76,6 +76,8 @@ pub(crate) fn dispatch(
         SYS_FSTATAT => ctx.dispatcher.sys_fstatat(args, ctx.procs, ctx.vfs),
         SYS_FSTAT => ctx.dispatcher.sys_fstat(args, ctx.procs, ctx.vfs),
         SYS_CHDIR => ctx.dispatcher.sys_chdir(args, ctx.procs, ctx.vfs),
+        SYS_CHMOD => ctx.dispatcher.sys_chmod(args, ctx.procs, ctx.vfs),
+        SYS_CHOWN => ctx.dispatcher.sys_chown(args, ctx.procs, ctx.vfs),
         SYS_FCHDIR => ctx.dispatcher.sys_fchdir(args, ctx.procs, ctx.vfs),
         SYS_CHROOT => ctx.dispatcher.sys_chroot(args, ctx.procs, ctx.vfs),
         SYS_FCHMOD => ctx.dispatcher.sys_fchmod(args, ctx.procs, ctx.vfs),

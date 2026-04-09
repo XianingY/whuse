@@ -15,7 +15,7 @@ use proc::ProcessTable;
 use syscall::cache_busybox_image;
 use syscall::{
     SyscallArgs, SyscallDispatcher, SIGNAL_TRAMPOLINE_BASE, SIGNAL_TRAMPOLINE_CODE,
-    SYS_CHDIR, SYS_CLOCK_NANOSLEEP, SYS_CLONE, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2,
+    SYS_CHDIR, SYS_CHMOD, SYS_CHOWN, SYS_CLOCK_NANOSLEEP, SYS_CLONE, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2,
     SYS_EXECVE, SYS_FACCESSAT, SYS_FCHMODAT, SYS_FCHOWNAT, SYS_FORK, SYS_FSTATAT, SYS_FUTEX, SYS_GETDENTS64, SYS_LINKAT,
     SYS_LSEEK, SYS_MKDIRAT, SYS_MKNODAT, SYS_MOUNT, SYS_MSGRCV, SYS_MUNMAP, SYS_NANOSLEEP,
     SYS_OPENAT, SYS_PIPE2, SYS_PPOLL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PSELECT6,
@@ -3307,6 +3307,54 @@ impl Kernel {
                         args.0[2], // group
                         0,
                         args.0[3], // flags
+                    ]);
+                    let result = syscalls.dispatch(
+                        SYS_FCHOWNAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_CHMOD (5): LA libc may call this directly as legacy "chmod(path, mode)"
+            // Convert to fchmodat(AT_FDCWD, path, mode, 0)
+            SYS_CHMOD => {
+                let a0 = args.0[0];
+                if looks_like_pathname(a0) {
+                    // Convert: (path, mode) -> (AT_FDCWD, path, mode, 0)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // path
+                        args.0[1], // mode
+                        0,         // flags
+                        args.0[3],
+                        args.0[4],
+                    ]);
+                    let result = syscalls.dispatch(
+                        SYS_FCHMODAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_CHOWN (6): LA libc may call this directly as legacy "chown(path, owner, group)"
+            // Convert to fchownat(AT_FDCWD, path, owner, group, 0)
+            SYS_CHOWN => {
+                let a0 = args.0[0];
+                if looks_like_pathname(a0) {
+                    // Convert: (path, owner, group) -> (AT_FDCWD, path, owner, group, 0)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // path
+                        args.0[1], // owner
+                        args.0[2], // group
+                        0,         // flags
+                        args.0[3],
                     ]);
                     let result = syscalls.dispatch(
                         SYS_FCHOWNAT,

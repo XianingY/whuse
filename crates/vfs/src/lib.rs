@@ -1747,29 +1747,42 @@ impl KernelVfs {
     pub fn fallocate(
         &mut self,
         handle: &mut FileHandle,
+        mode: i32,
         offset: usize,
         len: usize,
     ) -> KernelResult<()> {
-        let size = offset.saturating_add(len);
-        let mut guard = handle.node.data.lock();
-        match &mut *guard {
-            NodeData::File(buf) | NodeData::ProcFile(buf) => {
-                if size > INMEM_FILE_SIZE_LIMIT {
-                    let dense = core::mem::take(buf);
-                    let mut sparse = SparseFileState::from_dense(dense);
-                    sparse.size = sparse.size.max(size);
-                    *guard = NodeData::SparseFile(sparse);
-                } else {
-                    ensure_file_size(buf, size)?;
+        const FALLOC_FL_KEEP_SIZE: i32 = 1;
+        const FALLOC_FL_PUNCH_HOLE: i32 = 2;
+        // For now, we don't support punch hole or collapse range
+        // Just implement basic allocation with optional KEEP_SIZE
+        if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+            return Err(EINVAL); // Punch hole not supported
+        }
+        // KEEP_SIZE means don't extend file size, just allocate
+        if mode & FALLOC_FL_KEEP_SIZE == 0 {
+            let size = offset.saturating_add(len);
+            let mut guard = handle.node.data.lock();
+            match &mut *guard {
+                NodeData::File(buf) | NodeData::ProcFile(buf) => {
+                    if size > INMEM_FILE_SIZE_LIMIT {
+                        let dense = core::mem::take(buf);
+                        let mut sparse = SparseFileState::from_dense(dense);
+                        sparse.size = sparse.size.max(size);
+                        *guard = NodeData::SparseFile(sparse);
+                    } else {
+                        ensure_file_size(buf, size)?;
+                    }
+                    Ok(())
                 }
-                Ok(())
+                NodeData::SparseFile(state) => {
+                    state.size = state.size.max(size);
+                    Ok(())
+                }
+                NodeData::Ext4File(_) | NodeData::Ext4Dir(_) => Err(EROFS),
+                _ => Err(EINVAL),
             }
-            NodeData::SparseFile(state) => {
-                state.size = state.size.max(size);
-                Ok(())
-            }
-            NodeData::Ext4File(_) | NodeData::Ext4Dir(_) => Err(EROFS),
-            _ => Err(EINVAL),
+        } else {
+            Ok(()) // KEEP_SIZE - no-op, space already allocated
         }
     }
 
@@ -4720,7 +4733,7 @@ mod tests {
             .unwrap();
 
         let large_len = (INMEM_FILE_SIZE_LIMIT + 32 * 1024 * 1024) as usize;
-        vfs.fallocate(&mut file, 0, large_len).unwrap();
+        vfs.fallocate(&mut file, 0, 0, large_len).unwrap();
 
         let stat = vfs.stat_handle(&file).unwrap();
         assert_eq!(stat.size, large_len as u64);

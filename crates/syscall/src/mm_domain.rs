@@ -24,10 +24,12 @@ pub(crate) fn dispatch(
             // madvise(addr, length, advice)
             let advice = args.0[2] as i32;
             const MADV_NORMAL: i32 = 0;
+            const MADV_WILLNEED: i32 = 3;
             const MADV_DONTNEED: i32 = 6;
+            const MADV_REMOVE: i32 = 9;
             const MADV_FREE: i32 = 8;
             match advice {
-                MADV_NORMAL | MADV_DONTNEED | MADV_FREE => Ok(0),
+                MADV_NORMAL | MADV_WILLNEED | MADV_DONTNEED | MADV_REMOVE | MADV_FREE => Ok(0),
                 _ => Err(EINVAL),
             }
         }

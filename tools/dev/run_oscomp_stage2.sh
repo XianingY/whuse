@@ -632,7 +632,12 @@ prepare_ltp_runtime_image() {
     if [[ "${STAGE2_USE_IMAGE_COPY_WAS_SET}" != "1" ]]; then
         WHUSE_STAGE2_USE_IMAGE_COPY=1
     fi
-    prepare_runtime_image "rv" "${src}"
+    local arch
+    case "${src}" in
+        *la.img*|*loongarch*) arch="la" ;;
+        *) arch="rv" ;;
+    esac
+    prepare_runtime_image "${arch}" "${src}"
     WHUSE_STAGE2_USE_IMAGE_COPY="${saved_use_image_copy}"
 }
 

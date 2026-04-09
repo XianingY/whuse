@@ -16,7 +16,7 @@ use syscall::cache_busybox_image;
 use syscall::{
     SyscallArgs, SyscallDispatcher, SIGNAL_TRAMPOLINE_BASE, SIGNAL_TRAMPOLINE_CODE,
     SYS_CHDIR, SYS_CLOCK_NANOSLEEP, SYS_CLONE, SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2,
-    SYS_EXECVE, SYS_FCHMODAT, SYS_FORK, SYS_FSTATAT, SYS_FUTEX, SYS_GETDENTS64, SYS_LINKAT,
+    SYS_EXECVE, SYS_FCHMODAT, SYS_FCHOWNAT, SYS_FORK, SYS_FSTATAT, SYS_FUTEX, SYS_GETDENTS64, SYS_LINKAT,
     SYS_LSEEK, SYS_MKDIRAT, SYS_MKNODAT, SYS_MOUNT, SYS_MSGRCV, SYS_MUNMAP, SYS_NANOSLEEP,
     SYS_OPENAT, SYS_PIPE2, SYS_PPOLL, SYS_PREAD64, SYS_PREADV, SYS_PREADV2, SYS_PSELECT6,
     SYS_PWRITE64, SYS_PWRITEV, SYS_PWRITEV2, SYS_READ, SYS_READLINKAT, SYS_READV, SYS_RENAMEAT,
@@ -3286,6 +3286,30 @@ impl Kernel {
                     ]);
                     let result = syscalls.dispatch(
                         SYS_FCHMODAT,
+                        new_args,
+                        procs,
+                        scheduler,
+                        vfs,
+                    );
+                    return Some(result);
+                }
+            }
+            // SYS_FCHOWNAT (54): LA libc may call this as legacy "chown(path, owner, group)"
+            // or "fchownat(dirfd, path, owner, group, flags)" with wrong arg order
+            SYS_FCHOWNAT => {
+                let a0 = args.0[0];
+                if !looks_like_fd(a0) && looks_like_pathname(a0) {
+                    // Convert: (path, owner, group, flags) -> (AT_FDCWD, path, owner, group, flags)
+                    let new_args = SyscallArgs([
+                        AT_FDCWD,
+                        args.0[0], // path
+                        args.0[1], // owner
+                        args.0[2], // group
+                        0,
+                        args.0[3], // flags
+                    ]);
+                    let result = syscalls.dispatch(
+                        SYS_FCHOWNAT,
                         new_args,
                         procs,
                         scheduler,

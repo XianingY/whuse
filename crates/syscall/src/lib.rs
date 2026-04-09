@@ -5378,7 +5378,20 @@ impl SyscallDispatcher {
                 }
                 Err(ENOENT)
             }
-            _ => Ok(0),
+            0x3 => {
+                // NS_GET_NSTYPE - get namespace type (CLONE_NEWUSER=1, CLONE_NEWNS=2, etc.)
+                // We don't support namespace fd operations properly, so return EINVAL
+                Err(EINVAL)
+            }
+            0x4 => {
+                // NS_GET_SELF - get namespace for current process (same as fd)
+                let handle = procs.current()?.fd(fd)?.clone();
+                if !handle.path.starts_with("/proc/self/ns/") {
+                    return Err(EINVAL);
+                }
+                Ok(procs.current_mut()?.add_fd_from(fd, handle)? as usize)
+            }
+            _ => Err(ENOTTY),
         }
     }
 
@@ -7050,12 +7063,21 @@ impl SyscallDispatcher {
         vfs: &mut KernelVfs,
     ) -> Result<usize, i32> {
         let fd = args.0[0] as i32;
-        let _mode = args.0[1];
+        let mode = args.0[1] as i32;
         let offset = args.0[2];
         let len = args.0[3];
+        // fallocate mode flags
+        const FALLOC_FL_KEEP_SIZE: i32 = 1;
+        const FALLOC_FL_PUNCH_HOLE: i32 = 2;
+        const FALLOC_FL_COLLAPSE_RANGE: i32 = 8;
+        const FALLOC_FL_ZERO_RANGE: i32 = 16;
+        // Validate mode - reject unsupported flag combinations
+        if mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE) != 0 {
+            return Err(EINVAL);
+        }
         let process = procs.current_mut()?;
         let handle = process.fd_mut(fd)?;
-        vfs.fallocate(handle, offset, len)?;
+        vfs.fallocate(handle, mode, offset, len)?;
         Ok(0)
     }
 
@@ -9038,12 +9060,14 @@ impl SyscallDispatcher {
         // Valid advice values: POSIX_FADV_NORMAL=0, POSIX_FADV_SEQUENTIAL=2,
         // POSIX_FADV_RANDOM=3, POSIX_FADV_NOREUSE=4, POSIX_FADV_WILLNEED=5, POSIX_FADV_DONTNEED=6
         const POSIX_FADV_NORMAL: i32 = 0;
+        const POSIX_FADV_SEQUENTIAL: i32 = 2;
         const POSIX_FADV_RANDOM: i32 = 3;
+        const POSIX_FADV_NOREUSE: i32 = 4;
         const POSIX_FADV_WILLNEED: i32 = 5;
         const POSIX_FADV_DONTNEED: i32 = 6;
 
         match advice {
-            POSIX_FADV_NORMAL | POSIX_FADV_RANDOM | POSIX_FADV_WILLNEED | POSIX_FADV_DONTNEED => Ok(0),
+            POSIX_FADV_NORMAL | POSIX_FADV_SEQUENTIAL | POSIX_FADV_RANDOM | POSIX_FADV_NOREUSE | POSIX_FADV_WILLNEED | POSIX_FADV_DONTNEED => Ok(0),
             _ => Err(EINVAL),
         }
     }

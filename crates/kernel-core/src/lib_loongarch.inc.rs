@@ -2312,7 +2312,7 @@ const OSCOMP_OFFICIAL_SUITE_SCRIPT: &str = concat!(
     "    step=\"ltp_testcode.sh\"\n",
     "    timeout_s=\"$WHUSE_LTP_STEP_TIMEOUT\"\n",
     "    echo whuse-oscomp-step-begin:$step\n",
-    "    if [ \"${WHUSE_STAGE2_SKIP_LOONGARCH_FULL_LTP:-1}\" = \"1\" ]; then\n",
+    "    if [ \"${WHUSE_STAGE2_SKIP_LOONGARCH_FULL_LTP:-0}\" = \"1\" ]; then\n",
     "        if runtime_selected musl; then\n",
     "            echo whuse-oscomp-runtime-dispatch:musl\n",
     "            skip_runtime_step_with_reason musl \"$step\" loongarch-full-ltp-deferred\n",
@@ -6087,7 +6087,7 @@ run_time_test_group() {
         echo whuse-oscomp-step-end:ltp_testcode.sh:0
         return 0
     fi
-    if [ "${WHUSE_STAGE2_SKIP_LOONGARCH_FULL_LTP:-1}" = "1" ]; then
+    if [ "${WHUSE_STAGE2_SKIP_LOONGARCH_FULL_LTP:-0}" = "1" ]; then
         echo whuse-oscomp-step-begin:ltp_testcode.sh
         if runtime_selected musl; then
             echo whuse-oscomp-runtime-dispatch:musl

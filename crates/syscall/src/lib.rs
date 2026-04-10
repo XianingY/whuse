@@ -10893,6 +10893,10 @@ fn exec_interp_candidates(display_path: &str, interp_path: &str) -> Vec<String> 
             ordered.push(format!("/glibc/ltp/testcases/lib/{}", name));
         }
     }
+    // For non-musl paths, try the known-working glibc interpreter path FIRST
+    if !display_path.starts_with("/musl/") {
+        ordered.push("/glibc/lib/ld-linux-loongarch-lp64d.so.1".to_string());
+    }
     if display_path.starts_with("/musl/") {
         ordered.push("/musl/lib/libc.so".to_string());
         ordered.push(interp_path.to_string());
@@ -10905,7 +10909,12 @@ fn exec_interp_candidates(display_path: &str, interp_path: &str) -> Vec<String> 
             ordered.push(format!("/glibc/lib/{}", name));
         }
     }
-    ordered.push("/glibc/lib/ld-linux-loongarch-lp64d.so.1".to_string());
+    if !display_path.starts_with("/musl/") {
+        // Skip the ELF header path if it's a non-working path like /lib64/...
+        if !interp_path.starts_with("/lib64/") {
+            ordered.push(interp_path.to_string());
+        }
+    }
     ordered.push("/lib/ld-linux-riscv64-lp64d.so.1".to_string());
     ordered.dedup();
     ordered

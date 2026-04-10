@@ -185,6 +185,10 @@ pub struct LoadedImage {
     pub interp_entry: usize,
     pub program_entry: usize,
     pub is_dyn: bool,
+    pub argc: usize,
+    pub argv_ptr: usize,
+    pub envp_ptr: usize,
+    pub auxv_ptr: usize,
 }
 
 pub trait BinaryLoader {
@@ -908,10 +912,16 @@ impl AddressSpace {
         ];
         let stack_image = build_initial_stack(args, envs, stack_top, &auxv, execfn)?;
         let used = stack_image.len();
-        self.write_bytes(stack_top - used, &stack_image)?;
+        let stack_base = stack_top - used;
+        let pointer_size = size_of::<usize>();
+        let argc = args.len();
+        let argv_ptr = stack_base + pointer_size; // after argc
+        let envp_ptr = argv_ptr + (argc + 1) * pointer_size; // after argc + argv[] + NULL
+        let auxv_ptr = envp_ptr + envs.len() * pointer_size; // after envp[] (NULL terminator already after envp[])
+        self.write_bytes(stack_base, &stack_image)?;
         Ok(LoadedImage {
             entry: interp.map(|image| image.entry).unwrap_or(program.entry),
-            stack_pointer: stack_top - used,
+            stack_pointer: stack_base,
             load_bias: program.load_bias,
             phdr_addr: program.phdr_addr,
             phnum: program.phnum,
@@ -920,6 +930,10 @@ impl AddressSpace {
             interp_entry: interp.map(|image| image.entry).unwrap_or(0),
             program_entry: program.entry,
             is_dyn: program.is_dyn,
+            argc,
+            argv_ptr,
+            envp_ptr,
+            auxv_ptr,
         })
     }
 

@@ -4647,6 +4647,10 @@ impl SyscallDispatcher {
             let process = procs.current_mut()?;
             process.trap_frame.sepc = loaded.entry;
             process.trap_frame.regs[2] = loaded.stack_pointer;
+            process.trap_frame.regs[10] = loaded.argc;
+            process.trap_frame.regs[11] = loaded.argv_ptr;
+            process.trap_frame.regs[12] = loaded.envp_ptr;
+            process.trap_frame.regs[13] = loaded.auxv_ptr;
             process.name = display_path;
             if nested_execve_debug {
                 log_always(&format!(

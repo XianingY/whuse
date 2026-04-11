@@ -247,6 +247,10 @@ __whuse_run_user:
     .globl __whuse_user_trap_entry
 __whuse_user_trap_entry:
     csrwr $a0, 0x30
+    // After csrwr, SAVE0 contains user a0, $a0 contains trapframe ptr
+    // Read user a0 from SAVE0 and save to trapframe.80 BEFORE any other saves
+    csrrd $t0, 0x30
+    st.d $t0, $a0, 80
 
     st.d $ra, $a0, 8
     st.d $sp, $a0, 16
@@ -279,8 +283,6 @@ __whuse_user_trap_entry:
     st.d $r20, $a0, 240
     st.d $r21, $a0, 248
 
-    csrrd $t0, 0x30
-    st.d $t0, $a0, 80
     csrrd $sp, 0x31
     csrrd $t0, 0x6
     st.d $t0, $a0, 256

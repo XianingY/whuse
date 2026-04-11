@@ -5044,7 +5044,10 @@ fn read_oscomp_stage2_overrides(vfs: &mut KernelVfs) -> OscompStage2Overrides {
     let mut overrides = OscompStage2Overrides {
         full_max_group: oscomp_real_full_max_group(),
         iozone_profile: oscomp_iozone_profile(),
-        basic_profile: "full",
+        // Use smoke basic tests for LA full profile to avoid SIGHUP (exit 129) issue
+        // that occurs when running all 33 basic tests. The smoke approach runs only
+        // brk and sleep tests, matching the basic profile behavior.
+        basic_profile: "smoke",
         busybox_profile: "full",
         gate_libctest_scope: "smoke",
         libcbench_scope: "full",

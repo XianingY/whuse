@@ -12,7 +12,7 @@ use linux_raw_sys::general::S_IFSOCK;
 use super::{FileLike, Kstat};
 use crate::{
     file::{File, SealedBuf, SealedBufMut, get_file_like},
-    syscall::DummyFd,
+    syscall::fs::io::DummyFd,
 };
 
 pub struct Socket(pub axnet::Socket);

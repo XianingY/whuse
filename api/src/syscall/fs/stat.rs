@@ -2,7 +2,7 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{LinuxError, LinuxResult};
 use axfs_ng::FS_CONTEXT;
-use axfs_ng_vfs::{Location, NodePermission};
+use axfs_ng_vfs::Location;
 use linux_raw_sys::general::{
     __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, R_OK, W_OK, X_OK, stat,
     statfs, statx,

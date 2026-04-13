@@ -14,6 +14,7 @@ use axerrno::LinuxError;
 use axhal::context::TrapFrame;
 use syscalls::Sysno;
 
+pub(crate) use self::fs::DummyFd;
 use self::{
     fs::*, io_mpx::*, ipc::*, mm::*, net::*, resources::*, signal::*, sync::*, sys::*, task::*,
     time::*,

@@ -178,6 +178,7 @@ pub(super) fn require_sticky_unlink(parent: &Metadata, target: &Metadata) -> Lin
     }
 }
 
+pub(crate) use self::io::DummyFd;
 pub use self::{
     ctl::*, event::*, fd_ops::*, io::*, memfd::*, mount::*, pidfd::*, pipe::*, stat::*,
 };

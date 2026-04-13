@@ -115,7 +115,8 @@ fn process_dir_task(pid: u32) -> VfsResult<AxTaskRef> {
                 VfsError::EIO
             }
         })?
-        .proc;
+        .proc
+        .clone();
     let tid = representative_tid(proc.pid(), proc.threads()).ok_or(VfsError::ENOENT)?;
     let task = get_task(tid).map_err(|err| {
         if err == axerrno::LinuxError::ESRCH {

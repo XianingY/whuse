@@ -10,4 +10,5 @@
 /kernel-la
 /.cargo
 /.crates*
+/.worktrees
 /mnt

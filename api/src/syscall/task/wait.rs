@@ -17,7 +17,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 use crate::signal::check_signals;
 
 bitflags! {
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     struct WaitOptions: u32 {
         /// Do not block when there are no processes wishing to report status.
         const WNOHANG = WNOHANG;

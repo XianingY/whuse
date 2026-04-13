@@ -134,23 +134,24 @@ pub fn sys_openat(
 
     let mode = mode & !current().as_thread().proc_data.umask();
     let caller = effective_identity();
-    let access_mode = match flags & O_ACCMODE {
-        O_WRONLY => W_OK,
-        O_RDWR => R_OK | W_OK,
+    let flags_u32 = flags as u32;
+    let access_mode = match flags_u32 & O_ACCMODE {
+        x if x == O_WRONLY => W_OK,
+        x if x == O_RDWR => R_OK | W_OK,
         _ => R_OK,
     };
     let mut create_ids = (sys_geteuid()? as u32, sys_getegid()? as u32);
 
     let options = with_fs(dirfd, |fs| {
         let target = Path::new(&path);
-        let open_options = if flags & O_CREAT != 0 {
+        let open_options = if flags_u32 & O_CREAT != 0 {
             let (parent, name) = fs.resolve_nonexistent(target)?;
             if let Ok(existing) = parent.lookup_no_follow(name) {
                 require_search_path(&existing, caller, false)?;
-                if flags & O_DIRECTORY != 0 && existing.node_type() != NodeType::Directory {
+                if flags_u32 & O_DIRECTORY != 0 && existing.node_type() != NodeType::Directory {
                     return Err(LinuxError::ENOTDIR);
                 }
-                if flags & O_PATH == 0 {
+                if flags_u32 & O_PATH == 0 {
                     let existing_meta = existing.metadata()?;
                     require_access(&existing_meta, caller, access_mode)?;
                 }
@@ -162,10 +163,10 @@ pub fn sys_openat(
         } else {
             let loc = fs.resolve(target)?;
             require_search_path(&loc, caller, false)?;
-            if flags & O_DIRECTORY != 0 && loc.node_type() != NodeType::Directory {
+            if flags_u32 & O_DIRECTORY != 0 && loc.node_type() != NodeType::Directory {
                 return Err(LinuxError::ENOTDIR);
             }
-            if flags & O_PATH == 0 {
+            if flags_u32 & O_PATH == 0 {
                 require_access(&loc.metadata()?, caller, access_mode)?;
             }
             flags_to_options(flags, mode, create_ids)

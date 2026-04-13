@@ -42,7 +42,8 @@ fn clock_ticks(time: TimeValue) -> usize {
 }
 
 fn process_cpu_times() -> (TimeValue, TimeValue) {
-    let proc = &current().as_thread().proc_data.proc;
+    let curr = current();
+    let proc = &curr.as_thread().proc_data.proc;
     proc.threads().into_iter().fold(
         (TimeValue::ZERO, TimeValue::ZERO),
         |(utime_acc, stime_acc), tid| {

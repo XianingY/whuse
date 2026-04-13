@@ -194,15 +194,22 @@ impl Thread {
 /// Minimal Linux process credentials shared by all threads in a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Credentials {
+    /// Real user ID.
     pub ruid: u32,
+    /// Effective user ID.
     pub euid: u32,
+    /// Saved user ID.
     pub suid: u32,
+    /// Real group ID.
     pub rgid: u32,
+    /// Effective group ID.
     pub egid: u32,
+    /// Saved group ID.
     pub sgid: u32,
 }
 
 impl Credentials {
+    /// Returns root credentials for newly created processes.
     pub const fn root() -> Self {
         Self {
             ruid: 0,
@@ -214,22 +221,27 @@ impl Credentials {
         }
     }
 
+    /// Returns the effective user and group IDs.
     pub fn effective_ids(&self) -> (u32, u32) {
         (self.euid, self.egid)
     }
 
+    /// Returns the real user and group IDs.
     pub fn real_ids(&self) -> (u32, u32) {
         (self.ruid, self.rgid)
     }
 
+    /// Returns whether the effective user is root.
     pub fn is_effective_root(&self) -> bool {
         self.euid == 0
     }
 
+    /// Returns whether `uid` matches any of the process user IDs.
     pub fn matches_uid(&self, uid: u32) -> bool {
         uid == self.ruid || uid == self.euid || uid == self.suid
     }
 
+    /// Returns whether `gid` matches any of the process group IDs.
     pub fn matches_gid(&self, gid: u32) -> bool {
         gid == self.rgid || gid == self.egid || gid == self.sgid
     }

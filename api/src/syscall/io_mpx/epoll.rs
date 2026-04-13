@@ -11,8 +11,9 @@ use starry_signal::SignalSet;
 
 use crate::{
     file::{
-        Directory, EventFd, File, FileLike, PidFd, Pipe,
+        FileLike, PidFd, Pipe,
         epoll::{Epoll, EpollEvent, EpollFlags},
+        event::EventFd,
     },
     mm::{UserConstPtr, UserPtr, nullable},
     signal::with_replacen_blocked,

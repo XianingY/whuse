@@ -13,7 +13,7 @@ use axfs_ng_vfs::{Filesystem, NodeType, VfsError, VfsResult};
 use axtask::{AxTaskRef, WeakAxTaskRef, current};
 use indoc::indoc;
 use starry_core::{
-    task::{AsThread, TaskStat, get_task, tasks},
+    task::{AsThread, TaskStat, get_process_data, get_task, processes},
     vfs::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs,
@@ -85,6 +85,49 @@ const DUMMY_MEMINFO: &str = indoc! {"
 
 pub fn new_procfs() -> Filesystem {
     SimpleFs::new_with("proc".into(), 0x9fa0, builder)
+}
+
+fn dedup_sorted_pids(pids: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    let mut pids = pids.into_iter().collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+fn representative_tid(pid: u32, tids: impl IntoIterator<Item = u32>) -> Option<u32> {
+    let mut tids = tids.into_iter().collect::<Vec<_>>();
+    if tids.is_empty() {
+        return None;
+    }
+    tids.sort_unstable();
+    if let Some(index) = tids.iter().position(|tid| *tid == pid) {
+        return Some(tids[index]);
+    }
+    tids.into_iter().next()
+}
+
+fn process_dir_task(pid: u32) -> VfsResult<AxTaskRef> {
+    let proc = get_process_data(pid)
+        .map_err(|err| {
+            if err == axerrno::LinuxError::ESRCH {
+                VfsError::ENOENT
+            } else {
+                VfsError::EIO
+            }
+        })?
+        .proc;
+    let tid = representative_tid(proc.pid(), proc.threads()).ok_or(VfsError::ENOENT)?;
+    let task = get_task(tid).map_err(|err| {
+        if err == axerrno::LinuxError::ESRCH {
+            VfsError::ENOENT
+        } else {
+            VfsError::EIO
+        }
+    })?;
+    if task.as_thread().proc_data.proc.pid() != pid {
+        return Err(VfsError::ENOENT);
+    }
+    Ok(task)
 }
 
 struct ProcessTaskDir {
@@ -331,20 +374,19 @@ struct ProcFsHandler(Arc<SimpleFs>);
 
 impl SimpleDirOps for ProcFsHandler {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        Box::new(
-            tasks()
-                .into_iter()
-                .map(|task| task.id().as_u64().to_string().into())
-                .chain([Cow::Borrowed("self")]),
-        )
+        let pids = dedup_sorted_pids(processes().into_iter().map(|proc| proc.proc.pid()))
+            .into_iter()
+            .map(|pid| Cow::Owned(pid.to_string()))
+            .collect::<Vec<_>>();
+        Box::new(pids.into_iter().chain([Cow::Borrowed("self")]))
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let task = if name == "self" {
-            current().clone()
+            process_dir_task(current().as_thread().proc_data.proc.pid())?
         } else {
-            let tid = name.parse::<u32>().map_err(|_| VfsError::ENOENT)?;
-            get_task(tid).map_err(|_| VfsError::ENOENT)?
+            let pid = name.parse::<u32>().map_err(|_| VfsError::ENOENT)?;
+            process_dir_task(pid)?
         };
         let node = NodeOpsMux::Dir(SimpleDir::new_maker(
             self.0.clone(),
@@ -417,4 +459,24 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
 
     let proc_dir = ProcFsHandler(fs.clone());
     SimpleDir::new_maker(fs, Arc::new(proc_dir.chain(root)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dedup_sorted_pids, representative_tid};
+
+    #[test]
+    fn dedup_sorted_pids_prefers_process_view() {
+        assert_eq!(dedup_sorted_pids([42, 7, 42, 9, 7]), [7, 9, 42]);
+    }
+
+    #[test]
+    fn representative_tid_prefers_group_leader() {
+        assert_eq!(representative_tid(1002, [1003, 1001, 1002]), Some(1002));
+    }
+
+    #[test]
+    fn representative_tid_falls_back_to_smallest_tid() {
+        assert_eq!(representative_tid(42, [2003, 2001, 2002]), Some(2001));
+    }
 }

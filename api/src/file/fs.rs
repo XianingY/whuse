@@ -18,6 +18,10 @@ use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use super::{FileLike, Kstat, get_file_like};
 use crate::file::{SealedBuf, SealedBufMut};
 
+fn use_dirfd_for_path(path: &str) -> bool {
+    !path.starts_with('/')
+}
+
 pub fn with_fs<R>(
     dirfd: c_int,
     f: impl FnOnce(&mut FsContext) -> LinuxResult<R>,
@@ -68,14 +72,21 @@ pub fn resolve_at(dirfd: c_int, path: Option<&str>, flags: u32) -> LinuxResult<R
                 ResolveAtResult::Other(file_like)
             })
         }
-        Some(path) => with_fs(dirfd, |fs| {
-            if flags & AT_SYMLINK_NOFOLLOW != 0 {
-                fs.resolve_no_follow(path)
+        Some(path) => with_fs(
+            if use_dirfd_for_path(path) {
+                dirfd
             } else {
-                fs.resolve(path)
-            }
-            .map(ResolveAtResult::File)
-        }),
+                AT_FDCWD
+            },
+            |fs| {
+                if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                    fs.resolve_no_follow(path)
+                } else {
+                    fs.resolve(path)
+                }
+                .map(ResolveAtResult::File)
+            },
+        ),
     }
 }
 
@@ -255,4 +266,19 @@ impl Pollable for Directory {
     }
 
     fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_dirfd_for_path;
+
+    #[test]
+    fn absolute_paths_ignore_dirfd() {
+        assert!(!use_dirfd_for_path("/tmp/file"));
+    }
+
+    #[test]
+    fn relative_paths_use_dirfd() {
+        assert!(use_dirfd_for_path("tmp/file"));
+    }
 }

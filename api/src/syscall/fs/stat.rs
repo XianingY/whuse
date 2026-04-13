@@ -2,7 +2,7 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{LinuxError, LinuxResult};
 use axfs_ng::FS_CONTEXT;
-use axfs_ng_vfs::Location;
+use axfs_ng_vfs::{Location, NodeType};
 use linux_raw_sys::general::{
     __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, R_OK, W_OK, X_OK, stat,
     statfs, statx,
@@ -10,10 +10,46 @@ use linux_raw_sys::general::{
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
-    file::{File, FileLike, resolve_at},
+    file::{File, FileLike, with_fs},
     mm::vm_load_string,
     syscall::fs::{effective_identity, real_identity, require_access, require_search_path},
 };
+
+fn resolve_statfs_path(path: &str) -> LinuxResult<Location> {
+    if path.is_empty() {
+        return Err(LinuxError::ENOENT);
+    }
+    if path.starts_with('/') {
+        return with_fs(linux_raw_sys::general::AT_FDCWD as _, |fs| {
+            let loc = fs.resolve(path)?;
+            require_search_path(&loc, effective_identity(), false)?;
+            Ok(loc.mountpoint().root_location())
+        });
+    }
+
+    let identity = effective_identity();
+    let mut fs = FS_CONTEXT.lock();
+    let mut current = fs.current_dir().clone();
+
+    let mut components = path.split('/').filter(|part| !part.is_empty()).peekable();
+    if components.peek().is_none() {
+        return Ok(current.mountpoint().root_location());
+    }
+
+    while let Some(component) = components.next() {
+        let meta = current.metadata()?;
+        if meta.node_type != NodeType::Directory {
+            return Err(LinuxError::ENOTDIR);
+        }
+        require_access(&meta, identity, X_OK)?;
+        current = fs
+            .with_current_dir(current.clone())?
+            .resolve_no_follow(component)
+            .map_err(Into::into)?;
+    }
+
+    Ok(current.mountpoint().root_location())
+}
 
 /// Get the file metadata by `path` and write into `statbuf`.
 ///
@@ -176,13 +212,7 @@ pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> LinuxResult<isize> {
     let path = vm_load_string(path)?;
     debug!("sys_statfs <= path: {:?}", path);
 
-    buf.vm_write(statfs(
-        &FS_CONTEXT
-            .lock()
-            .resolve(path)?
-            .mountpoint()
-            .root_location(),
-    )?)?;
+    buf.vm_write(statfs(&resolve_statfs_path(&path)?)?)?;
     Ok(0)
 }
 

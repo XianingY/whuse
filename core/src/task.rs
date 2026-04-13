@@ -23,6 +23,7 @@ use axtask::{AxTaskRef, TaskExt, TaskInner, WeakAxTaskRef, current};
 use extern_trait::extern_trait;
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
+use linux_raw_sys::general::SCHED_OTHER;
 use scope_local::{ActiveScope, Scope};
 use spin::RwLock;
 use starry_process::{Pid, Process, ProcessGroup, Session};
@@ -284,6 +285,13 @@ pub struct ProcessData {
     /// Process credentials shared by every thread.
     creds: RwLock<Credentials>,
 
+    /// Minimal per-process scheduler policy state exposed via sched_* syscalls.
+    sched_policy: AtomicI32,
+
+    /// Minimal per-process scheduler priority state exposed via sched_*
+    /// syscalls.
+    sched_priority: AtomicI32,
+
     /// Accumulated child CPU time reported via `times()` and `getrusage()`.
     child_utime_ns: AtomicU64,
     child_stime_ns: AtomicU64,
@@ -325,6 +333,8 @@ impl ProcessData {
             futex_table: Arc::new(FutexTable::new()),
 
             creds: RwLock::new(Credentials::root()),
+            sched_policy: AtomicI32::new(SCHED_OTHER),
+            sched_priority: AtomicI32::new(0),
             child_utime_ns: AtomicU64::new(0),
             child_stime_ns: AtomicU64::new(0),
             umask: AtomicU32::new(0o022),
@@ -384,6 +394,20 @@ impl ProcessData {
     /// Check whether the process currently belongs to a group.
     pub fn has_group(&self, gid: u32) -> bool {
         self.credentials().matches_gid(gid)
+    }
+
+    /// Returns the current scheduler policy and priority pair.
+    pub fn sched_state(&self) -> (i32, i32) {
+        (
+            self.sched_policy.load(Ordering::Relaxed),
+            self.sched_priority.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Updates the minimal scheduler policy and priority pair.
+    pub fn set_sched_state(&self, policy: i32, priority: i32) {
+        self.sched_policy.store(policy, Ordering::Relaxed);
+        self.sched_priority.store(priority, Ordering::Relaxed);
     }
 
     /// Implements Linux `setuid(2)` with saved IDs.

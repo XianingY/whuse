@@ -11,10 +11,11 @@ use alloc::{
 use core::{
     cell::RefCell,
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use axerrno::{LinuxError, LinuxResult};
+use axhal::time::TimeValue;
 use axio::PollSet;
 use axmm::AddrSpace;
 use axsync::{Mutex, spin::SpinNoIrq};
@@ -190,6 +191,50 @@ impl Thread {
     }
 }
 
+/// Minimal Linux process credentials shared by all threads in a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Credentials {
+    pub ruid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub rgid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+}
+
+impl Credentials {
+    pub const fn root() -> Self {
+        Self {
+            ruid: 0,
+            euid: 0,
+            suid: 0,
+            rgid: 0,
+            egid: 0,
+            sgid: 0,
+        }
+    }
+
+    pub fn effective_ids(&self) -> (u32, u32) {
+        (self.euid, self.egid)
+    }
+
+    pub fn real_ids(&self) -> (u32, u32) {
+        (self.ruid, self.rgid)
+    }
+
+    pub fn is_effective_root(&self) -> bool {
+        self.euid == 0
+    }
+
+    pub fn matches_uid(&self, uid: u32) -> bool {
+        uid == self.ruid || uid == self.euid || uid == self.suid
+    }
+
+    pub fn matches_gid(&self, gid: u32) -> bool {
+        gid == self.rgid || gid == self.egid || gid == self.sgid
+    }
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
@@ -223,6 +268,13 @@ pub struct ProcessData {
 
     /// The futex table.
     futex_table: Arc<FutexTable>,
+
+    /// Process credentials shared by every thread.
+    creds: RwLock<Credentials>,
+
+    /// Accumulated child CPU time reported via `times()` and `getrusage()`.
+    child_utime_ns: AtomicU64,
+    child_stime_ns: AtomicU64,
 
     /// The default mask for file permissions.
     umask: AtomicU32,
@@ -260,6 +312,9 @@ impl ProcessData {
 
             futex_table: Arc::new(FutexTable::new()),
 
+            creds: RwLock::new(Credentials::root()),
+            child_utime_ns: AtomicU64::new(0),
+            child_stime_ns: AtomicU64::new(0),
             umask: AtomicU32::new(0o022),
         })
     }
@@ -302,6 +357,178 @@ impl ProcessData {
                 SHARED_FUTEX_TABLES.lock().get_or_insert(ptr)
             }
         }
+    }
+
+    /// Get the current process credentials.
+    pub fn credentials(&self) -> Credentials {
+        *self.creds.read()
+    }
+
+    /// Replace the current process credentials.
+    pub fn set_credentials(&self, creds: Credentials) {
+        *self.creds.write() = creds;
+    }
+
+    /// Check whether the process currently belongs to a group.
+    pub fn has_group(&self, gid: u32) -> bool {
+        self.credentials().matches_gid(gid)
+    }
+
+    /// Implements Linux `setuid(2)` with saved IDs.
+    pub fn setuid(&self, uid: u32) -> LinuxResult<()> {
+        let mut creds = self.creds.write();
+        if creds.is_effective_root() {
+            creds.ruid = uid;
+            creds.euid = uid;
+            creds.suid = uid;
+            return Ok(());
+        }
+        if uid != creds.ruid && uid != creds.suid {
+            return Err(LinuxError::EPERM);
+        }
+        creds.euid = uid;
+        Ok(())
+    }
+
+    /// Implements Linux `setgid(2)` with saved IDs.
+    pub fn setgid(&self, gid: u32) -> LinuxResult<()> {
+        let mut creds = self.creds.write();
+        if creds.is_effective_root() {
+            creds.rgid = gid;
+            creds.egid = gid;
+            creds.sgid = gid;
+            return Ok(());
+        }
+        if gid != creds.rgid && gid != creds.sgid {
+            return Err(LinuxError::EPERM);
+        }
+        creds.egid = gid;
+        Ok(())
+    }
+
+    /// Implements Linux `setfsuid(2)` as the minimal same-as-euid model.
+    pub fn setfsuid(&self, uid: u32) -> u32 {
+        let mut creds = self.creds.write();
+        let old = creds.euid;
+        if creds.is_effective_root() || creds.matches_uid(uid) {
+            creds.euid = uid;
+        }
+        old
+    }
+
+    /// Implements Linux `setfsgid(2)` as the minimal same-as-egid model.
+    pub fn setfsgid(&self, gid: u32) -> u32 {
+        let mut creds = self.creds.write();
+        let old = creds.egid;
+        if creds.is_effective_root() || creds.matches_gid(gid) {
+            creds.egid = gid;
+        }
+        old
+    }
+
+    /// Implements Linux `setreuid(2)`.
+    pub fn setreuid(&self, ruid: Option<u32>, euid: Option<u32>) -> LinuxResult<()> {
+        let mut creds = self.creds.write();
+        let old = *creds;
+        if !old.is_effective_root() {
+            if let Some(ruid) = ruid
+                && ruid != old.ruid
+                && ruid != old.euid
+            {
+                return Err(LinuxError::EPERM);
+            }
+            if let Some(euid) = euid
+                && euid != old.ruid
+                && euid != old.euid
+                && euid != old.suid
+            {
+                return Err(LinuxError::EPERM);
+            }
+        }
+
+        if let Some(ruid) = ruid {
+            creds.ruid = ruid;
+        }
+        if let Some(euid) = euid {
+            creds.euid = euid;
+        }
+        if ruid.is_some() || euid.is_some_and(|euid| euid != old.ruid) {
+            creds.suid = creds.euid;
+        }
+        Ok(())
+    }
+
+    /// Implements Linux `setresuid(2)`.
+    pub fn setresuid(
+        &self,
+        ruid: Option<u32>,
+        euid: Option<u32>,
+        suid: Option<u32>,
+    ) -> LinuxResult<()> {
+        let mut creds = self.creds.write();
+        let old = *creds;
+        if !old.is_effective_root() {
+            for uid in [ruid, euid, suid].into_iter().flatten() {
+                if !old.matches_uid(uid) {
+                    return Err(LinuxError::EPERM);
+                }
+            }
+        }
+
+        if let Some(ruid) = ruid {
+            creds.ruid = ruid;
+        }
+        if let Some(euid) = euid {
+            creds.euid = euid;
+        }
+        if let Some(suid) = suid {
+            creds.suid = suid;
+        }
+        Ok(())
+    }
+
+    /// Implements Linux `setresgid(2)`.
+    pub fn setresgid(
+        &self,
+        rgid: Option<u32>,
+        egid: Option<u32>,
+        sgid: Option<u32>,
+    ) -> LinuxResult<()> {
+        let mut creds = self.creds.write();
+        let old = *creds;
+        if !old.is_effective_root() {
+            for gid in [rgid, egid, sgid].into_iter().flatten() {
+                if !old.matches_gid(gid) {
+                    return Err(LinuxError::EPERM);
+                }
+            }
+        }
+
+        if let Some(rgid) = rgid {
+            creds.rgid = rgid;
+        }
+        if let Some(egid) = egid {
+            creds.egid = egid;
+        }
+        if let Some(sgid) = sgid {
+            creds.sgid = sgid;
+        }
+        Ok(())
+    }
+
+    /// Adds CPU time from a waited child process.
+    pub fn add_child_cpu_times(&self, utime: TimeValue, stime: TimeValue) {
+        self.child_utime_ns
+            .fetch_add(utime.as_nanos() as u64, Ordering::Relaxed);
+        self.child_stime_ns
+            .fetch_add(stime.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Returns accumulated child CPU time.
+    pub fn child_cpu_times(&self) -> (TimeValue, TimeValue) {
+        let utime = TimeValue::from_nanos(self.child_utime_ns.load(Ordering::Relaxed));
+        let stime = TimeValue::from_nanos(self.child_stime_ns.load(Ordering::Relaxed));
+        (utime, stime)
     }
 
     /// Get the umask.

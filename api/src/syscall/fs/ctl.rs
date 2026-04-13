@@ -20,6 +20,10 @@ use starry_vm::{VmPtr, vm_write_slice};
 use crate::{
     file::{Directory, FileLike, get_file_like, resolve_at, with_fs},
     mm::vm_load_string,
+    syscall::fs::{
+        caller_has_group, caller_is_owner_or_root, effective_identity, inherited_dir_attrs,
+        require_access, require_parent_write_search, require_search_path, require_sticky_unlink,
+    },
     time::TimeValueLike,
 };
 
@@ -56,6 +60,7 @@ pub fn sys_chdir(path: *const c_char) -> LinuxResult<isize> {
 
     let mut fs = FS_CONTEXT.lock();
     let entry = fs.resolve(path)?;
+    require_search_path(&entry, effective_identity(), true)?;
     fs.set_current_dir(entry)?;
     Ok(0)
 }
@@ -63,7 +68,8 @@ pub fn sys_chdir(path: *const c_char) -> LinuxResult<isize> {
 pub fn sys_fchdir(dirfd: i32) -> LinuxResult<isize> {
     debug!("sys_fchdir <= dirfd: {}", dirfd);
 
-    let entry = with_fs(dirfd, |fs| Ok(fs.current_dir().clone()))?;
+    let entry = Directory::from_fd(dirfd)?.inner().clone();
+    require_search_path(&entry, effective_identity(), true)?;
     FS_CONTEXT.lock().set_current_dir(entry)?;
     Ok(0)
 }
@@ -77,8 +83,13 @@ pub fn sys_chroot(path: *const c_char) -> LinuxResult<isize> {
     let path = vm_load_string(path)?;
     debug!("sys_chroot <= path: {}", path);
 
+    if !effective_identity().is_root {
+        return Err(LinuxError::EPERM);
+    }
+
     let mut fs = FS_CONTEXT.lock();
     let loc = fs.resolve(path)?;
+    require_search_path(&loc, effective_identity(), true)?;
     if loc.node_type() != NodeType::Directory {
         return Err(LinuxError::ENOTDIR);
     }
@@ -93,11 +104,19 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> LinuxResult<is
         dirfd, path, mode
     );
 
-    let mode = mode & !current().as_thread().proc_data.umask();
-    let mode = NodePermission::from_bits_truncate(mode as u16);
-
     with_fs(dirfd, |fs| {
-        fs.create_dir(path, mode)?;
+        let (parent, name) = fs.resolve_nonexistent(Path::new(&path))?;
+        let caller = effective_identity();
+        require_parent_write_search(&parent, caller)?;
+        let mode = mode & !current().as_thread().proc_data.umask();
+        let mode = NodePermission::from_bits_truncate(mode as u16);
+        let egid = current().as_thread().proc_data.credentials().egid;
+        let (gid, mode) = inherited_dir_attrs(&parent, egid, mode)?;
+        let dir = parent.create(name, NodeType::Directory, mode)?;
+        dir.update_metadata(MetadataUpdate {
+            owner: Some((caller.uid, gid)),
+            ..Default::default()
+        })?;
         Ok(0)
     })
 }
@@ -234,12 +253,20 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> LinuxResul
         dirfd, path, flags
     );
 
+    if path.is_empty() {
+        return Err(LinuxError::ENOENT);
+    }
+    if flags != 0 && flags != AT_REMOVEDIR as usize {
+        return Err(LinuxError::EINVAL);
+    }
+
     with_fs(dirfd, |fs| {
-        if flags == AT_REMOVEDIR as _ {
-            fs.remove_dir(path)?;
-        } else {
-            fs.remove_file(path)?;
-        }
+        let loc = fs.resolve_no_follow(Path::new(&path))?;
+        let parent = loc.parent().ok_or(LinuxError::EBUSY)?;
+        let caller = effective_identity();
+        require_parent_write_search(&parent, caller)?;
+        require_sticky_unlink(&parent.metadata()?, &loc.metadata()?)?;
+        parent.unlink(loc.name(), flags == AT_REMOVEDIR as usize)?;
         Ok(0)
     })
 }
@@ -348,7 +375,23 @@ pub fn sys_fchownat(
     let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
         .ok_or(LinuxError::EBADF)?;
+    if flags & AT_EMPTY_PATH == 0 {
+        require_search_path(&loc, effective_identity(), false)?;
+    }
     let meta = loc.metadata()?;
+    let caller = effective_identity();
+
+    let uid = if uid == -1 { meta.uid } else { uid as _ };
+    let gid = if gid == -1 { meta.gid } else { gid as _ };
+
+    if !caller.is_root {
+        if caller.uid != meta.uid || uid != meta.uid {
+            return Err(LinuxError::EPERM);
+        }
+        if gid != meta.gid && !caller_has_group(gid) {
+            return Err(LinuxError::EPERM);
+        }
+    }
 
     let mut mode = meta.mode;
     // chown always clears the setuid bits
@@ -358,8 +401,6 @@ pub fn sys_fchownat(
         mode.remove(NodePermission::SET_GID);
     }
 
-    let uid = if uid == -1 { meta.uid } else { uid as _ };
-    let gid = if gid == -1 { meta.gid } else { gid as _ };
     loc.update_metadata(MetadataUpdate {
         owner: Some((uid, gid)),
         mode: Some(mode),
@@ -379,13 +420,29 @@ pub fn sys_fchmod(fd: i32, mode: u32) -> LinuxResult<isize> {
 
 pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> LinuxResult<isize> {
     let path = path.nullable().map(vm_load_string).transpose()?;
-    resolve_at(dirfd, path.as_deref(), flags)?
+    let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
-        .ok_or(LinuxError::EBADF)?
-        .update_metadata(MetadataUpdate {
-            mode: Some(NodePermission::from_bits_truncate(mode as u16)),
-            ..Default::default()
-        })?;
+        .ok_or(LinuxError::EBADF)?;
+    if flags & AT_EMPTY_PATH == 0 {
+        require_search_path(&loc, effective_identity(), false)?;
+    }
+    let meta = loc.metadata()?;
+    if !caller_is_owner_or_root(&meta) {
+        return Err(LinuxError::EPERM);
+    }
+
+    let mut mode = NodePermission::from_bits_truncate(mode as u16);
+    if !effective_identity().is_root
+        && mode.contains(NodePermission::SET_GID)
+        && !current().as_thread().proc_data.has_group(meta.gid)
+    {
+        mode.remove(NodePermission::SET_GID);
+    }
+
+    loc.update_metadata(MetadataUpdate {
+        mode: Some(mode),
+        ..Default::default()
+    })?;
     Ok(0)
 }
 
@@ -395,16 +452,36 @@ fn update_times(
     atime: Option<Duration>,
     mtime: Option<Duration>,
     flags: u32,
+    current_time_only: bool,
 ) -> LinuxResult<()> {
+    if path.is_null() && flags & AT_EMPTY_PATH == 0 {
+        return Err(LinuxError::EFAULT);
+    }
     let path = path.nullable().map(vm_load_string).transpose()?;
-    resolve_at(dirfd, path.as_deref(), flags)?
+    let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
-        .ok_or(LinuxError::EBADF)?
-        .update_metadata(MetadataUpdate {
-            atime,
-            mtime,
-            ..Default::default()
-        })?;
+        .ok_or(LinuxError::EBADF)?;
+    if loc.filesystem().stat()?.mount_flags & MS_RDONLY != 0 {
+        return Err(LinuxError::EROFS);
+    }
+    if flags & AT_EMPTY_PATH == 0 {
+        require_search_path(&loc, effective_identity(), false)?;
+    }
+    let meta = loc.metadata()?;
+    let caller = effective_identity();
+    let writable = require_access(&meta, caller, W_OK).is_ok();
+    if current_time_only {
+        if !caller.is_root && caller.uid != meta.uid && !writable {
+            return Err(LinuxError::EACCES);
+        }
+    } else if !caller_is_owner_or_root(&meta) {
+        return Err(LinuxError::EPERM);
+    }
+    loc.update_metadata(MetadataUpdate {
+        atime,
+        mtime,
+        ..Default::default()
+    })?;
     Ok(())
 }
 
@@ -418,18 +495,26 @@ pub struct utimbuf {
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_utime(path: *const c_char, times: *const utimbuf) -> LinuxResult<isize> {
-    let (atime, mtime) = if let Some(times) = times.nullable() {
+    let (atime, mtime, current_time_only) = if let Some(times) = times.nullable() {
         // FIXME: AnyBitPattern
         let times = unsafe { times.vm_read_uninit()?.assume_init() };
         (
             Duration::from_secs(times.actime as _),
             Duration::from_secs(times.modtime as _),
+            false,
         )
     } else {
         let time = wall_time();
-        (time, time)
+        (time, time, true)
     };
-    update_times(AT_FDCWD, path, Some(atime), Some(mtime), 0)?;
+    update_times(
+        AT_FDCWD,
+        path,
+        Some(atime),
+        Some(mtime),
+        0,
+        current_time_only,
+    )?;
     Ok(0)
 }
 
@@ -438,15 +523,26 @@ pub fn sys_utimes(
     path: *const c_char,
     times: *const [linux_raw_sys::general::timeval; 2],
 ) -> LinuxResult<isize> {
-    let (atime, mtime) = if let Some(times) = times.nullable() {
+    let (atime, mtime, current_time_only) = if let Some(times) = times.nullable() {
         // FIXME: AnyBitPattern
         let [atime, mtime] = unsafe { times.vm_read_uninit()?.assume_init() };
-        (atime.try_into_time_value()?, mtime.try_into_time_value()?)
+        (
+            atime.try_into_time_value()?,
+            mtime.try_into_time_value()?,
+            false,
+        )
     } else {
         let time = wall_time();
-        (time, time)
+        (time, time, true)
     };
-    update_times(AT_FDCWD, path, Some(atime), Some(mtime), 0)?;
+    update_times(
+        AT_FDCWD,
+        path,
+        Some(atime),
+        Some(mtime),
+        0,
+        current_time_only,
+    )?;
     Ok(0)
 }
 
@@ -467,22 +563,27 @@ pub fn sys_utimensat(
         }
     }
 
-    let (atime, mtime) = if let Some(times) = times.nullable() {
+    let (atime, mtime, current_time_only) = if let Some(times) = times.nullable() {
         // FIXME: AnyBitPattern
         let [atime, mtime] = unsafe { times.vm_read_uninit()?.assume_init() };
+        let atime_now = atime.tv_nsec == UTIME_NOW as _;
+        let mtime_now = mtime.tv_nsec == UTIME_NOW as _;
+        let atime_omit = atime.tv_nsec == UTIME_OMIT as _;
+        let mtime_omit = mtime.tv_nsec == UTIME_OMIT as _;
         (
             utime_to_duration(&atime).transpose()?,
             utime_to_duration(&mtime).transpose()?,
+            (atime_now || atime_omit) && (mtime_now || mtime_omit) && (atime_now || mtime_now),
         )
     } else {
         let time = wall_time();
-        (Some(time), Some(time))
+        (Some(time), Some(time), true)
     };
     if atime.is_none() && mtime.is_none() {
         return Ok(0);
     }
 
-    update_times(dirfd, path, atime, mtime, flags)?;
+    update_times(dirfd, path, atime, mtime, flags, current_time_only)?;
     Ok(0)
 }
 

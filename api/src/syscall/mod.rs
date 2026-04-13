@@ -238,6 +238,8 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
             tf.arg4().into(),
             tf.arg5().into(),
         ),
+        #[cfg(target_arch = "x86_64")]
+        Sysno::epoll_create => sys_epoll_create(tf.arg0() as _),
         Sysno::epoll_create1 => sys_epoll_create1(tf.arg0() as _),
         Sysno::epoll_ctl => sys_epoll_ctl(
             tf.arg0() as _,
@@ -401,6 +403,10 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
         Sysno::setreuid => sys_setreuid(tf.arg0() as _, tf.arg1() as _),
         Sysno::setresuid => sys_setresuid(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
         Sysno::setresgid => sys_setresgid(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
+        Sysno::getresuid => sys_getresuid(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
+        Sysno::getresgid => sys_getresgid(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
+        Sysno::setfsuid => sys_setfsuid(tf.arg0() as _),
+        Sysno::setfsgid => sys_setfsgid(tf.arg0() as _),
         Sysno::get_mempolicy => sys_get_mempolicy(
             tf.arg0() as _,
             tf.arg1() as _,
@@ -423,6 +429,13 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
         Sysno::exit => sys_exit(tf.arg0() as _),
         Sysno::exit_group => sys_exit_group(tf.arg0() as _),
         Sysno::wait4 => sys_waitpid(tf, tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
+        Sysno::waitid => sys_waitid(
+            tf,
+            tf.arg0() as _,
+            tf.arg1() as _,
+            tf.arg2() as _,
+            tf.arg3() as _,
+        ),
         Sysno::getsid => sys_getsid(tf.arg0() as _),
         Sysno::setsid => sys_setsid(),
         Sysno::getpgid => sys_getpgid(tf.arg0() as _),
@@ -452,8 +465,8 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
         ),
         Sysno::rt_sigsuspend => sys_rt_sigsuspend(tf, tf.arg0() as _, tf.arg1() as _),
         Sysno::kill => sys_kill(tf.arg0() as _, tf.arg1() as _),
-        Sysno::tkill => sys_tkill(tf.arg0() as _, tf.arg1() as _),
-        Sysno::tgkill => sys_tgkill(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
+        Sysno::tkill => sys_tkill(tf.arg0() as i32, tf.arg1() as _),
+        Sysno::tgkill => sys_tgkill(tf.arg0() as i32, tf.arg1() as i32, tf.arg2() as _),
         Sysno::rt_sigqueueinfo => sys_rt_sigqueueinfo(
             tf.arg0() as _,
             tf.arg1() as _,

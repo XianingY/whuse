@@ -115,6 +115,10 @@ impl SocketOps for UdpSocket {
         let mut local_addr = local_addr.into_ip()?;
         let mut guard = self.local_addr.write();
 
+        if !local_addr.ip().is_unspecified() && !SERVICE.lock().iface.has_ip_addr(local_addr.ip()) {
+            return Err(LinuxError::EADDRNOTAVAIL);
+        }
+
         if local_addr.port() == 0 {
             local_addr.set_port(get_ephemeral_port()?);
         }

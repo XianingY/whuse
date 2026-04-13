@@ -7,7 +7,7 @@ use core::{
 
 use axerrno::{LinuxError, LinuxResult};
 use axfs_ng::{FS_CONTEXT, FileBackend, OpenOptions, OpenResult};
-use axfs_ng_vfs::{DirEntry, FileNode, Location, NodePermission, NodeType, Reference};
+use axfs_ng_vfs::{DirEntry, FileNode, Location, NodePermission, NodeType, Reference, path::Path};
 use axtask::current;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
@@ -19,7 +19,13 @@ use crate::{
         with_fs,
     },
     mm::{UserPtr, vm_load_string},
-    syscall::sys::{sys_getegid, sys_geteuid},
+    syscall::{
+        fs::{
+            created_file_gid, effective_identity, require_access, require_parent_write_search,
+            require_search_path,
+        },
+        sys::{sys_getegid, sys_geteuid},
+    },
     vfs::dev::tty,
 };
 
@@ -127,9 +133,46 @@ pub fn sys_openat(
     );
 
     let mode = mode & !current().as_thread().proc_data.umask();
+    let caller = effective_identity();
+    let access_mode = match flags & O_ACCMODE {
+        O_WRONLY => W_OK,
+        O_RDWR => R_OK | W_OK,
+        _ => R_OK,
+    };
+    let mut create_ids = (sys_geteuid()? as u32, sys_getegid()? as u32);
 
-    let options = flags_to_options(flags, mode, (sys_geteuid()? as _, sys_getegid()? as _));
-    with_fs(dirfd, |fs| options.open(fs, path))
+    let options = with_fs(dirfd, |fs| {
+        let target = Path::new(&path);
+        let open_options = if flags & O_CREAT != 0 {
+            let (parent, name) = fs.resolve_nonexistent(target)?;
+            if let Ok(existing) = parent.lookup_no_follow(name) {
+                require_search_path(&existing, caller, false)?;
+                if flags & O_DIRECTORY != 0 && existing.node_type() != NodeType::Directory {
+                    return Err(LinuxError::ENOTDIR);
+                }
+                if flags & O_PATH == 0 {
+                    let existing_meta = existing.metadata()?;
+                    require_access(&existing_meta, caller, access_mode)?;
+                }
+            } else {
+                require_parent_write_search(&parent, caller)?;
+                create_ids.1 = created_file_gid(&parent, create_ids.1)?;
+            }
+            flags_to_options(flags, mode, create_ids)
+        } else {
+            let loc = fs.resolve(target)?;
+            require_search_path(&loc, caller, false)?;
+            if flags & O_DIRECTORY != 0 && loc.node_type() != NodeType::Directory {
+                return Err(LinuxError::ENOTDIR);
+            }
+            if flags & O_PATH == 0 {
+                require_access(&loc.metadata()?, caller, access_mode)?;
+            }
+            flags_to_options(flags, mode, create_ids)
+        };
+        open_options.open(fs, path)
+    });
+    options
         .and_then(|it| add_to_fd(it, flags as _))
         .map(|fd| fd as isize)
 }

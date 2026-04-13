@@ -10,7 +10,10 @@ use axnet::{
 use linux_raw_sys::general::S_IFSOCK;
 
 use super::{FileLike, Kstat};
-use crate::file::{SealedBuf, SealedBufMut, get_file_like};
+use crate::{
+    file::{File, SealedBuf, SealedBufMut, get_file_like},
+    syscall::fs::DummyFd,
+};
 
 pub struct Socket(pub axnet::Socket);
 
@@ -64,10 +67,18 @@ impl FileLike for Socket {
     where
         Self: Sized + 'static,
     {
-        get_file_like(fd)?
-            .into_any()
-            .downcast::<Self>()
-            .map_err(|_| LinuxError::ENOTSOCK)
+        if let Ok(file) = File::from_fd(fd)
+            && file.inner().is_path()
+        {
+            return Err(LinuxError::EBADF);
+        }
+        let any = get_file_like(fd)?.into_any();
+        if let Some(dummy) = any.downcast_ref::<DummyFd>()
+            && dummy.bad_fd()
+        {
+            return Err(LinuxError::EBADF);
+        }
+        any.downcast::<Self>().map_err(|_| LinuxError::ENOTSOCK)
     }
 }
 impl Pollable for Socket {

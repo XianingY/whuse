@@ -281,7 +281,11 @@ impl SocketOps for TcpSocket {
             .lock(State::Idle)
             .map_err(|_| ax_err!(EINVAL, "already"))?
             .transit(State::Idle, || {
-                // TODO: check addr is available
+                if !local_addr.ip().is_unspecified()
+                    && !SERVICE.lock().iface.has_ip_addr(local_addr.ip())
+                {
+                    return Err(LinuxError::EADDRNOTAVAIL);
+                }
                 if local_addr.port() == 0 {
                     local_addr.set_port(get_ephemeral_port()?);
                 }

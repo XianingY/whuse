@@ -5,7 +5,7 @@ use alloc::{
 };
 use core::{
     fmt,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
 };
 
 use kspin::SpinNoIrq;
@@ -25,6 +25,10 @@ pub(crate) struct ThreadGroup {
 pub struct Process {
     pid: Pid,
     is_zombie: AtomicBool,
+    wait_consumed: AtomicBool,
+    exit_status: AtomicI32,
+    exit_utime_ns: AtomicU64,
+    exit_stime_ns: AtomicU64,
     pub(crate) tg: SpinNoIrq<ThreadGroup>,
 
     // TODO: child subreaper9
@@ -185,6 +189,25 @@ impl Process {
     pub fn exit_code(&self) -> i32 {
         self.tg.lock().exit_code
     }
+
+    pub fn exit_status(&self) -> i32 {
+        self.exit_status.load(Ordering::Acquire)
+    }
+
+    pub fn waitable(&self) -> bool {
+        self.is_zombie() && !self.wait_consumed.load(Ordering::Acquire)
+    }
+
+    pub fn consume_wait(&self) {
+        self.wait_consumed.store(true, Ordering::Release);
+    }
+
+    pub fn exit_cpu_times(&self) -> (u64, u64) {
+        (
+            self.exit_utime_ns.load(Ordering::Acquire),
+            self.exit_stime_ns.load(Ordering::Acquire),
+        )
+    }
 }
 
 /// Status & exit
@@ -267,6 +290,10 @@ impl Process {
         let process = Arc::new(Process {
             pid,
             is_zombie: AtomicBool::new(false),
+            wait_consumed: AtomicBool::new(false),
+            exit_status: AtomicI32::new(0),
+            exit_utime_ns: AtomicU64::new(0),
+            exit_stime_ns: AtomicU64::new(0),
             tg: SpinNoIrq::new(ThreadGroup::default()),
             children: SpinNoIrq::new(StrongMap::new()),
             parent: SpinNoIrq::new(parent.as_ref().map(Arc::downgrade).unwrap_or_default()),
@@ -295,6 +322,18 @@ impl Process {
     /// Creates a child [`Process`].
     pub fn fork(self: &Arc<Process>, pid: Pid) -> Arc<Process> {
         Self::new(pid, Some(self.clone()))
+    }
+}
+
+impl Process {
+    pub fn set_exit_status(&self, status: i32) {
+        self.exit_status.store(status, Ordering::Release);
+        self.wait_consumed.store(false, Ordering::Release);
+    }
+
+    pub fn set_exit_cpu_times(&self, utime_ns: u64, stime_ns: u64) {
+        self.exit_utime_ns.store(utime_ns, Ordering::Release);
+        self.exit_stime_ns.store(stime_ns, Ordering::Release);
     }
 }
 

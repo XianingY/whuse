@@ -2,7 +2,9 @@ use alloc::{borrow::ToOwned, string::String, sync::Arc};
 use core::{any::Any, borrow::Borrow, cmp::Ordering, task::Context, time::Duration};
 
 use axfs_ng_vfs::{
-    DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType, Reference, StatFs, VfsError, VfsResult, WeakDirEntry
+    DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, Filesystem,
+    FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType,
+    Reference, StatFs, VfsError, VfsResult, WeakDirEntry,
 };
 use axio::{IoEvents, Pollable};
 use axsync::Mutex;
@@ -51,15 +53,22 @@ impl Borrow<str> for FileName {
 pub struct MemoryFs {
     inodes: Mutex<Slab<Arc<Inode>>>,
     root: Mutex<Option<DirEntry>>,
+    mount_flags: u32,
 }
 
 impl MemoryFs {
     /// Creates a new empty memory filesystem.
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Filesystem {
+        Self::with_mount_flags(0)
+    }
+
+    #[allow(clippy::new_ret_no_self)]
+    pub fn with_mount_flags(mount_flags: u32) -> Filesystem {
         let fs = Arc::new(Self {
             inodes: Mutex::new(Slab::new()),
             root: Mutex::default(),
+            mount_flags,
         });
         let root_ino = Inode::new(
             &fs,
@@ -89,7 +98,9 @@ impl FilesystemOps for MemoryFs {
     }
 
     fn stat(&self) -> VfsResult<StatFs> {
-        Ok(dummy_stat_fs(0x01021994))
+        let mut stat = dummy_stat_fs(0x01021994);
+        stat.mount_flags = self.mount_flags;
+        Ok(stat)
     }
 }
 

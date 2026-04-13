@@ -1,5 +1,6 @@
 use alloc::{borrow::Cow, sync::Arc, vec};
 use core::{
+    any::Any,
     ffi::{c_char, c_int},
     task::Context,
 };
@@ -18,7 +19,33 @@ use crate::{
     mm::UserConstPtr,
 };
 
-struct DummyFd;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DummyFdKind {
+    Generic,
+    BadFd,
+}
+
+pub(crate) struct DummyFd {
+    kind: DummyFdKind,
+}
+
+impl DummyFd {
+    pub(crate) const fn generic() -> Self {
+        Self {
+            kind: DummyFdKind::Generic,
+        }
+    }
+
+    pub(crate) const fn bad_fd_handle() -> Self {
+        Self {
+            kind: DummyFdKind::BadFd,
+        }
+    }
+
+    pub(crate) const fn bad_fd(&self) -> bool {
+        matches!(self.kind, DummyFdKind::BadFd)
+    }
+}
 impl FileLike for DummyFd {
     fn read(&self, _dst: &mut SealedBufMut) -> LinuxResult<usize> {
         unimplemented!()
@@ -36,7 +63,7 @@ impl FileLike for DummyFd {
         "anon_inode:[bruh]".into()
     }
 
-    fn into_any(self: Arc<Self>) -> Arc<dyn core::any::Any + Send + Sync> {
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
     }
 }
@@ -55,7 +82,12 @@ pub fn sys_dummy_fd(sysno: Sysno) -> LinuxResult<isize> {
         return Err(LinuxError::ENOSYS);
     }
     warn!("Dummy fd created: {sysno}");
-    DummyFd.add_to_fd_table(false).map(|fd| fd as isize)
+    let file = if sysno == Sysno::open_tree {
+        DummyFd::bad_fd_handle()
+    } else {
+        DummyFd::generic()
+    };
+    file.add_to_fd_table(false).map(|fd| fd as isize)
 }
 
 /// Read data from the file indicated by `fd`.

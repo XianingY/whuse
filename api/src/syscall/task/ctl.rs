@@ -51,15 +51,33 @@ pub fn sys_umask(mask: u32) -> LinuxResult<isize> {
     Ok(old as isize)
 }
 
-pub fn sys_setreuid(_ruid: u32, _euid: u32) -> LinuxResult<isize> {
+fn decode_optional_id(id: u32) -> Option<u32> {
+    (id != u32::MAX).then_some(id)
+}
+
+pub fn sys_setreuid(ruid: u32, euid: u32) -> LinuxResult<isize> {
+    current()
+        .as_thread()
+        .proc_data
+        .setreuid(decode_optional_id(ruid), decode_optional_id(euid))?;
     Ok(0)
 }
 
-pub fn sys_setresuid(_ruid: u32, _euid: u32, _suid: u32) -> LinuxResult<isize> {
+pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> LinuxResult<isize> {
+    current().as_thread().proc_data.setresuid(
+        decode_optional_id(ruid),
+        decode_optional_id(euid),
+        decode_optional_id(suid),
+    )?;
     Ok(0)
 }
 
-pub fn sys_setresgid(_rgid: u32, _egid: u32, _sgid: u32) -> LinuxResult<isize> {
+pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> LinuxResult<isize> {
+    current().as_thread().proc_data.setresgid(
+        decode_optional_id(rgid),
+        decode_optional_id(egid),
+        decode_optional_id(sgid),
+    )?;
     Ok(0)
 }
 

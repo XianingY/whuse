@@ -11,7 +11,7 @@ use starry_signal::SignalSet;
 
 use crate::{
     file::{
-        FileLike,
+        Directory, EventFd, File, FileLike, PidFd, Pipe,
         epoll::{Epoll, EpollEvent, EpollFlags},
     },
     mm::{UserConstPtr, UserPtr, nullable},
@@ -36,6 +36,23 @@ pub fn sys_epoll_create1(flags: u32) -> LinuxResult<isize> {
         .map(|fd| fd as isize)
 }
 
+pub fn sys_epoll_create(size: i32) -> LinuxResult<isize> {
+    if size <= 0 {
+        return Err(LinuxError::EINVAL);
+    }
+    sys_epoll_create1(0)
+}
+
+fn fd_supports_epoll(fd: i32) -> LinuxResult<bool> {
+    let file = crate::file::get_file_like(fd)?;
+    let any = file.into_any();
+    Ok(any.is::<Pipe>()
+        || any.is::<EventFd>()
+        || any.is::<Epoll>()
+        || any.is::<crate::file::Socket>()
+        || any.is::<PidFd>())
+}
+
 pub fn sys_epoll_ctl(
     epfd: i32,
     op: u32,
@@ -44,6 +61,12 @@ pub fn sys_epoll_ctl(
 ) -> LinuxResult<isize> {
     let epoll = Epoll::from_fd(epfd)?;
     debug!("sys_epoll_ctl <= epfd: {}, op: {}, fd: {}", epfd, op, fd);
+    if fd == epfd {
+        return Err(LinuxError::EINVAL);
+    }
+    if matches!(op, EPOLL_CTL_ADD | EPOLL_CTL_MOD) && !fd_supports_epoll(fd)? {
+        return Err(LinuxError::EPERM);
+    }
 
     let parse_event = || -> LinuxResult<(EpollEvent, EpollFlags)> {
         let event = event.get_as_ref()?;

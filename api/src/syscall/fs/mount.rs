@@ -9,7 +9,7 @@ pub fn sys_mount(
     source: *const c_char,
     target: *const c_char,
     fs_type: *const c_char,
-    _flags: i32,
+    flags: i32,
     _data: *const c_void,
 ) -> LinuxResult<isize> {
     let source = vm_load_string(source)?;
@@ -24,7 +24,7 @@ pub fn sys_mount(
         return Err(axerrno::LinuxError::ENODEV);
     }
 
-    let fs = MemoryFs::new();
+    let fs = MemoryFs::with_mount_flags(flags as u32);
 
     let target = FS_CONTEXT.lock().resolve(target)?;
     target.mount(&fs)?;

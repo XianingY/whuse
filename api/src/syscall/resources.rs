@@ -101,19 +101,8 @@ pub fn sys_getrusage(who: i32, usage: *mut rusage) -> LinuxResult<isize> {
                 })
         }
         RUSAGE_CHILDREN => {
-            thr.proc_data
-                .proc
-                .threads()
-                .into_iter()
-                .fold(Rusage::default(), |acc, child| {
-                    if let Ok(task) = get_task(child)
-                        && !curr.ptr_eq(&task)
-                    {
-                        acc.collate(Rusage::from_thread(task.as_thread()))
-                    } else {
-                        acc
-                    }
-                })
+            let (utime, stime) = thr.proc_data.child_cpu_times();
+            Rusage { utime, stime }
         }
         RUSAGE_THREAD => Rusage::from_thread(thr),
         _ => return Err(LinuxError::EINVAL),

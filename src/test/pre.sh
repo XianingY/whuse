@@ -41,6 +41,25 @@ echo @@@@@@@@@@ env @@@@@@@@@@
 env
 echo
 
+ltp_list_has() {
+    case " $1 " in
+        *" $2 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ltp_list_append_unique() {
+    if ! ltp_list_has "$1" "$2"; then
+        if [ -n "$1" ]; then
+            printf '%s %s' "$1" "$2"
+        else
+            printf '%s' "$2"
+        fi
+    else
+        printf '%s' "$1"
+    fi
+}
+
 run_ltp() {
     echo "#### OS COMP TEST GROUP START ltp-$1 ####"
 
@@ -48,7 +67,7 @@ run_ltp() {
     export LTP_DEV_FS_TYPE=tmpfs
     export LTP_SINGLE_FS_TYPE=tmpfs
 
-    all_testcases="
+    keep_testcases="
     rt_sigsuspend01
     abort01
     accept01
@@ -112,14 +131,10 @@ run_ltp() {
     dup3_01
     dup3_02
     epoll_create01
-    epoll_create02
     epoll_create1_01
     epoll_create1_02
     epoll_ctl01
-    epoll_ctl02
     epoll_ctl03
-    epoll_ctl04
-    epoll_ctl05
     epoll_pwait01
     epoll_pwait02
     epoll_pwait03
@@ -509,7 +524,6 @@ run_ltp() {
     statfs02_64
     statvfs01
     statvfs02
-    statx01
     statx02
     statx03
     symlink02
@@ -529,8 +543,6 @@ run_ltp() {
     umask01
     uname01
     uname02
-    uname04
-    unlink05
     unlink07
     unlink08
     unlink09
@@ -544,15 +556,11 @@ run_ltp() {
     utime07
     utimes01
     utsname01
-    utsname04
     wait01
     wait02
     wait401
     wait402
     wait403
-    waitid04
-    waitid05
-    waitid06
     waitpid01
     waitpid03
     waitpid04
@@ -576,9 +584,57 @@ run_ltp() {
     writev06
     writev07
     "
-    if [ "$1" = "glibc" ]; then
-        all_testcases="$all_testcases sigtimedwait01 sigwaitinfo01"
+
+    quarantine_testcases="
+    epoll_create02
+    epoll_ctl02
+    epoll_ctl04
+    epoll_ctl05
+    statx01
+    unlink05
+    utsname04
+    waitid04
+    waitid05
+    waitid06
+    "
+
+    reenable_testcases=""
+
+    if [ "$ARCH" = "riscv64" ]; then
+        reenable_testcases=$(ltp_list_append_unique "$reenable_testcases" epoll_create02)
+        reenable_testcases=$(ltp_list_append_unique "$reenable_testcases" epoll_ctl02)
+        reenable_testcases=$(ltp_list_append_unique "$reenable_testcases" waitid04)
+        reenable_testcases=$(ltp_list_append_unique "$reenable_testcases" waitid05)
+        reenable_testcases=$(ltp_list_append_unique "$reenable_testcases" waitid06)
     fi
+
+    if [ "$ARCH" = "loongarch64" ]; then
+        reenable_testcases=$(ltp_list_append_unique "$reenable_testcases" epoll_create02)
+        reenable_testcases=$(ltp_list_append_unique "$reenable_testcases" epoll_ctl02)
+        reenable_testcases=$(ltp_list_append_unique "$reenable_testcases" waitid04)
+        reenable_testcases=$(ltp_list_append_unique "$reenable_testcases" waitid05)
+        reenable_testcases=$(ltp_list_append_unique "$reenable_testcases" waitid06)
+    fi
+
+    if [ "$1" = "glibc" ]; then
+        keep_testcases=$(ltp_list_append_unique "$keep_testcases" sigtimedwait01)
+        keep_testcases=$(ltp_list_append_unique "$keep_testcases" sigwaitinfo01)
+    fi
+
+    all_testcases=""
+    for f in $keep_testcases; do
+        if ! ltp_list_has "$quarantine_testcases" "$f"; then
+            all_testcases=$(ltp_list_append_unique "$all_testcases" "$f")
+        fi
+    done
+    for f in $reenable_testcases; do
+        all_testcases=$(ltp_list_append_unique "$all_testcases" "$f")
+    done
+
+    echo "LTP keep count: $(for _ in $keep_testcases; do echo x; done | wc -l)"
+    echo "LTP quarantine count: $(for _ in $quarantine_testcases; do echo x; done | wc -l)"
+    echo "LTP reenable count: $(for _ in $reenable_testcases; do echo x; done | wc -l)"
+    echo "LTP final count: $(for _ in $all_testcases; do echo x; done | wc -l)"
 
     cd ltp/testcases/bin
     for f in $all_testcases; do

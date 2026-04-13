@@ -2,34 +2,62 @@ use axerrno::{LinuxError, LinuxResult};
 use axhal::time::{TimeValue, monotonic_time, monotonic_time_nanos, nanos_to_ticks, wall_time};
 use axtask::current;
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE,
-    CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE,
-    CLOCK_THREAD_CPUTIME_ID, itimerval, timespec, timeval,
+    __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
+    CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
+    CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID, itimerval, timespec,
+    timeval,
 };
-use starry_core::{task::AsThread, time::ITimerType};
+use starry_core::{
+    task::{AsThread, get_task},
+    time::ITimerType,
+};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::time::TimeValueLike;
 
-pub fn sys_clock_gettime(clock_id: __kernel_clockid_t, ts: *mut timespec) -> LinuxResult<isize> {
-    let now = match clock_id as u32 {
-        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => wall_time(),
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
-            monotonic_time()
+const CLOCK_TICKS_PER_SEC: u64 = 100;
+
+fn clock_now(clock_id: __kernel_clockid_t) -> LinuxResult<TimeValue> {
+    match clock_id as u32 {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM => Ok(wall_time()),
+        CLOCK_MONOTONIC
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME
+        | CLOCK_BOOTTIME_ALARM => Ok(monotonic_time()),
+        CLOCK_PROCESS_CPUTIME_ID => {
+            let (utime, stime) = process_cpu_times();
+            Ok(utime + stime)
         }
-        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
+        CLOCK_THREAD_CPUTIME_ID => {
             let (utime, stime) = current().as_thread().time.borrow().output();
-            utime + stime
+            Ok(utime + stime)
         }
-        _ => {
-            warn!(
-                "Called sys_clock_gettime for unsupported clock {}",
-                clock_id
-            );
-            wall_time()
-            // return Err(LinuxError::EINVAL);
-        }
-    };
+        _ => Err(LinuxError::EINVAL),
+    }
+}
+
+fn clock_ticks(time: TimeValue) -> usize {
+    ((time.as_nanos() * CLOCK_TICKS_PER_SEC as u128) / 1_000_000_000u128) as usize
+}
+
+fn process_cpu_times() -> (TimeValue, TimeValue) {
+    let proc = &current().as_thread().proc_data.proc;
+    proc.threads().into_iter().fold(
+        (TimeValue::ZERO, TimeValue::ZERO),
+        |(utime_acc, stime_acc), tid| {
+            if let Ok(task) = get_task(tid) {
+                let (utime, stime) = task.as_thread().time.borrow().output();
+                (utime_acc + utime, stime_acc + stime)
+            } else {
+                (utime_acc, stime_acc)
+            }
+        },
+    )
+}
+
+pub fn sys_clock_gettime(clock_id: __kernel_clockid_t, ts: *mut timespec) -> LinuxResult<isize> {
+    let now = clock_now(clock_id)?;
     ts.vm_write(timespec::from_time_value(now))?;
     Ok(0)
 }
@@ -40,9 +68,7 @@ pub fn sys_gettimeofday(ts: *mut timeval) -> LinuxResult<isize> {
 }
 
 pub fn sys_clock_getres(clock_id: __kernel_clockid_t, res: *mut timespec) -> LinuxResult<isize> {
-    if clock_id as u32 != CLOCK_MONOTONIC && clock_id as u32 != CLOCK_REALTIME {
-        warn!("Called sys_clock_getres for unsupported clock {}", clock_id);
-    }
+    let _ = clock_now(clock_id)?;
     if let Some(res) = res.nullable() {
         res.vm_write(timespec::from_time_value(TimeValue::from_micros(1)))?;
     }
@@ -62,14 +88,13 @@ pub struct Tms {
 }
 
 pub fn sys_times(tms: *mut Tms) -> LinuxResult<isize> {
-    let (utime, stime) = current().as_thread().time.borrow().output();
-    let utime = utime.as_micros() as usize;
-    let stime = stime.as_micros() as usize;
+    let (utime, stime) = process_cpu_times();
+    let (cutime, cstime) = current().as_thread().proc_data.child_cpu_times();
     tms.vm_write(Tms {
-        tms_utime: utime,
-        tms_stime: stime,
-        tms_cutime: utime,
-        tms_cstime: stime,
+        tms_utime: clock_ticks(utime),
+        tms_stime: clock_ticks(stime),
+        tms_cutime: clock_ticks(cutime),
+        tms_cstime: clock_ticks(cstime),
     })?;
     Ok(nanos_to_ticks(monotonic_time_nanos()) as _)
 }

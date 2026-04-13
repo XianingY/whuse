@@ -4,13 +4,15 @@ use axerrno::{LinuxError, LinuxResult};
 use axfs_ng::FS_CONTEXT;
 use axfs_ng_vfs::{Location, NodePermission};
 use linux_raw_sys::general::{
-    __kernel_fsid_t, AT_EMPTY_PATH, R_OK, W_OK, X_OK, stat, statfs, statx,
+    __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, R_OK, W_OK, X_OK, stat,
+    statfs, statx,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     file::{File, FileLike, resolve_at},
     mm::vm_load_string,
+    syscall::fs::{effective_identity, real_identity, require_access, require_search_path},
 };
 
 /// Get the file metadata by `path` and write into `statbuf`.
@@ -123,25 +125,28 @@ pub fn sys_faccessat2(
         dirfd, path, mode, flags
     );
 
-    let file = resolve_at(dirfd, path.as_deref(), flags)?;
+    let allowed_flags = AT_EACCESS | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+    if flags & !allowed_flags != 0 {
+        return Err(LinuxError::EINVAL);
+    }
+    if mode & !(R_OK | W_OK | X_OK) != 0 {
+        return Err(LinuxError::EINVAL);
+    }
 
+    let identity = if flags & AT_EACCESS != 0 {
+        effective_identity()
+    } else {
+        real_identity()
+    };
+    let file = resolve_at(dirfd, path.as_deref(), flags)?;
+    let loc = file.into_file().ok_or(LinuxError::EBADF)?;
+    if flags & AT_EMPTY_PATH == 0 {
+        require_search_path(&loc, identity, false)?;
+    }
     if mode == 0 {
         return Ok(0);
     }
-    let mut required_mode = NodePermission::empty();
-    if mode & R_OK != 0 {
-        required_mode |= NodePermission::OWNER_READ;
-    }
-    if mode & W_OK != 0 {
-        required_mode |= NodePermission::OWNER_WRITE;
-    }
-    if mode & X_OK != 0 {
-        required_mode |= NodePermission::OWNER_EXEC;
-    }
-    let required_mode = required_mode.bits();
-    if (file.stat()?.mode as u16 & required_mode) != required_mode {
-        return Err(LinuxError::EACCES);
-    }
+    require_access(&loc.metadata()?, identity, mode)?;
 
     Ok(0)
 }

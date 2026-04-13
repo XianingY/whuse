@@ -182,6 +182,7 @@ pub fn sys_clone(
             signal_actions,
             exit_signal,
         );
+        proc_data.set_credentials(old_proc_data.credentials());
         proc_data.set_umask(old_proc_data.umask());
 
         {

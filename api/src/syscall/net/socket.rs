@@ -10,7 +10,7 @@ use linux_raw_sys::{
     general::{O_CLOEXEC, O_NONBLOCK},
     net::{
         AF_INET, AF_UNIX, IPPROTO_TCP, IPPROTO_UDP, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM,
-        SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
+        SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
     },
 };
 use starry_core::task::AsThread;
@@ -158,8 +158,21 @@ pub fn sys_socketpair(
     );
     let ty = raw_ty & 0xFF;
 
-    if domain != AF_UNIX {
+    if domain != AF_UNIX && domain != AF_INET {
         return Err(LinuxError::EAFNOSUPPORT);
+    }
+    if domain == AF_INET {
+        return match ty {
+            SOCK_STREAM if proto == 0 => Err(LinuxError::EOPNOTSUPP),
+            SOCK_DGRAM if proto == IPPROTO_UDP as u32 => Err(LinuxError::EOPNOTSUPP),
+            SOCK_DGRAM if proto == IPPROTO_TCP as u32 => Err(LinuxError::EPROTONOSUPPORT),
+            SOCK_DGRAM if proto == 0 => Err(LinuxError::EOPNOTSUPP),
+            SOCK_STREAM if proto == IPPROTO_TCP as u32 => Err(LinuxError::EOPNOTSUPP),
+            SOCK_STREAM if proto == 1 => Err(LinuxError::EPROTONOSUPPORT),
+            SOCK_RAW => Err(LinuxError::EPROTONOSUPPORT),
+            _ if ty > SOCK_SEQPACKET => Err(LinuxError::EINVAL),
+            _ => Err(LinuxError::EPROTONOSUPPORT),
+        };
     }
 
     let pid = current().as_thread().proc_data.proc.pid();
@@ -173,8 +186,7 @@ pub fn sys_socketpair(
             (UnixSocket::new(sock1), UnixSocket::new(sock2))
         }
         _ => {
-            warn!("Unsupported socketpair type: {}", ty);
-            return Err(LinuxError::ESOCKTNOSUPPORT);
+            return Err(LinuxError::EINVAL);
         }
     };
     let sock1 = Socket(axnet::Socket::Unix(sock1));

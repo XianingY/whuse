@@ -3,45 +3,76 @@ use core::ffi::c_char;
 
 use axerrno::{LinuxError, LinuxResult};
 use axfs_ng::FS_CONTEXT;
+use axtask::current;
 use linux_raw_sys::{
     general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM},
     system::{new_utsname, sysinfo},
 };
-use starry_core::task::processes;
+use starry_core::task::{AsThread, processes};
 use starry_vm::{VmMutPtr, vm_write_slice};
 
 pub fn sys_getuid() -> LinuxResult<isize> {
-    Ok(0)
+    Ok(current().as_thread().proc_data.credentials().ruid as _)
 }
 
 pub fn sys_geteuid() -> LinuxResult<isize> {
-    Ok(0)
+    Ok(current().as_thread().proc_data.credentials().euid as _)
 }
 
 pub fn sys_getgid() -> LinuxResult<isize> {
-    Ok(0)
+    Ok(current().as_thread().proc_data.credentials().rgid as _)
 }
 
 pub fn sys_getegid() -> LinuxResult<isize> {
+    Ok(current().as_thread().proc_data.credentials().egid as _)
+}
+
+pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> LinuxResult<isize> {
+    let creds = current().as_thread().proc_data.credentials();
+    ruid.vm_write(creds.ruid)?;
+    euid.vm_write(creds.euid)?;
+    suid.vm_write(creds.suid)?;
     Ok(0)
 }
 
-pub fn sys_setuid(_uid: u32) -> LinuxResult<isize> {
-    debug!("sys_setuid <= uid: {}", _uid);
+pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> LinuxResult<isize> {
+    let creds = current().as_thread().proc_data.credentials();
+    rgid.vm_write(creds.rgid)?;
+    egid.vm_write(creds.egid)?;
+    sgid.vm_write(creds.sgid)?;
     Ok(0)
 }
 
-pub fn sys_setgid(_gid: u32) -> LinuxResult<isize> {
-    debug!("sys_setgid <= gid: {}", _gid);
+pub fn sys_setuid(uid: u32) -> LinuxResult<isize> {
+    debug!("sys_setuid <= uid: {}", uid);
+    current().as_thread().proc_data.setuid(uid)?;
     Ok(0)
+}
+
+pub fn sys_setgid(gid: u32) -> LinuxResult<isize> {
+    debug!("sys_setgid <= gid: {}", gid);
+    current().as_thread().proc_data.setgid(gid)?;
+    Ok(0)
+}
+
+pub fn sys_setfsuid(uid: u32) -> LinuxResult<isize> {
+    Ok(current().as_thread().proc_data.setfsuid(uid) as isize)
+}
+
+pub fn sys_setfsgid(gid: u32) -> LinuxResult<isize> {
+    Ok(current().as_thread().proc_data.setfsgid(gid) as isize)
 }
 
 pub fn sys_getgroups(size: usize, list: *mut u32) -> LinuxResult<isize> {
     debug!("sys_getgroups <= size: {}", size);
+    let gid = current().as_thread().proc_data.credentials().egid;
+    if size == 0 {
+        return Ok(1);
+    }
     if size < 1 {
         return Err(LinuxError::EINVAL);
     }
-    vm_write_slice(list, &[0])?;
+    vm_write_slice(list, &[gid])?;
     Ok(1)
 }
 

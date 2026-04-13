@@ -1,0 +1,130 @@
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/ahci_driver.git?rev=beaa9c8"]
+git = "https://github.com/Starry-Mix-THU/ahci_driver.git"
+rev = "beaa9c8"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/allocator.git?rev=d5feebd"]
+git = "https://github.com/Starry-Mix-THU/allocator.git"
+rev = "d5feebd"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/axbacktrace.git?rev=322f6da"]
+git = "https://github.com/Starry-Mix-THU/axbacktrace.git"
+rev = "322f6da"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/axcpu.git?rev=c0230c8"]
+git = "https://github.com/Starry-Mix-THU/axcpu.git"
+rev = "c0230c8"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/axdriver_crates.git?rev=60dbbb6"]
+git = "https://github.com/Starry-Mix-THU/axdriver_crates.git"
+rev = "60dbbb6"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/axerrno.git?rev=f5d8f86"]
+git = "https://github.com/Starry-Mix-THU/axerrno.git"
+rev = "f5d8f86"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/axfs-ng-vfs.git?rev=60491ba"]
+git = "https://github.com/Starry-Mix-THU/axfs-ng-vfs.git"
+rev = "60491ba"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/axio.git?rev=4ececd3"]
+git = "https://github.com/Starry-Mix-THU/axio.git"
+rev = "4ececd3"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/axplat-loongarch64-2k1000la.git?rev=792e170"]
+git = "https://github.com/Starry-Mix-THU/axplat-loongarch64-2k1000la.git"
+rev = "792e170"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/axplat-riscv64-visionfive2.git?rev=504675a"]
+git = "https://github.com/Starry-Mix-THU/axplat-riscv64-visionfive2.git"
+rev = "504675a"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/axplat_crates.git?rev=e00adbb"]
+git = "https://github.com/Starry-Mix-THU/axplat_crates.git"
+rev = "e00adbb"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/kernel_elf_parser.git?rev=fdcce74"]
+git = "https://github.com/Starry-Mix-THU/kernel_elf_parser.git"
+rev = "fdcce74"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/lwext4_rust?rev=43d771a"]
+git = "https://github.com/Starry-Mix-THU/lwext4_rust"
+rev = "43d771a"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/page_table_multiarch.git?rev=4edb821"]
+git = "https://github.com/Starry-Mix-THU/page_table_multiarch.git"
+rev = "4edb821"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/plic.git?rev=ee40f86"]
+git = "https://github.com/Starry-Mix-THU/plic.git"
+rev = "ee40f86"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/rust-fatfs?rev=2685439"]
+git = "https://github.com/Starry-Mix-THU/rust-fatfs"
+rev = "2685439"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/scheduler.git?rev=3bc2f73"]
+git = "https://github.com/Starry-Mix-THU/scheduler.git"
+rev = "3bc2f73"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/simple-sdmmc.git?rev=db64be9"]
+git = "https://github.com/Starry-Mix-THU/simple-sdmmc.git"
+rev = "db64be9"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/smoltcp.git?rev=7401a54"]
+git = "https://github.com/Starry-Mix-THU/smoltcp.git"
+rev = "7401a54"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/starry-process.git?rev=6327455"]
+git = "https://github.com/Starry-Mix-THU/starry-process.git"
+rev = "6327455"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/starry-signal.git?rev=f45379a"]
+git = "https://github.com/Starry-Mix-THU/starry-signal.git"
+rev = "f45379a"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/Starry-Mix-THU/starry-vm.git?rev=8b7dd37"]
+git = "https://github.com/Starry-Mix-THU/starry-vm.git"
+rev = "8b7dd37"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/arceos-org/slab_allocator.git?tag=v0.3.1"]
+git = "https://github.com/arceos-org/slab_allocator.git"
+tag = "v0.3.1"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/jasonwhite/syscalls.git?rev=92624de"]
+git = "https://github.com/jasonwhite/syscalls.git"
+rev = "92624de"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/lights0123/printf-compat.git?rev=5f5c9cc"]
+git = "https://github.com/lights0123/printf-compat.git"
+rev = "5f5c9cc"
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

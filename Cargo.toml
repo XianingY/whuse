@@ -1,0 +1,160 @@
+[workspace]
+resolver = "2"
+members = ["api", "core"]
+exclude = ["arceos"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = [
+    "Azure-stars <Azure_stars@126.com>",
+    "Yuekai Jia <equation618@gmail.com>",
+]
+homepage = "https://github.com/arceos-org/arceos"
+repository = "https://github.com/arceos-org/starry-next"
+
+[workspace.dependencies]
+axfeat = { path = "arceos/api/axfeat", features = [
+    "alloc-slab",
+    "fp-simd",
+    "ext4",
+    "fs",
+    "irq",
+    "multitask",
+    "net",
+    "page-alloc-4g",
+    "rtc",
+    # "sched-fifo",
+    "sched-rr",
+] }
+
+axalloc = { path = "arceos/modules/axalloc" }
+axconfig = { path = "arceos/modules/axconfig" }
+axdisplay = { path = "arceos/modules/axdisplay" }
+axdriver = { path = "arceos/modules/axdriver" }
+axfs-ng = { path = "arceos/modules/axfs-ng" }
+axhal = { path = "arceos/modules/axhal", features = ["uspace"] }
+axinput = { path = "arceos/modules/axinput" }
+axlog = { path = "arceos/modules/axlog" }
+axmm = { path = "arceos/modules/axmm" }
+axnet = { path = "arceos/modules/axnet" }
+axruntime = { path = "arceos/modules/axruntime" }
+axsync = { path = "arceos/modules/axsync" }
+axtask = { path = "arceos/modules/axtask", features = ["task-ext"] }
+
+axbacktrace = "0.1"
+axerrno = { git = "https://github.com/Starry-Mix-THU/axerrno.git", rev = "f5d8f86" }
+axfs-ng-vfs = { git = "https://github.com/Starry-Mix-THU/axfs-ng-vfs.git", rev = "60491ba" }
+axio = { git = "https://github.com/Starry-Mix-THU/axio.git", rev = "4ececd3" }
+starry-process = "0.2"
+starry-signal = "0.2"
+starry-vm = "0.1"
+
+bitflags = "2.6"
+bytemuck = { version = "1.23", features = ["unsound_ptr_pod_impl"] }
+cfg-if = "1.0"
+event-listener = { version = "5.4.0", default-features = false }
+extern-trait = "0.2"
+hashbrown = "0.15.4"
+kspin = "0.1"
+lazy_static = { version = "1.5", features = ["spin_no_std"] }
+linkme = "0.3.33"
+linux-raw-sys = { version = "0.9.3", default-features = false, features = [
+    "no_std",
+    "general",
+    "net",
+    "prctl",
+    "system",
+] }
+memory_addr = "0.4"
+scope-local = "0.1"
+slab = { version = "0.4.9", default-features = false }
+spin = "0.9"
+
+starry-core = { path = "./core" }
+starry-api = { path = "./api" }
+
+[package]
+name = "starry"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+qemu = [
+    "axfeat/driver-virtio-blk",
+    "axfeat/driver-virtio-net",
+
+    "axfeat/driver-virtio-gpu",
+    "axfeat/display",
+
+    "axfeat/driver-virtio-input",
+    "axfeat/input",
+    # "axdriver/dyn",
+    "starry-api/input",
+
+    "axfeat/defplat",
+
+    # auxilary features
+    "axfeat/fs-times",
+    "starry-api/dev-log",
+]
+vf2 = ["dep:axplat-riscv64-visionfive2", "axfeat/driver-sdmmc-gpt"]
+2k1000la = ["dep:axplat-loongarch64-2k1000la", "axfeat/driver-ahci-gpt"]
+
+# Stubs
+pci = ["axfeat/bus-pci"]
+mmio = ["axfeat/bus-mmio"]
+
+[dependencies]
+axfeat.workspace = true
+
+axdriver.workspace = true
+axfs-ng.workspace = true
+axhal.workspace = true
+axlog.workspace = true
+axruntime.workspace = true
+axsync.workspace = true
+axtask.workspace = true
+
+starry-core.workspace = true
+starry-api.workspace = true
+
+axerrno.workspace = true
+cfg-if.workspace = true
+linkme.workspace = true
+linux-raw-sys.workspace = true
+starry-process.workspace = true
+starry-signal.workspace = true
+
+[dependencies.axplat-riscv64-visionfive2]
+git = "https://github.com/Starry-Mix-THU/axplat-riscv64-visionfive2.git"
+rev = "504675a"
+features = ["fp-simd", "irq", "rtc"]
+optional = true
+
+[dependencies.axplat-loongarch64-2k1000la]
+git = "https://github.com/Starry-Mix-THU/axplat-loongarch64-2k1000la.git"
+rev = "792e170"
+features = ["fp-simd", "irq", "rtc"]
+optional = true
+
+[patch.crates-io]
+axbacktrace = { git = "https://github.com/Starry-Mix-THU/axbacktrace.git", rev = "322f6da" }
+axcpu = { git = "https://github.com/Starry-Mix-THU/axcpu.git", rev = "c0230c8" }
+axerrno = { git = "https://github.com/Starry-Mix-THU/axerrno.git", rev = "f5d8f86" }
+axplat = { git = "https://github.com/Starry-Mix-THU/axplat_crates.git", rev = "e00adbb" }
+axplat-riscv64-qemu-virt = { git = "https://github.com/Starry-Mix-THU/axplat_crates.git", rev = "e00adbb" }
+axplat-loongarch64-qemu-virt = { git = "https://github.com/Starry-Mix-THU/axplat_crates.git", rev = "e00adbb" }
+page_table_entry = { git = "https://github.com/Starry-Mix-THU/page_table_multiarch.git", rev = "4edb821" }
+page_table_multiarch = { git = "https://github.com/Starry-Mix-THU/page_table_multiarch.git", rev = "4edb821" }
+starry-process = { git = "https://github.com/Starry-Mix-THU/starry-process.git", rev = "6327455" }
+starry-signal = { git = "https://github.com/Starry-Mix-THU/starry-signal.git", rev = "f45379a" }
+starry-vm = { git = "https://github.com/Starry-Mix-THU/starry-vm.git", rev = "8b7dd37" }
+
+[package.metadata.vendor-filter]
+platforms = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none-softfloat"]
+all-features = true

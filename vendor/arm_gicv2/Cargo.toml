@@ -1,0 +1,23 @@
+[dependencies.tock-registers]
+version = "0.8"
+
+[lib]
+path = "src/lib.rs"
+
+[package]
+authors = ["Yuekai Jia <equation618@gmail.com>"]
+autobenches = false
+autobins = false
+autoexamples = false
+autotests = false
+categories = ["embedded", "no-std", "hardware-support", "os"]
+description = "ARM Generic Interrupt Controller version 2 (GICv2) register definitions and basic operations"
+documentation = "https://docs.rs/arm_gicv2"
+edition = "2021"
+homepage = "https://github.com/arceos-org/arceos"
+keywords = ["arceos", "arm", "aarch64", "gic", "interrupt-controller"]
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+name = "arm_gicv2"
+readme = "README.md"
+repository = "https://github.com/arceos-org/arm_gicv2"
+version = "0.1.0"

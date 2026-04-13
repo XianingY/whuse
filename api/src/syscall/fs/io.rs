@@ -261,16 +261,22 @@ pub fn sys_preadv2(
     iov: *const IoVec,
     iovcnt: usize,
     offset: __kernel_off_t,
-    _flags: u32,
+    flags: u32,
 ) -> LinuxResult<isize> {
     debug!(
         "sys_preadv2 <= fd: {}, iovcnt: {}, offset: {}, flags: {}",
-        fd, iovcnt, offset, _flags
+        fd, iovcnt, offset, flags
     );
     let f = File::from_fd(fd)?;
-    f.inner()
-        .read_at(&mut IoVectorBuf::new(iov, iovcnt)?.into_io(), offset as _)
-        .map(|n| n as _)
+    if flags != 0 {
+        return Err(LinuxError::EOPNOTSUPP);
+    }
+    let mut io = IoVectorBuf::new(iov, iovcnt)?.into_io();
+    match offset {
+        -1 => f.read(&mut io.into()).map(|n| n as _),
+        off if off < -1 => Err(LinuxError::EINVAL),
+        off => f.inner().read_at(&mut io, off as _).map(|n| n as _),
+    }
 }
 
 pub fn sys_pwritev2(
@@ -278,16 +284,22 @@ pub fn sys_pwritev2(
     iov: *const IoVec,
     iovcnt: usize,
     offset: __kernel_off_t,
-    _flags: u32,
+    flags: u32,
 ) -> LinuxResult<isize> {
     debug!(
         "sys_pwritev2 <= fd: {}, iovcnt: {}, offset: {}, flags: {}",
-        fd, iovcnt, offset, _flags
+        fd, iovcnt, offset, flags
     );
     let f = File::from_fd(fd)?;
-    f.inner()
-        .read_at(&mut IoVectorBuf::new(iov, iovcnt)?.into_io(), offset as _)
-        .map(|n| n as _)
+    if flags != 0 {
+        return Err(LinuxError::EOPNOTSUPP);
+    }
+    let mut io = IoVectorBuf::new(iov, iovcnt)?.into_io();
+    match offset {
+        -1 => f.write(&mut io.into()).map(|n| n as _),
+        off if off < -1 => Err(LinuxError::EINVAL),
+        off => f.inner().write_at(&mut io, off as _).map(|n| n as _),
+    }
 }
 
 enum SendFile {

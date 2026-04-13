@@ -6,7 +6,7 @@ use axtask::{
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CLOCK_MONOTONIC, CLOCK_REALTIME, PRIO_PGRP, PRIO_PROCESS, PRIO_USER,
-    SCHED_RR, TIMER_ABSTIME, timespec,
+    SCHED_FIFO, SCHED_OTHER, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use starry_core::task::{get_process_data, get_process_group};
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
@@ -135,15 +135,48 @@ pub fn sys_sched_setaffinity(
     Ok(0)
 }
 
-pub fn sys_sched_getscheduler(_pid: i32) -> LinuxResult<isize> {
-    Ok(SCHED_RR as _)
+#[repr(C)]
+struct SchedParam {
+    sched_priority: i32,
 }
 
-pub fn sys_sched_setscheduler(_pid: i32, _policy: i32, _param: *const ()) -> LinuxResult<isize> {
+fn sched_target(pid: i32) -> LinuxResult<alloc::sync::Arc<starry_core::task::ProcessData>> {
+    if pid == 0 {
+        Ok(current().as_thread().proc_data.clone())
+    } else if pid < 0 {
+        Err(LinuxError::EINVAL)
+    } else {
+        get_process_data(pid as u32)
+    }
+}
+
+fn validate_sched(policy: i32, priority: i32) -> LinuxResult<()> {
+    match policy {
+        SCHED_OTHER if priority == 0 => Ok(()),
+        SCHED_FIFO | SCHED_RR if (1..=99).contains(&priority) => Ok(()),
+        SCHED_OTHER | SCHED_FIFO | SCHED_RR => Err(LinuxError::EINVAL),
+        _ => Err(LinuxError::EINVAL),
+    }
+}
+
+pub fn sys_sched_getscheduler(pid: i32) -> LinuxResult<isize> {
+    Ok(sched_target(pid)?.sched_state().0 as _)
+}
+
+pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const ()) -> LinuxResult<isize> {
+    let proc = sched_target(pid)?;
+    let param = unsafe { (param as *const SchedParam).vm_read_uninit()?.assume_init() };
+    validate_sched(policy, param.sched_priority)?;
+    proc.set_sched_state(policy, param.sched_priority);
     Ok(0)
 }
 
-pub fn sys_sched_getparam(_pid: i32, _param: *mut ()) -> LinuxResult<isize> {
+pub fn sys_sched_getparam(pid: i32, param: *mut ()) -> LinuxResult<isize> {
+    let proc = sched_target(pid)?;
+    let (_, priority) = proc.sched_state();
+    (param as *mut SchedParam).vm_write(SchedParam {
+        sched_priority: priority,
+    })?;
     Ok(0)
 }
 

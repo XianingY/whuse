@@ -13,13 +13,21 @@ use axfs_ng_vfs::{Location, Metadata, NodeFlags};
 use axio::{IoEvents, Pollable};
 use axsync::Mutex;
 use axtask::future::Poller;
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, PATH_MAX};
 
 use super::{FileLike, Kstat, get_file_like};
 use crate::file::{SealedBuf, SealedBufMut};
 
 fn use_dirfd_for_path(path: &str) -> bool {
     !path.starts_with('/')
+}
+
+fn validate_path_arg(path: &str) -> LinuxResult<()> {
+    if path.len() > PATH_MAX as usize {
+        Err(LinuxError::ENAMETOOLONG)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn with_fs<R>(
@@ -72,21 +80,24 @@ pub fn resolve_at(dirfd: c_int, path: Option<&str>, flags: u32) -> LinuxResult<R
                 ResolveAtResult::Other(file_like)
             })
         }
-        Some(path) => with_fs(
-            if use_dirfd_for_path(path) {
-                dirfd
-            } else {
-                AT_FDCWD
-            },
-            |fs| {
-                if flags & AT_SYMLINK_NOFOLLOW != 0 {
-                    fs.resolve_no_follow(path)
+        Some(path) => {
+            validate_path_arg(path)?;
+            with_fs(
+                if use_dirfd_for_path(path) {
+                    dirfd
                 } else {
-                    fs.resolve(path)
-                }
-                .map(ResolveAtResult::File)
-            },
-        ),
+                    AT_FDCWD
+                },
+                |fs| {
+                    if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                        fs.resolve_no_follow(path)
+                    } else {
+                        fs.resolve(path)
+                    }
+                    .map(ResolveAtResult::File)
+                },
+            )
+        }
     }
 }
 

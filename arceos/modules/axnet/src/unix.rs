@@ -1,7 +1,7 @@
 pub(crate) mod dgram;
 pub(crate) mod stream;
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, format, sync::Arc};
 use core::task::Context;
 
 use async_trait::async_trait;
@@ -132,6 +132,18 @@ fn with_slot_or_insert<R>(
     }
 }
 
+fn ensure_datagram_local_addr(addr: &UnixSocketAddr) -> LinuxResult<UnixSocketAddr> {
+    match addr {
+        UnixSocketAddr::Unnamed => {
+            let local = format!("peer.sock.{}", axtask::current().id().as_u64());
+            let addr = UnixSocketAddr::Path(local.into());
+            with_slot_or_insert(&addr, |_| Ok(()))?;
+            Ok(addr)
+        }
+        _ => Ok(addr.clone()),
+    }
+}
+
 pub struct UnixSocket {
     transport: Transport,
     local_addr: Mutex<UnixSocketAddr>,
@@ -170,7 +182,15 @@ impl SocketOps for UnixSocket {
 
     fn connect(&self, remote_addr: SocketAddrEx) -> LinuxResult<()> {
         let remote_addr = remote_addr.into_unix()?;
-        let local_addr = self.local_addr.lock().clone();
+        let local_addr = {
+            let mut local = self.local_addr.lock();
+            if matches!(&*local, UnixSocketAddr::Unnamed)
+                && matches!(self.transport, Transport::Dgram(_))
+            {
+                *local = ensure_datagram_local_addr(&local)?;
+            }
+            local.clone()
+        };
         let mut guard = self.remote_addr.lock();
         if matches!(&*guard, UnixSocketAddr::Unnamed) {
             with_slot(&remote_addr, |slot| {

@@ -176,6 +176,15 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> LinuxResult<isize> {
     let mut buffer = DirBuffer::new(len);
 
     let dir = Directory::from_fd(fd)?;
+    if dir.inner().metadata()?.nlink == 0 {
+        return Err(LinuxError::ENOENT);
+    }
+    if dir.inner().parent().is_some() {
+        let parent = dir.inner().parent().ok_or(LinuxError::ENOENT)?;
+        if parent.lookup_no_follow(dir.inner().name()).is_err() {
+            return Err(LinuxError::ENOENT);
+        }
+    }
     let mut dir_offset = dir.offset.lock();
 
     let mut has_remaining = false;
@@ -194,7 +203,7 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> LinuxResult<isize> {
         return Err(LinuxError::EINVAL);
     }
 
-    vm_write_slice(buf, &buffer.buf)?;
+    vm_write_slice(buf, &buffer.buf[..buffer.offset])?;
 
     Ok(buffer.offset as _)
 }
@@ -419,6 +428,10 @@ pub fn sys_fchmod(fd: i32, mode: u32) -> LinuxResult<isize> {
 }
 
 pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> LinuxResult<isize> {
+    let allowed_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+    if flags & !allowed_flags != 0 {
+        return Err(LinuxError::EINVAL);
+    }
     let path = path.nullable().map(vm_load_string).transpose()?;
     let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
